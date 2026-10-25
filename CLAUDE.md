@@ -22,7 +22,7 @@ This project runs an agent team (see [Agent Team Workflow](https://github.com/rm
 
 **Status**: In production. The service is built and runs from the production compose stack in `deploy/` (see Server deployment below).
 
-**Naming**: Only the repository is named `shoebox-filer`. The Python package, the `receipt-index` CLI, the `RECEIPT_INDEX_*` environment variables and the `receipt_index` database role keep their original names. Don't rename them.
+**Naming**: Only the repository is named `shoebox-filer`. The Python package (`receipt-index` / `receipt_index`), the `receipt-index` CLI, the `RECEIPT_INDEX_*` environment variables and the `receipt_index` database role keep their original names. Don't rename them.
 
 **Tech Stack**: Python 3.11+, PostgreSQL 18+, Anthropic Claude Haiku via Pydantic-AI, Click CLI, Playwright (headless Chromium) for PDF rendering with weasyprint fallback.
 
@@ -49,15 +49,16 @@ Port mappings are configurable via env vars (see `example.env`):
 
 On a host that also runs the production stack, the default host ports can collide with production's. Keep the devtest stack apart:
 
-- Set non-default ports in `.env`, for example:
+- Set non-default ports and a compose project name in the devtest checkout's `.env`, for example:
   ```bash
   POSTGRES_HOST_PORT=25432
   GREENMAIL_SMTP_PORT=23025
   GREENMAIL_IMAP_PORT=23143
+  COMPOSE_PROJECT_NAME=shoebox-dev
   ```
-- Give the devtest stack its own compose project name, so its containers and volumes stay separate from production's, for example `docker compose -p shoebox-dev up -d` (and the same `-p` on every later `docker compose` command).
-- Export the same port variables for `make test-integration`, and for `pytest` run directly: `tests/integration/conftest.py` reads them and falls back to the defaults when they are unset.
-- Use your `POSTGRES_HOST_PORT` in the migration URL below in place of 15432.
+  Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env`, so plain `docker compose` commands and `make docker-up` / `make docker-down` all use the same project, and its containers and volumes stay separate from production's. Passing `docker compose -p shoebox-dev` on every command does the same; the `make docker-*` targets don't pass `-p`. Keep this `.env` to the devtest checkout: an exported `COMPOSE_PROJECT_NAME` overrides the production compose file's own project name.
+- Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env`, and in the migration URL below, from 15432 to your `POSTGRES_HOST_PORT`.
+- `tests/integration/conftest.py` reads the three port variables and falls back to the defaults when they are unset. The Makefile loads `.env`, so `make test-integration` gets them; export them yourself when running `pytest` directly, or if the Makefile can't parse your `.env`.
 
 ### Database
 Migrations (requires [golang-migrate](https://github.com/golang-migrate/migrate)):
