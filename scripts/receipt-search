@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# Run the receipt-index CLI on the always-on server from this laptop.
+#
+#     scripts/receipt-search search --vendor "Acme Parking (U.S.), LLC"
+#     scripts/receipt-search show <receipt-id>
+#     scripts/receipt-search failures --output json
+#
+# Everything after the script name is passed through to `receipt-index` inside
+# the running scheduler container. See docs/user/server-deployment.md.
+#
+# Two things here are load-bearing:
+#
+#   * printf %q re-quoting. ssh does not pass an argv to the remote host; it
+#     concatenates its arguments with spaces and hands the result to the remote
+#     login shell, which word-splits it again. Vendor filters routinely contain
+#     spaces, parentheses and commas ("Acme Parking (U.S.), LLC"), so each
+#     argument is re-quoted for that second parse. %q emits backslash escapes,
+#     which every POSIX shell understands; it only reaches for bash's $'...'
+#     form on control characters, which cannot appear in a search filter.
+#
+#   * -T. ssh allocates no TTY for a command invocation, so `docker compose
+#     exec` must be told not to ask for one; without it exec fails outright.
+#
+# Container targeting is by compose *project name* (-p), not by compose-file
+# path (-f). The project name is set in deploy/docker-compose.yml (`name:
+# receipt-index`) and is therefore independent of where the repo was cloned on
+# the server, which -f is not. The tradeoff: -p can only find a project that is
+# already up. That is the normal state — the scheduler runs under `restart:
+# unless-stopped` — and a "no such service" error correctly means the service
+# is down, which is worth surfacing rather than papering over.
+
+set -euo pipefail
+
+# Default assumes a `receipt-server` alias in ~/.ssh/config; override with
+# RECEIPT_INDEX_SSH_HOST or edit the alias to point at your server.
+SSH_HOST="${RECEIPT_INDEX_SSH_HOST:-receipt-server}"
+COMPOSE_PROJECT="${RECEIPT_INDEX_COMPOSE_PROJECT:-receipt-index}"
+SERVICE="${RECEIPT_INDEX_SERVICE:-scheduler}"
+
+# With no arguments, `printf '%q '` would emit a quoted empty string and the
+# CLI would reject it as an unknown command. Show the CLI's own help instead.
+if [ "$#" -eq 0 ]; then
+    set -- --help
+fi
+
+remote_args="$(printf '%q ' "$@")"
+
+exec ssh "${SSH_HOST}" "docker compose -p $(printf '%q' "${COMPOSE_PROJECT}") \
+exec -T $(printf '%q' "${SERVICE}") receipt-index ${remote_args}"

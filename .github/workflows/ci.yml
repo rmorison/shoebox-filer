@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --all-extras
+      - run: uv run ruff check src/ tests/
+      - run: uv run ruff format --check src/ tests/
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --all-extras
+      - run: uv run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras
+      - run: uv run pytest -m "not integration" --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.11'
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  test-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: receipt_index_dev
+          POSTGRES_USER: main
+          POSTGRES_PASSWORD: localpass  # pragma: allowlist secret
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U main -d receipt_index_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      greenmail:
+        image: greenmail/standalone:2.1.2
+        env:
+          GREENMAIL_OPTS: "-Dgreenmail.auth.disabled -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0"
+        ports:
+          - 3025:3025
+          - 3143:3143
+        options: >-
+          --health-cmd "bash -c 'echo > /dev/tcp/localhost/3143'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/integration/ -m integration --cov-fail-under=60
+        env:
+          POSTGRES_HOST_PORT: "15432"
+          GREENMAIL_SMTP_PORT: "3025"
+          GREENMAIL_IMAP_PORT: "3143"
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --all-extras
+      - run: uv run pip-audit --ignore-vuln CVE-2025-69872  # transitive: pydantic-ai → diskcache, no fix available

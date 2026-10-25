@@ -1,0 +1,55 @@
+# receipt-index.yaml — Application configuration
+#
+# Config file search order (first found wins):
+#   1. --config CLI flag
+#   2. RECEIPT_INDEX_CONFIG environment variable
+#   3. ./receipt-index.yaml (current working directory)
+#   4. ~/.config/receipt-index/config.yaml (XDG convention)
+#
+# Secrets use ${VAR_NAME} syntax for env var interpolation.
+# All referenced env vars must be set at runtime.
+
+# ---------------------------------------------------------------------------
+# Sources — one or more named receipt sources to ingest from
+# ---------------------------------------------------------------------------
+sources:
+  # IMAP email source
+  - name: personal-email
+    type: imap
+    host: mail.example.com
+    port: 993                          # default: 993
+    username: user@example.com
+    password: ${IMAP_PASSWORD}         # env var interpolation for secrets
+    folder: INBOX.Receipts             # default: INBOX
+    use_ssl: true                      # default: true
+
+  # Google Drive source (Phase 2)
+  # - name: scanned-receipts
+  #   type: gdrive
+  #   folder_id: "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
+  #   token_json: ${GDRIVE_TOKEN_JSON}              # from: receipt-index auth gdrive
+
+# ---------------------------------------------------------------------------
+# Database — PostgreSQL connection
+# ---------------------------------------------------------------------------
+database:
+  url: ${DATABASE_URL}                 # e.g. postgresql://user:pass@localhost:5432/receipt_index  # pragma: allowlist secret
+
+# ---------------------------------------------------------------------------
+# File store — where rendered PDF receipts are saved
+# ---------------------------------------------------------------------------
+store:
+  path: ./data/receipts                # default: ./data/receipts
+
+# ---------------------------------------------------------------------------
+# LLM — metadata extraction provider
+# ---------------------------------------------------------------------------
+llm:
+  model: claude-haiku-4-5-20251001     # default: claude-haiku-4-5-20251001
+  api_key: ${ANTHROPIC_API_KEY}
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: INFO                          # DEBUG | INFO | WARNING | ERROR | CRITICAL

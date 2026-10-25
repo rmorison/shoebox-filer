@@ -1,0 +1,24 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.git/
+.github/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.env
+data/
+deploy/
+docs/
+tests/
+*.md
+# hatchling requires the readme to build the package (pyproject readme field)
+!README.md
+.DS_Store
+Thumbs.db

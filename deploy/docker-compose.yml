@@ -1,0 +1,116 @@
+# Production compose project for the always-on receipt-index service.
+#
+# The repo-root docker-compose.yml is the *dev* stack (db + GreenMail) and is
+# untouched by this file. There is no GreenMail here.
+#
+# Run it from the clone root:
+#     docker compose -f deploy/docker-compose.yml up -d
+#
+# Path conventions, because compose resolves relative paths against the
+# directory holding this file (deploy/), not the working directory:
+#   ./  -> deploy/            (config that is version-controlled)
+#   ../ -> the clone root     (secrets and mutable server state, git-ignored)
+#
+# Server state that lives at the clone root: .env, data/receipts,
+# data/backups, rclone-config/. All three data directories must be owned by
+# uid/gid 1000 (the image's appuser) — see docs/user/server-deployment.md.
+
+name: receipt-index
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD / RECEIPT_INDEX_PASSWORD
+    # come from here. env_file (container environment) is used rather than
+    # ${VAR} interpolation because the .env lives at the clone root, and
+    # compose only auto-loads a .env sitting next to the compose file — so
+    # interpolated values would silently resolve to empty.
+    env_file: ../.env
+    ports:
+      # Loopback only. Enough for `make migrate-up`, psql, and pg_restore on
+      # the server (and from the laptop over an SSH tunnel); not reachable
+      # from the network.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      # PostgreSQL 18 requires the volume at /var/lib/postgresql — NOT the
+      # /var/lib/postgresql/data subdirectory used by earlier majors.
+      # Getting this wrong loses the cluster on the next container restart.
+      - pgdata:/var/lib/postgresql
+      # Runs once, on first boot of an empty volume.
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      # Always-on box: container logs share a disk with pgdata and the receipt
+      # store, so they are capped rather than left to grow without bound.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+
+  scheduler:
+    build:
+      # Build context is the clone root; `dockerfile` is resolved relative to
+      # the context, so it is a bare filename here, not ../Dockerfile.
+      context: ..
+      dockerfile: Dockerfile
+    image: receipt-index
+    # supercronic replaces the image's ENTRYPOINT ["receipt-index"]. The CLI is
+    # still reachable for ad-hoc use via `docker compose ... exec scheduler
+    # receipt-index <cmd>`.
+    entrypoint: ["supercronic", "/app/crontab"]
+    restart: unless-stopped
+    # Give a mid-cycle ingest time to finish on docker stop / host shutdown:
+    # the 10s default would SIGKILL it mid-item, orphaning a PDF that the
+    # additive Dropbox mirror then preserves forever.
+    stop_grace_period: 5m
+    # PID 1 zombie reaping: Chromium forks aggressively during rendering.
+    init: true
+    # Chromium crashes on the 64 MB default /dev/shm.
+    shm_size: 1gb
+    depends_on:
+      db:
+        condition: service_healthy
+    # Secrets: IMAP_PASSWORD, ANTHROPIC_API_KEY, GDRIVE_TOKEN_JSON,
+    # DATABASE_URL. Never baked into the image. See deploy/example.env.
+    env_file: ../.env
+    environment:
+      # Explicit rather than relying on CWD-relative config discovery, which
+      # breaks under `docker compose exec -w`.
+      RECEIPT_INDEX_CONFIG: /app/receipt-index.yaml
+      # Pinned explicitly because env_file values override baked image ENV: a
+      # stray PLAYWRIGHT_BROWSERS_PATH in ../.env (e.g. the dev .playwright
+      # value) would otherwise silently break Chromium discovery and downgrade
+      # every HTML receipt to the weasyprint fallback. Service-level
+      # environment: beats env_file, making that leak mechanically impossible.
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    volumes:
+      # Rendered receipt tree. Bind-mounted (not a named volume) so it can be
+      # rsynced in at cutover and read by rclone from the host if needed.
+      - ../data/receipts:/app/data/receipts
+      # Nightly pg_dump output, mirrored to Dropbox by the sync cron line.
+      - ../data/backups:/app/data/backups
+      # Copied from deploy/example.receipt-index.yaml at provision time and
+      # edited with your sources; the copy is gitignored.
+      - ./receipt-index.yaml:/app/receipt-index.yaml:ro
+      - ./crontab:/app/crontab:ro
+      - ./backup.sh:/app/backup.sh:ro
+      # rclone's config directory, mounted READ-WRITE and as a whole directory.
+      # Dropbox access tokens are short-lived; on refresh rclone rewrites
+      # rclone.conf by creating a temp file and renaming it over the original.
+      # A :ro mount or a single-file bind mount breaks that rename and the
+      # mirror dies silently a few hours after deploy. See rclone-setup.md.
+      - ../rclone-config:/app/.rclone
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+
+volumes:
+  pgdata:

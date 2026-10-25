@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment and config
+.env
+receipt-index.yaml
+# ...but the server config in deploy/ holds no secrets (only ${VAR} refs) and
+# is version-controlled. The bare pattern above matches at any depth.
+!deploy/example.receipt-index.yaml
+
+# Data
+data/
+
+# Server-side rclone config directory (contains live Dropbox OAuth tokens)
+rclone-config/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# mypy
+.mypy_cache/
+
+# ruff
+.ruff_cache/
+
+# pytest
+.pytest_cache/
+
+# Playwright browsers
+.playwright/
+
+# Local tools (golang-migrate, etc.)
+.bin/
+
+# Local working notes
+PHASE2-PLAN.md
+
+# OS
+.DS_Store
+Thumbs.db

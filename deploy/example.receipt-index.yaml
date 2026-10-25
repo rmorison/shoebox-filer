@@ -1,0 +1,48 @@
+# Server application config TEMPLATE. Copy to deploy/receipt-index.yaml
+# (gitignored) and fill in your source definitions; the copy is mounted
+# read-only at /app/receipt-index.yaml via RECEIPT_INDEX_CONFIG in
+# deploy/docker-compose.yml.
+#
+# Mirrors the source definitions of the repo-root receipt-index.yaml. Two
+# deliberate differences:
+#
+#   1. store.path is the absolute in-container bind-mount path. The dev config
+#      uses ./data/receipts, which resolves against the CWD — fragile under
+#      `docker compose exec -w`.
+#   2. The gdrive source drops `credentials_json`. GdriveSourceConfig has no
+#      such field (it is ignored on parse), but ${VAR} interpolation happens
+#      *before* parsing and hard-fails on undefined names — so keeping the key
+#      would force GDRIVE_CREDENTIALS_JSON into the server .env purely to
+#      satisfy a value nothing reads. The OAuth client id/secret needed for
+#      token refresh are already inside GDRIVE_TOKEN_JSON.
+#
+# Every ${VAR} below must be defined in the clone-root .env — see
+# deploy/example.env. A missing one aborts startup with the full list.
+
+sources:
+  - name: personal-email
+    type: imap
+    host: mail.example.com
+    port: 993
+    username: user@example.com
+    password: ${IMAP_PASSWORD}
+    folder: INBOX.Receipts
+    use_ssl: true
+
+  - name: scanned-receipts
+    type: gdrive
+    folder_id: "replace-with-gdrive-folder-id"
+    token_json: ${GDRIVE_TOKEN_JSON}
+
+database:
+  url: ${DATABASE_URL}
+
+store:
+  path: /app/data/receipts
+
+llm:
+  model: claude-haiku-4-5-20251001
+  api_key: ${ANTHROPIC_API_KEY}
+
+logging:
+  level: INFO
