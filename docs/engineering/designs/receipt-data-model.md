@@ -290,19 +290,20 @@ Existing receipts have no `extractions` row, and count as prompt version 0. That
 ```
 receipt-index reextract [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
                         [--source NAME] [--id UUID ...]
-                        [--stale] [--overwrite] [--force]
+                        [--model-not MODEL] [--confidence-below [FIELD=]X]
+                        [--all] [--overwrite] [--force]
                         [--input auto|rendition] [--limit N]
                         [--dry-run] [--output text|json]
 ```
 
-- **Selection.** By receipt date range, source and IDs, combined with AND. `--stale` keeps only receipts whose latest extraction has an older prompt version than the current one.
-- **Repeat runs.** A receipt whose latest extraction already has the current prompt version is skipped unless `--force` is given. An interrupted run can be started again with the same arguments.
-- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt extracted under the old prompt, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
+- **Selection.** By receipt date range, source and IDs, combined with AND. `--model-not` keeps receipts whose latest extraction used another model, and `--confidence-below` those whose overall confidence, or one field's, is below a value. A selector, `--limit` or `--all` is required, so that a bare command never re-extracts the whole catalogue. (The sign-off dropped a `--stale` option: the default already selects only stale receipts.)
+- **Repeat runs.** A receipt whose latest extraction already has the current prompt version and the configured model is skipped unless `--force` is given, so a model change makes receipts stale as a prompt change does. An interrupted run can be started again with the same arguments. A failed run is recorded with `output` holding only its `error`, and doesn't count as the latest extraction for this rule, so the next run retries it.
+- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt extracted under the old prompt, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier, and the overall confidence; a receipt with no extraction history counts as entirely machine-extracted. A field's `field_confidence` entry is written with the field. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
 - **Refund links.** When a run sets `kind = 'refund'` or an order number, it runs the same linking rule as ingest; see [Refunds and returns](#6-refunds-and-returns). A run never changes the kind of a refund that is linked to a purchase (the constraint `ck_receipts_refund_of_kind` would refuse it); it lists the receipt instead, and a person unlinks it with `refund unlink` before editing it.
 - **Confidence gate.** If the new overall confidence is below 0.5, the run records the extraction and applies nothing, and the summary lists the receipt.
-- **What still needs review.** `search --needs-review` lists receipts whose `paid_amount` is `NULL`, or whose latest extraction applied nothing (the confidence gate or a failure), lowest paid-amount confidence first. It is the list success criterion 6 is checked against, and it survives after the run's own output has gone.
+- **What still needs review.** `search --needs-review` lists receipts whose `paid_amount` is `NULL`, or whose latest extraction applied nothing because of the confidence gate or a failure, lowest paid-amount confidence first. Both are read from the run's `output` (its `confidence`, or an `error`), with no extra column; a run that applied nothing because nothing was empty doesn't count. It is the list success criterion 6 is checked against, and it survives after the run's own output has gone.
 - **Transactions.** Each receipt is its own transaction: the `extractions` row, the receipt update and any line items commit together. A failure is logged and the run moves on.
-- **Dry run.** `--dry-run` lists the selected receipts, the input each would use and the estimated tokens, from the average of recent extractions. If the configuration gives token prices (`extraction.price_per_mtok_input` and `extraction.price_per_mtok_output`, both optional), it prints an estimated cost too. Prices change, so they are configuration rather than code.
+- **Dry run.** `--dry-run` lists the selected receipts, the input each would use and the estimated tokens, from the average of recent extractions. If the configuration gives token prices (`llm.price_per_mtok_input` and `llm.price_per_mtok_output`, both optional, beside the model they price), it prints an estimated cost too. Prices change, so they are configuration rather than code.
 
 #### What it reads
 
@@ -718,7 +719,7 @@ The devtest database holds no real receipts, so this check runs in production af
 |---|---|---|
 | The extractor confuses paid and total on some formats | Wrong figures in claims and reconciliation | Explicit rules in the prompt, per-field confidence, the hand-checked sample, `edit` for corrections that re-extraction respects |
 | A re-extraction run overwrites good values with worse ones | Lost data | Fill-only by default, `--overwrite` prints every change, manual fields are never written, every run's output is kept in `extractions` |
-| Re-extraction cost grows with the back catalogue and with each prompt change | Spend | `--dry-run` estimates first, `--stale` and the prompt version skip what is current, the suggested two runs |
+| Re-extraction cost grows with the back catalogue and with each prompt change | Spend | `--dry-run` estimates first, the prompt version and model skip what is current, the suggested two runs |
 | The source item is gone (message deleted, file moved) | Re-extraction falls back to the rendition, which can be less complete | The rendition path; originals from the evidence store remove this risk for new receipts |
 | Long orders produce long output | Truncated output or failed validation | The 100-item cap and an output token limit large enough for it |
 | Tags drift or multiply | Tags stop mapping to tracking codes | Controlled vocabulary; only a person can define a tag |

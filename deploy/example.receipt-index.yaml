@@ -44,6 +44,10 @@ store:
 llm:
   model: claude-haiku-4-5-20251001
   api_key: ${ANTHROPIC_API_KEY}
+  # Optional list prices per million tokens, for `reextract --dry-run` cost
+  # estimates.
+  # price_per_mtok_input: 1.00
+  # price_per_mtok_output: 5.00
 
 logging:
   level: INFO

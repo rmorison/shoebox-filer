@@ -5,6 +5,7 @@
 - [`uv run receipt-index ingest`](#ingest) — Fetch and process receipts from email
 - [`uv run receipt-index search`](#search) — Find receipts by metadata
 - [`uv run receipt-index show`](#show) — View full details for a receipt
+- [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
 All commands require a configured `.env` file (see [Getting Started](getting-started.md)).
@@ -27,7 +28,7 @@ Each receipt has three amounts:
 
 The search amount filters and the `Amount` column in text output use the effective amount. JSON output keeps `amount` as the total and adds `paid_amount` and `effective_amount`, so a script that reads `amount` keeps working; read `effective_amount` for what was paid.
 
-Receipts ingested before the paid amount was added have `paid_amount: null`, so their effective amount is their `amount`. Their `amount` may be the payment rather than the total, because the earlier extraction prompt asked for "the total amount charged". When these receipts are re-extracted, `paid_amount` is filled in and `amount` can be corrected to the total, so an `amount` already read from an old receipt can change.
+Receipts ingested before the paid amount was added have `paid_amount: null`, so their effective amount is their `amount`. Their `amount` may be the payment rather than the total, because the earlier extraction prompt asked for "the total amount charged". When these receipts are re-extracted ([`reextract`](#reextract)), `paid_amount` is filled in and `amount` can be corrected to the total, so an `amount` already read from an old receipt can change.
 
 **Field confidence.** `field_confidence` holds the extractor's own confidence, from 0 to 1, for each of `vendor`, `amount`, `paid_amount` and `date`; it is below 0.5 when a figure was inferred rather than printed. It is the model's estimate, not a measured probability: use it to choose which receipts to check first, not as a pass mark. It is empty (`{}`) for receipts ingested before it was recorded.
 
@@ -112,11 +113,12 @@ uv run receipt-index search [OPTIONS]
 | `--amount-max DECIMAL` | Filter by maximum effective amount (inclusive) |
 | `--date-from YYYY-MM-DD` | Filter by start date (inclusive) |
 | `--date-to YYYY-MM-DD` | Filter by end date (inclusive) |
+| `--needs-review` | Only receipts still needing a look: `paid_amount` is `null`, or the latest extraction failed or fell below the confidence gate (see [reextract](#reextract)) |
 | `--output text\|json` | Output format (default: `text`) |
 
 Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
 
-Results are ordered by date (newest first), then vendor name.
+Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all.
 
 ### Examples
 
@@ -220,7 +222,7 @@ Sender:       ship-confirm@amazon.com
 Email Date:   2026-01-15T10:30:00
 ```
 
-`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded.
+`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded. A `Hand-edited:` line lists the fields a person has edited (`manual_fields` in JSON); re-extraction never writes them.
 
 The `PDF` path is relative to the store root, `store.path` in the config. `Rendition` is the same file's evidence-store reference: `local:` followed by that path.
 
@@ -235,6 +237,109 @@ store:
 ```
 
 `store.backend` selects the evidence store. Any value other than `local` is a config error.
+
+---
+
+## reextract
+
+Re-extract existing receipts with the current extraction prompt and model, and record each run in the receipt's extraction history. This is how receipts ingested before a field existed get it, such as the paid amount.
+
+```bash
+uv run receipt-index reextract [SELECTION] [OPTIONS]
+```
+
+### Selection
+
+At least one of these, `--limit` or `--all` is required, so that a bare command never re-extracts the whole catalogue. They combine with AND.
+
+| Option | Description |
+|---|---|
+| `--date-from YYYY-MM-DD` | Receipts dated on or after this day |
+| `--date-to YYYY-MM-DD` | Receipts dated on or before this day |
+| `--source NAME` | Receipts from this configured source |
+| `--id UUID` | This receipt (repeatable) |
+| `--model-not MODEL` | Receipts whose latest extraction used a different model, or that have none |
+| `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing |
+| `--all` | Every receipt |
+| `--limit N` | At most `N` receipts, oldest first |
+
+A receipt whose latest extraction already used the current prompt version **and** the configured model (`llm.model`) is left out, unless `--force` is given. So after a prompt change, or after changing the model, the same command picks up every receipt that is now stale, and an interrupted run can be started again with the same arguments. A run that failed doesn't count: the next run tries that receipt again.
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--overwrite` | Also replace fields an earlier extraction set (see below) |
+| `--force` | Include receipts already at the current prompt version and model |
+| `--input auto\|rendition` | `auto` (default): fetch the item from its source again, and use the stored PDF if it's gone. `rendition`: use the stored PDF only, with no network access, the cheapest |
+| `--dry-run` | List the selection and the input each would use, with a token and cost estimate. Writes nothing and calls no model |
+| `--output text\|json` | Output format (default: `text`) |
+
+### What a run writes
+
+By default a run fills only **empty** fields: a `null` `paid_amount` or `description`, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (no extraction history and an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)).
+
+With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. A receipt with no extraction history counts as entirely machine-extracted.
+
+In both modes:
+
+- a field a person has edited (`manual_fields`) is never written;
+- a field's confidence entry changes with the field;
+- a `null` result never clears a value;
+- every change is printed as old and new, and kept with the run in the receipt's history (`receipt.extractions`: the full output, the fields applied and the values they replaced), so any run can be undone by hand.
+
+If the new overall confidence is below 0.5, the run is recorded and nothing is applied (`gated`). The rendition's file name is never changed.
+
+### Inputs
+
+Under `--input auto`, the source item is fetched again by its ID: IMAP searches the source's folder for the message's `Message-ID` and uses it only if exactly one message has that ID; Drive gets the file by its ID. A receipt whose source is no longer configured is looked up in each configured source of the same type. If the item is gone, or has no `Message-ID`, or the server refuses that one message, the stored PDF is used, with the stored subject and sender. If the source can't be reached at all, its receipts are reported as `unavailable`, nothing is written for them, and the source isn't contacted again in that run; the next run tries them again.
+
+### Output
+
+Each receipt gets one line: its status, the input used and the extracted paid amount with its confidence, whether or not it was applied. Changed fields follow, old and new. The statuses are `applied`, `unchanged`, `gated`, `failed`, `locked` (another process is working on the item) and `unavailable`. JSON output has the same per receipt (`changes`, `extracted_paid_amount`, `paid_amount_confidence`, `error`).
+
+A run stops after 5 failures in a row, since the model or the store is then most likely down; the receipts it didn't reach are tried by the next run.
+
+Exit codes: 0 when every receipt was applied or unchanged; 1 when any failed, was gated, locked or unavailable, or the run stopped early. [`search --needs-review`](#search) lists what is still missing a paid amount afterwards.
+
+### Cost estimates
+
+`--dry-run` estimates tokens from measured averages: the runs at the current prompt version and model once there are at least 10, otherwise successful ingests with that model in the last 30 days. With prices in the configuration it also estimates the cost:
+
+```yaml
+llm:
+  model: claude-haiku-4-5-20251001
+  price_per_mtok_input: 1.00    # optional, per million input tokens
+  price_per_mtok_output: 5.00   # optional, per million output tokens
+```
+
+Prices change, so they are configuration, not code.
+
+### Examples
+
+```bash
+# What would a run over 2025 cost?
+uv run receipt-index reextract --date-from 2025-01-01 --date-to 2025-12-31 --dry-run
+
+# Re-extract one source's receipts for a quarter
+uv run receipt-index reextract --source personal-email --date-from 2026-01-01 --date-to 2026-03-31
+
+# After changing llm.model: receipts last extracted by another model
+uv run receipt-index reextract --model-not claude-haiku-4-5-20251001 --all --dry-run
+
+# Look again at receipts whose paid amount was uncertain
+uv run receipt-index reextract --confidence-below paid_amount=0.5 --force --all
+```
+
+### Accuracy check
+
+Before re-extracting the whole back catalogue after a prompt or model change, check a sample by hand:
+
+1. Choose at least 30 receipts, including gift cards, invoices, statements and refunds.
+2. Run `uv run receipt-index reextract --id ID1 --id ID2 ... --output json > sample.json`.
+3. For each receipt, compare `extracted_paid_amount` (present whether or not it was applied) with what was actually charged, and mark it correct, wrong or null.
+4. For each null, note whether the document names a card or account with no amount, such as an order confirmation with a card on file. Such a document keeps `paid_amount` null by design; the tally shows how often that happens.
+5. Record the tally, and whether it meets the success criterion, before running over the back catalogue.
 
 ---
 
