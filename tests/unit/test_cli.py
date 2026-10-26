@@ -8,7 +8,7 @@ import textwrap
 from collections.abc import Iterator  # noqa: TC003
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from pathlib import Path  # noqa: TC003
+from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 from uuid import UUID
@@ -20,6 +20,7 @@ from receipt_index.cli import cli
 from receipt_index.config import AppConfig, ImapSourceConfig, LoggingConfig
 from receipt_index.models import IngestLogEntry, Receipt
 from receipt_index.pipeline import IngestResult
+from receipt_index.store import LocalEvidenceStore
 
 _RECEIPT_ROW: dict[str, Any] = {
     "id": UUID("019572a0-0000-7000-8000-000000000001"),
@@ -200,7 +201,7 @@ class TestIngestLocking:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -233,7 +234,7 @@ class TestIngestLocking:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -258,7 +259,7 @@ class TestIngestLocking:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -286,7 +287,7 @@ class TestIngestLocking:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -314,7 +315,7 @@ class TestIngestCommand:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -323,21 +324,24 @@ class TestIngestCommand:
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_create_agent: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         config_file: Path,
     ) -> None:
-        mock_load_config.return_value = _make_config()
+        config = _make_config()
+        mock_load_config.return_value = config
         mock_run.return_value = IngestResult(processed=3, skipped=0, failed=0)
         runner = CliRunner()
         result = runner.invoke(cli, ["--config", str(config_file), "ingest"])
         assert result.exit_code == 0, result.output
         assert "Processed: 3" in result.output
+        mock_open_store.assert_called_once_with(config.store)
+        assert mock_run.call_args.kwargs["store"] is mock_open_store.return_value
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -346,7 +350,7 @@ class TestIngestCommand:
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_create_agent: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         config_file: Path,
@@ -363,7 +367,7 @@ class TestIngestCommand:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -372,7 +376,7 @@ class TestIngestCommand:
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_create_agent: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         config_file: Path,
@@ -389,7 +393,7 @@ class TestIngestCommand:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -398,7 +402,7 @@ class TestIngestCommand:
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_create_agent: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         config_file: Path,
@@ -411,7 +415,7 @@ class TestIngestCommand:
 
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
@@ -420,7 +424,7 @@ class TestIngestCommand:
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
         mock_create_agent: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         config_file: Path,
@@ -455,12 +459,12 @@ class TestIngestCommand:
     @patch("receipt_index.cli.load_config")
     @patch("receipt_index.pipeline.run_ingest")
     @patch("receipt_index.db.get_connection")
-    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.store.open_store")
     @patch("receipt_index.adapters.gdrive.GdriveAdapter", autospec=True)
     def test_ingest_gdrive_source(
         self,
         mock_gdrive_cls: MagicMock,
-        mock_store_cls: MagicMock,
+        mock_open_store: MagicMock,
         mock_get_conn: MagicMock,
         mock_run: MagicMock,
         mock_load_config: MagicMock,
@@ -790,6 +794,9 @@ class TestShowCommand:
         assert "Amazon" in result.output
         assert "42.99" in result.output
         assert "Source Name:  personal-email" in result.output
+        assert (
+            "Rendition:    local:2025/06/2025-06-15__amazon__42.99.pdf" in result.output
+        )
 
     @patch("receipt_index.repository.get_receipt_by_id", return_value=_SAMPLE_RECEIPT)
     @patch("receipt_index.db.get_connection")
@@ -1041,6 +1048,9 @@ class TestMcpCommand:
         assert kwargs["database_url"] == reader_url
         assert kwargs["max_content_bytes"] == 2048
         assert kwargs["access_log"].path == tmp_path / "log.jsonl"
+        assert isinstance(kwargs["store"], LocalEvidenceStore)
+        assert kwargs["store"].root == Path("./data/receipts").resolve()
+        assert "store_root" not in kwargs
         mock_build.return_value.run.assert_called_once_with("stdio")
 
     @patch("receipt_index.mcp_server.build_server")

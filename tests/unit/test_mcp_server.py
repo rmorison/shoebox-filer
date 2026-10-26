@@ -28,6 +28,7 @@ from receipt_index.mcp_server import (
     default_access_log_path,
 )
 from receipt_index.models import IngestLogEntry, Receipt
+from receipt_index.store import LocalEvidenceStore, pdf_path_for, store_rendition
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -863,3 +864,77 @@ class TestPaidAmountOutput:
         assert "Paid amount" not in schema["amount"]["description"]
         assert "null" in schema["paid_amount"]["description"].lower()
         assert "otherwise the total" in schema["effective_amount"]["description"]
+
+
+# ---------------------------------------------------------------------------
+# Old and new store layouts through the evidence store
+# ---------------------------------------------------------------------------
+
+
+_READER_URL = "postgresql://reader@localhost/test"  # pragma: allowlist secret
+
+
+class TestBothStoreLayouts:
+    """A legacy YYYY/MM receipt and a new renditions/ receipt both come back.
+
+    The server is built the way ``receipt-index mcp`` builds it, with the
+    store, and fetches each file through the store's interface.
+    """
+
+    def test_legacy_and_new_receipts_are_returned(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        store = LocalEvidenceStore(store_root)
+        new_bytes = b"%PDF-1.4\n% new layout\n%%EOF\n"
+        new_path = pdf_path_for(
+            store_rendition(
+                store,
+                new_bytes,
+                receipt_date=date(2026, 10, 14),
+                vendor="Acme Parking (U.S.), LLC",
+                amount=Decimal("12.00"),
+            ).ref
+        )
+        assert new_path.startswith("renditions/2026/10/")
+        server = build_server(
+            database_url=_READER_URL,
+            store=store,
+            access_log=AccessLog(log_path),
+            max_content_bytes=1024,
+        )
+
+        for pdf_path, data in ((_PDF_PATH, _PDF_BYTES), (new_path, new_bytes)):
+            with patch(
+                "receipt_index.repository.get_receipt_by_id",
+                return_value=_receipt(pdf_path=pdf_path),
+            ):
+                result = _call(
+                    server,
+                    "get_receipt_file",
+                    {"receipt_id": str(_ID), "include_content": True},
+                )
+            assert result.is_error is False, _text(result)
+            out = result.structured_content
+            assert out is not None
+            assert out["path"] == str((store_root / pdf_path).resolve())
+            assert out["size_bytes"] == len(data)
+            (resource,) = [c for c in result.content if c.type == "resource"]
+            assert base64.b64decode(resource.resource.blob) == data
+
+        entries = _log_lines(log_path)
+        assert [e["pdf_path"] for e in entries] == [_PDF_PATH, new_path]
+        assert [e["outcome"] for e in entries] == ["ok", "ok"]
+
+    def test_store_or_store_root_but_not_both(
+        self, store_root: Path, log_path: Path
+    ) -> None:
+        for kwargs in (
+            {},
+            {"store": LocalEvidenceStore(store_root), "store_root": store_root},
+        ):
+            with pytest.raises(ValueError, match="exactly one"):
+                build_server(
+                    database_url=_READER_URL,
+                    access_log=AccessLog(log_path),
+                    **kwargs,  # type: ignore[arg-type]
+                )

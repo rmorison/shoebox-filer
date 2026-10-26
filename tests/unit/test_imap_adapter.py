@@ -20,6 +20,7 @@ from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginEr
 from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
 from receipt_index.adapters.imap import ImapAdapter, MessageRefusedError
 from receipt_index.models import ItemRef, SyncState
+from receipt_index.store import StoredFile
 
 if TYPE_CHECKING:
     from receipt_index.config import ImapSourceConfig
@@ -849,7 +850,9 @@ class TestRefusedMessages:
         )
         monkeypatch.setattr(pipeline, "render_pdf", MagicMock(return_value=b"%PDF"))
         store = MagicMock()
-        store.save.return_value = "x.pdf"
+        store.put.return_value = StoredFile(
+            sha256=None, byte_size=4, media_type="application/pdf", ref="local:x.pdf"
+        )
 
         result = pipeline.run_ingest(
             conn=MagicMock(),

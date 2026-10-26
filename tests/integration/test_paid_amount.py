@@ -22,7 +22,7 @@ from receipt_index.config import ImapSourceConfig
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import count_receipts, insert_receipt, search_receipts
-from receipt_index.store import LocalFileStore
+from receipt_index.store import LocalEvidenceStore
 
 from .conftest import GREENMAIL_IMAP_PORT, seed_email
 
@@ -136,7 +136,7 @@ class TestIngestStoresPaidAmount:
         result = run_ingest(
             conn=pg_conn,
             adapter=ImapAdapter(_imap_config(user)),
-            store=LocalFileStore(tmp_path),
+            store=LocalEvidenceStore(tmp_path),
             source_name="greenmail-test",
             source_type="imap",
             agent=_agent_for_fixtures(),

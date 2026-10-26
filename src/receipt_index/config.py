@@ -42,6 +42,7 @@ database:
   url: ${DATABASE_URL}
 
 store:
+  backend: local
   path: ./data/receipts
 
 llm:
@@ -105,8 +106,13 @@ class DatabaseConfig(BaseModel):
 
 
 class StoreConfig(BaseModel):
-    """File store configuration."""
+    """Evidence store configuration.
 
+    ``backend`` selects the store. Only ``local`` exists so far; the Drive
+    backend adds ``drive`` and its own settings.
+    """
+
+    backend: Literal["local"] = "local"
     path: str = "./data/receipts"
 
 

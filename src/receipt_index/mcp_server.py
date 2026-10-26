@@ -1,14 +1,15 @@
 """Read-only MCP server over stdio for the receipt index.
 
-The server wraps the same repository and file-store code the CLI uses. It
-never writes to the database or the file store:
+The server wraps the same repository and evidence-store code the CLI uses.
+It never writes to the database or the store:
 
 - every connection is opened with ``default_transaction_read_only`` on, and
   each tool call runs in one ``REPEATABLE READ, READ ONLY`` transaction, so a
   page and its total come from the same snapshot;
 - ``receipt-index mcp`` refuses to start when the connected role holds any
   write privilege on the receipt tables (see :func:`check_read_only_role`);
-- PDFs are only opened for reading.
+- PDFs are only read, through the store's interface; building the store
+  creates nothing on disk.
 
 Every ``get_receipt_file`` call is recorded as one JSON line in an access log
 (and echoed at INFO on stderr). If the log can't be written, the file is not
@@ -26,7 +27,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from uuid import UUID
 
 import psycopg
@@ -43,6 +44,7 @@ from pydantic import BaseModel, Field
 
 from receipt_index import repository
 from receipt_index.db import get_connection
+from receipt_index.store import InvalidRefError, LocalEvidenceStore, rendition_ref
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -423,12 +425,21 @@ def _client_info(ctx: Context) -> dict[str, str | None]:
 def build_server(
     *,
     database_url: str,
-    store_root: Path,
     access_log: AccessLog,
+    store: LocalEvidenceStore | None = None,
+    store_root: Path | None = None,
     max_content_bytes: int = DEFAULT_MAX_CONTENT_BYTES,
 ) -> MCPServer:
-    """Build the MCP server and register its four read-only tools."""
-    root = store_root.resolve()
+    """Build the MCP server and register its four read-only tools.
+
+    Pass the evidence store, or ``store_root`` for a local store at that
+    root. File paths in the results are on this host, so the store must be
+    local.
+    """
+    if (store is None) == (store_root is None):
+        msg = "pass exactly one of store and store_root"
+        raise ValueError(msg)
+    files = store or LocalEvidenceStore(cast("Path", store_root))
     server: MCPServer = MCPServer(name="receipt-index", instructions=_INSTRUCTIONS)
 
     @contextmanager
@@ -439,16 +450,13 @@ def build_server(
             conn.read_only = True
             yield conn
 
-    def resolve(pdf_path: str) -> Path | None:
-        """Absolute path of a stored PDF, or None if it leaves the store."""
-        candidate = (root / pdf_path).resolve()
-        return candidate if candidate.is_relative_to(root) else None
-
     def file_ref(pdf_path: str) -> FileRef:
-        path = resolve(pdf_path)
-        if path is None:
-            return FileRef(path=str(root / pdf_path), exists=False)
-        return FileRef(path=str(path), exists=path.is_file())
+        ref = rendition_ref(pdf_path)
+        try:
+            path = files.local_path(ref)
+        except InvalidRefError as exc:
+            return FileRef(path=str(exc.candidate), exists=False)
+        return FileRef(path=str(path), exists=files.exists(ref))
 
     def receipt_out(r: Receipt) -> ReceiptOut:
         data = r.model_dump()
@@ -589,19 +597,21 @@ def build_server(
                 raise fail("not_found", f"Receipt not found: {receipt_id}")
 
             entry["pdf_path"] = receipt.pdf_path
-            path = resolve(receipt.pdf_path)
-            if path is None:
+            ref = rendition_ref(receipt.pdf_path)
+            try:
+                path = files.local_path(ref)
+            except InvalidRefError:
                 raise fail(
                     "path_outside_store",
                     f"Receipt {receipt_id}: stored path is outside the file store",
-                )
-            if not path.is_file():
+                ) from None
+            if not files.exists(ref):
                 raise fail(
                     "file_missing",
                     f"Receipt {receipt_id}: PDF file is missing from the store: {path}",
                 )
 
-            size = path.stat().st_size
+            size = files.stat(ref).size
             entry["size_bytes"] = size
             content: bytes | None = None
             reason: Literal["not_requested", "too_large"] | None
@@ -610,7 +620,7 @@ def build_server(
             elif size > max_content_bytes:
                 reason = "too_large"
             else:
-                with path.open("rb") as fh:
+                with files.open(ref) as fh:
                     data = fh.read(max_content_bytes + 1)
                 if len(data) > max_content_bytes:
                     reason = "too_large"

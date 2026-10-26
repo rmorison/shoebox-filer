@@ -21,7 +21,7 @@ from receipt_index.config import ImapSourceConfig
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
-from receipt_index.store import LocalFileStore
+from receipt_index.store import LocalEvidenceStore, rendition_ref
 
 from .conftest import GREENMAIL_IMAP_PORT, seed_email
 
@@ -101,7 +101,7 @@ class TestFullPipelineE2E:
         )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent()
 
         result = run_ingest(
@@ -122,8 +122,11 @@ class TestFullPipelineE2E:
         assert receipt.amount == Decimal("42.99")
         assert receipt.email_subject == "Your Order #12345"
 
-        # Verify file was saved
-        assert store.exists(receipt.pdf_path)
+        # Verify file was saved, in the evidence store's rendition layout
+        assert receipt.pdf_path.startswith("renditions/")
+        assert store.exists(rendition_ref(receipt.pdf_path))
+        with store.open(rendition_ref(receipt.pdf_path)) as fh:
+            assert fh.read(5) == b"%PDF-"
 
         # Verify DB record
         rows = search_receipts(pg_conn, vendor="TestVendor")
@@ -146,7 +149,7 @@ class TestFullPipelineE2E:
         )
 
         config = _greenmail_imap_config(user)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent(vendor="ShopA", amount=Decimal("10.00"))
 
         # First run
@@ -192,7 +195,7 @@ class TestFullPipelineE2E:
         )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         result = run_ingest(
             conn=pg_conn,
@@ -228,7 +231,7 @@ class TestFullPipelineE2E:
             )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent()
 
         result = run_ingest(
@@ -261,7 +264,7 @@ class TestFullPipelineE2E:
             )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent()
 
         result = run_ingest(
@@ -299,7 +302,7 @@ class TestFullPipelineE2E:
         )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent(vendor="BillingCo", amount=Decimal("199.99"))
 
         result = run_ingest(
@@ -314,7 +317,7 @@ class TestFullPipelineE2E:
         assert result.processed == 1
         receipt = result.receipts[0]
         assert receipt.vendor == "BillingCo"
-        assert store.exists(receipt.pdf_path)
+        assert store.exists(rendition_ref(receipt.pdf_path))
 
     def test_search_filters_on_seeded_data(
         self,
@@ -338,7 +341,7 @@ class TestFullPipelineE2E:
         )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         # Mock agent returns different vendor for each call
         meta1 = ReceiptMetadata(

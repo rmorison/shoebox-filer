@@ -31,7 +31,7 @@ from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
-from receipt_index.store import LocalFileStore
+from receipt_index.store import LocalEvidenceStore, rendition_ref
 
 from .conftest import _DB_DSN, _POSTGRES_HOST_PORT, GREENMAIL_IMAP_PORT, seed_email
 
@@ -180,7 +180,7 @@ class TestConfigImapIngest:
         )
 
         adapter = ImapAdapter(source_cfg)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent(vendor="ShopCo", amount=Decimal("55.00"))
 
         result = run_ingest(
@@ -199,7 +199,7 @@ class TestConfigImapIngest:
         assert receipt.source_name == "personal-email"
         assert receipt.vendor == "ShopCo"
         assert receipt.amount == Decimal("55.00")
-        assert store.exists(receipt.pdf_path)
+        assert store.exists(rendition_ref(receipt.pdf_path))
 
         rows = search_receipts(pg_conn, vendor="ShopCo")
         assert len(rows) == 1
@@ -233,7 +233,7 @@ class TestConfigImapIngest:
             use_ssl=False,
         )
         adapter = ImapAdapter(source_cfg)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent(vendor="WorkVendor", amount=Decimal("20.00"))
 
         run_ingest(
@@ -308,7 +308,7 @@ class TestMultiSourceIngest:
             use_ssl=False,
         )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent_a = _make_mock_agent(vendor="ACME Corp", amount=Decimal("100.00"))
         agent_b = _make_mock_agent(vendor="Globex Inc", amount=Decimal("200.00"))
 
@@ -366,7 +366,7 @@ class TestMultiSourceIngest:
                 use_ssl=False,
             )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         run_ingest(
             conn=pg_conn,
             adapter=ImapAdapter(_src("alpha", user_a)),
@@ -431,7 +431,7 @@ class TestSourceFiltering:
             use_ssl=False,
         )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         # Only ingest source-a, deliberately skip source-b
         result = run_ingest(
             conn=pg_conn,
@@ -476,7 +476,7 @@ class TestSourceFiltering:
                 use_ssl=False,
             )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         # Ingest source-a first
         run_ingest(
@@ -543,7 +543,7 @@ class TestIdempotentReIngest:
             folder="INBOX",
             use_ssl=False,
         )
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         agent = _make_mock_agent(vendor="IdemVendor", amount=Decimal("75.00"))
 
         # First run
@@ -598,7 +598,7 @@ class TestIdempotentReIngest:
             folder="INBOX",
             use_ssl=False,
         )
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         # First run: one email
         run_ingest(
@@ -668,7 +668,7 @@ class TestSearchWithSourceFilter:
                 use_ssl=False,
             )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         run_ingest(
             conn=pg_conn,
             adapter=ImapAdapter(_src("search-a", user_a)),
@@ -726,7 +726,7 @@ class TestSearchWithSourceFilter:
                 use_ssl=False,
             )
 
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
         run_ingest(
             conn=pg_conn,
             adapter=ImapAdapter(_src("combo-a", user_a)),
@@ -883,7 +883,7 @@ class TestGdriveAdapterMocked:
             "_download_file",
             return_value=(fake_pdf, "application/pdf"),
         ):
-            store = LocalFileStore(tmp_path)
+            store = LocalEvidenceStore(tmp_path)
             agent = _make_mock_agent(
                 vendor="ACME Corp",
                 amount=Decimal("88.50"),
@@ -907,7 +907,7 @@ class TestGdriveAdapterMocked:
         assert receipt.source_type == "gdrive"
         assert receipt.vendor == "ACME Corp"
         assert receipt.file_name == "acme-receipt-june.pdf"
-        assert store.exists(receipt.pdf_path)
+        assert store.exists(rendition_ref(receipt.pdf_path))
 
         rows = search_receipts(pg_conn, source_name="scanned-receipts")
         assert len(rows) == 1
@@ -943,7 +943,7 @@ class TestGdriveAdapterMocked:
 
         config = self._make_gdrive_source_config()
         adapter = GdriveAdapter(config)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         with patch.object(
             adapter,
@@ -1020,7 +1020,7 @@ class TestGdriveAdapterMocked:
 
         config = self._make_gdrive_source_config()
         adapter = GdriveAdapter(config)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         result = run_ingest(
             conn=pg_conn,
@@ -1063,7 +1063,7 @@ class TestGdriveAdapterMocked:
 
         config = self._make_gdrive_source_config()
         adapter = GdriveAdapter(config)
-        store = LocalFileStore(tmp_path)
+        store = LocalEvidenceStore(tmp_path)
 
         result = run_ingest(
             conn=pg_conn,
