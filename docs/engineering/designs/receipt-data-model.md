@@ -193,7 +193,7 @@ class ReceiptMetadata(BaseModel):
     field_confidence: FieldConfidence
 ```
 
-Ticket 1 adds only `paid_amount` and `field_confidence` (with its first four entries). Ticket 2 adds `receipt_document`, which names the attachment that held the receipt (its file name), or `body` when the receipt was in the email itself; it is `null` when the extractor can't tell, for example when a lone PDF holds only terms and conditions. It is kept in the extraction record, where the evidence-store design's duplicate rules read it. Later tickets add the rest.
+Ticket 1 adds only `paid_amount` and `field_confidence` (with its first four entries). Ticket 2 adds `receipt_document`, which names the attachment that held the receipt (its file name exactly as the message's MIME headers give it, so it can be matched to the stored attachment), or `body` when the receipt was in the email itself; it is `null` when the extractor can't tell, for example when a lone PDF holds only terms and conditions. It is kept in the extraction record, where the evidence-store design's duplicate rules read it. Later tickets add the rest.
 
 #### Prompt changes
 
