@@ -10,7 +10,7 @@
 
 Ingestion runs as a one-shot `receipt-index ingest`, which supercronic starts every 15 minutes in the production compose stack (`deploy/crontab`). It works, but it scales badly, misses items for good when anything goes wrong, and nobody can tell when it stops:
 
-- **Every run rescans everything.** The IMAP adapter runs `SEARCH ALL` and downloads every full message before checking the `Message-ID` against the processed set (`adapters/imap.py`). The Drive adapter lists the whole folder and ignores the `modifiedTime` it fetches (`adapters/gdrive.py`). A run's cost grows with the whole mailbox, not with what's new.
+- **Every run rescans everything.** The IMAP adapter runs `SEARCH ALL` and downloads every full message before checking the `Message-ID` against the processed set (`adapters/imap.py`). The Drive adapter lists the whole folder on every run. It uses each file's `modifiedTime` only as the receipt date, never to skip files it has already seen (`adapters/gdrive.py`). A run's cost grows with the whole mailbox, not with what's new.
 - **A failure is final.** `get_processed_source_ids` treats any `ingest_log` row as done, so a `failed` item, maybe from a timeout or an API outage, is never tried again. A `skipped` item, one the LLM judged a non-receipt at low confidence, is never looked at again either.
 - **Input folders only grow.** Nothing moves a processed message or file out of the dropoff folder, so the operator can't see which items are new.
 - **Nothing reports a stop.** The scheduler container has no healthcheck. A broken token or a dead connection shows up only as log lines nobody reads.
@@ -83,25 +83,31 @@ receipt-index serve
 ```
 
 - **One worker.** Items are processed one at a time, as today. That keeps LLM spend predictable, keeps Chromium to one instance and keeps cursor advancement simple (see [Sync state](#5-sync-state)). Throughput isn't the constraint: a single item takes seconds, and a normal day brings a handful.
-- **The queue is in memory and disposable.** A watcher advances its source's cursor only past items whose attempt has a committed `started` row ([§ 5 cursor rule](#5-sync-state)). If `serve` dies with items queued but not started, they're re-read on restart from the old cursor. Items it dies *during* are recovered from their `started` row by the retry scheduler.
+- **The queue is in memory and disposable.** A watcher advances its source's cursor only past items that have a committed `started` row or an existing record ([§ 5 cursor rule](#5-sync-state)). If `serve` dies with items queued but not started, they're re-read on restart from the old cursor. Items it dies *during* are recovered from their `started` row by the retry scheduler.
 - **Pipeline refactor.** `run_ingest` today loops over `adapter.fetch_unprocessed()`. It splits into `process_item(conn, raw, ...) -> ItemOutcome` (the body of today's loop) and thin loops around it: the one-shot `ingest`, the `serve` worker and `backfill` all call `process_item`. The adapters split the same way: `list_new(sync_state) -> list[ItemRef]` and `fetch(ItemRef) -> RawReceipt`.
-- **Shutdown.** On SIGTERM the watchers stop, the worker finishes the item in hand, the cursors are saved and the process exits 0. The compose `stop_grace_period: 5m` the scheduler has today moves over to the new service.
+- **Shutdown.** On SIGTERM the watchers stop and the cursors are saved. If the worker is in a transient pause, it abandons the pause at once. It writes the item an *uncounted* `failed` row (`counts_attempt = false`, `next_retry_at = now()`, [§ 6](#6-retries)) and releases the lock, so a shutdown during an outage costs no attempt. An item that is actually running gets until `item_timeout_seconds` to finish. The new service's `stop_grace_period` is `11m`, the item timeout plus a minute, so Docker's SIGKILL never cuts a running item short. If one is killed anyway, the dead-`started` rule in [§ 6](#6-retries) recovers it.
 - **Chromium.** The renderer launches a fresh browser per item today (`renderer.py`). That stays, so a long-running process doesn't accumulate browser state.
 - **One client per thread.** The Google API client (`googleapiclient` on `httplib2`) isn't thread-safe, so the Drive watcher and the worker each build their own service object. IMAP connections and database connections aren't shared between threads either.
-- **Item timeout.** The worker abandons an item that runs longer than `item_timeout_seconds` (default 600), recording it as an item error ([§ 6](#6-retries)). The extraction call gets an explicit client timeout below that bound, so a hung LLM call or Chromium render can't hold the worker indefinitely.
+- **Item timeout and watchdog.** A Python thread blocked in synchronous psycopg, Playwright or an LLM call can't be abandoned from outside. So the bounds come in two layers:
+  - Each blocking call gets its own timeout below `item_timeout_seconds` (default 600): the extraction client's request timeout, Playwright's page and PDF timeouts, and a psycopg `statement_timeout`. A call that hits its timeout raises, and the item is recorded as an item error ([§ 6](#6-retries)).
+  - A **watchdog** in the health loop covers anything those miss. If the current item has *run* longer than `item_timeout_seconds`, counting only running time and not time spent in a transient pause ([§ 6](#6-retries)), it logs the source ID and exits the process with a non-zero code. `restart: unless-stopped` then restarts the container. That is the recovery path the healthcheck alone can't provide, because Docker doesn't restart an unhealthy container. On restart, the item's leftover `started` row is recovered by the dead-`started` rule in [§ 6](#6-retries), which uses up an attempt, so an item that hangs every time still ends up terminal.
 
 #### Locking
 
 Two kinds of Postgres advisory lock replace "supercronic runs one job line at a time":
 
 - **Source lock**, held by whoever advances a source's cursor: `pg_try_advisory_lock` on a key derived from `('receipt-index:source', source_name)`, held on a dedicated connection for as long as the holder runs. `serve` holds one for each source it watches. A session lock disappears silently if its connection drops (a Postgres restart, for example), so `serve` checks the lock connection on every watcher loop. On loss it stops that source's watcher, re-takes the lock, and resumes from the stored cursor; if another process took it meanwhile, the watcher stays stopped and `status --check` fails. A one-shot `ingest --source X` that can't take the lock exits with "source X is being watched by a running serve; see `receipt-index status`", with exit code 3, so a cron left in place by mistake fails loudly instead of racing.
-- **Item lock**, held while one item is processed: a session-level advisory lock keyed on a hash of the `source_id`, taken before the item's `started` row is written and released after its outcome is committed. `backfill` and `retry` take item locks but never source locks, so they can run while `serve` is up. If an item is locked, the other process skips it, because someone else is handling it. A hash collision only serializes two unrelated items. It never skips one, because the skip is re-checked against the processed set once the lock is free.
+- **Item lock**, held while one item is processed: a session-level advisory lock keyed on a hash of the `source_id`, taken before the item's `started` row is written and released after its outcome is committed. `backfill` and `retry` take item locks but never source locks, so they can run while `serve` is up. If an item is locked, the other process skips it, because someone else is handling it. **After taking any item lock, the holder re-reads the item's latest state and acts only if it still calls for that action.** That closes the check-then-act gap:
+  - The retry scheduler re-checks that the latest row is still `started` (or still a due `failed`). A worker that committed and unlocked in between leaves an outcome row, and the scheduler then does nothing. A skipped item is never turned into an automatic retry.
+  - The worker re-checks that the item is still unseen (for a watcher-queued item) or still due (for a retry). An item that `backfill` finished a moment earlier is dropped, with no second LLM call.
+
+  When the worker skips a locked item, the watcher doesn't advance its cursor past it until the item has a `started` row or another record. If the lock holder dies before writing one, the item is re-read on the next poll, not lost. A hash collision only serializes two unrelated items, because the re-check runs once the lock is free.
 
 The `UNIQUE (source_id)` constraint stays as the last line of defence.
 
 ### 2. IMAP: library and IDLE
 
-**Library: `imapclient` 4.x.** Its PyPI metadata lists Python 3.8–3.14, so it works on 3.11. It provides `idle()`, `idle_check(timeout)` and `idle_done()`, plus `move()` (RFC 6851), `uid_expunge()` (UIDPLUS), capability checks and parsed `FETCH` responses. It's a thin layer over `imaplib` and adds one runtime dependency. **TLS is verified:** both connections use `imapclient`'s default context (`ssl.create_default_context()`, certificate and hostname checked). That deliberately tightens today's adapter, whose `imaplib.IMAP4_SSL(host, port)` call with no `ssl_context` doesn't verify the server certificate on Python 3.11. A long-running service logs in far more often than a cron job, which makes an unverified connection a bigger risk. A unit test asserts the client is built with a verifying context. Login behaviour is otherwise unchanged.
+**Library: `imapclient` 4.x.** PyPI shows `requires_python >=3.8`, and its README lists 3.8–3.14 as supported, so it works on 3.11. It provides `idle()`, `idle_check(timeout)` and `idle_done()`, plus `move()` (RFC 6851), `uid_expunge()` (UIDPLUS), capability checks and parsed `FETCH` responses. It's a thin layer over `imaplib` and adds one runtime dependency. **TLS is verified:** both connections use `imapclient`'s default context (`ssl.create_default_context()`, certificate and hostname checked). That deliberately tightens today's adapter, whose `imaplib.IMAP4_SSL(host, port)` call with no `ssl_context` doesn't verify the server certificate on Python 3.11. A long-running service logs in far more often than a cron job, which makes an unverified connection a bigger risk. A unit test asserts the client is built with a verifying context. Login behaviour is otherwise unchanged.
 
 **Two connections per IMAP source:**
 
@@ -115,7 +121,7 @@ The worker can't use the watcher's connection, because no other command can be i
 1. Connect and log in. On startup or after any reconnect, run a **catch-up poll** (step 4).
 2. If the server lacks the `IDLE` capability, poll every `imap_poll_seconds` instead, and stop here.
 3. Enter IDLE. Call `idle_check(timeout=…)` in a loop. On an `EXISTS` response, leave IDLE and poll (step 4). Re-issue IDLE every `idle_reissue_seconds` (default 600) even when nothing happened. RFC 2177 lets a server drop a client after 29 minutes, and home routers often drop idle TCP flows sooner. TCP keepalive is enabled on the socket too.
-4. **Poll:** `UID SEARCH UID <last_uid+1>:*` (see [Sync state](#5-sync-state)). RFC 3501 treats `n:*` as covering the highest existing UID even when `n` is above it, so the result is filtered client-side to UIDs greater than `last_uid`. Queue the new UIDs and update `last_poll_at`. When the source has `archive: true`, run the archive sweep too (see [§ 7](#7-dropoff-archive)).
+4. **Poll:** `UID SEARCH UID <last_uid+1>:*` (see [Sync state](#5-sync-state)). RFC 3501 treats `n:*` as covering the highest existing UID even when `n` is above it, so the result is filtered client-side to UIDs greater than `last_uid`. Queue the new UIDs and update `last_poll_at`. When the source has `archive: true`, queue an archive sweep for the worker too (see [§ 7](#7-dropoff-archive)).
 5. Run a **safety poll** every `imap_poll_seconds` (default 240) whether or not IDLE fired. This covers a half-open connection where IDLE never fires, and it sets the worst-case latency.
 
 **Reconnect.** A connection error or a missed IDLE response closes both connections. Reconnection backs off from 5 seconds to 5 minutes. A login refused with an authentication error isn't retried in a tight loop: it's recorded in `sync_state.last_error`, shows in `status`, fails the health check, and is retried every 15 minutes.
@@ -136,9 +142,11 @@ The worker can't use the watcher's connection, because no other command can be i
 - **Poll** every `drive_poll_seconds` (default 120): `changes.list(pageToken=…, spaces='drive', fields='nextPageToken,newStartPageToken,changes(fileId,removed,time,file(id,name,mimeType,parents,trashed,createdTime,modifiedTime))')`. Follow `nextPageToken` to the end, and keep each change whose file has the dropoff folder in `parents`, isn't trashed and isn't a folder (`application/vnd.google-apps.folder`, which drops the needs-attention subfolder). A kept file of a type the adapter can't ingest is recorded as `skipped` with the reason "unsupported file type", so it has an outcome like any other. Save `newStartPageToken` only once every kept file has a committed `started` row or outcome ([§ 5 cursor rule](#5-sync-state)).
 - **The feed covers the whole Drive**, not just the dropoff folder: every edit the operator makes anywhere shows up in it. For a personal Drive that means at most a few pages per poll, and the filter is in memory.
 - **Settle time.** Scanner apps sometimes create a file and then upload its content in a second step. A change whose server-assigned `time` is less than `drive_settle_seconds` (default 60) old is left for the next poll, and the token isn't advanced past it. The file's own `modifiedTime` isn't used, because a scanner app can set it from its own clock (see [ADR-0008](../adr/0008-incremental-source-sync-state.md)).
-- **Invalid token** (an HTTP 410 or 404 on `changes.list`, rare): rerun the bootstrap. That's one folder listing and no duplicates.
+- **Invalid token** (rare): Drive v3 answers a bad or expired `pageToken` with HTTP 400 "Invalid Value", not the 404 or 410 that some other Google APIs use. A 400 that names `pageToken` reruns the bootstrap, and so does a 404 or 410, as a precaution. That's one folder listing and no duplicates. Ticket 1 confirms the exact response against the API and records it in its test fixture.
 - **Quota:** a poll every 2 minutes is 720 calls a day plus paging, far inside Drive's default per-project quota.
-- **Scope:** reading a folder's changes and operator-uploaded files needs a scope that sees files the app didn't create. The evidence-store design decides the scope (it leans to full `drive`). Until that lands, the current `drive.readonly` token is enough for everything in this section. Only the moves in [§ 7](#7-dropoff-archive) need write access.
+- **Account and token.** The evidence-store design's sign-off settled the scope. The full `drive` scope is held by a **dedicated store account**, and the operator shares each dropoff folder with that account as Editor. After that design's Drive ticket, one token (`GDRIVE_STORE_TOKEN_JSON`) does everything Drive-side: it reads the changes feed and the dropoff folders, and it makes the adopt and needs-attention moves. The operator's `drive.readonly` token is retired. Until then, the operator's current `drive.readonly` token reads the feed, and Drive sources run with `archive: false`.
+- **The feed belongs to an account.** A saved page token is a position in one account's change log, so it means nothing to another account. `sync_state` stores the Drive account's stable ID (`about.get(fields='user(permissionId)')`, not an email address) next to the token. When the configured token's account differs from the stored one, as at the switch to the store account, the source re-bootstraps: one folder listing, no duplicates.
+- **Shared folders in the feed.** The dropoff folder is shared with the store account, not owned by it. Ticket 1 confirms, against a scratch folder, that the store account's changes feed reports files the operator adds to a folder shared with it. If it doesn't, the Drive watcher lists the dropoff folder's direct children with `files.list` on each poll instead. That's cheap once archiving is on, because the folder then holds only unfinished items.
 
 **When would Drive push (`changes.watch`) pay off?** When the target drops below about a minute, or when the polling cost matters. Neither is true at a 2-minute poll. Push would need a public HTTPS endpoint (a tunnel or a reverse proxy with a certificate), and channel renewal before expiry (changes channels last up to a week). Polling would still be needed as a fallback, since notifications can be lost. If push is ever added, the `serve` process is where the endpoint and the renewal loop would live, which is one more reason to build it now.
 
@@ -155,6 +163,8 @@ CREATE TABLE IF NOT EXISTS receipt.sync_state (
     imap_uidvalidity  BIGINT,
     imap_last_uid     BIGINT,
     drive_page_token  TEXT,
+    drive_account_id  TEXT,                   -- permissionId of the account whose change log the token belongs to
+    archive_enabled_at TIMESTAMPTZ,           -- when archive: true was first seen for this source; NULL while off
     last_poll_at      TIMESTAMPTZ,            -- last time the source was read, success or not
     last_success_at   TIMESTAMPTZ,            -- last read that completed without error
     last_error        TEXT,
@@ -167,14 +177,14 @@ CREATE TABLE IF NOT EXISTS receipt.sync_state (
     CONSTRAINT uq_sync_state_source_folder UNIQUE (source_name, folder),
     CONSTRAINT ck_sync_state_source_type CHECK (source_type IN ('imap', 'gdrive')),
     CONSTRAINT ck_sync_state_imap_cursor CHECK (
-        source_type <> 'imap' OR drive_page_token IS NULL),
+        source_type <> 'imap' OR (drive_page_token IS NULL AND drive_account_id IS NULL)),
     CONSTRAINT ck_sync_state_drive_cursor CHECK (
         source_type <> 'gdrive' OR (imap_uidvalidity IS NULL AND imap_last_uid IS NULL))
 );
 ```
 
 - It sits in the `receipt` schema next to `ingest_log`, with the `set_updated_at` trigger from the `public` migrations. `receipt_index_dev_write` gets `SELECT, INSERT, UPDATE` and `receipt_index_dev_read` gets `SELECT`, following migrations 000002 and 000004. As every migration must be, it's mirrored in `tests/integration/conftest.py` `_run_migrations()`.
-- **Cursor rule.** The cursor only ever moves to a position at or below which every item has at least a committed `started` row in `ingest_log` ([§ 6](#6-retries)). From that row on, the item is owned by the retry machinery, not by the cursor: a crash, a `failed` outcome and a pending retry are all recovered by source ID. With a single worker, items start in queue order, so the rule is "once item N's `started` row is committed, the watcher may store N's UID or token". An item that is queued but not started is never passed, so it is re-read if `serve` stops.
+- **Cursor rule.** The cursor only ever moves to a position at or below which every item has a committed `started` row in `ingest_log` ([§ 6](#6-retries)), or an existing record: a receipt or an earlier `ingest_log` row, which is why a known message the worker skips doesn't stall it. From that row on, the item is owned by the retry machinery, not by the cursor: a crash, a `failed` outcome and a pending retry are all recovered by source ID. With a single worker, items start in queue order, so the rule is "once item N's `started` row is committed, the watcher may store N's UID or token". An item that is queued but not started is never passed, so it is re-read if `serve` stops.
 - Sync state is a cache of "where to start reading". Deleting a row is always safe: the source re-bootstraps with a full header scan or folder listing, and idempotency absorbs it.
 
 ### 6. Retries
@@ -191,12 +201,13 @@ CREATE TABLE IF NOT EXISTS receipt.sync_state (
 
 **Backoff and limits:** `retry_backoff_seconds` defaults to `[300, 1800, 7200, 43200]`: 5 minutes, 30 minutes, 2 hours, 12 hours. `retry_max_attempts` defaults to 5. The fifth failure is **terminal**: `next_retry_at` stays NULL, the item moves to `needs-attention` if the source archives, and it shows in `failures`, in `status` and on the dead-man's ping ([§ 9](#9-health)).
 
-**Schema:** `ingest_log` stays append-only, and the latest row for a `source_id` gives the item's state. Each attempt writes a `started` row when it begins, committed before any work so a crash leaves a trace, and then a row with its outcome. Two migrations add a status value and three columns: ticket 1 adds `started` and `source_name`, which the cursor rule needs, and ticket 2 adds `attempt` and `next_retry_at` (see [Implementation Plan](#implementation-plan)). Together:
+**Schema:** `ingest_log` stays append-only, and the latest row for a `source_id` gives the item's state. Each attempt writes a `started` row when it begins, committed before any work so a crash leaves a trace, and then a row with its outcome. Two migrations add a status value and four columns: ticket 1 adds `started` and `source_name`, which the cursor rule needs, and ticket 2 adds `attempt`, `counts_attempt` and `next_retry_at` (see [Implementation Plan](#implementation-plan)). Together:
 
 ```sql
 ALTER TABLE receipt.ingest_log
     ADD COLUMN source_name    TEXT,
     ADD COLUMN attempt        INTEGER NOT NULL DEFAULT 1,
+    ADD COLUMN counts_attempt BOOLEAN NOT NULL DEFAULT TRUE,
     ADD COLUMN next_retry_at  TIMESTAMPTZ;
 
 ALTER TABLE receipt.ingest_log DROP CONSTRAINT ck_ingest_log_status;
@@ -208,7 +219,8 @@ CREATE INDEX IF NOT EXISTS idx_ingest_log_next_retry_at
 ```
 
 - **`source_name`** says which configured source an item came from, and so which account, folder and token a retry uses. Today's table records only `source_type`, and the spec allows several sources of one type. Every new row sets it. A historical row with a NULL `source_name` is re-fetched by trying each configured source of its `source_type`.
-- **Grants:** migration 000004 grants `INSERT` on `ingest_log` column by column, so these migrations also grant `INSERT (source_name, attempt, next_retry_at)` to `receipt_index_dev_write`. It's mirrored in `conftest.py`.
+- **Grants:** migration 000004 grants `INSERT` on `ingest_log` column by column, so these migrations also grant `INSERT (source_name, attempt, counts_attempt, next_retry_at)` to `receipt_index_dev_write`.
+- **Attempt numbering.** Each attempt's rows carry its `attempt` number. The next attempt's number is the latest `failed` row's `attempt` plus one, or the same number when that row has `counts_attempt = false`. Only a shutdown during a transient pause writes an uncounted row ([§ 1](#1-process-model)). A transient error that doesn't meet a shutdown writes nothing, because the worker keeps the item and pauses. The terminal check compares the number of counted attempts with `retry_max_attempts`. A manual `retry` starts again at 1. It's mirrored in `conftest.py`.
 - **Down migration:** ticket 1's deletes the `started` rows before re-adding the original status constraint, which would otherwise fail on them. See the rollback note in [§ 13](#13-deployment-and-rollback).
 - The `failures` command and other readers of `ingest_log` ignore `started` rows unless asked for them.
 
@@ -263,13 +275,22 @@ Once the evidence store keeps originals, a retry whose original is already store
 - **After the original is stored, before the commit** (steps 1–3).
   - IMAP: a stored file with no provenance. The retry scheduler requeues the item from its `started` row, and the content-addressed `store_email_original` reuses that file. The evidence store's `verify --orphans` reports any that are left over.
   - Drive: the file is already in `originals/` (or copied, with the dropoff file in `processed/`) and has no receipt. The changes feed can't be relied on here, because it reports a file's *current* parents, which no longer include the dropoff folder. The retry scheduler requeues the item from its `started` row instead: `files.get` by file ID finds the file wherever it is now, and the idempotent `adopt_drive_original` returns the existing record.
-- **After the commit, before the IMAP move** (steps 4–5), **or after a failed move to needs-attention.** The receipt is committed but the message is still in the watched folder, and the cursor has already passed it, so an incremental poll won't see it again. The **archive sweep** handles it: when a source has `archive: true`, every safety poll also runs a header-only pass over the *whole* watched folder (`UID SEARCH ALL`, then `BODY.PEEK[HEADER.FIELDS (...)]`) and moves each message whose source ID has a final outcome to its archive or needs-attention folder. This is cheap, because an archiving folder holds only unfinished items. A message is never processed twice.
+- **After the commit, before the IMAP move** (steps 4–5), **or after a failed move to needs-attention.** The receipt is committed but the message is still in the watched folder, and the cursor has already passed it, so an incremental poll won't see it again. The **archive sweep** handles it. When a source has `archive: true`, every safety poll queues a sweep for the **worker**, which holds the read-write connection (the watcher's is `EXAMINE`, and connections aren't shared between threads). The worker runs a header-only pass over the whole watched folder (`UID SEARCH ALL`, then `BODY.PEEK[HEADER.FIELDS (...)]`). It moves each message whose source ID reached a final outcome **after archiving was turned on** (`sync_state.archive_enabled_at`) to its archive or needs-attention folder. A message is never processed twice.
+  - The back catalogue, items finished before archiving was enabled, is left alone. Filing it is a deliberate step, `backfill --archive` ([§ 8](#8-backfill)), not a side effect of the first sweep.
+  - The sweep is cheap, because an archiving folder holds only unfinished items, recent finished ones and the back catalogue.
+  - On a server with neither `MOVE` nor `UIDPLUS`, archiving is unsupported (below), so the sweep doesn't run at all.
+  - **Drive has the same sweep.** When a Drive source has `archive: true`, each poll also queues a Drive sweep for the worker, which lists the dropoff folder's direct children with its own client and moves any file whose source ID reached a final outcome after `archive_enabled_at` to its destination. That catches a failed needs-attention move or an interrupted adopt.
 
 The tests cover each window explicitly (see [Testing Strategy](#testing-strategy)).
 
 **How IMAP moves a message:** `UID MOVE` when the server advertises `MOVE`. Otherwise `UID COPY`, then `UID STORE +FLAGS (\Deleted)`, then `UID EXPUNGE`, the last of which needs `UIDPLUS`. With neither `MOVE` nor `UIDPLUS`, a plain `EXPUNGE` would also delete any other `\Deleted` messages in the folder, so the watcher refuses: it leaves the message in place, logs a warning once and shows "archive unsupported" in `status`. The archive and needs-attention folders are created on startup if they're missing.
 
-**Drive skipped and failed moves** use `files.update(addParents=<needs-attention>, removeParents=<dropoff>)`. Every Drive move, these and the adopt, needs write access to files the operator uploaded, which comes from the evidence-store design's scope decision (it leans to the full `drive` scope with one re-authorization). Until that design's Drive backend and scope change land, Drive sources run with `archive: false`, and config validation rejects `archive: true` on a Drive source while the configured store backend isn't Drive.
+**Drive skipped and failed moves** use `files.update(addParents=<needs-attention>, removeParents=<dropoff>)`. They're made with the store account's token, under the evidence-store design's client guard, which allows exactly these moves. Every Drive move, these and the adopt, needs that token. Until the evidence store's Drive backend and the dedicated account land, Drive sources run with `archive: false`, and config validation rejects `archive: true` on a Drive source while the configured store backend isn't Drive.
+
+**Drive edge cases:**
+- **A whole-original duplicate** (step 2 skips extraction) is still adopted with `archive: true`, so the dropoff empties. The store records it as a second provenance of the existing receipt, under its own file ID.
+- **An item that fails terminally after it was adopted** is a commit that failed after the file moved into `originals/`. It stays there with no receipt and is never deleted. The store's `verify --orphans` reports it. `status` lists it among terminal failures with its location, and `retry` re-fetches it by file ID from wherever it is.
+- **A failed needs-attention move** is caught by the Drive sweep above.
 
 ### 8. Backfill
 
@@ -286,14 +307,14 @@ receipt-index backfill --source NAME [--since DATE] [--until DATE]
   4. If an item can't be found, call `mark_original_unavailable(provenance_id, reason)`.
 
   This mode needs the evidence store's schema ticket, which creates one provenance row for each existing receipt.
-- **Draining the dropoffs** (needs ticket 6's archive moves). Today's Drive files, already indexed, are still in the dropoff folder. Once the source has `archive: true`, running `backfill --originals-only` on it adopts each one, which moves it into `originals/`, so the same run empties the dropoff. For IMAP, `backfill` with `--archive` moves already-processed messages to the archive folder. Without `--archive` it never moves mail, so a dry run and a first real run change nothing in the mailbox.
+- **Draining the dropoffs** (needs ticket 6's archive moves). Today's Drive files, already indexed, are still in the dropoff folder. Once the source has `archive: true`, running `backfill --originals-only` on it adopts each one, which moves it into `originals/`, so the same run empties the dropoff. For IMAP, `backfill` with `--archive` moves already-processed messages to the archive folder. This is the only way the back catalogue gets filed, since the sweep handles only outcomes reached after archiving was enabled. Without `--archive` it never moves mail, so a dry run and a first real run change nothing in the mailbox.
 - **Idempotency and locking.** It takes item locks, never the source lock, so it runs while `serve` is up. It never moves a sync-state cursor. Re-running it over the same range does nothing new.
 - **Cost.** Full mode costs one LLM call per unseen item; `--dry-run` prints how many there are first. `--originals-only` makes no LLM calls.
 - **Completeness check.** `backfill --dry-run --since <date>` reporting zero unseen items is how the operator checks after cutover, and from time to time, that the watchers miss nothing.
 
 ### 9. Health
 
-**The heartbeat.** The health loop touches a heartbeat file (`/tmp/receipt-index-serve.heartbeat`) every 30 seconds while the worker thread is alive and is either idle or within `item_timeout_seconds` of starting its current item. A slow LLM call therefore doesn't trip the check, but a wedged worker does. Each watcher updates `last_poll_at` and, on success, `last_success_at` in its sync-state row.
+**The heartbeat.** The health loop touches a heartbeat file (`/tmp/receipt-index-serve.heartbeat`) every 30 seconds while the worker thread is alive and is idle, paused on a transient error, or has run its current item for less than `item_timeout_seconds` (running time only, as for the watchdog). A slow LLM call therefore doesn't trip the check, but a wedged worker does. Each watcher updates `last_poll_at` and, on success, `last_success_at` in its sync-state row.
 
 **`receipt-index status [--output json] [--check]`** reports:
 - each source's cursor, `last_poll_at`, `last_success_at`, `last_error`, reset count and archive mode;
@@ -306,6 +327,7 @@ receipt-index backfill --source NAME [--since DATE] [--until DATE]
 **`status --check`** exits non-zero, printing one line per problem, when any of these holds:
 - the heartbeat file is older than `heartbeat_stale_seconds` (default 120);
 - a source's `last_success_at` is older than its stale threshold. That's `source_stale_seconds` when set, and otherwise three times the source's poll interval: 720 seconds for IMAP and 360 for Drive at the defaults. A threshold that follows the interval keeps hourly polling from failing the check between polls;
+- a watcher has stopped after losing its source lock to another process ([§ 1](#1-process-model));
 - the worker has been paused on transient errors for longer than `source_stale_seconds` when that's set, or otherwise the largest of the sources' stale thresholds (720 seconds at the defaults).
 
 Terminal failures don't fail the check. They're content problems, not liveness problems, so they mustn't mark the container unhealthy. They still reach the operator through the dead-man's ping (below) as well as `status` and `failures`.
@@ -319,7 +341,7 @@ Terminal failures don't fail the check. They're content problems, not liveness p
 
 A new terminal failure therefore raises one alert, which clears itself after `terminal_alert_seconds` without an acknowledgement step. The operator handles it with `failures --status terminal` and `retry`.
 
-The external monitor alerts when pings stop arriving or when a failure ping arrives. That covers what the healthcheck can't: the host down, Docker down, or the whole container gone. The URL comes from an env var (`${HEALTH_PING_URL}`), because a ping URL is a capability: anyone holding it can send pings. With `ping_url` unset, there's no ping. The success GET and the `/fail` POST follow the conventions of Healthchecks.io-style monitors. A monitor without a failure endpoint still alerts on missed pings. **Which monitor to use, and its grace period, is the operator's choice** at deployment. The runbook suggests a 15-minute grace period, three missed pings.
+The external monitor alerts when pings stop arriving or when a failure ping arrives. That covers what the healthcheck can't: the host down, Docker down, or the whole container gone. The URL comes from an env var (`${HEALTH_PING_URL}`), because a ping URL is a capability: anyone holding it can send pings. With no `ping_url` key, there's no ping. The key stays commented out in the example config, because the config loader refuses any `${VAR}` whose variable is unset ([ADR-0006](../adr/0006-config-based-source-definitions.md)). An uncommented key with `HEALTH_PING_URL` missing would stop every command, including the healthcheck and a rollback `ingest`. Rollout step 4 sets the variable first and uncomments the key after. The success GET and the `/fail` POST follow the conventions of Healthchecks.io-style monitors. A monitor without a failure endpoint still alerts on missed pings. **Which monitor to use, and its grace period, is the operator's choice** at deployment. The runbook suggests a 15-minute grace period, three missed pings.
 
 ### 10. Latency target
 
@@ -356,7 +378,7 @@ ingest:
     heartbeat_stale_seconds: 120
     # source_stale_seconds: 900   # optional; default is 3x each source's poll interval
     terminal_alert_seconds: 86400
-    ping_url: ${HEALTH_PING_URL}    # optional; omit the key to disable
+    # ping_url: ${HEALTH_PING_URL}  # add only once HEALTH_PING_URL is set (see below)
     ping_interval_seconds: 300
 
 sources:
@@ -373,7 +395,7 @@ sources:
   - name: scanned-receipts
     type: gdrive
     folder_id: "1aBcDeFg..."
-    token_json: ${GDRIVE_TOKEN_JSON}
+    token_json: ${GDRIVE_TOKEN_JSON}       # becomes ${GDRIVE_STORE_TOKEN_JSON} at the switch to the store account
     archive: false                         # true needs the evidence store's Drive backend and scope
     needs_attention_folder_id: "1hIjKlMn..."
 ```
@@ -403,7 +425,7 @@ All new commands support `--output json` (RD-03).
 
 **The target compose layout** (`deploy/docker-compose.yml`):
 
-- A new **`ingest`** service: the same image, `entrypoint: ["receipt-index", "serve"]`, `restart: unless-stopped`, the `healthcheck` from [§ 9](#9-health), `init: true`, `shm_size: 1gb` and `stop_grace_period: 5m`, with the env, config and data mounts the scheduler has today.
+- A new **`ingest`** service: the same image, `entrypoint: ["receipt-index", "serve"]`, `restart: unless-stopped`, the `healthcheck` from [§ 9](#9-health), `init: true`, `shm_size: 1gb` and `stop_grace_period: 11m` ([§ 1](#1-process-model)), with the env, config and data mounts the scheduler has today.
 - The **`scheduler`** service stays for the rclone mirror and backup lines. The `*/15 … receipt-index ingest` line leaves `deploy/crontab`. Its 5-minute grace period can drop back to the default once no ingest runs there.
 - `HEALTH_PING_URL` is added to `deploy/example.env`, and `deploy/example.receipt-index.yaml` gains the `ingest:` block.
 
@@ -412,11 +434,11 @@ All new commands support `--output json` (RD-03).
 1. Ship tickets 1 and 2 (sync state and retries) into the one-shot `ingest`, still on cron. Each 15-minute run then reads only new items and runs due retries. Watch a few days of runs.
 2. Run `receipt-index retry --status failed` once by hand to work through the historical failures.
 3. Deploy `serve` with every source on `archive: false`, and remove the cron ingest line in the same change. Even if the cron line is left by mistake, the source lock makes it exit 3 rather than race.
-4. Set up the external monitor and `HEALTH_PING_URL`, and confirm that one deliberate stop (`docker compose stop ingest`) raises an alert.
-5. After a week with `status --check` clean and `backfill --dry-run --since <cutover - 7 days>` reporting zero unseen items, set `archive: true` on IMAP sources. Run `backfill --archive` once to file the already-processed back catalogue.
+4. Set up the external monitor, add `HEALTH_PING_URL` to the server `.env`, then uncomment `ping_url` in the config. Confirm that one deliberate stop (`docker compose stop ingest`) raises an alert.
+5. After a week with `status --check` clean and `backfill --dry-run --since <cutover - 7 days>` reporting zero unseen items, set `archive: true` on IMAP sources. From then on, the sweep files new outcomes. Filing the back catalogue is a separate, deliberate step: `backfill --archive --dry-run` first, then `backfill --archive`.
 6. After the evidence store's Drive backend and scope change land, set `archive: true` on Drive sources and run `backfill --originals-only` to drain the dropoff into `originals/`.
 
-**Rollback**, at any step after 3: `docker compose stop ingest`, restore the cron line, `docker compose restart scheduler`. The schema changes are additive, so the one-shot `ingest` keeps working against them. Messages and files that were already moved stay where they are. They were processed, so nothing is lost, and `backfill` searches the archive folders if anything needs re-reading. Rolling back step 1 brings back today's full rescan. Before running the down migrations for `sync_state` and the `ingest_log` changes, drain pending retries with `retry --status failed`: the old code counts any `ingest_log` row as processed, so an item still waiting for its retry would never be tried again. The down migration deletes `started` rows, so the old status constraint can be restored.
+**Rollback**, at any step after 3: revert the cutover change in `deploy/` (git revert of ticket 7's commit), which removes the `ingest` service and restores the cron line. Then run `docker compose -f deploy/docker-compose.yml up -d --remove-orphans`, which removes the `ingest` container and restarts the scheduler with the old crontab. A plain `docker compose stop ingest` isn't enough, because the next `up -d` would start it again. The schema changes are additive, so the one-shot `ingest` keeps working against them. Messages and files that were already moved stay where they are. They were processed, so nothing is lost, and `backfill` searches the archive folders if anything needs re-reading. Rolling back step 1 brings back today's full rescan. Before running the down migrations for `sync_state` and the `ingest_log` changes, drain pending retries with `retry --status failed`: the old code counts any `ingest_log` row as processed, so an item still waiting for its retry would never be tried again. The down migration deletes `started` rows, so the old status constraint can be restored.
 
 ---
 
@@ -424,19 +446,19 @@ All new commands support `--output json` (RD-03).
 
 Proposed tickets. They are filed after the operator signs off this design, not before. Each lists the files it's expected to touch.
 
-1. **Sync state and incremental reads in the one-shot `ingest`.** The `sync_state` migration (with grants and the `conftest.py` mirror); the adapter split into `list_new` and `fetch`; the pipeline split into `process_item`; header-first IMAP fetch; the UIDVALIDITY reset; the Drive changes feed with bootstrap, settle time (on the change's `time`), the folder and unsupported-type filtering and the invalid-token path; verified IMAP TLS; the source lock and the item lock, with the lock-connection check; the `ingest_log` migration that adds the `started` status and `source_name` (with the `INSERT (source_name)` grant, and a down migration that deletes `started` rows first), and the `started`-row write, which the cursor rule needs; the first keys of the `ingest:` config block (`drive_settle_seconds`). It stands on its own and already pays off under cron.
+1. **Sync state and incremental reads in the one-shot `ingest`.** The `sync_state` migration (with grants and the `conftest.py` mirror); the adapter split into `list_new` and `fetch`; the pipeline split into `process_item`; header-first IMAP fetch; the UIDVALIDITY reset; the Drive changes feed with bootstrap, settle time (on the change's `time`), the folder and unsupported-type filtering and the invalid-token path; verified IMAP TLS; the Drive account ID in `sync_state` with re-bootstrap on change, and the check that a shared dropoff folder shows in the store account's feed (with the `files.list` fallback); the source lock and the item lock, with the lock-connection check and the re-check after locking; the `ingest_log` migration that adds the `started` status and `source_name` (with the `INSERT (source_name)` grant, and a down migration that deletes `started` rows first), and the `started`-row write, which the cursor rule needs; the first keys of the `ingest:` config block (`drive_settle_seconds`). It stands on its own and already pays off under cron.
    Files: `db/migrations/receipt/0000NN_create_sync_state.*.sql`, `db/migrations/receipt/0000NN_ingest_log_started.*.sql`, `tests/integration/conftest.py`, `src/receipt_index/config.py`, `src/receipt_index/adapters/{base,imap,gdrive}.py`, `src/receipt_index/pipeline.py`, `src/receipt_index/repository.py`, a new `src/receipt_index/locks.py`, `src/receipt_index/cli.py`, `pyproject.toml` (`imapclient`), and the unit and integration tests.
-2. **Retries and failure surfacing.** The `attempt` and `next_retry_at` columns and grants; the `TransientError` boundaries, the per-item transient cap and the item timeout; the two pick-up checks; the retry-scheduler function, run once by the one-shot `ingest`; the shared re-fetch path (three folders, fallback-hash search); `retry`; `failures --status/--since/--source`; the retry and timeout keys of the `ingest:` block.
+2. **Retries and failure surfacing.** The `attempt` and `next_retry_at` columns and grants; the `TransientError` boundaries, the per-item transient cap, the per-call timeouts and `counts_attempt`; the two pick-up checks; the retry-scheduler function, run once by the one-shot `ingest`; the shared re-fetch path (three folders, fallback-hash search); `retry`; `failures --status/--since/--source`; the retry and timeout keys of the `ingest:` block.
    Files: a migration, `conftest.py`, `config.py`, `pipeline.py`, `extraction.py`, `repository.py`, `cli.py`, `models.py`, `docs/user/cli-reference.md`, tests. Depends on 1.
-3. **`serve` with IMAP IDLE and Drive polling.** Watcher threads, the worker queue, the retry scheduler on a timer (ticket 2's function), one Google client per thread, SIGTERM handling, the remaining `ingest:` keys (IDLE and poll intervals).
+3. **`serve` with IMAP IDLE and Drive polling.** Watcher threads, the worker queue, the retry scheduler on a timer (ticket 2's function), one Google client per thread, the health-loop skeleton with the watchdog, SIGTERM handling (abandoning a pause uncounted), the remaining `ingest:` keys (IDLE and poll intervals).
    Files: a new `src/receipt_index/service.py`, `adapters/imap.py`, `config.py`, `cli.py`, `example.env`/`deploy/example.receipt-index.yaml`, tests (a fake IMAP client for the IDLE loop; GreenMail for an end-to-end IDLE wake-up where it supports IDLE). Depends on 1 and 2.
-4. **Health.** The heartbeat, `status` and `status --check`, the dead-man's ping.
+4. **Health.** The heartbeat, `status` and `status --check`, the dead-man's ping. Ticket 3 creates the health loop with its watchdog; this ticket adds the rest.
    Files: `service.py`, a new `src/receipt_index/health.py`, `repository.py`, `cli.py`, `config.py`, tests. Depends on 3.
 5. **`backfill` (full mode).** Date-range enumeration across the watched, archive and needs-attention folders, through ticket 2's shared fetch path.
    Files: `adapters/{imap,gdrive}.py`, `pipeline.py`, `cli.py`, `docs/user/cli-reference.md`, tests. Depends on 1 and 2. `--originals-only` follows the evidence store's schema and originals tickets; `--archive` lands with ticket 6.
-6. **Dropoff archive.** The `archive` config and its validation; IMAP `MOVE` and the UIDPLUS fallback; the archive sweep; needs-attention moves; the Drive adopt and needs-attention moves; the crash-window recovery paths; `backfill --archive`.
+6. **Dropoff archive.** The `archive` config and its validation; setting and reading `sync_state.archive_enabled_at` (the column comes with ticket 1's table); IMAP `MOVE` and the UIDPLUS fallback; the IMAP and Drive archive sweeps, run by the worker; needs-attention moves; the Drive adopt and needs-attention moves; the crash-window recovery paths; `backfill --archive`.
    Files: `adapters/{imap,gdrive}.py`, `pipeline.py`, `service.py`, `config.py`, tests. IMAP depends on 3 and on the evidence store's IMAP originals ticket, and Drive on the evidence store's Drive backend and scope ticket.
-7. **Production cutover.** The `ingest` service in `deploy/docker-compose.yml`, `deploy/crontab`, `deploy/example.env`, `deploy/example.receipt-index.yaml`, the runbook steps in `docs/user/server-deployment.md` (rollout and rollback above, and monitor setup), `docs/user/troubleshooting.md`. Depends on 3 and 4.
+7. **Production cutover.** The `ingest` service in `deploy/docker-compose.yml`, `deploy/crontab`, `deploy/example.env`, `deploy/example.receipt-index.yaml`, the runbook steps in `docs/user/server-deployment.md` (rollout and rollback above, and monitor setup), `docs/user/troubleshooting.md`. The Drive sources' `token_json` switch to `${GDRIVE_STORE_TOKEN_JSON}` isn't part of it: that lands with the evidence store's Drive ticket. Depends on 3 and 4.
 
 Suggested order: 1 → 2 → 3 → 4 → 7, with 5 any time after 1 and 6 after the matching evidence-store tickets.
 
@@ -456,6 +478,9 @@ Suggested order: 1 → 2 → 3 → 4 → 7, with 5 any time after 1 and 6 after 
 - **Unit, Drive feed.** Bootstrap order (token before listing); filtering by parent, with folders dropped; an unsupported file type recorded as `skipped` so the token passes it; settle time on the change's `time` holding the token back; the invalid-token rebootstrap; pagination.
 - **Unit, retries.** Backoff schedule; terminal after max attempts; transient errors not using up an attempt; an item that always raises the same transient error giving way after `transient_item_max_seconds`, so later items still run; a source-wide refusal pausing without using attempts; an item over `item_timeout_seconds` recorded as an item error; a dead `started` row using up an attempt; the two pick-up checks over mixed `ingest_log` histories (a re-read never jumps a pending retry); the re-fetch path finding a message in needs-attention and archive, and a fallback-hash message by its headers; existing failed rows terminal after the migration; the one-shot `ingest` running due retries.
 - **Unit, cursor rule and crash windows.** The cursor never passes an item without a committed `started` row. After a simulated crash in each window of [§ 7](#7-dropoff-archive), the item is recovered by source ID. The archive sweep moves a message committed but not moved.
+- **Unit, locks and races.** The scheduler, after taking the lock, finds a committed outcome and does nothing (a skipped item never becomes an automatic retry). The worker drops an item that `backfill` finished between queueing and locking. A locked item holds the cursor back until it has a record.
+- **Unit, shutdown and watchdog.** SIGTERM during a transient pause writes an uncounted row and exits promptly. The watchdog exits the process when an item outruns `item_timeout_seconds`, and the restart charges one attempt.
+- **Unit, Drive account and sweeps.** A changed account ID re-bootstraps the source. Both sweeps move only outcomes after `archive_enabled_at`, leaving the back catalogue to `backfill --archive`.
 - **Unit, health.** The stale threshold follows the poll interval; the heartbeat survives a slow item but not a wedged worker; the `/fail` POST body carries no error text; a new terminal failure turns the ping to `/fail` until `terminal_alert_seconds` passes.
 - **Integration (Postgres).** The `sync_state` and `ingest_log` migrations up and down, with grants checked under `receipt_index_dev_write`. Source-lock contention between two connections (the second `ingest` exits 3), and the lock re-taken after its connection is killed. Item-lock skipping between `backfill` and a worker. The `ingest_log` down migration succeeding with `started` rows present.
 - **Integration (GreenMail).** End to end: a message delivered by SMTP while `serve` is in IDLE is indexed without a poll, and `UID MOVE` lands it in the archive folder. GreenMail's IDLE and MOVE support is confirmed in ticket 3; any path it lacks stays covered by the fake client only, and the ticket says which.
@@ -474,7 +499,7 @@ Suggested order: 1 → 2 → 3 → 4 → 7, with 5 any time after 1 and 6 after 
 | A UIDVALIDITY reset on a very large folder | One header-only `FETCH`. Idempotency keyed on `Message-ID` makes it duplicate-free. It's counted in `resets` and shown in `status`. |
 | Messages without a `Message-ID` | Today's fallback hash (subject, date, sender) is kept, using the same headers fetched by the header-first read. |
 | An LLM outage or a lapsed key burns retries | Transient errors and source-wide refusals pause the worker without using up attempts, and a long pause fails `status --check`. |
-| One item blocks the single worker | An item timeout, a cap on transient retries per item, and an attempt charged for each crash recovery all end in an ordinary item error. |
+| One item blocks the single worker | Per-call timeouts, a watchdog that restarts the process, a cap on transient retries per item, and an attempt charged for each crash recovery all end in an ordinary item error. |
 
 ---
 
@@ -495,4 +520,5 @@ Suggested order: 1 → 2 → 3 → 4 → 7, with 5 any time after 1 and 6 after 
 |---|---|---|
 | Which external monitor receives the dead-man's ping, and its grace period | The operator | At the production cutover (ticket 7) |
 | Whether GreenMail supports IDLE and `MOVE` well enough for an end-to-end test | The implementer of ticket 3 | During ticket 3; the fallback is the fake client |
-| The Drive OAuth scope, and when its re-authorization happens | The evidence-store design, with the operator | That design's sign-off; Drive `archive` waits on it |
+| Whether the store account can move an operator-owned file, or the copy fallback applies | The evidence store's Drive ticket checks it, and the operator confirms | That ticket's first step; Drive `archive` follows the result |
+| Whether the store account's changes feed reports files added to a folder shared with it | The implementer of ticket 1, against a scratch folder | During ticket 1; the fallback is listing the dropoff folder each poll |

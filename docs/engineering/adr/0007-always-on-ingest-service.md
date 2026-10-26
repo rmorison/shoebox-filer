@@ -22,7 +22,7 @@ Production runs the one-shot `receipt-index ingest` every 15 minutes from a cron
 ## Decision
 
 1. **A long-running `receipt-index serve` process** is the production ingest path. It runs a watcher per source, a single worker that sends items through the existing pipeline one at a time, a retry scheduler and a health loop. The one-shot `ingest` stays, for development, manual catch-up and rollback, and shares the same sync state and locks.
-2. **IMAP: IDLE (RFC 2177) as the trigger, polling as the fallback.** One IDLE connection per watched folder, re-issued every 10 minutes by default. A catch-up poll after every connect, a safety poll every 4 minutes by default, and polling alone when the server has no `IDLE` capability. The library is `imapclient` (4.x supports Python 3.8–3.14), because `imaplib` gains IDLE only in Python 3.14.
+2. **IMAP: IDLE (RFC 2177) as the trigger, polling as the fallback.** One IDLE connection per watched folder, re-issued every 10 minutes by default. A catch-up poll after every connect, a safety poll every 4 minutes by default, and polling alone when the server has no `IDLE` capability. The library is `imapclient` 4.x (PyPI: `requires_python >=3.8`; its README lists 3.8–3.14), because `imaplib` gains IDLE only in Python 3.14.
 3. **Drive: poll the changes feed** (`changes.list` with a saved page token) every 2 minutes by default. **No Drive push (`changes.watch`) for now.** It would need a public HTTPS endpoint and channel renewal, and it would pay off only for a target under about a minute.
 4. **The default latency target is 5 minutes** from arrival to searchable, with the source and the LLM API reachable. It's a default, not a fixed requirement: every interval that sets it (IDLE re-issue, IMAP safety poll, Drive poll and settle time, health thresholds) is a config value. The operator can trade latency for load without a code change, up to hourly polling from the same process.
 5. **Postgres advisory locks replace the scheduler's no-overlap guarantee.** A lock per source for whoever advances its cursor, and a lock per item while it's processed. `backfill` and `retry` can therefore run next to `serve`, and a stray cron `ingest` exits instead of racing.
@@ -35,7 +35,7 @@ Production runs the one-shot `receipt-index ingest` every 15 minutes from a cron
 - New mail is indexed in seconds while IDLE works, and within the safety-poll interval when it doesn't. Drive files within about 4 minutes.
 - One process gives one place for locking, retries, health and, later, push or an HTTP interface.
 - Ingest stopping becomes visible: an unhealthy container, a failed `status --check`, an alert when the pings stop.
-- Rollback is a config change (stop the service, restore the cron line). Ingest's state lives in additive tables that the one-shot command also reads.
+- Rollback is a deploy change: revert the cutover commit, which removes the service and restores the cron line, then `docker compose up -d --remove-orphans`. Ingest's state lives in additive tables that the one-shot command also reads.
 
 ### Negative
 
