@@ -593,11 +593,11 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
     psql "$DATABASE_URL" -At -c "SELECT pdf_path FROM receipt.receipts" | sort > /tmp/db.txt
-    ( cd /app/data/receipts && find . -type f ! -name "*.tmp" | sed "s|^\./||" ) | sort > /tmp/fs.txt
+    ( cd /app/data/receipts && find . -path ./originals -prune -o -type f ! -name ".put.*.tmp" -print | sed "s|^\./||" ) | sort > /tmp/fs.txt
     echo "orphan files: $(comm -13 /tmp/db.txt /tmp/fs.txt | wc -l)"'
 ```
 
-The count leaves out temp files. The store writes each file to a `.put.<random>.tmp` name in its folder and links it into place, so a temp file is left behind only when an ingest is killed mid-write. Nothing references one, and the Dropbox mirror skips them. Delete any older than an hour, when no write can still be using it:
+The count leaves out temp files, and `originals/`, whose files aren't renditions and so never appear in `pdf_path`. The store writes each file to a `.put.<random>.tmp` name in its folder and links it into place, so a temp file is left behind only when an ingest is killed mid-write. Nothing references one, and the Dropbox mirror skips them. Delete any older than an hour, when no write can still be using it:
 
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '

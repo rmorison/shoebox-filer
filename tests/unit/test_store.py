@@ -364,6 +364,28 @@ class TestRefsOutsideTheStore:
             _rendition(store)
         assert list(outside.iterdir()) == []  # no folder created outside either
 
+    def test_a_symlink_planted_while_creating_a_folder_is_refused(
+        self, store_root: Path, tmp_path: Path
+    ) -> None:
+        """A level created as a symlink in a race is checked before use."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        store = LocalEvidenceStore(store_root)
+        real_mkdir = Path.mkdir
+
+        def plant_symlink(self: Path, *args: object, **kwargs: object) -> None:
+            if self.name == "renditions":
+                self.symlink_to(outside)  # another process wins the race
+                return
+            real_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch("pathlib.Path.mkdir", plant_symlink),
+            pytest.raises(InvalidRefError),
+        ):
+            _rendition(store)
+        assert list(outside.iterdir()) == []
+
     def test_an_original_symlinked_out_of_the_store_is_not_read(
         self, store_root: Path, tmp_path: Path
     ) -> None:
@@ -494,6 +516,48 @@ class TestLongNamesAndRaces:
         with store.open(new) as fh:
             assert fh.read() == b"pdf"
         assert not store.exists(old)
+        assert _tmp_files(store_root) == []
+
+    def test_rename_copy_fallback_takes_the_next_name(self, store_root: Path) -> None:
+        store = LocalEvidenceStore(store_root)
+        old = rendition_ref(_rendition(store, b"pdf"))
+        old_path = store.local_path(old)
+        real_link = os.link
+        copies = []
+
+        def refuse_then_collide(src: str | Path, dst: str | Path) -> None:
+            if Path(src) == old_path:
+                raise PermissionError(1, "Operation not permitted")
+            copies.append(Path(dst).name)
+            if len(copies) == 1:
+                Path(dst).write_bytes(b"other")  # a concurrent writer's file
+            real_link(src, dst)
+
+        with patch("receipt_index.store.os.link", side_effect=refuse_then_collide):
+            new = store.rename(old, "renamed.pdf")
+
+        assert new.endswith("/renamed_2.pdf")
+        with store.open(new) as fh:
+            assert fh.read() == b"pdf"
+        assert not store.exists(old)
+        assert _tmp_files(store_root) == []
+
+    def test_rename_permission_error_on_the_copy_is_raised(
+        self, store_root: Path
+    ) -> None:
+        store = LocalEvidenceStore(store_root)
+        old = rendition_ref(_rendition(store, b"pdf"))
+
+        with (
+            patch(
+                "receipt_index.store.os.link",
+                side_effect=PermissionError(1, "Operation not permitted"),
+            ),
+            pytest.raises(PermissionError),
+        ):
+            store.rename(old, "renamed.pdf")
+
+        assert store.exists(old)
         assert _tmp_files(store_root) == []
 
     def test_rename_of_a_missing_file(self, store_root: Path) -> None:

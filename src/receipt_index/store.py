@@ -272,19 +272,19 @@ class LocalEvidenceStore:
     def _folder_path(self, relative: PurePosixPath) -> Path:
         """Create a folder under the root, one level at a time.
 
-        Each level that already exists is checked to stay inside the root
-        before anything is created beneath it, so a symlinked folder that
-        points outside is refused without creating folders there.
+        Each level is checked to stay inside the root, after creating it if
+        it was missing, before anything is created beneath it. A symlinked
+        folder that points outside is refused without creating folders there,
+        even one planted between the check and the ``mkdir``.
         """
         path = self.root
         for part in relative.parts:
             path = path / part
-            if path.exists() or path.is_symlink():
-                if not path.resolve().is_relative_to(self.root):
-                    msg = f"store folder resolves outside the store: {relative}"
-                    raise InvalidRefError(msg, candidate=self.root / relative)
-            else:
+            if not (path.exists() or path.is_symlink()):
                 path.mkdir(exist_ok=True)
+            if not path.resolve().is_relative_to(self.root):
+                msg = f"store folder resolves outside the store: {relative}"
+                raise InvalidRefError(msg, candidate=self.root / relative)
         return path
 
     def _twin_folder(self, relative: PurePosixPath) -> Path | None:
