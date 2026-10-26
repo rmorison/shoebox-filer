@@ -190,6 +190,7 @@ class TestConfigImapIngest:
             agent=agent,
             source_name="personal-email",
             source_type="imap",
+            llm_model="test-model",
         )
 
         assert result.processed == 1
@@ -243,6 +244,7 @@ class TestConfigImapIngest:
             agent=agent,
             source_name="work-receipts",
             source_type="imap",
+            llm_model="test-model",
         )
 
         rows = pg_conn.execute(
@@ -319,6 +321,7 @@ class TestMultiSourceIngest:
             agent=agent_a,
             source_name="source-a",
             source_type="imap",
+            llm_model="test-model",
         )
         result_b = run_ingest(
             conn=pg_conn,
@@ -327,6 +330,7 @@ class TestMultiSourceIngest:
             agent=agent_b,
             source_name="source-b",
             source_type="imap",
+            llm_model="test-model",
         )
 
         assert result_a.processed == 1
@@ -374,6 +378,7 @@ class TestMultiSourceIngest:
             agent=_make_mock_agent(vendor="AlphaVendor", amount=Decimal("10.00")),
             source_name="alpha",
             source_type="imap",
+            llm_model="test-model",
         )
         run_ingest(
             conn=pg_conn,
@@ -382,6 +387,7 @@ class TestMultiSourceIngest:
             agent=_make_mock_agent(vendor="BetaVendor", amount=Decimal("20.00")),
             source_name="beta",
             source_type="imap",
+            llm_model="test-model",
         )
 
         alpha_rows = search_receipts(pg_conn, source_name="alpha")
@@ -440,6 +446,7 @@ class TestSourceFiltering:
             agent=_make_mock_agent(vendor="FilterVendorA", amount=Decimal("30.00")),
             source_name="filter-source-a",
             source_type="imap",
+            llm_model="test-model",
         )
 
         assert result.processed == 1
@@ -486,6 +493,7 @@ class TestSourceFiltering:
             agent=_make_mock_agent(vendor="PidVendorA", amount=Decimal("50.00")),
             source_name="pid-a",
             source_type="imap",
+            llm_model="test-model",
         )
 
         # get_processed_source_ids returns all IDs globally, but source-b's
@@ -500,6 +508,7 @@ class TestSourceFiltering:
             agent=_make_mock_agent(vendor="PidVendorB", amount=Decimal("60.00")),
             source_name="pid-b",
             source_type="imap",
+            llm_model="test-model",
         )
         assert result_b.processed == 1
 
@@ -554,6 +563,7 @@ class TestIdempotentReIngest:
             agent=agent,
             source_name="idem-source",
             source_type="imap",
+            llm_model="test-model",
         )
         assert r1.processed == 1
 
@@ -565,6 +575,7 @@ class TestIdempotentReIngest:
             agent=_make_mock_agent(vendor="IdemVendor", amount=Decimal("75.00")),
             source_name="idem-source",
             source_type="imap",
+            llm_model="test-model",
         )
         assert r2.processed == 0
 
@@ -608,6 +619,7 @@ class TestIdempotentReIngest:
             agent=_make_mock_agent(vendor="FirstVendor", amount=Decimal("10.00")),
             source_name="idem2-source",
             source_type="imap",
+            llm_model="test-model",
         )
 
         # Seed a second email
@@ -625,6 +637,7 @@ class TestIdempotentReIngest:
             agent=_make_mock_agent(vendor="SecondVendor", amount=Decimal("20.00")),
             source_name="idem2-source",
             source_type="imap",
+            llm_model="test-model",
         )
         assert r2.processed == 1
 
@@ -676,6 +689,7 @@ class TestSearchWithSourceFilter:
             agent=_make_mock_agent(vendor="SearchVendorA", amount=Decimal("100.00")),
             source_name="search-a",
             source_type="imap",
+            llm_model="test-model",
         )
         run_ingest(
             conn=pg_conn,
@@ -684,6 +698,7 @@ class TestSearchWithSourceFilter:
             agent=_make_mock_agent(vendor="SearchVendorB", amount=Decimal("200.00")),
             source_name="search-b",
             source_type="imap",
+            llm_model="test-model",
         )
 
         results_a = search_receipts(pg_conn, source_name="search-a")
@@ -734,6 +749,7 @@ class TestSearchWithSourceFilter:
             agent=_make_mock_agent(vendor="ACME Corp", amount=Decimal("50.00")),
             source_name="combo-a",
             source_type="imap",
+            llm_model="test-model",
         )
         run_ingest(
             conn=pg_conn,
@@ -742,6 +758,7 @@ class TestSearchWithSourceFilter:
             agent=_make_mock_agent(vendor="ACME Corp", amount=Decimal("50.00")),
             source_name="combo-b",
             source_type="imap",
+            llm_model="test-model",
         )
 
         # Search vendor=ACME in combo-a only
@@ -897,6 +914,7 @@ class TestGdriveAdapterMocked:
                 agent=agent,
                 source_name="scanned-receipts",
                 source_type="gdrive",
+                llm_model="test-model",
             )
 
         assert result.processed == 1
@@ -960,6 +978,7 @@ class TestGdriveAdapterMocked:
                 agent=agent,
                 source_name="scanned-receipts",
                 source_type="gdrive",
+                llm_model="test-model",
             )
             assert r1.processed == 1
 
@@ -988,6 +1007,7 @@ class TestGdriveAdapterMocked:
                 agent=_make_mock_agent(vendor="DupeVendor", amount=Decimal("15.00")),
                 source_name="scanned-receipts",
                 source_type="gdrive",
+                llm_model="test-model",
             )
 
         assert r2.processed == 0
@@ -1029,6 +1049,7 @@ class TestGdriveAdapterMocked:
             agent=_make_mock_agent(),
             source_name="scanned-receipts",
             source_type="gdrive",
+            llm_model="test-model",
         )
 
         # Nothing processed or failed: the unsupported file is recorded as
@@ -1072,6 +1093,7 @@ class TestGdriveAdapterMocked:
             agent=_make_mock_agent(),
             source_name="scanned-receipts",
             source_type="gdrive",
+            llm_model="test-model",
         )
 
         assert result.processed == 0

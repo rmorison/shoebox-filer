@@ -140,6 +140,7 @@ class TestIngestStoresPaidAmount:
             source_name="greenmail-test",
             source_type="imap",
             agent=_agent_for_fixtures(),
+            llm_model="test-model",
         )
         assert (result.processed, result.failed) == (2, 0)
 

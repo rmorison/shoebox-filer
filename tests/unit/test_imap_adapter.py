@@ -860,6 +860,7 @@ class TestRefusedMessages:
             store=store,
             source_name="test-imap",
             source_type="imap",
+            llm_model="test-model",
         )
 
         assert result.source_error is None

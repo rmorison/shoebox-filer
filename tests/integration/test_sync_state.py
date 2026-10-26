@@ -111,6 +111,7 @@ def _ingest(conn: Conn, adapter: ImapAdapter, tmp_path: Path) -> Any:
         source_name=adapter.name,
         source_type="imap",
         agent=_agent(),  # type: ignore[arg-type]
+        llm_model="test-model",
     )
 
 

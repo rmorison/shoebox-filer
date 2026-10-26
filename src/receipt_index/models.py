@@ -137,9 +137,44 @@ class ReceiptMetadata(BaseModel):
     currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     date: date
     description: str | None = None
+    # Which part of an email held the receipt: an attachment's file name as
+    # listed, or "body". None when the extractor can't tell, and always None
+    # for a Drive document or a rendition.
+    receipt_document: str | None = None
     # Whether this is a receipt at all; below 0.5 the item is skipped.
     confidence: float = Field(ge=0.0, le=1.0)
     field_confidence: FieldConfidence
+
+
+# Below this overall confidence an extraction isn't treated as a receipt:
+# ingest skips the item, and re-extraction records the run and applies
+# nothing (it is "gated"). One value for ingest, reextract and --needs-review.
+MIN_RECEIPT_CONFIDENCE = 0.5
+
+# An extraction run that failed records only this key in its output. Such a
+# run never makes a receipt current, and --needs-review lists it.
+FAILED_RUN_KEY = "error"
+
+
+def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
+    """The receipt fields an extraction gives, keyed by their applied name.
+
+    Columns by name (``receipt_date`` for the model's ``date``), and each
+    field confidence as ``field_confidence.<field>``: the names that
+    ``extractions.applied_fields`` and ``receipts.manual_fields`` use.
+    """
+    values: dict[str, Any] = {
+        "vendor": metadata.vendor,
+        "amount": metadata.amount,
+        "paid_amount": metadata.paid_amount,
+        "currency": metadata.currency,
+        "receipt_date": metadata.date,
+        "description": metadata.description,
+        "confidence": metadata.confidence,
+    }
+    for name, value in metadata.field_confidence.model_dump().items():
+        values[f"field_confidence.{name}"] = value
+    return values
 
 
 @dataclass
@@ -168,6 +203,8 @@ class Receipt(BaseModel):
     description: str | None
     confidence: float
     field_confidence: dict[str, float] = Field(default_factory=dict)
+    # Fields a person has edited; re-extraction never writes them.
+    manual_fields: list[str] = Field(default_factory=list)
     pdf_path: str
     email_subject: str | None
     email_sender: str | None

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import ssl
 import time
 from datetime import UTC, datetime
@@ -61,6 +62,27 @@ _SESSION_CODES = ("UNAVAILABLE", "INUSE", "OVERQUOTA")
 def _is_session_refusal(exc: Exception) -> bool:
     text = str(exc).upper()
     return any(f"[{code}" in text for code in _SESSION_CODES)
+
+
+# The fallback ID of a message with no Message-ID: a SHA-256 hex digest.
+_HASH_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def _message_id_search(source_id: str) -> str | None:
+    """The ``SEARCH`` criteria for a Message-ID, or None if it can't be searched.
+
+    The ID is sent as an IMAP quoted string (RFC 3501: backslash and quote
+    escaped; no CR, LF or 8-bit characters). The criteria are passed to
+    IMAPClient as one string, which it sends as is; as a list item it would
+    quote the string again, and it leaves some specials such as ``(`` bare.
+    Fallback-hash IDs (no ``Message-ID``) and ``imap-uid:`` IDs return None.
+    """
+    if source_id.startswith("imap-uid:") or _HASH_ID.fullmatch(source_id):
+        return None
+    if not source_id.isascii() or any(c in source_id for c in "\r\n\0"):
+        return None
+    escaped = source_id.replace("\\", "\\\\").replace('"', '\\"')
+    return f'HEADER Message-ID "{escaped}"'
 
 
 def _header_bytes(data: dict[bytes, Any]) -> bytes | None:
@@ -318,6 +340,91 @@ class ImapAdapter:
         if not isinstance(raw, bytes):
             return None
         return self._parse_message(message_from_bytes(raw), ref.source_id)
+
+    def _lookup_folders(self) -> list[str]:
+        """The folders ``fetch_by_id`` searches, in order.
+
+        Only the watched folder for now; the archive and needs-attention
+        folders join it when the configuration has them.
+        """
+        return [self.config.folder]
+
+    def fetch_by_id(self, source_id: str) -> RawReceipt | None:
+        """Find one message by its Message-ID and download it.
+
+        None unless exactly one message, across the searched folders, has
+        that exact Message-ID (it is set by the sender and isn't guaranteed
+        unique), and for IDs that can't be searched for.
+        """
+        criteria = _message_id_search(source_id)
+        if criteria is None:
+            return None
+        # Everything up to the body fetch: SEARCH, the exact-ID check and the
+        # re-select. A dropped connection anywhere here is the source's
+        # problem, never this message's (the body fetch handles its own).
+        try:
+            found = self._find_exact(criteria, source_id)
+        except (OSError, IMAPClientAbortError, ConnectionError) as exc:
+            self._drop_client()
+            raise SourceUnavailableError(
+                f"IMAP connection to {self.config.host} failed: {exc}"
+            ) from exc
+        except IMAPClientError as exc:
+            if _is_session_refusal(exc) or self._client is None:
+                self._drop_client()
+                raise SourceUnavailableError(f"IMAP server refused: {exc}") from exc
+            raise MessageRefusedError(
+                f"server refused the search for {source_id}: {exc}"
+            ) from exc
+        if found is None:
+            return None
+        uid = found
+        response = self._fetch_body(uid)
+        data = response.get(uid)
+        raw = data.get(_BODY_KEY) if data else None
+        if not isinstance(raw, bytes):
+            return None
+        return self._parse_message(message_from_bytes(raw), source_id)
+
+    def _find_exact(self, criteria: str, source_id: str) -> int | None:
+        """The UID of the one message with exactly this Message-ID, selected.
+
+        None when none or several match. Leaves its folder selected.
+        """
+        matches: list[tuple[str, int, int]] = []
+        for folder in self._lookup_folders():
+            client = self._session()
+            info = client.select_folder(folder, readonly=True)  # EXAMINE
+            uidvalidity = int(info[b"UIDVALIDITY"])
+            for hit in client.search(criteria):
+                matches.append((folder, uidvalidity, int(hit)))
+
+        # SEARCH HEADER matches substrings: keep exact matches only.
+        exact = [m for m in matches if self._has_message_id(m, source_id)]
+        if len(exact) != 1:
+            if len(exact) > 1:
+                logger.warning(
+                    "%d messages share Message-ID %s; not re-fetching",
+                    len(exact),
+                    source_id,
+                )
+            return None
+        folder, uidvalidity, uid = exact[0]
+        self._session().select_folder(folder, readonly=True)
+        self._uidvalidity = uidvalidity
+        return uid
+
+    def _has_message_id(self, match: tuple[str, int, int], source_id: str) -> bool:
+        """Whether a search hit's own Message-ID is exactly ``source_id``."""
+        folder, _uidvalidity, uid = match
+        client = self._session()
+        client.select_folder(folder, readonly=True)
+        response, refused = self._fetch_headers(client, [uid])
+        data = response.get(uid)
+        headers = _header_bytes(data) if data and uid not in refused else None
+        if headers is None:
+            return False
+        return self._get_message_id(message_from_bytes(headers)) == source_id
 
     def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:
         """Fetch one body, reconnecting once if the connection fails.

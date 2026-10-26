@@ -32,6 +32,9 @@ class SourceAdapter(Protocol):
       raises ``SourceUnavailableError`` when the source can't be reached, and
       any other exception for a problem with the item itself.
 
+    ``fetch_by_id(source_id)`` re-fetches one item from its source ID alone,
+    for re-extraction, with the same meaning for None and for errors.
+
     An adapter is a context manager, so a connection can be held across
     both steps; ``close()`` releases it.
     """
@@ -46,6 +49,8 @@ class SourceAdapter(Protocol):
     def list_new(self, state: SyncState | None) -> SourceRead: ...
 
     def fetch(self, ref: ItemRef) -> RawReceipt | None: ...
+
+    def fetch_by_id(self, source_id: str) -> RawReceipt | None: ...
 
     def close(self) -> None: ...
 

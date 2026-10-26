@@ -43,6 +43,9 @@ _CHANGE_FIELDS = (
 
 UNSUPPORTED_REASON = "unsupported file type"
 
+# What fetch_by_id asks files.get for: enough to build a ref.
+_GET_FIELDS = "id, name, mimeType, modifiedTime"
+
 # A changes feed longer than this is treated as an API error rather than paged
 # for ever (at 1000 changes a page, that is ten million changes).
 _MAX_CHANGE_PAGES = 10_000
@@ -88,6 +91,13 @@ def _is_invalid_token_error(exc: Exception) -> bool:
     if isinstance(content, str):
         content = content.encode()
     return status == 400 and b"pageToken" in content
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """Whether an API error says the file doesn't exist (or isn't visible)."""
+    from googleapiclient.errors import HttpError
+
+    return isinstance(exc, HttpError) and int(exc.resp.status) == 404
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -331,6 +341,36 @@ class GdriveAdapter:
             file_content=content,
             file_content_type=mime_type,
         )
+
+    def fetch_by_id(self, source_id: str) -> RawReceipt | None:
+        """Get one file by its ID, wherever it is now, and download it.
+
+        None if it no longer exists or its type can't be ingested. A service
+        that can't be built (bad or missing credentials) is an outage for the
+        whole source, never one file's fault.
+        """
+        try:
+            service = self._session()
+        except Exception as exc:
+            raise SourceUnavailableError(
+                f"Drive source {self.config.name} can't be reached: {exc}"
+            ) from exc
+        try:
+            meta: dict[str, Any] = (
+                service.files().get(fileId=source_id, fields=_GET_FIELDS).execute()
+            )
+        except Exception as exc:
+            if _is_not_found(exc):
+                return None
+            if _is_transient_error(exc):
+                raise SourceUnavailableError(
+                    f"Drive lookup of {source_id} failed: {exc}"
+                ) from exc
+            raise
+        ref = self._ref(meta)
+        if ref.skip_reason is not None:
+            return None
+        return self.fetch(ref)
 
     def _build_service(self) -> Any:
         """Create a Google Drive API service from stored credentials.

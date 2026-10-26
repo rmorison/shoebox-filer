@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 from psycopg.types.json import Jsonb
 
-from receipt_index.models import IngestLogEntry, Receipt, SyncState
+from receipt_index.models import (
+    FAILED_RUN_KEY,
+    MIN_RECEIPT_CONFIDENCE,
+    IngestLogEntry,
+    Receipt,
+    SyncState,
+)
 
 if TYPE_CHECKING:
     from datetime import date, datetime
@@ -235,8 +241,13 @@ def insert_receipt(
     file_name: str | None = None,
     paid_amount: Decimal | None = None,
     field_confidence: dict[str, float] | None = None,
+    commit: bool = True,
 ) -> Receipt:
-    """Insert a receipt row and return the validated Receipt model."""
+    """Insert a receipt row and return the validated Receipt model.
+
+    With ``commit=False`` the caller commits, so that the receipt and its
+    extraction row land together.
+    """
     cur = conn.execute(
         """\
         INSERT INTO receipt.receipts (
@@ -273,8 +284,62 @@ def insert_receipt(
         },
     )
     row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return Receipt.model_validate(row)
+
+
+def insert_extraction(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    origin: str,
+    input_kind: str,
+    prompt_version: int,
+    llm_model: str,
+    output: dict[str, Any],
+    applied_fields: list[str],
+    replaced: dict[str, Any],
+    llm_input_tokens: int | None,
+    llm_output_tokens: int | None,
+    llm_cache_read_tokens: int | None,
+    llm_requests: int | None,
+    input_file_id: UUID | None = None,
+) -> None:
+    """Append one extraction run to the history. The caller commits.
+
+    The table is append-only: the guard trigger refuses any later change.
+    """
+    conn.execute(
+        """\
+        INSERT INTO receipt.extractions (
+            receipt_id, origin, input_kind, input_file_id, prompt_version,
+            llm_model, output, applied_fields, replaced,
+            llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
+            llm_requests
+        ) VALUES (
+            %(receipt_id)s, %(origin)s, %(input_kind)s, %(input_file_id)s,
+            %(prompt_version)s, %(llm_model)s, %(output)s, %(applied_fields)s,
+            %(replaced)s, %(llm_input_tokens)s, %(llm_output_tokens)s,
+            %(llm_cache_read_tokens)s, %(llm_requests)s
+        )
+        """,
+        {
+            "receipt_id": receipt_id,
+            "origin": origin,
+            "input_kind": input_kind,
+            "input_file_id": input_file_id,
+            "prompt_version": prompt_version,
+            "llm_model": llm_model,
+            "output": Jsonb(output),
+            "applied_fields": applied_fields,
+            "replaced": Jsonb(replaced),
+            "llm_input_tokens": llm_input_tokens,
+            "llm_output_tokens": llm_output_tokens,
+            "llm_cache_read_tokens": llm_cache_read_tokens,
+            "llm_requests": llm_requests,
+        },
+    )
 
 
 def _receipt_filters(
@@ -286,6 +351,7 @@ def _receipt_filters(
     date_from: date | None,
     date_to: date | None,
     source_name: str | None,
+    needs_review: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Build the WHERE clause and parameters shared by search and count."""
     clauses: list[str] = []
@@ -319,6 +385,9 @@ def _receipt_filters(
         clauses.append("source_name = %(source_name)s")
         params["source_name"] = source_name
 
+    if needs_review:
+        clauses.append(_NEEDS_REVIEW)
+
     where = " AND ".join(clauses) if clauses else "TRUE"
     return where, params
 
@@ -349,11 +418,14 @@ def search_receipts(
     source_name: str | None = None,
     limit: int | None = None,
     offset: int | None = None,
+    needs_review: bool = False,
 ) -> list[Receipt]:
     """Search receipts with optional filters, combined with AND.
 
     Results are ordered newest first, then by vendor, then by id, so that
-    ``limit``/``offset`` pages are stable between calls.
+    ``limit``/``offset`` pages are stable between calls. ``needs_review``
+    keeps receipts still missing a paid amount or whose latest extraction
+    failed or was gated, lowest paid-amount confidence first.
     """
     where, params = _receipt_filters(
         vendor=vendor,
@@ -363,10 +435,13 @@ def search_receipts(
         date_from=date_from,
         date_to=date_to,
         source_name=source_name,
+        needs_review=needs_review,
+    )
+    order = (
+        _NEEDS_REVIEW_ORDER if needs_review else "receipt_date DESC, vendor ASC, id ASC"
     )
     sql = (
-        f"SELECT * FROM receipt.receipts WHERE {where} "
-        "ORDER BY receipt_date DESC, vendor ASC, id ASC"
+        f"SELECT * FROM receipt.receipts WHERE {where} ORDER BY {order}"
     ) + _page_clause(params, limit, offset)
 
     cur = conn.execute(sql, params)
@@ -383,6 +458,7 @@ def count_receipts(
     date_from: date | None = None,
     date_to: date | None = None,
     source_name: str | None = None,
+    needs_review: bool = False,
 ) -> int:
     """Count the receipts that ``search_receipts`` would return unpaged."""
     where, params = _receipt_filters(
@@ -393,6 +469,7 @@ def count_receipts(
         date_from=date_from,
         date_to=date_to,
         source_name=source_name,
+        needs_review=needs_review,
     )
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
@@ -502,3 +579,259 @@ def get_receipt_by_id(
     if row is None:
         return None
     return Receipt.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# Re-extraction (receipt data-model design, §3)
+# ---------------------------------------------------------------------------
+
+
+def _failed(output: str = "output") -> str:
+    """SQL that is true for a failed extraction run's ``output``."""
+    return f"{output} ? '{FAILED_RUN_KEY}'"
+
+
+# Each receipt's latest extraction that didn't fail. A failed run (its output
+# holds an "error") never makes a receipt current, so the next run retries it.
+_LATEST_GOOD = f"""\
+SELECT DISTINCT ON (receipt_id) receipt_id, prompt_version, llm_model
+FROM receipt.extractions
+WHERE NOT ({_failed()})
+ORDER BY receipt_id, created_at DESC, id DESC
+"""
+
+# A receipt still needs review when its paid amount isn't known, or when its
+# latest run (failed ones included) applied nothing because it failed or was
+# gated. A run that applied nothing because nothing was empty doesn't count.
+_NEEDS_REVIEW = f"""\
+(paid_amount IS NULL OR EXISTS (
+    SELECT 1 FROM (
+        SELECT e.output FROM receipt.extractions e
+        WHERE e.receipt_id = receipts.id
+        ORDER BY e.created_at DESC, e.id DESC
+        LIMIT 1
+    ) latest
+    WHERE {_failed("latest.output")}
+       OR (latest.output->>'confidence')::numeric < {MIN_RECEIPT_CONFIDENCE}
+))"""
+
+# Lowest paid-amount confidence first; receipts with no such entry first of all.
+_NEEDS_REVIEW_ORDER = (
+    "(field_confidence->>'paid_amount')::numeric ASC NULLS FIRST, "
+    "receipt_date DESC, vendor ASC, id ASC"
+)
+
+
+def select_for_reextract(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    prompt_version: int,
+    llm_model: str,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    source_name: str | None = None,
+    ids: list[UUID] | None = None,
+    force: bool = False,
+    model_not: str | None = None,
+    confidence_below: tuple[str | None, float] | None = None,
+    limit: int | None = None,
+) -> list[Receipt]:
+    """The receipts a re-extraction run selects, oldest first.
+
+    Filters combine with AND. Unless ``force``, a receipt is left out when its
+    latest extraction that didn't fail has the current prompt version and the
+    configured model: a prompt change or a model change makes it stale.
+    ``model_not`` keeps receipts whose latest such run used another model (or
+    that have none). ``confidence_below`` is ``(field, x)``: the overall
+    confidence when ``field`` is None, else that field's entry, missing
+    entries counting as below.
+    """
+    clauses: list[str] = []
+    params: dict[str, object] = {"version": prompt_version, "model": llm_model}
+    if date_from is not None:
+        clauses.append("r.receipt_date >= %(date_from)s")
+        params["date_from"] = date_from
+    if date_to is not None:
+        clauses.append("r.receipt_date <= %(date_to)s")
+        params["date_to"] = date_to
+    if source_name is not None:
+        clauses.append("r.source_name = %(source_name)s")
+        params["source_name"] = source_name
+    if ids:
+        clauses.append("r.id = ANY(%(ids)s)")
+        params["ids"] = list(ids)
+    if not force:
+        clauses.append(
+            "NOT (l.prompt_version IS NOT DISTINCT FROM %(version)s"
+            " AND l.llm_model IS NOT DISTINCT FROM %(model)s)"
+        )
+    if model_not is not None:
+        clauses.append("l.llm_model IS DISTINCT FROM %(model_not)s")
+        params["model_not"] = model_not
+    if confidence_below is not None:
+        field, threshold = confidence_below
+        params["below"] = threshold
+        if field is None:
+            clauses.append("r.confidence < %(below)s")
+        else:
+            clauses.append(
+                "COALESCE((r.field_confidence->>%(below_field)s)::numeric, -1)"
+                " < %(below)s"
+            )
+            params["below_field"] = field
+    where = " AND ".join(clauses) if clauses else "TRUE"
+    sql = (
+        f"WITH l AS ({_LATEST_GOOD}) "
+        "SELECT r.* FROM receipt.receipts r LEFT JOIN l ON l.receipt_id = r.id "
+        f"WHERE {where} ORDER BY r.receipt_date ASC, r.id ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT %(limit)s"
+        params["limit"] = limit
+    cur = conn.execute(sql, params)
+    return [Receipt.model_validate(row) for row in cur.fetchall()]
+
+
+def is_current(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    *,
+    prompt_version: int,
+    llm_model: str,
+) -> bool:
+    """Whether a receipt's latest extraction that didn't fail used this
+    prompt version and model: the staleness test ``select_for_reextract``
+    applies, for one receipt, re-checked under its item lock."""
+    cur = conn.execute(
+        f"WITH l AS ({_LATEST_GOOD}) SELECT 1 FROM l "
+        "WHERE l.receipt_id = %(id)s AND l.prompt_version = %(version)s "
+        "AND l.llm_model = %(model)s",
+        {"id": receipt_id, "version": prompt_version, "model": llm_model},
+    )
+    return cur.fetchone() is not None
+
+
+def lock_receipt(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> Receipt | None:
+    """Read a receipt with ``FOR UPDATE``, in the caller's transaction."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.receipts WHERE id = %(id)s FOR UPDATE",
+        {"id": receipt_id},
+    )
+    row = cur.fetchone()
+    return None if row is None else Receipt.model_validate(row)
+
+
+def get_extraction_history(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> tuple[bool, set[str]]:
+    """Whether ingest recorded the receipt's extraction, and every field any
+    of its extractions applied."""
+    cur = conn.execute(
+        """\
+        SELECT bool_or(origin = 'ingest') AS ingested,
+               COALESCE(array_agg(DISTINCT f) FILTER (WHERE f IS NOT NULL),
+                        '{}') AS applied
+        FROM receipt.extractions
+        LEFT JOIN LATERAL unnest(applied_fields) AS f ON TRUE
+        WHERE receipt_id = %(id)s
+        """,
+        {"id": receipt_id},
+    )
+    row = cur.fetchone()
+    if row is None:
+        return False, set()
+    return bool(row["ingested"]), set(row["applied"] or [])
+
+
+# The receipt columns re-extraction may write (field_confidence apart).
+_REEXTRACT_COLUMNS = frozenset(
+    {
+        "vendor",
+        "amount",
+        "paid_amount",
+        "currency",
+        "receipt_date",
+        "description",
+        "confidence",
+    }
+)
+
+
+def update_receipt_fields(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    columns: dict[str, Any],
+    field_confidence: dict[str, float] | None = None,
+) -> None:
+    """Write re-extracted values to one receipt. The caller commits."""
+    from psycopg import sql
+
+    unknown = set(columns) - _REEXTRACT_COLUMNS
+    if unknown:
+        raise ValueError(f"not a re-extractable column: {sorted(unknown)}")
+    sets = [
+        sql.SQL("{} = {}").format(sql.Identifier(name), sql.Placeholder(name))
+        for name in sorted(columns)
+    ]
+    params: dict[str, Any] = dict(columns)
+    if field_confidence is not None:
+        sets.append(sql.SQL("field_confidence = {}").format(sql.Placeholder("fc")))
+        params["fc"] = Jsonb(field_confidence)
+    if not sets:
+        return
+    params["id"] = receipt_id
+    conn.execute(
+        sql.SQL("UPDATE receipt.receipts SET {} WHERE id = {}").format(
+            sql.SQL(", ").join(sets), sql.Placeholder("id")
+        ),
+        params,
+    )
+
+
+# How many runs at the current version and model an average needs before it
+# stands in for the ingest_log figures.
+_MIN_RUNS_FOR_AVERAGE = 10
+
+
+def token_averages(
+    conn: psycopg.Connection[dict[str, Any]], *, llm_model: str, prompt_version: int
+) -> dict[str, Any] | None:
+    """Measured tokens per extraction, for ``reextract --dry-run`` estimates.
+
+    From extractions at the current prompt version and model once there are
+    enough of them, else from the last 30 days of successful ingests with
+    this model (the design's measuring query). None when neither has any.
+    Returns ``runs``, ``avg_input``, ``avg_output`` and ``basis``.
+    """
+    cur = conn.execute(
+        f"""\
+        SELECT count(*) AS runs,
+               avg(llm_input_tokens) AS avg_input,
+               avg(llm_output_tokens) AS avg_output
+        FROM receipt.extractions
+        WHERE llm_model = %(model)s AND prompt_version = %(version)s
+          AND NOT ({_failed()}) AND llm_input_tokens IS NOT NULL
+        """,
+        {"model": llm_model, "version": prompt_version},
+    )
+    row = cur.fetchone()
+    if row is not None and int(row["runs"]) >= _MIN_RUNS_FOR_AVERAGE:
+        return {**row, "basis": "extractions"}
+    cur = conn.execute(
+        """\
+        SELECT count(*) AS runs,
+               avg(llm_input_tokens) AS avg_input,
+               avg(llm_output_tokens) AS avg_output
+        FROM receipt.ingest_log
+        WHERE status = 'success' AND llm_model = %(model)s
+          AND llm_input_tokens IS NOT NULL
+          AND created_at >= now() - interval '30 days'
+        """,
+        {"model": llm_model},
+    )
+    row = cur.fetchone()
+    if row is not None and int(row["runs"]) > 0:
+        return {**row, "basis": "ingest_log"}
+    return None

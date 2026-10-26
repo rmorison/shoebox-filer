@@ -215,7 +215,7 @@ class TestExtractMetadata:
         mock_agent.run_sync.assert_called_once()
 
     @patch(
-        "receipt_index.extraction._extract_pdf_text",
+        "receipt_index.pdf_reader.extract_text",
         return_value="PDF Amount: $99.00",
     )
     def test_includes_pdf_text_in_prompt(self, _mock_pdf_extract: MagicMock) -> None:
@@ -251,7 +251,7 @@ class TestExtractMetadata:
 
         prompt = mock_agent.run_sync.call_args[0][0]
         assert "PDF Amount: $99.00" in prompt
-        assert "--- PDF Attachment Content ---" in prompt
+        assert "--- PDF Attachment Content: receipt.pdf ---" in prompt
 
     @patch("receipt_index.extraction._extract_pdf_text", return_value=None)
     def test_no_pdf_section_without_attachments(
