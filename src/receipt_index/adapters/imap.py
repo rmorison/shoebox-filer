@@ -18,7 +18,7 @@ from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from imapclient import IMAPClient
-from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
+from imapclient.exceptions import IMAPClientError
 
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import Attachment, ItemRef, RawReceipt, SourceRead
@@ -67,6 +67,9 @@ class ImapAdapter:
         self.config = config
         self.name = config.name
         self._client: IMAPClient | None = None
+        # The folder's UIDVALIDITY as list_new saw it: the UIDs in its refs
+        # mean something only while it is unchanged.
+        self._uidvalidity: int | None = None
 
     @property
     def folder(self) -> str:
@@ -156,6 +159,7 @@ class ImapAdapter:
         client = self._session()
         info = client.select_folder(self.config.folder, readonly=True)  # EXAMINE
         uidvalidity = int(info[b"UIDVALIDITY"])
+        self._uidvalidity = uidvalidity
 
         reset: str | None = None
         start_uid = 0
@@ -233,25 +237,53 @@ class ImapAdapter:
         return self._parse_message(message_from_bytes(raw), ref.source_id)
 
     def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:
-        """Fetch one body, reconnecting once if the connection has dropped.
+        """Fetch one body, reconnecting once if the connection fails.
 
-        A connection that fails twice means the server is unreachable, not
-        that the message is bad: raise ``SourceUnavailableError``.
+        Any connection or protocol error is the server's, not the message's
+        (a message that has gone comes back as an empty response). After one
+        reconnect, which re-selects the folder and checks its UIDVALIDITY, a
+        second failure raises ``SourceUnavailableError``.
         """
-        for attempt in (1, 2):
+        try:
+            result: dict[int, dict[bytes, Any]] = self._session().fetch(
+                [uid], [_BODY_FETCH]
+            )
+            return result
+        except (OSError, IMAPClientError) as exc:
+            logger.warning("IMAP fetch failed (%s); reconnecting once", exc)
+            self._drop_client()
+        try:
+            self._reselect()
+            result = self._session().fetch([uid], [_BODY_FETCH])
+            return result
+        except (OSError, IMAPClientError, ConnectionError) as exc:
+            self._drop_client()
+            raise SourceUnavailableError(
+                f"IMAP connection to {self.config.host} failed: {exc}"
+            ) from exc
+
+    def _drop_client(self) -> None:
+        """Forget a broken connection, so the next session reconnects."""
+        client, self._client = self._client, None
+        if client is not None:
             try:
-                result: dict[int, dict[bytes, Any]] = self._session().fetch(
-                    [uid], [_BODY_FETCH]
-                )
-                return result
-            except (OSError, IMAPClientAbortError) as exc:
-                self._client = None  # dead: the next _session() reconnects
-                if attempt == 2:
-                    raise SourceUnavailableError(
-                        f"IMAP connection to {self.config.host} failed: {exc}"
-                    ) from exc
-                logger.warning("IMAP connection dropped (%s); reconnecting", exc)
-        raise AssertionError("unreachable")  # pragma: no cover
+                client.shutdown()
+            except Exception:
+                logger.debug("Error closing a broken IMAP connection", exc_info=True)
+
+    def _reselect(self) -> None:
+        """Open a fresh session on the folder list_new read.
+
+        A changed UIDVALIDITY means the UIDs in hand point at other messages:
+        stop the source, and the next run's list_new resets the cursor.
+        """
+        info = self._session().select_folder(self.config.folder, readonly=True)
+        uidvalidity = int(info[b"UIDVALIDITY"])
+        if self._uidvalidity is not None and uidvalidity != self._uidvalidity:
+            raise SourceUnavailableError(
+                f"UIDVALIDITY of {self.config.folder} changed during the run "
+                f"({self._uidvalidity} -> {uidvalidity})"
+            )
 
     def _parse_message(self, msg: Message, source_id: str) -> RawReceipt:
         """Convert an email Message to a RawReceipt."""

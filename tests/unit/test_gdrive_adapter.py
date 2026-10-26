@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import httplib2
 import pytest
+from google.auth import exceptions as google_auth_exceptions
 from googleapiclient.errors import HttpError
 
 from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
@@ -706,8 +707,20 @@ class TestDownloadErrors:
                 b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}',
             ),
             TimeoutError("timed out"),
+            httplib2.ServerNotFoundError("Unable to find the server"),
+            google_auth_exceptions.TransportError("refresh: connection refused"),
+            google_auth_exceptions.RefreshError("invalid_grant"),
         ],
-        ids=["503", "500", "429", "403-rate-limit", "timeout"],
+        ids=[
+            "503",
+            "500",
+            "429",
+            "403-rate-limit",
+            "timeout",
+            "dns",
+            "refresh-transport",
+            "refresh-refused",
+        ],
     )
     def test_service_errors_are_a_source_outage(self, error: Exception) -> None:
         adapter, ref = self._failing(error)

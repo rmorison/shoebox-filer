@@ -459,6 +459,29 @@ class TestFetchErrors:
         assert repo.imap_saves[-1] == (7, 1, False)
         assert adapter.fetched == ["<msg-1@example.com>", "<msg-2@example.com>"]
 
+    def test_read_transaction_ends_before_the_download(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        events: list[str] = []
+        conn = MagicMock()
+        conn.commit.side_effect = lambda: events.append("commit")
+        adapter = FakeAdapter(_imap_read([1]))
+        real_fetch = adapter.fetch
+
+        def fetch(ref: ItemRef) -> RawReceipt | None:
+            events.append("fetch")
+            return real_fetch(ref)
+
+        adapter.fetch = fetch  # type: ignore[method-assign]
+        run_ingest(
+            conn=conn,
+            adapter=adapter,  # type: ignore[arg-type]
+            store=_store(),
+            source_name="personal-email",
+            source_type="imap",
+        )
+        assert events[:2] == ["commit", "fetch"]
+
     def test_unreachable_drive_keeps_the_token(
         self, repo: FakeRepo, extract: MagicMock
     ) -> None:

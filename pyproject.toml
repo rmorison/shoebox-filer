@@ -84,7 +84,7 @@ warn_unused_configs = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "yaml.*", "imapclient.*"]
+module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "yaml.*", "imapclient.*", "httplib2.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

@@ -81,12 +81,20 @@ def _is_invalid_token_error(exc: Exception) -> bool:
 def _is_transient_error(exc: Exception) -> bool:
     """Whether a download error is the service's, not the file's.
 
-    Rate limits (429, or a 403 naming a rate limit) and server errors (5xx)
-    pass; a 404 means the file itself is gone.
+    Rate limits (429, or a 403 naming a rate limit), server errors (5xx) and
+    network or credential failures are the service's; a 404 means the file
+    itself is gone.
     """
+    import httplib2
+    from google.auth.exceptions import RefreshError, TransportError
     from googleapiclient.errors import HttpError
 
-    if isinstance(exc, OSError):
+    # Network failures (OSError, a DNS failure from httplib2, a token refresh
+    # that can't reach Google) and a refused refresh (an auth problem for
+    # the whole source) are not the file's fault.
+    if isinstance(
+        exc, OSError | httplib2.HttpLib2Error | TransportError | RefreshError
+    ):
         return True
     if not isinstance(exc, HttpError):
         return False

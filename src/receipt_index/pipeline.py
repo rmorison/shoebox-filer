@@ -269,6 +269,9 @@ def handle_item(
             return ItemOutcome("locked")
         if is_source_id_known(conn, ref.source_id):
             return ItemOutcome("known")
+        # End the re-check's read transaction before the download, so the
+        # connection never sits idle in a transaction while a fetch waits.
+        conn.commit()
 
         email_date = _email_date(ref.source_type, ref)
         if ref.skip_reason is not None:

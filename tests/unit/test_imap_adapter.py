@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from imapclient.exceptions import IMAPClientAbortError, LoginError
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError
 
 from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
 from receipt_index.adapters.imap import ImapAdapter
@@ -296,6 +296,8 @@ class FakeIMAPClient:
         return uids
 
     def fetch(self, uids: list[int], items: list[str]) -> dict[int, dict[bytes, Any]]:
+        if self.selected is None:  # a real server answers BAD
+            raise IMAPClientError("FETCH command error: BAD [No mailbox selected]")
         self.fetches.append((list(uids), list(items)))
         out: dict[int, dict[bytes, Any]] = {}
         for uid in uids:
@@ -348,6 +350,8 @@ def fake() -> FakeIMAPClient:
 def adapter(imap_config: ImapSourceConfig, fake: FakeIMAPClient) -> ImapAdapter:
     a = ImapAdapter(imap_config)
     a._client = fake  # type: ignore[assignment]
+    fake.select_folder("INBOX", readonly=True)  # as list_new would
+    a._uidvalidity = fake.uidvalidity
     return a
 
 
@@ -587,6 +591,7 @@ class TestFetch:
 class TestTransportErrors:
     def _broken(self, error: Exception) -> FakeIMAPClient:
         broken = FakeIMAPClient({1: _mail(1)})
+        broken.selected = ("INBOX", True)
 
         def fail(*_: Any, **__: Any) -> Any:
             raise error
@@ -596,8 +601,12 @@ class TestTransportErrors:
 
     @pytest.mark.parametrize(
         "error",
-        [OSError("connection reset"), IMAPClientAbortError("socket error: EOF")],
-        ids=["oserror", "abort"],
+        [
+            OSError("connection reset"),
+            IMAPClientAbortError("socket error: EOF"),
+            IMAPClientError("FETCH command error: BAD"),
+        ],
+        ids=["oserror", "abort", "protocol-error"],
     )
     def test_reconnects_once_after_a_dropped_connection(
         self, imap_config: ImapSourceConfig, error: Exception
@@ -614,6 +623,35 @@ class TestTransportErrors:
         assert raw is not None
         assert raw.source_id == "<msg-1@example.com>"
         assert adapter._client is fresh
+        assert fresh.selected == ("INBOX", True)  # re-selected, read-only
+
+    def test_changed_uidvalidity_on_reconnect_is_a_source_outage(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        adapter = ImapAdapter(imap_config)
+        adapter._client = self._broken(OSError("reset"))  # type: ignore[assignment]
+        adapter._uidvalidity = 7
+        rebuilt = FakeIMAPClient({1: _mail(1)}, uidvalidity=8)
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+
+        with (
+            patch.object(adapter, "_connect", return_value=rebuilt),
+            pytest.raises(SourceUnavailableError, match="UIDVALIDITY"),
+        ):
+            adapter.fetch(ref)
+        assert rebuilt.body_fetches() == []
+
+    def test_login_refused_on_reconnect_is_a_source_outage(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        adapter = ImapAdapter(imap_config)
+        adapter._client = self._broken(OSError("reset"))  # type: ignore[assignment]
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+        with (
+            patch.object(adapter, "_connect", side_effect=LoginError("too many")),
+            pytest.raises(SourceUnavailableError, match="too many"),
+        ):
+            adapter.fetch(ref)
 
     def test_second_failure_is_a_source_outage(
         self, imap_config: ImapSourceConfig
@@ -635,7 +673,9 @@ class TestTransportErrors:
         self, imap_config: ImapSourceConfig
     ) -> None:
         adapter = ImapAdapter(imap_config)
-        adapter._client = FakeIMAPClient({1: _mail(1)})  # type: ignore[assignment]
+        fake = FakeIMAPClient({1: _mail(1)})
+        fake.selected = ("INBOX", True)
+        adapter._client = fake  # type: ignore[assignment]
         ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
         with (
             patch.object(adapter, "_parse_message", side_effect=ValueError("bad MIME")),
