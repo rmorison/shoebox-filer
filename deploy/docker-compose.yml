@@ -95,6 +95,12 @@ services:
       - ../data/receipts:/app/data/receipts
       # Nightly pg_dump output, mirrored to Dropbox by the sync cron line.
       - ../data/backups:/app/data/backups
+      # Access log of the read-only MCP server (`receipt-index mcp`), one JSON
+      # line per file fetch. Deliberately outside data/receipts and
+      # data/backups: both are copied to Dropbox, and the log must neither
+      # change the file store nor leave the host. Point
+      # RECEIPT_INDEX_MCP_ACCESS_LOG at /app/data/mcp-logs/mcp-access.jsonl.
+      - ../data/mcp-logs:/app/data/mcp-logs
       # Copied from deploy/example.receipt-index.yaml at provision time and
       # edited with your sources; the copy is gitignored.
       - ./receipt-index.yaml:/app/receipt-index.yaml:ro
