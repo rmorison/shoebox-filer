@@ -230,3 +230,26 @@ class TestShowHandEdited:
             )
         assert result.exit_code == 0, result.output
         assert "Hand-edited:  paid_amount" in result.output
+
+
+class TestCurrentReport:
+    def test_a_skipped_current_receipt_shows_no_extracted_amount(
+        self, env: dict[str, Any]
+    ) -> None:
+        outcome = env["run"].return_value.outcomes[0]
+        outcome.status = "current"
+        outcome.changes = {}
+        outcome.extracted_paid_amount = None
+        outcome.paid_amount_confidence = None
+        outcome.input_kind = None
+
+        def run(*_: Any, on_outcome: Any = None, **__: Any) -> Any:
+            if on_outcome is not None:
+                on_outcome(outcome)
+            return env["run"].return_value
+
+        env["run"].side_effect = run
+        result = _invoke(env, "--all")
+        assert result.exit_code == 0, result.output
+        assert "paid null" not in result.output
+        assert "paid ?" in result.output

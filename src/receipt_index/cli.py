@@ -769,7 +769,7 @@ def reextract(
                 conf = outcome.paid_amount_confidence
                 extracted = (
                     "paid ?"
-                    if outcome.status in ("locked", "unavailable")
+                    if outcome.status in ("locked", "unavailable", "current")
                     else f"paid {paid if paid is not None else 'null'}"
                     + (f" ({conf:.2f})" if conf is not None else "")
                 )
