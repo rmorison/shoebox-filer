@@ -202,7 +202,7 @@ An MCP client normally starts this command itself (see [MCP client setup](#mcp-c
 
 ### Database role
 
-The server connects with `RECEIPT_INDEX_MCP_DATABASE_URL`, or with `database.url` from the config when that is unset. **It refuses to start unless the role is read-only:** the role must hold `SELECT` on `receipt.receipts` and `receipt.ingest_log`, and no `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on either (column-level grants count), nor `CREATE` on schema `receipt`. In devtest, use `receipt_index_dev_read`. For production, see [Server Deployment: Read-only MCP server](server-deployment.md#10-read-only-mcp-server).
+The server connects with `RECEIPT_INDEX_MCP_DATABASE_URL`, or with `database.url` from the config when that is unset. **It refuses to start unless the role is read-only:** the role must hold `SELECT` on `receipt.receipts` and `receipt.ingest_log`, and no `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on either (column-level grants count), nor `CREATE` on schema `receipt`. That includes privileges of any role it is a member of, even one whose privileges it doesn't inherit, since it could `SET ROLE` to that role. In devtest, use `receipt_index_dev_read`. For production, see [Server Deployment: Read-only MCP server](server-deployment.md#10-read-only-mcp-server).
 
 Every connection is also opened read-only (`default_transaction_read_only`), and each tool call runs in one `REPEATABLE READ, READ ONLY` transaction, so a page and its `total` come from the same snapshot.
 
@@ -231,7 +231,7 @@ Every `get_receipt_file` call appends one JSON line to the access log, and the s
 {"client": {"name": "example-agent", "version": "1.0"}, "content_included": true, "outcome": "ok", "pdf_path": "2026/01/2026-01-15__acme-parking-u-s-llc__12.50.pdf", "receipt_id": "01942a3b-1234-7def-8abc-567890abcdef", "size_bytes": 48213, "tool": "get_receipt_file", "ts": "2026-01-20T09:12:44.512408+00:00"}
 ```
 
-`outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged.
+`outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged. A `receipt_id` that isn't a UUID is cut to its first 64 characters in the log line and the error. One kind of call writes no line: one the SDK rejects before the tool runs, because an argument is missing or has the wrong type. It gets a protocol error and no file.
 
 ### MCP client setup
 

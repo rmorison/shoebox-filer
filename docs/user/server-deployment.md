@@ -830,7 +830,9 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
 
-5. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
+5. If the MCP server was set up, recreate its read-only role: all of [10.1](#101-one-time-setup) step 2, with the password already in `RECEIPT_INDEX_MCP_DATABASE_URL` in the restored `.env`. Then run its check, step 5.
+
+6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
 
 ---
 
@@ -901,7 +903,7 @@ GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_mcp;
 \q
 ```
 
-Generate the password from an alphanumeric alphabet (`openssl rand -hex 24`), as for the other Postgres passwords ([3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password)). The role is cluster-level and survives a `DROP DATABASE`, but the `CONNECT` grant doesn't: after recreating the database (6.3, 8.3), run the `GRANT CONNECT` line again.
+Generate the password from an alphanumeric alphabet (`openssl rand -hex 24`), as for the other Postgres passwords ([3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password)). The role is cluster-level. It survives a `DROP DATABASE` but its `CONNECT` grant doesn't, so after recreating the database in 6.3, run the `GRANT CONNECT` line again. Disaster recovery (8.3) starts a new cluster, and `pg_dump` doesn't carry roles, so there the role is gone: redo all of this step, setting the password already in the restored `.env`.
 
 **3. Add two lines to the clone-root `.env`:**
 

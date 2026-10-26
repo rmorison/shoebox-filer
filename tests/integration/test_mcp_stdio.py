@@ -59,6 +59,8 @@ _COLUMN_WRITER = "receipt_index_mcp_test_column_writer"
 _TRUNCATER = "receipt_index_mcp_test_truncater"
 _SCHEMA_CREATOR = "receipt_index_mcp_test_schema_creator"
 _NO_USAGE = "receipt_index_mcp_test_no_usage"
+_NOINHERIT_MEMBER = "receipt_index_mcp_test_noinherit_member"
+_INHERIT_FALSE_MEMBER = "receipt_index_mcp_test_inherit_false_member"
 
 _CLI = str(Path(sys.executable).parent / "receipt-index")
 
@@ -121,6 +123,20 @@ def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
     # _NO_USAGE gets CONNECT only, like a login role created without
     # membership in receipt_index_dev_read.
     pg_conn.execute(f"REVOKE ALL ON SCHEMA receipt FROM {_NO_USAGE}")
+    # Read roles that are also members of the writer without inheriting its
+    # privileges, so has_*_privilege on the login role alone sees no write.
+    for role in (_NOINHERIT_MEMBER, _INHERIT_FALSE_MEMBER):
+        _ensure_login_role(pg_conn, role)
+        pg_conn.execute(
+            f"GRANT USAGE ON SCHEMA receipt TO {role}; "
+            f"GRANT SELECT ON receipt.receipts, receipt.ingest_log TO {role}"
+        )
+    pg_conn.execute(f"ALTER ROLE {_NOINHERIT_MEMBER} NOINHERIT")
+    pg_conn.execute(f"GRANT {_WRITE_ROLE} TO {_NOINHERIT_MEMBER}")
+    pg_conn.execute(f"ALTER ROLE {_INHERIT_FALSE_MEMBER} INHERIT")
+    pg_conn.execute(
+        f"GRANT {_WRITE_ROLE} TO {_INHERIT_FALSE_MEMBER} WITH INHERIT FALSE"
+    )
     pg_conn.commit()
 
 
@@ -438,6 +454,8 @@ def test_startup_check_passes_read_role() -> None:
         (_SCHEMA_CREATOR, r"schema receipt: CREATE"),
         (_WRITE_ROLE, r"receipt\.receipts: UPDATE"),
         (_NO_USAGE, r"lacks SELECT"),
+        (_NOINHERIT_MEMBER, r"receipt\.receipts: DELETE"),
+        (_INHERIT_FALSE_MEMBER, r"receipt\.receipts: DELETE"),
     ],
 )
 def test_startup_check_refuses_in_process(role: str, match: str) -> None:

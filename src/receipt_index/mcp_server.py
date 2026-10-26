@@ -257,19 +257,29 @@ SELECT has_table_privilege('receipt.receipts', 'SELECT')
 
 # INSERT and UPDATE are often granted per column in this schema, which
 # has_table_privilege does not see; has_any_column_privilege covers both
-# table-level and column-level grants. All of these count privileges held
-# through role membership and ownership.
+# table-level and column-level grants. The privilege functions count only
+# inherited privileges, so they run for every role the login role is a member
+# of, inherited or not: a member of a writer through NOINHERIT or
+# WITH INHERIT FALSE could still SET ROLE to it and write.
 _WRITE_PRIVILEGES_SQL = """\
-SELECT t.name AS object, p.priv AS privilege
-  FROM (VALUES ('receipt.receipts'), ('receipt.ingest_log')) AS t(name)
- CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE')) AS p(priv)
- WHERE CASE WHEN p.priv IN ('INSERT', 'UPDATE')
-            THEN has_any_column_privilege(t.name, p.priv)
-            ELSE has_table_privilege(t.name, p.priv)
-       END
-UNION ALL
-SELECT 'schema receipt', 'CREATE'
- WHERE has_schema_privilege('receipt', 'CREATE')
+WITH member_of AS (
+    SELECT oid FROM pg_roles WHERE pg_has_role(current_user, oid, 'MEMBER')
+),
+held AS (
+    SELECT t.name AS object, p.priv AS privilege
+      FROM member_of m
+     CROSS JOIN (VALUES ('receipt.receipts'), ('receipt.ingest_log')) AS t(name)
+     CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE')) AS p(priv)
+     WHERE CASE WHEN p.priv IN ('INSERT', 'UPDATE')
+                THEN has_any_column_privilege(m.oid, t.name, p.priv)
+                ELSE has_table_privilege(m.oid, t.name, p.priv)
+           END
+    UNION
+    SELECT 'schema receipt', 'CREATE'
+      FROM member_of m
+     WHERE has_schema_privilege(m.oid, 'receipt', 'CREATE')
+)
+SELECT object, privilege FROM held ORDER BY object, privilege
 """
 
 
@@ -313,11 +323,21 @@ def startup_check(database_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MAX_ECHOED_ID = 64
+
+
+def _clip(value: str) -> str:
+    """Bound a client-supplied ID before it is logged or echoed back."""
+    if len(value) <= _MAX_ECHOED_ID:
+        return value
+    return f"{value[:_MAX_ECHOED_ID]}... ({len(value)} chars)"
+
+
 def _parse_uuid(value: str) -> UUID:
     try:
         return UUID(value)
     except ValueError:
-        msg = f"Invalid UUID: {value}"
+        msg = f"Invalid UUID: {_clip(value)}"
         raise ToolError(msg) from None
 
 
@@ -484,13 +504,15 @@ def build_server(
         """Get a receipt's PDF: its path, and optionally its content.
 
         The path is on the server's host, which may not be the client's; use
-        include_content=true to receive the PDF itself. Every call is recorded
-        in the server's access log.
+        include_content=true to receive the PDF itself. Every call that
+        reaches this tool is recorded in the server's access log; a call the
+        SDK rejects first (a missing or wrongly typed argument) returns an
+        error without a log line, and no file.
         """
         entry: dict[str, Any] = {
             "ts": datetime.now(UTC).isoformat(),
             "tool": "get_receipt_file",
-            "receipt_id": receipt_id,
+            "receipt_id": _clip(receipt_id),
             "pdf_path": None,
             "size_bytes": None,
             "content_included": False,
@@ -505,7 +527,7 @@ def build_server(
         try:
             uid = UUID(receipt_id)
         except ValueError:
-            raise fail("invalid_id", f"Invalid UUID: {receipt_id}") from None
+            raise fail("invalid_id", f"Invalid UUID: {_clip(receipt_id)}") from None
 
         try:
             with snapshot() as conn:

@@ -628,6 +628,7 @@ class TestCheckReadOnlyRole:
         sql = conn.execute.call_args_list[1].args[0]
         assert "has_any_column_privilege" in sql
         assert "has_schema_privilege" in sql
+        assert "pg_has_role(current_user, oid, 'MEMBER')" in sql
 
     def test_role_without_schema_usage_is_refused_first(self) -> None:
         conn = self._conn([], usage=False)
@@ -717,3 +718,36 @@ class TestOutputModelsMatchDomainModels:
 
     def test_failure_out_fields(self) -> None:
         assert set(FailureOut.model_fields) == set(IngestLogEntry.model_fields)
+
+
+class TestClientIdClipping:
+    def test_long_invalid_id_is_clipped_in_log_and_error(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        huge = "x" * 100_000
+        result = _call(
+            _server(store_root, log_path), "get_receipt_file", {"receipt_id": huge}
+        )
+
+        assert result.is_error is True
+        text = _text(result)
+        assert len(text) < 300
+        assert "(100000 chars)" in text
+        (entry,) = _log_lines(log_path)
+        assert entry["outcome"] == "invalid_id"
+        assert entry["receipt_id"] == "x" * 64 + "... (100000 chars)"
+        assert len(log_path.read_text()) < 1000
+
+    def test_get_receipt_error_is_clipped(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        result = _call(
+            _server(store_root, log_path), "get_receipt", {"receipt_id": "y" * 5000}
+        )
+        assert result.is_error is True
+        assert len(_text(result)) < 300
+
+    def test_short_value_is_unchanged(self) -> None:
+        from receipt_index.mcp_server import _clip
+
+        assert _clip("not-a-uuid") == "not-a-uuid"
