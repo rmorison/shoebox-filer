@@ -362,7 +362,25 @@ class TestRefsOutsideTheStore:
 
         with pytest.raises(InvalidRefError):
             _rendition(store)
-        assert list(outside.rglob("*.pdf")) == []
+        assert list(outside.iterdir()) == []  # no folder created outside either
+
+    def test_an_original_symlinked_out_of_the_store_is_not_read(
+        self, store_root: Path, tmp_path: Path
+    ) -> None:
+        """A planted symlink at an original's target is refused, not compared."""
+        store = LocalEvidenceStore(store_root)
+        ref = _original(store, b"raw")
+        target = store.local_path(ref)
+        outside = tmp_path / "outside.eml"
+        outside.write_bytes(b"raw")
+        target.unlink()
+        target.symlink_to(outside)
+
+        with (
+            patch("pathlib.Path.read_bytes", side_effect=AssertionError("read")),
+            pytest.raises(InvalidRefError),
+        ):
+            _original(store, b"raw")
 
 
 class TestStoreFolder:
@@ -454,6 +472,29 @@ class TestLongNamesAndRaces:
         with store.open(new) as fh:
             assert fh.read() == b"pdf"
         assert not store.exists(ref)
+
+    def test_rename_falls_back_to_a_copy_when_linking_is_refused(
+        self, store_root: Path
+    ) -> None:
+        """With protected hard links, another owner's file can't be linked."""
+        store = LocalEvidenceStore(store_root)
+        old = rendition_ref(_rendition(store, b"pdf"))
+        old_path = store.local_path(old)
+        real_link = os.link
+
+        def refuse_the_original(src: str | Path, dst: str | Path) -> None:
+            if Path(src) == old_path:
+                raise PermissionError(1, "Operation not permitted")
+            real_link(src, dst)
+
+        with patch("receipt_index.store.os.link", side_effect=refuse_the_original):
+            new = store.rename(old, "renamed.pdf")
+
+        assert new.endswith("/renamed.pdf")
+        with store.open(new) as fh:
+            assert fh.read() == b"pdf"
+        assert not store.exists(old)
+        assert _tmp_files(store_root) == []
 
     def test_rename_of_a_missing_file(self, store_root: Path) -> None:
         store = LocalEvidenceStore(store_root)

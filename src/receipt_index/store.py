@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
@@ -270,12 +270,21 @@ class LocalEvidenceStore:
     # -- writing ------------------------------------------------------------
 
     def _folder_path(self, relative: PurePosixPath) -> Path:
-        """Create a folder under the root and check it stays there."""
-        path = self.root / relative
-        path.mkdir(parents=True, exist_ok=True)
-        if not path.resolve().is_relative_to(self.root):
-            msg = f"store folder resolves outside the store: {relative}"
-            raise InvalidRefError(msg, candidate=path)
+        """Create a folder under the root, one level at a time.
+
+        Each level that already exists is checked to stay inside the root
+        before anything is created beneath it, so a symlinked folder that
+        points outside is refused without creating folders there.
+        """
+        path = self.root
+        for part in relative.parts:
+            path = path / part
+            if path.exists() or path.is_symlink():
+                if not path.resolve().is_relative_to(self.root):
+                    msg = f"store folder resolves outside the store: {relative}"
+                    raise InvalidRefError(msg, candidate=self.root / relative)
+            else:
+                path.mkdir(exist_ok=True)
         return path
 
     def _twin_folder(self, relative: PurePosixPath) -> Path | None:
@@ -343,6 +352,9 @@ class LocalEvidenceStore:
                         pass  # A concurrent writer won; compare with its file.
                     else:
                         return stored(name)
+            if not target.resolve().is_relative_to(self.root):
+                msg = f"stored original resolves outside the store: {relative / name}"
+                raise InvalidRefError(msg, candidate=target)
             if hashlib.sha256(target.read_bytes()).digest() != digest:
                 msg = (
                     "an original with different content is already stored: "
@@ -381,17 +393,31 @@ class LocalEvidenceStore:
             msg = f"no stored file at {ref!r}"
             raise FileNotFoundError(msg)
         twin = self._twin_folder(relative.parent)
-        for candidate in _numbered(name):
-            if candidate == path.name:
-                return self._ref(relative)
-            if self._taken(path.parent, twin, candidate):
-                continue
-            try:
-                os.link(path, path.parent / candidate)
-            except FileExistsError:
-                continue
-            path.unlink()
-            return self._ref(relative.parent / candidate)
+        with ExitStack() as stack:
+            source = path
+            for candidate in _numbered(name):
+                if candidate == path.name:
+                    return self._ref(relative)
+                if self._taken(path.parent, twin, candidate):
+                    continue
+                try:
+                    os.link(source, path.parent / candidate)
+                except FileExistsError:
+                    continue
+                except PermissionError:
+                    if source != path:
+                        raise
+                    # With fs.protected_hardlinks, a file another user owns
+                    # can't be linked: link a copy this process owns instead.
+                    source = stack.enter_context(
+                        _temp_file(path.parent, path.read_bytes())
+                    )
+                    try:
+                        os.link(source, path.parent / candidate)
+                    except FileExistsError:
+                        continue
+                path.unlink()
+                return self._ref(relative.parent / candidate)
         msg = "unreachable: numbered names are unbounded"  # pragma: no cover
         raise AssertionError(msg)  # pragma: no cover
 
