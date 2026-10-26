@@ -192,6 +192,10 @@ class FailureOut(BaseModel):
     llm_cache_read_tokens: int | None
     llm_requests: int | None
     llm_model: str | None
+    source_name: str | None = Field(
+        default=None,
+        description="Configured source the item came from; null on older rows.",
+    )
     created_at: datetime
 
 

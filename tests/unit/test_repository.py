@@ -405,3 +405,40 @@ class TestPaidAmountWrites:
         assert "%(paid_amount)s" in sql
         assert params["paid_amount"] == Decimal("0")
         assert entry.paid_amount == Decimal("0")
+
+
+class TestInsertIngestLogSourceName:
+    """Every ingest_log row records which configured source it came from."""
+
+    def test_source_name_is_written(self) -> None:
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = {
+            "id": UUID("019572a0-0000-7000-8000-000000000009"),
+            "source_id": "<a@example.com>",
+            "source_type": "imap",
+            "status": "started",
+            "receipt_id": None,
+            "vendor": None,
+            "amount": None,
+            "email_subject": None,
+            "email_sender": None,
+            "email_date": None,
+            "error_message": None,
+            "source_name": "personal-email",
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+        }
+
+        entry = insert_ingest_log(
+            conn,
+            source_id="<a@example.com>",
+            source_type="imap",
+            source_name="personal-email",
+            status="started",
+        )
+
+        sql, params = conn.execute.call_args.args
+        assert "source_name" in sql
+        assert params["source_name"] == "personal-email"
+        assert entry.status == "started"
+        assert entry.source_name == "personal-email"
+        conn.commit.assert_called_once()
