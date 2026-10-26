@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 from uuid import UUID
 
 from receipt_index.repository import (
+    count_ingest_failures,
+    count_receipts,
+    get_ingest_failures,
     get_processed_source_ids,
     get_receipt_by_id,
     insert_receipt,
@@ -247,3 +250,82 @@ class TestGetReceiptById:
         args = conn.execute.call_args
         assert "%(id)s" in args[0][0]
         assert args[0][1]["id"] == uid
+
+
+class TestSearchPaging:
+    """Tests for limit/offset paging and counting on search."""
+
+    def test_unpaged_by_default(self) -> None:
+        conn = _mock_conn([])
+        search_receipts(conn)
+        sql, params = conn.execute.call_args.args
+        assert "LIMIT" not in sql
+        assert "OFFSET" not in sql
+        assert "limit" not in params
+
+    def test_order_has_id_tiebreak(self) -> None:
+        conn = _mock_conn([])
+        search_receipts(conn)
+        sql = conn.execute.call_args.args[0]
+        assert sql.rstrip().endswith("ORDER BY receipt_date DESC, vendor ASC, id ASC")
+
+    def test_limit_and_offset(self) -> None:
+        conn = _mock_conn([_RECEIPT_ROW])
+        results = search_receipts(conn, vendor="acme", limit=10, offset=20)
+        sql, params = conn.execute.call_args.args
+        assert sql.endswith("id ASC LIMIT %(limit)s OFFSET %(offset)s")
+        assert params["limit"] == 10
+        assert params["offset"] == 20
+        assert params["vendor"] == "%acme%"
+        assert len(results) == 1
+
+    def test_count_uses_same_filters(self) -> None:
+        conn = _mock_conn([{"n": 7}])
+        n = count_receipts(
+            conn,
+            vendor="acme",
+            amount_min=Decimal("1.00"),
+            date_to=date(2025, 6, 30),
+            source_name="test-email",
+        )
+        sql, params = conn.execute.call_args.args
+        assert n == 7
+        assert sql.startswith("SELECT COUNT(*) AS n FROM receipt.receipts WHERE ")
+        assert "vendor ILIKE %(vendor)s" in sql
+        assert "amount >= %(amount_min)s" in sql
+        assert "receipt_date <= %(date_to)s" in sql
+        assert "source_name = %(source_name)s" in sql
+        assert params == {
+            "vendor": "%acme%",
+            "amount_min": Decimal("1.00"),
+            "date_to": date(2025, 6, 30),
+            "source_name": "test-email",
+        }
+
+    def test_count_without_filters(self) -> None:
+        conn = _mock_conn([{"n": 0}])
+        assert count_receipts(conn) == 0
+        assert "WHERE TRUE" in conn.execute.call_args.args[0]
+
+
+class TestFailuresPaging:
+    """Tests for limit/offset paging and counting on ingest failures."""
+
+    def test_unpaged_by_default(self) -> None:
+        conn = _mock_conn([])
+        get_ingest_failures(conn)
+        sql = conn.execute.call_args.args[0]
+        assert "LIMIT" not in sql
+        assert "ORDER BY created_at DESC, id ASC" in sql
+
+    def test_limit_and_offset(self) -> None:
+        conn = _mock_conn([])
+        get_ingest_failures(conn, limit=5, offset=10)
+        sql, params = conn.execute.call_args.args
+        assert sql.endswith("LIMIT %(limit)s OFFSET %(offset)s")
+        assert params == {"limit": 5, "offset": 10}
+
+    def test_count(self) -> None:
+        conn = _mock_conn([{"n": 3}])
+        assert count_ingest_failures(conn) == 3
+        assert "status = 'failed'" in conn.execute.call_args.args[0]
