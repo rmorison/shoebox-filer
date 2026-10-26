@@ -62,7 +62,7 @@ The two designs divide the `receipt` schema as follows.
 | The receipt's own fields: vendor, amounts, date, currency, description, confidence, order number, payment, kind and refund link | Stored files: originals, attachments and renditions, with their hashes and storage references |
 | `line_items`, `tags`, `receipt_tags`, `external_links`, `receipt_events`, `extractions`, the `receipt_net` view | Provenance records (one per source item), which take over `source_id`, `source_type`, `source_name`, `file_name` and the `email_*` columns |
 | The search document | Today's `pdf_path`, and the rendition reference that replaces it |
-| | Duplicate detection, and linking and unlinking duplicates |
+| | Duplicate detection (its `duplicate_candidates` table references provenance records, not receipts), and linking and unlinking duplicates |
 
 Where they meet:
 
