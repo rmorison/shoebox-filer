@@ -7,6 +7,7 @@ import smtplib
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import psycopg
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 # TODO: Tests run as superuser (main). Ideally bootstrap schema as main,
 # then run pipeline tests as receipt_index_dev_write to catch missing GRANTs.
+_MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
 _POSTGRES_HOST_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
 _DB_DSN = (
     "postgresql://main:localpass@localhost:"  # pragma: allowlist secret
@@ -32,7 +34,7 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000010 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000011 (tables, indexes and
     constraints; not the grants, since CI's Postgres has no application roles).
     Keep in sync with db/migrations/ when schema changes.
     """
@@ -52,6 +54,8 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # receipt/000001 — receipts table, indexes, trigger
     conn.execute("CREATE SCHEMA IF NOT EXISTS receipt")
     conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    # extractions references receipts: drop it first (receipt/000011).
+    conn.execute("DROP TABLE IF EXISTS receipt.extractions")
     conn.execute("DROP TABLE IF EXISTS receipt.receipts CASCADE")
     conn.execute(
         """\
@@ -75,6 +79,7 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             paid_amount     NUMERIC(12,2),
             field_confidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+            manual_fields   TEXT[] NOT NULL DEFAULT '{}',
 
             CONSTRAINT pk_receipts PRIMARY KEY (id),
             CONSTRAINT uq_receipts_source_id UNIQUE (source_id),
@@ -193,7 +198,21 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
             EXECUTE FUNCTION public.set_updated_at()
         """
     )
+
+    # receipt/000011 — extractions, the append-only guard, manual_fields.
+    # Run from the migration file itself, up to its grants, so the guard
+    # under test is the one that ships.
+    conn.execute(_schema_part("receipt", "000011"))
     conn.commit()
+
+
+def _schema_part(schema: str, version: str) -> str:
+    """A migration's SQL before its grants (CI's Postgres has no app roles)."""
+    (path,) = (_MIGRATIONS / schema).glob(f"{version}_*.up.sql")
+    sql = path.read_text()
+    head, sep, _ = sql.partition("-- _all:")
+    assert sep, f"{path.name}: no '-- _all:' grants marker"
+    return head
 
 
 @pytest.fixture(scope="session")
@@ -213,6 +232,9 @@ def pg_conn() -> Iterator[psycopg.Connection[dict[str, Any]]]:
 def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Clear the receipts, ingest_log and sync_state tables before each test."""
     pg_conn.rollback()  # clear any dangling transaction from a prior test failure
+    # The cascade reaches receipt.extractions, whose guard refuses TRUNCATE.
+    # Replica mode skips ordinary triggers for this test-only statement.
+    pg_conn.execute("SET LOCAL session_replication_role = replica")
     pg_conn.execute(
         "TRUNCATE receipt.ingest_log, receipt.receipts, receipt.sync_state CASCADE"
     )
