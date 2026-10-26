@@ -92,11 +92,12 @@ Run ingestion as a long-running service rather than a scheduled one-shot command
            │
      ┌─────┴─────┐
      ▼           ▼
-┌─────────┐ ┌──────────┐
-│ Postgres │ │ File     │
-│ (index)  │ │ Store    │
-└─────────┘ │ (PDFs)   │
-            └──────────┘
+┌────────────┐ ┌────────────────┐
+│ Postgres   │ │ Evidence Store │
+│ (index,    │ │ (Google Drive: │
+│ hashes,    │ │ originals,     │
+│ provenance)│ │ renditions)    │
+└────────────┘ └────────────────┘
      ┌───────────┘
      ▼
 ┌──────────────┐
@@ -108,7 +109,7 @@ Run ingestion as a long-running service rather than a scheduled one-shot command
 **Key design decisions:**
 
 - **PostgreSQL over SQLite:** Richer full-text search, better concurrency if we later add a web UI, aligns with existing infrastructure.
-- **File store abstraction:** Local filesystem with a defined directory/naming structure. Interface designed so a cloud backend (S3, GCS) can be swapped in without changing callers.
+- **Evidence store:** Google Drive, owned by a dedicated account, holds each receipt's originals (the email as received, its attachments, the Drive source file) and its rendered PDF, in a defined directory and naming structure. Every file has a sha256 in the database. The interface works in bytes and stable references, not local paths; a local filesystem backend remains for development and offline use. See [ADR-0009](../../engineering/adr/0009-google-drive-evidence-store-with-originals-and-hashes.md).
 - **Adapter pattern for sources:** Each ingestion source (IMAP, Drive, future vendor APIs) implements a common interface, keeping the pipeline source-agnostic.
 
 ## Success Criteria
@@ -128,7 +129,7 @@ Run ingestion as a long-running service rather than a scheduled one-shot command
 | RD-04 | **PDF rendition:** Single human-readable PDF per receipt — rendered HTML with embedded images/attachments. Target audience is bookkeeper during reconciliation and claims adjuster during documentation review. |
 | RD-05 | **Project scope:** Standalone project. |
 | RD-06 | **Ingestion mode:** Always-on service (`receipt-index serve`) that watches every source: IMAP IDLE with a safety poll, and the Google Drive changes feed polled. Each source is read from a stored position, and failed items are retried. The default target is a new receipt searchable within 5 minutes; the intervals that set it are configurable. The one-shot `ingest` command remains for development, catch-up and rollback. Replaces the earlier one-shot-only decision. See [ADR-0007](../../engineering/adr/0007-always-on-ingest-service.md) and [ADR-0008](../../engineering/adr/0008-incremental-source-sync-state.md). |
-| RD-07 | **Idempotency:** Track processed items by unique ID (e.g., IMAP message ID, Drive file ID) to skip on re-runs. Duplicate receipt detection is out of scope. |
+| RD-07 | **Idempotency and duplicates:** Track processed items by unique ID (e.g., IMAP message ID, Drive file ID) to skip on re-runs. A receipt has one or more provenance records, one per source item. A new item joins an existing receipt automatically only on an exact match: the hash of its whole original, the hash of its receipt document (never any other attachment), or the same order number, vendor and paid amount, always between receipts of the same kind. Metadata-only matches are flagged for review, not linked. Every link can be undone and is recorded. Amended by [ADR-0010](../../engineering/adr/0010-provenance-records-and-duplicate-detection.md). |
 | RD-08 | **Config file:** YAML configuration for source definitions. Secrets stay in environment variables. Supports `${ENV_VAR}` interpolation for non-secret config values. |
 | RD-09 | **Google Drive auth:** OAuth2 with offline refresh token stored as environment variable. Service accounts require folder sharing, which is less natural for personal Drive usage. |
 | RD-10 | **Drive file handling:** PDFs copied directly to file store. Images (JPG, PNG) converted to PDF via Pillow. Google Docs exported as PDF via Drive API. |

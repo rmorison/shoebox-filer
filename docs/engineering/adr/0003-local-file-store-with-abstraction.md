@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. Amended by [ADR-0009](0009-google-drive-evidence-store-with-originals-and-hashes.md): Google Drive, not S3 or GCS, is the next backend, and the interface no longer returns local paths.
 
 ## Context
 
