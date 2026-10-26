@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from psycopg.types.json import Jsonb
+
 from receipt_index.models import IngestLogEntry, Receipt
 
 if TYPE_CHECKING:
@@ -12,6 +14,10 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     import psycopg
+
+# The effective amount: paid when known, the total otherwise. The expression
+# matches idx_receipts_effective_amount, so keep the two in step.
+_EFFECTIVE_AMOUNT = "COALESCE(paid_amount, amount)"
 
 
 def get_processed_source_ids(
@@ -47,6 +53,8 @@ def insert_receipt(
     email_sender: str | None,
     email_date: datetime | None,
     file_name: str | None = None,
+    paid_amount: Decimal | None = None,
+    field_confidence: dict[str, float] | None = None,
 ) -> Receipt:
     """Insert a receipt row and return the validated Receipt model."""
     cur = conn.execute(
@@ -54,12 +62,14 @@ def insert_receipt(
         INSERT INTO receipt.receipts (
             source_id, source_type, source_name, vendor, amount, currency,
             receipt_date, description, confidence, pdf_path,
-            email_subject, email_sender, email_date, file_name
+            email_subject, email_sender, email_date, file_name,
+            paid_amount, field_confidence
         ) VALUES (
             %(source_id)s, %(source_type)s, %(source_name)s,
             %(vendor)s, %(amount)s, %(currency)s,
             %(receipt_date)s, %(description)s, %(confidence)s, %(pdf_path)s,
-            %(email_subject)s, %(email_sender)s, %(email_date)s, %(file_name)s
+            %(email_subject)s, %(email_sender)s, %(email_date)s, %(file_name)s,
+            %(paid_amount)s, %(field_confidence)s
         )
         RETURNING *
         """,
@@ -78,6 +88,8 @@ def insert_receipt(
             "email_sender": email_sender,
             "email_date": email_date,
             "file_name": file_name,
+            "paid_amount": paid_amount,
+            "field_confidence": Jsonb(field_confidence or {}),
         },
     )
     row = cur.fetchone()
@@ -104,15 +116,15 @@ def _receipt_filters(
         params["vendor"] = f"%{vendor}%"
 
     if amount is not None:
-        clauses.append("amount = %(amount)s")
+        clauses.append(f"{_EFFECTIVE_AMOUNT} = %(amount)s")
         params["amount"] = amount
 
     if amount_min is not None:
-        clauses.append("amount >= %(amount_min)s")
+        clauses.append(f"{_EFFECTIVE_AMOUNT} >= %(amount_min)s")
         params["amount_min"] = amount_min
 
     if amount_max is not None:
-        clauses.append("amount <= %(amount_max)s")
+        clauses.append(f"{_EFFECTIVE_AMOUNT} <= %(amount_max)s")
         params["amount_max"] = amount_max
 
     if date_from is not None:
@@ -218,6 +230,7 @@ def insert_ingest_log(
     receipt_id: UUID | None = None,
     vendor: str | None = None,
     amount: Decimal | None = None,
+    paid_amount: Decimal | None = None,
     email_subject: str | None = None,
     email_sender: str | None = None,
     email_date: datetime | None = None,
@@ -235,13 +248,13 @@ def insert_ingest_log(
             source_id, source_type, status, receipt_id, vendor, amount,
             email_subject, email_sender, email_date, error_message,
             llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
-            llm_requests, llm_model
+            llm_requests, llm_model, paid_amount
         ) VALUES (
             %(source_id)s, %(source_type)s, %(status)s, %(receipt_id)s,
             %(vendor)s, %(amount)s, %(email_subject)s, %(email_sender)s,
             %(email_date)s, %(error_message)s,
             %(llm_input_tokens)s, %(llm_output_tokens)s, %(llm_cache_read_tokens)s,
-            %(llm_requests)s, %(llm_model)s
+            %(llm_requests)s, %(llm_model)s, %(paid_amount)s
         )
         RETURNING *
         """,
@@ -261,6 +274,7 @@ def insert_ingest_log(
             "llm_cache_read_tokens": llm_cache_read_tokens,
             "llm_requests": llm_requests,
             "llm_model": llm_model,
+            "paid_amount": paid_amount,
         },
     )
     row = cur.fetchone()

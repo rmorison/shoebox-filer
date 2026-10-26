@@ -10,6 +10,8 @@ import pytest
 from pydantic_ai import BinaryContent
 
 from receipt_index.extraction import (
+    _SYSTEM_PROMPT,
+    DOCUMENT_SYSTEM_PROMPT,
     _build_prompt,
     _extract_from_document,
     _extract_pdf_text,
@@ -17,7 +19,14 @@ from receipt_index.extraction import (
     _strip_html_tags,
     extract_metadata,
 )
-from receipt_index.models import Attachment, RawReceipt, ReceiptMetadata
+from receipt_index.models import (
+    Attachment,
+    FieldConfidence,
+    RawReceipt,
+    ReceiptMetadata,
+)
+
+_FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
 
 def _mock_agent_result(metadata: ReceiptMetadata) -> MagicMock:
@@ -150,6 +159,7 @@ class TestExtractMetadata:
             amount=Decimal("42.99"),
             date=date(2025, 6, 15),
             confidence=0.95,
+            field_confidence=_FIELD_CONFIDENCE,
         )
 
         mock_result = _mock_agent_result(expected)
@@ -171,6 +181,7 @@ class TestExtractMetadata:
                 amount=Decimal("42.99"),
                 date=date(2025, 6, 15),
                 confidence=0.95,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
 
@@ -191,6 +202,7 @@ class TestExtractMetadata:
                 amount=Decimal("1.00"),
                 date=date(2025, 1, 1),
                 confidence=0.5,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
 
@@ -229,6 +241,7 @@ class TestExtractMetadata:
                 amount=Decimal("99.00"),
                 date=date(2025, 1, 1),
                 confidence=0.9,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
         mock_agent = MagicMock()
@@ -250,6 +263,7 @@ class TestExtractMetadata:
                 amount=Decimal("42.99"),
                 date=date(2025, 6, 15),
                 confidence=0.95,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
         mock_agent = MagicMock()
@@ -310,6 +324,7 @@ class TestExtractMetadataRouting:
                 amount=Decimal("10.00"),
                 date=date(2025, 1, 1),
                 confidence=0.9,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
         agent = MagicMock()
@@ -368,6 +383,7 @@ class TestExtractFromDocument:
                 amount=Decimal("15.00"),
                 date=date(2025, 3, 1),
                 confidence=0.85,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
         agent = MagicMock()
@@ -483,6 +499,7 @@ class TestEmailImageAttachments:
                 amount=Decimal("3500.00"),
                 date=date(2026, 6, 6),
                 confidence=0.95,
+                field_confidence=_FIELD_CONFIDENCE,
             )
         )
         agent = MagicMock()
@@ -589,3 +606,54 @@ class TestEmailImageAttachments:
 
         message = agent.run_sync.call_args[0][0]
         assert isinstance(message, str)
+
+
+_PROMPTS = pytest.mark.parametrize(
+    "prompt",
+    [_SYSTEM_PROMPT, DOCUMENT_SYSTEM_PROMPT],
+    ids=["email", "document"],
+)
+
+# One phrase per paid-amount rule in the data-model design, so that an edit
+# dropping a rule from either prompt fails a test.
+_PAID_AMOUNT_RULES = {
+    "includes tax, shipping and tip": "tax, shipping and tip",
+    "after discounts": "after discounts and coupons",
+    "excludes gift cards and credit": "gift cards, store credit, points or vouchers",
+    "description notes gift cards": "say in the description",
+    "invoice payment, not balance": "the payment, not the balance or the invoice total",
+    "charged in parts": "charged in parts",
+    "hold is not a payment": "pre-authorization or hold is not a payment",
+    "unpaid invoice is 0": "nothing has been paid (an unpaid invoice), use 0",
+    "refund returned to payment methods": "for a refund, what was returned",
+    "refund excludes store credit": "returned as store credit, a gift card or points",
+    "unknown is null": "does not say what was paid or returned, use null",
+    "never copied from amount": "Never copy amount into paid_amount",
+}
+
+
+class TestPaidAmountPrompts:
+    """Both system prompts carry the paid-amount rules and field confidence."""
+
+    @_PROMPTS
+    @pytest.mark.parametrize(
+        "phrase", list(_PAID_AMOUNT_RULES.values()), ids=list(_PAID_AMOUNT_RULES)
+    )
+    def test_paid_amount_rule_present(self, prompt: str, phrase: str) -> None:
+        assert phrase in " ".join(prompt.split())
+
+    @_PROMPTS
+    def test_amount_is_the_total(self, prompt: str) -> None:
+        assert "amount: The order, invoice or statement total" in prompt
+
+    @_PROMPTS
+    def test_old_total_rule_removed(self, prompt: str) -> None:
+        assert "use the total amount" not in prompt
+        assert "The total amount charged" not in prompt
+
+    @_PROMPTS
+    def test_field_confidence_instruction(self, prompt: str) -> None:
+        flat = " ".join(prompt.split())
+        assert "field_confidence:" in flat
+        assert "vendor, amount, paid_amount and date" in flat
+        assert "below 0.5 when a figure is inferred rather than printed" in flat

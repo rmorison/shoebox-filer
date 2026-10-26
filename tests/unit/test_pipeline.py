@@ -8,8 +8,16 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
-from receipt_index.models import ExtractionResult, RawReceipt, Receipt, ReceiptMetadata
+from receipt_index.models import (
+    ExtractionResult,
+    FieldConfidence,
+    RawReceipt,
+    Receipt,
+    ReceiptMetadata,
+)
 from receipt_index.pipeline import IngestResult, run_ingest
+
+_FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
 _RECEIPT_ROW: dict[str, Any] = {
     "id": UUID("019572a0-0000-7000-8000-000000000001"),
@@ -41,6 +49,7 @@ _SAMPLE_METADATA = ExtractionResult(
         date=date(2025, 6, 15),
         description="Python Cookbook",
         confidence=0.95,
+        field_confidence=_FIELD_CONFIDENCE,
     ),
     input_tokens=150,
     output_tokens=50,
@@ -246,3 +255,89 @@ class TestIngestResult:
         assert result.skipped == 0
         assert result.failed == 0
         assert result.receipts == []
+
+
+def _paid_extraction(confidence: float = 0.95) -> ExtractionResult:
+    return ExtractionResult(
+        metadata=ReceiptMetadata(
+            vendor="Acme Parking (U.S.), LLC",
+            amount=Decimal("50.00"),
+            paid_amount=Decimal("30.00"),
+            currency="USD",
+            date=date(2025, 6, 15),
+            description="Parking; 20.00 paid with a gift card",
+            confidence=confidence,
+            field_confidence=FieldConfidence(
+                vendor=0.95, amount=0.9, paid_amount=0.7, date=0.99
+            ),
+        ),
+        input_tokens=150,
+        output_tokens=50,
+        cache_read_tokens=0,
+        requests=1,
+    )
+
+
+class TestPaidAmountPassThrough:
+    """The pipeline stores the paid amount and per-field confidence."""
+
+    @patch("receipt_index.pipeline.insert_ingest_log")
+    @patch("receipt_index.pipeline.insert_receipt", return_value=_SAMPLE_RECEIPT)
+    @patch("receipt_index.pipeline.render_pdf", return_value=b"%PDF-fake")
+    @patch("receipt_index.pipeline.extract_metadata")
+    @patch("receipt_index.pipeline.get_processed_source_ids", return_value=set())
+    def test_success_writes_paid_amount(
+        self,
+        mock_get_ids: MagicMock,
+        mock_extract: MagicMock,
+        mock_render: MagicMock,
+        mock_insert: MagicMock,
+        mock_log: MagicMock,
+    ) -> None:
+        mock_extract.return_value = _paid_extraction()
+        store = _mock_store()
+        run_ingest(
+            conn=_mock_conn(),
+            adapter=_mock_adapter([_make_raw()]),
+            store=store,
+            source_name="test-imap",
+            source_type="imap",
+        )
+
+        receipt_kwargs = mock_insert.call_args.kwargs
+        assert receipt_kwargs["amount"] == Decimal("50.00")
+        assert receipt_kwargs["paid_amount"] == Decimal("30.00")
+        assert receipt_kwargs["field_confidence"] == {
+            "vendor": 0.95,
+            "amount": 0.9,
+            "paid_amount": 0.7,
+            "date": 0.99,
+        }
+        log_kwargs = mock_log.call_args.kwargs
+        assert log_kwargs["amount"] == Decimal("50.00")
+        assert log_kwargs["paid_amount"] == Decimal("30.00")
+        # The file name keeps the total; naming belongs to the evidence store.
+        assert store.save.call_args.args[2] == Decimal("50.00")
+
+    @patch("receipt_index.pipeline.insert_ingest_log")
+    @patch("receipt_index.pipeline.extract_metadata")
+    @patch("receipt_index.pipeline.get_processed_source_ids", return_value=set())
+    def test_skip_logs_paid_amount(
+        self,
+        mock_get_ids: MagicMock,
+        mock_extract: MagicMock,
+        mock_log: MagicMock,
+    ) -> None:
+        mock_extract.return_value = _paid_extraction(confidence=0.3)
+        result = run_ingest(
+            conn=_mock_conn(),
+            adapter=_mock_adapter([_make_raw()]),
+            store=_mock_store(),
+            source_name="test-imap",
+            source_type="imap",
+        )
+
+        assert result.skipped == 1
+        log_kwargs = mock_log.call_args.kwargs
+        assert log_kwargs["status"] == "skipped"
+        assert log_kwargs["paid_amount"] == Decimal("30.00")

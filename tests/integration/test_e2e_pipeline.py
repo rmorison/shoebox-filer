@@ -18,7 +18,7 @@ import pytest
 
 from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.config import ImapSourceConfig
-from receipt_index.models import ReceiptMetadata
+from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
 from receipt_index.store import LocalFileStore
@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import psycopg
+
+_FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
 
 def _make_mock_agent(
@@ -43,6 +45,7 @@ def _make_mock_agent(
         amount=amount,
         date=receipt_date or date(2025, 6, 15),
         confidence=confidence,
+        field_confidence=_FIELD_CONFIDENCE,
     )
     mock_usage = MagicMock()
     mock_usage.input_tokens = 100
@@ -343,12 +346,14 @@ class TestFullPipelineE2E:
             amount=Decimal("100.00"),
             date=date(2025, 3, 1),
             confidence=0.9,
+            field_confidence=_FIELD_CONFIDENCE,
         )
         meta2 = ReceiptMetadata(
             vendor="Globex Inc",
             amount=Decimal("200.00"),
             date=date(2025, 3, 2),
             confidence=0.85,
+            field_confidence=_FIELD_CONFIDENCE,
         )
 
         def _mock_result(meta: ReceiptMetadata) -> MagicMock:
