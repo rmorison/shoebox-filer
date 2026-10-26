@@ -400,6 +400,26 @@ class TestIncrementalImap:
         assert spy.fetched == []
 
 
+class TestImapReconnect:
+    def test_fetch_after_a_dropped_connection_reconnects_and_reselects(
+        self, greenmail_available: bool, pg_conn: Conn
+    ) -> None:
+        user = _user("drop")
+        _seed(user, 1)
+        adapter = ImapAdapter(_config(user))
+        try:
+            (ref,) = adapter.list_new(None).items
+            assert adapter._client is not None
+            adapter._client.shutdown()  # the socket dies under the session
+
+            raw = adapter.fetch(ref)
+
+            assert raw is not None
+            assert raw.source_id == ref.source_id
+        finally:
+            adapter.close()
+
+
 class TestConcurrentIngest:
     def test_second_ingest_exits_3_while_the_source_is_held(
         self,
