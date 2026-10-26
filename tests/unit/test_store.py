@@ -368,7 +368,18 @@ class TestRefsOutsideTheStore:
 class TestStoreFolder:
     @pytest.mark.parametrize(
         "segment",
-        ["", ".", "..", "a/b", "a\\b", "nul\x00", "tab\t", ".hidden", "x" * 256],
+        [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "nul\x00",
+            "tab\t",
+            ".hidden",
+            "x" * 241,
+            "é" * 121,
+        ],
     )
     def test_unsafe_segments_are_refused(self, segment: str) -> None:
         with pytest.raises(ValueError, match="segment"):
@@ -385,6 +396,69 @@ class TestStoreFolder:
                 name="../../escape.pdf",
             )
         assert list(store_root.rglob("*.pdf")) == []
+
+
+class TestLongNamesAndRaces:
+    def test_longest_allowed_name_is_stored(self, store_root: Path) -> None:
+        """A 240-byte name and its _N twin both fit the 255-byte limit."""
+        store = LocalEvidenceStore(store_root)
+        folder = StoreFolder.for_rendition(date(2025, 1, 1))
+        name = "x" * 236 + ".pdf"
+        refs = [
+            store.put(
+                data,
+                media_type="application/pdf",
+                purpose="rendition",
+                folder=folder,
+                name=name,
+            ).ref
+            for data in (b"one", b"two")
+        ]
+        assert refs[1].endswith("x_2.pdf")
+        assert all(store.exists(ref) for ref in refs)
+
+    def test_rendition_lost_race_takes_the_next_name(self, store_root: Path) -> None:
+        store = LocalEvidenceStore(store_root)
+        real_link = os.link
+        calls = []
+
+        def other_writer_first(src: str | Path, dst: str | Path) -> None:
+            calls.append(Path(dst).name)
+            if len(calls) == 1:
+                Path(dst).write_bytes(b"other")  # a concurrent writer's file
+            real_link(src, dst)
+
+        with patch("receipt_index.store.os.link", side_effect=other_writer_first):
+            result = _rendition(store, b"mine")
+
+        assert result.endswith("42.99_2.pdf")
+        assert (store_root / result).read_bytes() == b"mine"
+        assert _tmp_files(store_root) == []
+
+    def test_rename_lost_race_takes_the_next_name(self, store_root: Path) -> None:
+        store = LocalEvidenceStore(store_root)
+        ref = rendition_ref(_rendition(store, b"pdf"))
+        real_link = os.link
+        calls = []
+
+        def other_writer_first(src: str | Path, dst: str | Path) -> None:
+            calls.append(Path(dst).name)
+            if len(calls) == 1:
+                Path(dst).write_bytes(b"other")
+            real_link(src, dst)
+
+        with patch("receipt_index.store.os.link", side_effect=other_writer_first):
+            new = store.rename(ref, "renamed.pdf")
+
+        assert new.endswith("/renamed_2.pdf")
+        with store.open(new) as fh:
+            assert fh.read() == b"pdf"
+        assert not store.exists(ref)
+
+    def test_rename_of_a_missing_file(self, store_root: Path) -> None:
+        store = LocalEvidenceStore(store_root)
+        with pytest.raises(FileNotFoundError):
+            store.rename("local:renditions/2025/06/gone.pdf", "x.pdf")
 
 
 class TestOpenStore:

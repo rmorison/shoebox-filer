@@ -41,7 +41,8 @@ LOCAL_SCHEME = "local:"
 
 _TOP_FOLDER: dict[str, str] = {"original": "originals", "rendition": "renditions"}
 _PDF_MEDIA_TYPE = "application/pdf"
-_MAX_SEGMENT_LENGTH = 255
+# A filesystem name is at most 255 bytes; leave room for a "_NN" suffix.
+_MAX_SEGMENT_BYTES = 240
 _VENDOR_SLUG_MAX = 50
 _SOURCE_SLUG_MAX = 60
 
@@ -89,8 +90,8 @@ def _check_segment(segment: str) -> str:
     if segment.startswith("."):
         msg = f"path segment may not start with '.': {segment!r}"
         raise ValueError(msg)
-    if len(segment) > _MAX_SEGMENT_LENGTH:
-        msg = f"path segment longer than {_MAX_SEGMENT_LENGTH} characters"
+    if len(segment.encode("utf-8")) > _MAX_SEGMENT_BYTES:
+        msg = f"path segment longer than {_MAX_SEGMENT_BYTES} bytes"
         raise ValueError(msg)
     if any(c in "/\\" or ord(c) < 32 or ord(c) == 127 for c in segment):
         msg = f"path segment holds a separator or control character: {segment!r}"
@@ -197,9 +198,13 @@ def _numbered(name: str) -> Iterator[str]:
 
 
 @contextmanager
-def _temp_file(folder: Path, name: str, data: bytes) -> Iterator[Path]:
-    """A fully written, fsynced ``.<name>.<random>.tmp`` file, then removed."""
-    path = folder / f".{name}.{secrets.token_hex(6)}.tmp"
+def _temp_file(folder: Path, data: bytes) -> Iterator[Path]:
+    """A fully written, fsynced ``.put.<random>.tmp`` file, then removed.
+
+    The name is short and fixed, so a long target name can't push it over the
+    filesystem's limit.
+    """
+    path = folder / f".put.{secrets.token_hex(6)}.tmp"
     try:
         with path.open("xb") as fh:
             fh.write(data)
@@ -331,7 +336,7 @@ class LocalEvidenceStore:
         if purpose == "original":
             target = folder_path / name
             if not target.exists():
-                with _temp_file(folder_path, name, data) as tmp:
+                with _temp_file(folder_path, data) as tmp:
                     try:
                         os.link(tmp, target)
                     except FileExistsError:
@@ -347,7 +352,7 @@ class LocalEvidenceStore:
             return stored(name)
 
         twin = self._twin_folder(relative)
-        with _temp_file(folder_path, name, data) as tmp:
+        with _temp_file(folder_path, data) as tmp:
             for candidate in _numbered(name):
                 if self._taken(folder_path, twin, candidate):
                     continue
