@@ -3,7 +3,7 @@
 **Version:** 0.1 — Draft
 **Date:** 2026-10-25
 **Product Spec:** [receipt-search-index-spec.md](../../product/features/receipt-search-index-spec.md)
-**Related designs:** [Evidence Store](evidence-store.md) (files, hashes and provenance)
+**Related designs:** [Evidence Store](evidence-store.md) (files, hashes and provenance), [Always-On Ingest](always-on-ingest.md) (sources, archive folders and backfill)
 
 ---
 
@@ -309,7 +309,7 @@ receipt-index reextract [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
 The input for each receipt, in order of preference (`--input auto`):
 
 1. **The original**, from the evidence store, once that design's originals exist.
-2. **The source**, fetched again by its ID. Each adapter gains a `fetch_by_id(source_id) -> RawReceipt | None`: IMAP searches the watched folder by the `Message-ID` header (and the archive folder, once the always-on ingest design adds one); Drive gets the file by ID. A `Message-ID` is set by the sender and isn't guaranteed unique, so the IMAP search quotes it as an IMAP string and returns `None` unless exactly one message matches. Receipts stored under the adapter's hash fallback (messages with no `Message-ID`) can't be searched for and also return `None`.
+2. **The source**, fetched again by its ID. Each adapter gains a `fetch_by_id(source_id) -> RawReceipt | None`: IMAP searches by the `Message-ID` header in the folders the [always-on ingest design](always-on-ingest.md)'s backfill searches: the watched folder, the archive folder and `needs-attention`. Drive gets the file by ID, which still works after the file has moved into the evidence store's `originals/`. A `Message-ID` is set by the sender and isn't guaranteed unique, so the IMAP search quotes it as an IMAP string and returns `None` unless exactly one message matches. Receipts stored under the adapter's hash fallback (messages with no `Message-ID`) can't be searched for and also return `None`.
 3. **The rendition**, the stored PDF, through the same text-first, vision-fallback path that Drive documents use today, with the stored subject and sender prepended.
 
 `--input rendition` goes straight to the third, which needs no network access and is the cheapest. The extraction row's `input_kind` records which was used.
