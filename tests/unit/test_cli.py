@@ -902,3 +902,38 @@ class TestMcpCommand:
         assert result.exit_code == 0, result.output
         mock_check.assert_called_once_with("postgresql://localhost/test")
         assert mock_build.call_args.kwargs["max_content_bytes"] == 10 * 1024 * 1024
+
+
+class TestMcpCommandDatabaseErrors:
+    """The mcp command turns database errors at startup into a short message."""
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            ("OperationalError", "cannot connect to the database"),
+            ("ProgrammingError", "startup check failed"),
+        ],
+    )
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_database_error_exits_1(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+        error: str,
+        message: str,
+    ) -> None:
+        import psycopg
+
+        mock_load_config.return_value = _make_config()
+        mock_check.side_effect = getattr(psycopg, error)("boom")
+        result = CliRunner().invoke(
+            cli, ["mcp", "--access-log", str(tmp_path / "log.jsonl")]
+        )
+        assert result.exit_code == 1
+        assert message in result.output
+        assert "Traceback" not in result.output
+        mock_build.assert_not_called()

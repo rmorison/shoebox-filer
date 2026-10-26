@@ -18,7 +18,10 @@ from mcp_types import Implementation
 from receipt_index.mcp_server import (
     AccessLog,
     AccessLogError,
+    FailureOut,
+    ReceiptOut,
     RoleCheckError,
+    _client_info,
     build_server,
     check_read_only_role,
     default_access_log_path,
@@ -495,6 +498,27 @@ class TestGetReceiptFile:
         assert entry["outcome"] == outcome
         assert entry["content_included"] is False
 
+    def test_database_error_is_logged(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        import psycopg
+
+        with patch(
+            "receipt_index.repository.get_receipt_by_id",
+            side_effect=psycopg.OperationalError("server closed the connection"),
+        ):
+            result = _call(
+                _server(store_root, log_path),
+                "get_receipt_file",
+                {"receipt_id": str(_ID), "include_content": True},
+            )
+
+        assert result.is_error is True
+        assert "file lookup failed (OperationalError)" in _text(result)
+        (entry,) = _log_lines(log_path)
+        assert entry["outcome"] == "error"
+        assert entry["content_included"] is False
+
     def test_absent_client_info_logs_null(
         self, conn: MagicMock, store_root: Path, log_path: Path
     ) -> None:
@@ -578,13 +602,20 @@ class TestListFailures:
 
 
 class TestCheckReadOnlyRole:
-    def _conn(self, rows: list[dict[str, Any]], can_read: bool = True) -> MagicMock:
+    def _conn(
+        self,
+        rows: list[dict[str, Any]],
+        can_read: bool = True,
+        usage: bool = True,
+    ) -> MagicMock:
         conn = MagicMock()
+        usage_cur = MagicMock()
+        usage_cur.fetchone.return_value = {"usage": usage}
         read_cur = MagicMock()
         read_cur.fetchone.return_value = {"can_read": can_read}
         write_cur = MagicMock()
         write_cur.fetchall.return_value = rows
-        conn.execute.side_effect = [write_cur, read_cur]
+        conn.execute.side_effect = [usage_cur, write_cur, read_cur]
         return conn
 
     def test_read_only_role_passes(self) -> None:
@@ -594,9 +625,16 @@ class TestCheckReadOnlyRole:
         conn = self._conn([{"object": "receipt.receipts", "privilege": "INSERT"}])
         with pytest.raises(RoleCheckError, match=r"receipt\.receipts: INSERT"):
             check_read_only_role(conn)
-        sql = conn.execute.call_args_list[0].args[0]
+        sql = conn.execute.call_args_list[1].args[0]
         assert "has_any_column_privilege" in sql
         assert "has_schema_privilege" in sql
+
+    def test_role_without_schema_usage_is_refused_first(self) -> None:
+        conn = self._conn([], usage=False)
+        with pytest.raises(RoleCheckError, match="lacks SELECT"):
+            check_read_only_role(conn)
+        # The privilege queries would fail without USAGE, so they never run.
+        assert conn.execute.call_count == 1
 
     def test_role_without_select_is_refused(self) -> None:
         with pytest.raises(RoleCheckError, match="SELECT"):
@@ -633,3 +671,49 @@ class TestAccessLog:
         assert default_access_log_path() == (
             tmp_path / ".local" / "state" / "receipt-index" / "mcp-access.jsonl"
         )
+
+
+class TestClientInfo:
+    def test_no_session_params_gives_nulls(self) -> None:
+        ctx = MagicMock()
+        type(ctx).session = property(lambda _self: (_ for _ in ()).throw(ValueError))
+        assert _client_info(ctx) == {"name": None, "version": None}
+
+    def test_missing_client_info_gives_nulls(self) -> None:
+        ctx = MagicMock()
+        ctx.session.client_params.client_info = None
+        assert _client_info(ctx) == {"name": None, "version": None}
+
+    def test_client_params_none_gives_nulls(self) -> None:
+        ctx = MagicMock()
+        ctx.session.client_params = None
+        assert _client_info(ctx) == {"name": None, "version": None}
+
+
+class TestFileRef:
+    def test_path_outside_store_is_not_reported_as_existing(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        (store_root.parent / "secret.pdf").write_bytes(b"not a receipt")
+        with (
+            patch(
+                "receipt_index.repository.search_receipts",
+                return_value=[_receipt(pdf_path="../secret.pdf")],
+            ),
+            patch("receipt_index.repository.count_receipts", return_value=1),
+        ):
+            result = _call(_server(store_root, log_path), "search_receipts", {})
+
+        data = result.structured_content
+        assert data is not None
+        assert data["receipts"][0]["file"]["exists"] is False
+
+
+class TestOutputModelsMatchDomainModels:
+    """A new column on Receipt or IngestLogEntry must reach the MCP output."""
+
+    def test_receipt_out_fields(self) -> None:
+        assert set(ReceiptOut.model_fields) - {"file"} == set(Receipt.model_fields)
+
+    def test_failure_out_fields(self) -> None:
+        assert set(FailureOut.model_fields) == set(IngestLogEntry.model_fields)

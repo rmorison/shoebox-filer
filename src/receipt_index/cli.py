@@ -454,6 +454,9 @@ def mcp_command(
     except psycopg.OperationalError as exc:
         click.echo(f"Error: cannot connect to the database: {exc}", err=True)
         sys.exit(1)
+    except psycopg.Error as exc:
+        click.echo(f"Error: startup check failed: {exc}", err=True)
+        sys.exit(1)
 
     server = build_server(
         database_url=database_url,

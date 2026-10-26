@@ -56,6 +56,9 @@ def _dsn(role: str) -> str:
 _READ_ROLE = "receipt_index_dev_read"
 _WRITE_ROLE = "receipt_index_dev_write"
 _COLUMN_WRITER = "receipt_index_mcp_test_column_writer"
+_TRUNCATER = "receipt_index_mcp_test_truncater"
+_SCHEMA_CREATOR = "receipt_index_mcp_test_schema_creator"
+_NO_USAGE = "receipt_index_mcp_test_no_usage"
 
 _CLI = str(Path(sys.executable).parent / "receipt-index")
 
@@ -81,7 +84,14 @@ def _ensure_login_role(conn: psycopg.Connection[dict[str, Any]], role: str) -> N
 def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Login roles with the grants migrations 000002/000004 give, plus one
     that holds only a column-level INSERT."""
-    for role in (_READ_ROLE, _WRITE_ROLE, _COLUMN_WRITER):
+    for role in (
+        _READ_ROLE,
+        _WRITE_ROLE,
+        _COLUMN_WRITER,
+        _TRUNCATER,
+        _SCHEMA_CREATOR,
+        _NO_USAGE,
+    ):
         _ensure_login_role(pg_conn, role)
     pg_conn.execute(
         f"GRANT USAGE ON SCHEMA receipt TO {_READ_ROLE}, {_WRITE_ROLE}, "
@@ -93,13 +103,24 @@ def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
     pg_conn.execute(
         f"GRANT SELECT, DELETE ON receipt.receipts TO {_WRITE_ROLE}; "
         f"GRANT SELECT ON receipt.ingest_log TO {_WRITE_ROLE}; "
-        f"GRANT INSERT (source_id, vendor) ON receipt.receipts TO {_WRITE_ROLE}"
+        f"GRANT INSERT (source_id, vendor) ON receipt.receipts TO {_WRITE_ROLE}; "
+        f"GRANT UPDATE (vendor) ON receipt.receipts TO {_WRITE_ROLE}"
     )
     pg_conn.execute(
         "GRANT SELECT ON receipt.receipts, receipt.ingest_log "
         f"TO {_COLUMN_WRITER}; "
         f"GRANT INSERT (vendor) ON receipt.receipts TO {_COLUMN_WRITER}"
     )
+    pg_conn.execute(
+        f"GRANT USAGE ON SCHEMA receipt TO {_TRUNCATER}, {_SCHEMA_CREATOR}; "
+        "GRANT SELECT ON receipt.receipts, receipt.ingest_log "
+        f"TO {_TRUNCATER}, {_SCHEMA_CREATOR}; "
+        f"GRANT TRUNCATE ON receipt.ingest_log TO {_TRUNCATER}; "
+        f"GRANT CREATE ON SCHEMA receipt TO {_SCHEMA_CREATOR}"
+    )
+    # _NO_USAGE gets CONNECT only, like a login role created without
+    # membership in receipt_index_dev_read.
+    pg_conn.execute(f"REVOKE ALL ON SCHEMA receipt FROM {_NO_USAGE}")
     pg_conn.commit()
 
 
@@ -404,7 +425,21 @@ def pg_conn_as(role: str) -> psycopg.Connection[dict[str, Any]]:
 
 
 @pytest.mark.usefixtures("roles")
-def test_startup_check_in_process() -> None:
+def test_startup_check_passes_read_role() -> None:
     startup_check(_dsn(_READ_ROLE))
-    with pytest.raises(RoleCheckError, match=r"receipt\.receipts: INSERT"):
-        startup_check(_dsn(_COLUMN_WRITER))
+
+
+@pytest.mark.usefixtures("roles")
+@pytest.mark.parametrize(
+    ("role", "match"),
+    [
+        (_COLUMN_WRITER, r"receipt\.receipts: INSERT"),
+        (_TRUNCATER, r"receipt\.ingest_log: TRUNCATE"),
+        (_SCHEMA_CREATOR, r"schema receipt: CREATE"),
+        (_WRITE_ROLE, r"receipt\.receipts: UPDATE"),
+        (_NO_USAGE, r"lacks SELECT"),
+    ],
+)
+def test_startup_check_refuses_in_process(role: str, match: str) -> None:
+    with pytest.raises(RoleCheckError, match=match):
+        startup_check(_dsn(role))

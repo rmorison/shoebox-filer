@@ -217,7 +217,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
 | `list_failures` | `limit`, `offset` | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives, newest first |
 
-Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. Results carry no file content; only `get_receipt_file` returns content.
+Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. The `source` filter is an exact match on `source_name`. Results carry no file content; only `get_receipt_file` returns content.
 
 **Paging.** Call again with `offset` set to `next_offset` until `next_offset` is `null`, then check that you received `total` results. Results are ordered newest first, then by vendor, then by ID. If an ingest commits between two calls, rows can shift between pages, and `total` changes with them. Re-run from offset 0, or narrow the date range, when you need a complete set.
 
@@ -231,7 +231,7 @@ Every `get_receipt_file` call appends one JSON line to the access log, and the s
 {"client": {"name": "example-agent", "version": "1.0"}, "content_included": true, "outcome": "ok", "pdf_path": "2026/01/2026-01-15__amazon__47.99.pdf", "receipt_id": "01942a3b-1234-7def-8abc-567890abcdef", "size_bytes": 48213, "tool": "get_receipt_file", "ts": "2026-01-20T09:12:44.512408+00:00"}
 ```
 
-`outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store` or `invalid_id`. The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged.
+`outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged.
 
 ### MCP client setup
 
