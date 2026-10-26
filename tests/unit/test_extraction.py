@@ -634,6 +634,12 @@ _PAID_AMOUNT_RULES = {
     "total not assumed paid": (
         "Don't assume the total was paid when no payment is shown"
     ),
+    "shown-payment rule is for purchases": "For a purchase, when the document shows",
+    "one payment method without an amount": (
+        "one payment method with no amount next to it"
+    ),
+    "charge later is not a payment yet": "will be charged later",
+    "cash is net of change": "not the cash tendered",
     "refund is never negative": "It is never negative",
     "store-credit refund is 0": "0 when all of it was returned as store credit",
 }

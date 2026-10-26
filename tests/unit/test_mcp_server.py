@@ -855,6 +855,7 @@ class TestPaidAmountOutput:
     def test_instructions_cover_refunds(self) -> None:
         flat = " ".join(_INSTRUCTIONS.split())
         assert "for a refund, what was returned to them" in flat
+        assert "a sum of effective_amount values counts them as charges" in flat
 
     def test_amount_descriptions_follow_the_design(self) -> None:
         schema = ReceiptOut.model_json_schema()["properties"]

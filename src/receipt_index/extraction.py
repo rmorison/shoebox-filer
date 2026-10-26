@@ -40,8 +40,12 @@ use 0.
 any part returned as store credit, a gift card or points. It is never \
 negative: use 0 when all of it was returned as store credit, a gift card or \
 points.
-  - When the document shows a payment (a card or account line, "paid", \
-"amount charged"), give it, even when it equals the total. Don't assume the \
+  - For a purchase, when the document shows a payment (a card or account \
+line, "paid", "amount charged"), give it, even when it equals the total. For \
+cash, it is the amount charged, net of change, not the cash tendered. When the \
+document shows one payment method with no amount next to it and nothing \
+deducted from the total, the total was charged to it, unless the document says \
+the order will be charged later (for example on shipment). Don't assume the \
 total was paid when no payment is shown. When the document does not say what \
 was paid or returned, use null: null means not known, and 0 means nothing was \
 charged.

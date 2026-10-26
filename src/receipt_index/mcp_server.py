@@ -65,8 +65,9 @@ a rendered PDF for each. amount is the order, invoice or statement total;
 paid_amount is what was charged to the payer's payment methods, or for a
 refund, what was returned to them (null when not known, 0 when nothing was
 charged). A refund's paid_amount is not negative and refunds are not yet
-marked, so a sum of amounts counts them as charges. effective_amount is
-paid_amount when known, otherwise amount, and the amount filters match on it.
+marked, so a sum of effective_amount values counts them as charges.
+effective_amount is paid_amount when known, otherwise amount, and the amount
+filters match on it.
 Use search_receipts to find receipts (paged: keep calling with next_offset
 until it is null, and compare the count with total), get_receipt for one
 receipt's metadata, get_receipt_file for its PDF, and list_failures for
