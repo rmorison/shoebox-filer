@@ -35,7 +35,7 @@ There are smaller problems too. `FileStore.get_path` returns a local `Path`, so 
 
 ### Related Designs
 
-- **Always-on ingest** calls this store for every item it ingests and archives Drive dropoff files into it. The interface between the two is in [Write Path](#7-write-path).
+- **[Always-on ingest](always-on-ingest.md)** calls this store for every item it ingests and archives Drive dropoff files into it. The interface between the two is in [Write Path](#7-write-path).
 - **Receipt data model** owns the receipt's own fields (paid amount, line items, payment, order number, refunds, tags, external links, extraction history). This design owns files, storage references and provenance. The split is in [Schema Split](#schema-split-with-the-receipt-data-model-design).
 
 ---
@@ -198,7 +198,7 @@ receipt-index/                                  (evidence root, owned by the sto
 - **Renditions** keep today's metadata name, so the tree stays browsable by period. A Drive file ID survives a rename, so when re-extraction changes the vendor or amount the file is renamed and no reference breaks. Name collisions get today's numeric suffix.
 - **Originals** go in one folder per source item, named `{received-date}__{source-name}__{sha256[:12]}`. The year and month come from the date the item was received, not the receipt date, since the original's identity doesn't depend on extraction. The hash prefix is from the whole original: the `.eml`, or the Drive file (for a native Doc, its export). These folders and files are never renamed.
 - **Attachment names are built, never taken from the sender.** A MIME filename is untrusted input (it can hold `../`, control characters or thousands of characters). The stored name is `{position:02d}__{slugified stem, at most 60 characters}.{extension}`, with the extension from an allow-list keyed on the media type (`pdf`, `jpg`, `png`, `gif`, `webp`, `html`, `txt`, otherwise `bin`). The raw filename is kept only in `provenance_files.file_name`. The position prefix also keeps two attachments with the same name apart. `LocalEvidenceStore` resolves every write and every `local:` reference under `store.path`, and refuses any path that resolves outside it.
-- **Dropoff `needs-attention/`** (owned by the always-on ingest design) is a subfolder of each dropoff folder. It holds skipped and terminally failed items, which aren't adopted.
+- **Dropoff `needs-attention/`** (owned by the always-on ingest design's [dropoff archive](always-on-ingest.md#7-dropoff-archive)) is a subfolder of each dropoff folder. It holds skipped and terminally failed items, which aren't adopted.
 
 The local backend uses the same layout under `store.path`, so a local tree and a Drive tree can be compared file for file.
 
@@ -414,7 +414,7 @@ CREATE OR REPLACE TRIGGER trg_receipts_check_merged_into
 
 ### 7. Write Path
 
-This is the interface agreed with the always-on ingest design, with the operator's required fix to hash matching applied.
+This is the interface agreed with the [always-on ingest design](always-on-ingest.md#7-dropoff-archive), with the operator's required fix to hash matching applied.
 
 **What ingest calls:**
 
@@ -469,12 +469,12 @@ def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor:
 | An IMAP original was stored (step 1) | Stored files with no provenance | The retry's `put` finds the hashes and reuses them. `verify --orphans` reports any left for good |
 | A rendition was uploaded (step 3) | A Drive rendition file with no location row | The retry uploads a fresh one (the receipt ID is new each attempt). `verify --orphans` reports the unrecorded file |
 | A Drive adopt (step 4) | The file in `originals/` (or, under the copy fallback, copied, with the dropoff file in `processed/`), no receipt | The changes feed can't be relied on, since the file's parents no longer include the dropoff folder. The ingest design's retry scheduler requeues the item from its started record, finds the file by its ID, and the idempotent adopt returns the existing record before the commit |
-| Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's retry policy |
+| Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's [retry policy](always-on-ingest.md#6-retries) |
 | The commit (step 5) | Nothing committed | The whole item is retried. Every earlier step is idempotent |
 
 **Skipped and terminally failed items are not adopted.** They stay at the source, in the ingest design's `needs-attention` folder (IMAP folder or Drive subfolder), so the original is never lost. **Nothing deletes from `needs-attention` automatically.** A later `retry` that succeeds adopts the item then.
 
-**Backfill** (the command belongs to the ingest design) uses these from the store side:
+**Backfill** (the command belongs to the ingest design; see its [backfill section](always-on-ingest.md#8-backfill)) uses these from the store side:
 
 ```python
 def provenance_missing_originals(source_name: str, since: date | None,
