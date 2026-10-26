@@ -85,15 +85,22 @@ def _is_transient_error(exc: Exception) -> bool:
     network or credential failures are the service's; a 404 means the file
     itself is gone.
     """
+    import http.client
+
     import httplib2
     from google.auth.exceptions import RefreshError, TransportError
     from googleapiclient.errors import HttpError
 
-    # Network failures (OSError, a DNS failure from httplib2, a token refresh
-    # that can't reach Google) and a refused refresh (an auth problem for
-    # the whole source) are not the file's fault.
+    # Network failures (OSError, a body cut off mid-download, a DNS failure
+    # from httplib2, a token refresh that can't reach Google) and a refused
+    # refresh (an auth problem for the whole source) are not the file's fault.
     if isinstance(
-        exc, OSError | httplib2.HttpLib2Error | TransportError | RefreshError
+        exc,
+        OSError
+        | http.client.HTTPException
+        | httplib2.HttpLib2Error
+        | TransportError
+        | RefreshError,
     ):
         return True
     if not isinstance(exc, HttpError):

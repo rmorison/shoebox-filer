@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -707,6 +708,7 @@ class TestDownloadErrors:
                 b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}',
             ),
             TimeoutError("timed out"),
+            http.client.IncompleteRead(b"partial"),
             httplib2.ServerNotFoundError("Unable to find the server"),
             google_auth_exceptions.TransportError("refresh: connection refused"),
             google_auth_exceptions.RefreshError("invalid_grant"),
@@ -717,6 +719,7 @@ class TestDownloadErrors:
             "429",
             "403-rate-limit",
             "timeout",
+            "cut-off-body",
             "dns",
             "refresh-transport",
             "refresh-refused",
