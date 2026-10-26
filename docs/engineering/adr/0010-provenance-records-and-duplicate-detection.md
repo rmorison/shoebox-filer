@@ -22,11 +22,11 @@ The consumer values correct totals and completeness over automation.
 2. **Automatic linking only on exact evidence**, and only between receipts of the same `kind` (purchase or refund):
    1. the same sha256 of the whole original;
    2. the same sha256 of the receipt document, when both documents were identified with certainty and the extracted kind, vendor and paid amount match the existing receipt;
-   3. the same order or invoice number, vendor and paid amount.
+   3. the same order or invoice number, vendor and paid amount (greater than zero), with the same receipt date and, where both have them, the same line items. An equal split-shipment charge differs in date or items, so it is flagged, not linked.
 
    **An attachment hash match on its own never links**: only the receipt document is compared.
 3. **Metadata-only matches are flagged, never linked.** The same vendor and paid amount with dates within a few days goes into `receipt.duplicate_candidates` for a person or agent to review.
-4. **Every link can be undone.** `unlink` moves a provenance record out to a new receipt of its own, and `link` merges by hand. Both, and every automatic link, are recorded in an append-only `receipt.provenance_link_history` with the actor, the actor kind and the reason.
+4. **Every link can be undone, and a merge deletes nothing.** The receipt a merge empties is marked as merged into the one that remains, keeping its extractions, events and rendition, and it drops out of search and totals. `unlink` restores it, or gives the provenance record a new receipt of its own. `link` merges by hand, and is refused while the emptied receipt carries tags, links or hand edits. Both, and every automatic link, are recorded in an append-only `receipt.provenance_link_history` with the actor, the actor kind and the reason, and guard triggers refuse any change to it, by the table's owner too.
 5. **Only the whole-original rule runs before extraction**, so an identical file costs no LLM call. The receipt-document and order-number rules need the extracted kind, vendor and paid amount, so they run after extraction. A receipt document counts as certain only for a Drive source file, or when the extraction names the attachment it read.
 
 ## Consequences

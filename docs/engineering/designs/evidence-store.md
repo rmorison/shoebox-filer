@@ -48,7 +48,7 @@ Google Drive becomes the evidence store, behind a storage interface that has no 
 
 For every source item, the store keeps the original exactly as received: the raw RFC 822 message and each of its attachments, or the Drive source file. It also keeps a rendered PDF, as today. Every stored file has a sha256 in the database. Verification reads Drive's own checksum metadata, so routine checks download nothing.
 
-A receipt gains one or more **provenance records**, one per source item that contributed to it. A new item that matches an existing receipt by the hash of its whole original, by the hash of its receipt document, or by order number joins that receipt instead of creating a new one. Matches on vendor, amount and date alone are flagged for review and never linked. Links can be undone, and every link and unlink is recorded.
+A receipt gains one or more **provenance records**, one per source item that contributed to it. A new item that matches an existing receipt by the hash of its whole original, by the hash of its receipt document, or by order number joins that receipt instead of creating a new one. Matches on vendor, amount and date alone are flagged for review and never linked. A merge never deletes a receipt: the receipt it empties is marked as merged into the one that remains, so its history and its rendition are kept. Links can be undone, and every link and unlink is recorded.
 
 The local backend stays for devtest, tests and offline use. Existing files move to Drive with a resumable, verified migration. A second copy of the Drive store (a replica or a cold archive) is deferred to a future feature, and the gap is recorded under [Risks](#risks--mitigation).
 
@@ -90,7 +90,8 @@ class EvidenceStore(Protocol):
     def rename(self, ref: str, name: str) -> None: ... # renditions only
 ```
 
-- **`put` is content-addressed and idempotent for originals.** It hashes the bytes first. If `stored_files` already holds that sha256 with an `original` location, it returns the existing row and writes nothing, so a retry after a crash never stores an original twice.
+- **`put` is content-addressed and idempotent for originals.** It hashes the bytes first. If `stored_files` already holds that sha256 with an `original` location **that the store account owns** (`file_locations.owner = 'store'`), it returns the existing row and writes nothing, so a retry after a crash never stores an original twice. A location the operator's account owns (an adopted dropoff file, under the move default) doesn't count, because the operator can delete it: an email attachment with the same bytes still gets its own store-owned copy.
+- **Concurrent writers.** `serve` and `backfill` can store the same bytes at the same moment. `stored_files` rows are inserted with `INSERT ... ON CONFLICT (sha256) DO NOTHING`, followed by a `SELECT` by sha256, and `file_locations` rows with `ON CONFLICT (backend, locator) DO NOTHING`, so the loser of the race reuses the winner's row. A Drive upload that lost the race is trashed (it is the process's own unrecorded upload, which the guard allows).
 - **Each receipt has its own rendition location.** The `stored_files` row is shared when two receipts' renditions have the same bytes (a PDF passed through as the rendition, a scan dropped twice). But every receipt gets its own rendition file in `renditions/`, recorded as a `file_locations` row with that `receipt_id`. A rename then touches one receipt's file only. A retry finds the receipt's existing rendition location and writes nothing.
 - **There is no update or delete for originals.** `rename` refuses any location whose purpose is `original`. Only renditions get renamed, when re-extraction changes the vendor, date or amount in the name.
 - **`open` streams.** Callers never get a local path: the CLI's `show`, the read-only MCP server and packet builders all read through `open(ref)`.
@@ -124,7 +125,7 @@ Higher-level helpers sit on top of `put` so that ingest never deals with attachm
 2. The Drive backend sets `contentRestrictions.readOnly` on every original, with a reason naming the store. The owner can lift it by hand, but nothing lifts it by accident.
 3. Verification ([section 3](#3-hashes-and-verification)) detects any change.
 
-**Native Google Docs** have no bytes to hash. The Doc itself is the original: `provenance.original_file_id` points at its `drive_native` row (no sha256). The PDF export snapshot taken at adoption is a second `provenance_files` row with role `drive_export`. Wherever this design compares or names an original by hash (rule 1, the folder's hash prefix), it uses the export's sha256.
+**Native Google Docs** have no bytes to hash. The Doc itself is the original: `provenance.original_file_id` points at its `drive_native` row (no sha256). The PDF export snapshot taken at adoption is a second `provenance_files` row with role `drive_export`. Wherever this design compares or names an original by hash (rule 1, the folder's hash prefix), it uses the export's sha256. Drive's export is limited to 10 MB. If the export fails (too large, or an API error), the adopt fails and the item goes to the ingest design's retries. An export that is too large is terminal on the first attempt, and the item moves to `needs-attention` with that reason, since retrying can't help.
 
 **The receipt document.** Each provenance record names the one file the receipt was read from: its *receipt document*. It is `certain` only when the source makes it so, or the extraction says so:
 
@@ -237,6 +238,7 @@ CREATE TABLE receipt.file_locations (
     locator           TEXT        NOT NULL,  -- Drive file ID, or path relative to the local root
     purpose           TEXT        NOT NULL,  -- 'original' | 'rendition'
     receipt_id        UUID,                  -- set for renditions: each receipt has its own
+    owner             TEXT        NOT NULL DEFAULT 'store',  -- 'store' | 'operator' (an adopted dropoff file)
     display_path      TEXT        NOT NULL,  -- e.g. renditions/2026/10/2026-10-14__...pdf
     read_only_set     BOOLEAN     NOT NULL DEFAULT FALSE,
     last_verified_at  TIMESTAMPTZ,
@@ -246,6 +248,7 @@ CREATE TABLE receipt.file_locations (
     CONSTRAINT uq_file_locations_backend_locator UNIQUE (backend, locator),
     CONSTRAINT ck_file_locations_backend CHECK (backend IN ('drive', 'local')),
     CONSTRAINT ck_file_locations_purpose CHECK (purpose IN ('original', 'rendition')),
+    CONSTRAINT ck_file_locations_owner CHECK (owner IN ('store', 'operator')),
     CONSTRAINT ck_file_locations_rendition_receipt
         CHECK ((purpose = 'rendition') = (receipt_id IS NOT NULL)),
     CONSTRAINT fk_file_locations_file FOREIGN KEY (file_id) REFERENCES receipt.stored_files (id),
@@ -267,6 +270,8 @@ CREATE TABLE receipt.provenance (
     email_sender                TEXT,
     email_date                  TIMESTAMPTZ,
     file_name                   TEXT,
+    source_sha256               BYTEA,                      -- whole-original hash: the .eml, or Drive's sha256Checksum
+    home_receipt_id             UUID,                       -- the receipt first created for this item, if any
     original_file_id            UUID,                       -- the .eml or the Drive file
     receipt_document_file_id    UUID,                       -- see "The receipt document"
     document_certainty          TEXT,                       -- 'certain' | 'ambiguous'
@@ -278,6 +283,7 @@ CREATE TABLE receipt.provenance (
     CONSTRAINT pk_provenance PRIMARY KEY (id),
     CONSTRAINT uq_provenance_source_id UNIQUE (source_id),
     CONSTRAINT fk_provenance_receipt FOREIGN KEY (receipt_id) REFERENCES receipt.receipts (id),
+    CONSTRAINT fk_provenance_home_receipt FOREIGN KEY (home_receipt_id) REFERENCES receipt.receipts (id),
     CONSTRAINT fk_provenance_original FOREIGN KEY (original_file_id) REFERENCES receipt.stored_files (id),
     CONSTRAINT fk_provenance_receipt_document FOREIGN KEY (receipt_document_file_id)
         REFERENCES receipt.stored_files (id),
@@ -289,6 +295,7 @@ CREATE TABLE receipt.provenance (
 CREATE UNIQUE INDEX uq_provenance_primary_per_receipt
     ON receipt.provenance (receipt_id) WHERE is_primary;
 CREATE INDEX idx_provenance_receipt_id ON receipt.provenance (receipt_id);
+CREATE INDEX idx_provenance_source_sha256 ON receipt.provenance (source_sha256);
 CREATE INDEX idx_provenance_original_file_id ON receipt.provenance (original_file_id);
 CREATE INDEX idx_provenance_receipt_document_file_id ON receipt.provenance (receipt_document_file_id);
 
@@ -308,12 +315,12 @@ CREATE TABLE receipt.provenance_files (
 
 -- Suspected duplicates awaiting review (metadata-only matches, and hash matches a guard refused).
 -- Pairs reference provenance, not receipts: provenance survives a link, so a decided pair
--- stays valid after the emptied receipt is deleted. Commands resolve current receipts through it.
+-- stays valid after a merge. Commands resolve current receipts through it.
 CREATE TABLE receipt.duplicate_candidates (
     id                          UUID        NOT NULL DEFAULT uuidv7(),
     provenance_id               UUID        NOT NULL,
     candidate_of_provenance_id  UUID        NOT NULL,
-    reason            TEXT        NOT NULL,   -- 'metadata' | 'document_hash_conflict'
+    reason            TEXT        NOT NULL,   -- 'metadata' | 'document_hash_conflict' | 'order_number_conflict' | 'merge_blocked'
     status            TEXT        NOT NULL DEFAULT 'open',  -- 'open' | 'linked' | 'dismissed'
     decided_by        TEXT,
     decided_at        TIMESTAMPTZ,
@@ -331,7 +338,7 @@ CREATE TABLE receipt.duplicate_candidates (
 CREATE TABLE receipt.provenance_link_history (
     id                UUID        NOT NULL DEFAULT uuidv7(),
     provenance_id     UUID        NOT NULL,
-    action            TEXT        NOT NULL,   -- 'link' | 'unlink'
+    action            TEXT        NOT NULL,   -- 'link' | 'unlink' | 'merge' | 'unmerge'
     from_receipt_id   UUID,
     to_receipt_id     UUID        NOT NULL,
     match_method      TEXT        NOT NULL,
@@ -342,22 +349,36 @@ CREATE TABLE receipt.provenance_link_history (
     CONSTRAINT pk_provenance_link_history PRIMARY KEY (id),
     CONSTRAINT fk_provenance_link_history_provenance FOREIGN KEY (provenance_id)
         REFERENCES receipt.provenance (id),
-    CONSTRAINT ck_provenance_link_history_action CHECK (action IN ('link', 'unlink')),
+    CONSTRAINT ck_provenance_link_history_action CHECK (action IN ('link', 'unlink', 'merge', 'unmerge')),
     CONSTRAINT ck_provenance_link_history_actor_kind CHECK (actor_kind IN ('system', 'person', 'agent'))
 );
 
 ALTER TABLE receipt.receipts
     ADD COLUMN rendition_file_id UUID,
+    ADD COLUMN merged_into_id UUID,       -- set when a merge empties this receipt
+    ADD COLUMN merged_at TIMESTAMPTZ,
     ADD CONSTRAINT fk_receipts_rendition_file FOREIGN KEY (rendition_file_id)
-        REFERENCES receipt.stored_files (id);
+        REFERENCES receipt.stored_files (id),
+    ADD CONSTRAINT fk_receipts_merged_into FOREIGN KEY (merged_into_id)
+        REFERENCES receipt.receipts (id),
+    ADD CONSTRAINT ck_receipts_merged_not_self CHECK (merged_into_id IS NULL OR merged_into_id <> id),
+    ADD CONSTRAINT ck_receipts_merged_at CHECK ((merged_into_id IS NULL) = (merged_at IS NULL));
+CREATE INDEX idx_receipts_merged_into_id ON receipt.receipts (merged_into_id);
+
+CREATE OR REPLACE TRIGGER trg_provenance_link_history_append_only
+    BEFORE UPDATE OR DELETE ON receipt.provenance_link_history
+    FOR EACH ROW EXECUTE FUNCTION receipt.forbid_history_change();
+CREATE OR REPLACE TRIGGER trg_provenance_link_history_no_truncate
+    BEFORE TRUNCATE ON receipt.provenance_link_history
+    FOR EACH STATEMENT EXECUTE FUNCTION receipt.forbid_history_change();
 ```
 
-The `_write` role gets INSERT and SELECT on `provenance_link_history`, but no UPDATE or DELETE, so the history stays append-only at the database level.
+**Append-only, and what that guarantees.** Grants alone don't make `provenance_link_history` append-only in production, where the application connects as `receipt_index`, the owner of every table, and an owner can update and delete regardless of grants. The guard triggers above refuse UPDATE, DELETE and TRUNCATE for every role, the owner included. They use `receipt.forbid_history_change()` from the receipt data-model design. Whichever of the two designs' migrations lands first creates that function, and the other uses `CREATE OR REPLACE` with the same body. Nothing here deletes a provenance record or a receipt, so the triggers need no cascade exception. What isn't guaranteed: a superuser, or the owner disabling the triggers by hand, can still change the history. The triggers stop the application and mistakes, not an administrator.
 
 **Migration sequence** (each step is its own migration file, so each can roll back alone):
 
-1. Create the tables above, and add `receipts.rendition_file_id` as nullable. Drop NOT NULL from `receipts.pdf_path` and `receipts.source_id` (`uq_receipts_source_id` stays: it allows NULLs). From here on, receipts created by `unlink`, or by ingest after cutover to Drive, write NULL to the legacy columns, so neither the NOT NULL nor the UNIQUE constraint blocks them.
-2. Backfill: one `provenance` row per existing receipt, copied from `receipts.source_id`, `source_type`, `source_name`, `file_name` and `email_*`, with `is_primary = true`, `match_method = 'migrated'` and `original_status = 'pending'`. The `received_at` comes from `email_date`, or `created_at` for Drive rows.
+1. Create the tables above, and add `receipts.rendition_file_id` as nullable. Drop NOT NULL from `receipts.pdf_path`, `receipts.source_id`, `receipts.source_name` (NOT NULL since receipt migration 000005) and `receipts.source_type` (NOT NULL since 000001), and drop `source_type`'s `'imap'` default, so a new receipt gets NULL rather than a wrong source type. `uq_receipts_source_id` stays, since it allows NULLs. From here on, receipts created by `unlink`, or by ingest after cutover to Drive, write NULL to the legacy columns, so neither the NOT NULL nor the UNIQUE constraint blocks them.
+2. Backfill: one `provenance` row per existing receipt, copied from `receipts.source_id`, `source_type`, `source_name`, `file_name` and `email_*`, with `is_primary = true`, `home_receipt_id` set to that receipt, `match_method = 'migrated'` and `original_status = 'pending'`. The `received_at` comes from `email_date`, or `created_at` for Drive rows.
 3. The code reads and writes provenance. Idempotency becomes the union of `provenance.source_id` and `ingest_log.source_id`, the same rule as today with `provenance` in place of `receipts`.
 4. Set `rendition_file_id` NOT NULL. This is safe on every backend, because the schema ticket's local hash backfill already sets `rendition_file_id` for every existing receipt; on the production database it runs after the file migration ([section 11](#11-migrating-existing-files)) is verified.
 5. After consumers have moved (one release later): drop `receipts.pdf_path`, `source_id`, `source_type`, `source_name`, `file_name` and `email_*`. The receipt data-model design builds its search document from provenance, so nothing it owns reads those columns.
@@ -379,8 +400,20 @@ def adopt_drive_original(file_id: str, *, source_name: str, received_at: datetim
     # Moves the dropoff file into originals/, sets it read-only, records it.
     # Native Google Docs: also stores a PDF export snapshot (purpose original, role drive_export).
 
-def store_rendition(pdf: bytes, *, receipt_date: date, vendor: str,
+@dataclass(frozen=True)
+class StoredDriveOriginal:
+    file: StoredFile             # the Drive file (for a native Doc, its drive_native row)
+    export: StoredFile | None    # a native Doc's PDF export snapshot; None otherwise
+
+@dataclass(frozen=True)
+class StoredEmail:
+    message: StoredFile          # message.eml
+    attachments: list[StoredFile]  # in MIME order
+
+def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor: str,
                     amount: Decimal) -> StoredFile: ...
+    # Uploads the receipt's own rendition file (step 3 of the order below). Its
+    # file_locations row, tied to receipt_id, is written in step 5's transaction.
 ```
 
 `RawReceipt` gains `raw_bytes`, the exact RFC 822 bytes the IMAP adapter fetched and parsed, so the stored original is byte for byte what extraction read.
@@ -388,15 +421,15 @@ def store_rendition(pdf: bytes, *, receipt_date: date, vendor: str,
 **`adopt_drive_original` is idempotent**, keyed on the Drive file ID:
 
 1. If `file_locations` already has `('drive', file_id)`, return that file.
-2. Otherwise read the file's metadata. If its parent is already under `originals/`, a previous attempt moved it and crashed before recording: record it now and return.
+2. Otherwise read the file's metadata. If its parent is already under `originals/`, a previous attempt moved it and crashed before recording. Set `contentRestrictions.readOnly` (again, if the crash fell between the move and the restriction), record it, and return.
 3. Otherwise move it (`files.update` with `addParents` and `removeParents`, so the file ID stays the same), set `contentRestrictions.readOnly`, record it, and return.
 
 **Order of one successful item:**
 
-1. Fetch. For IMAP, store the original with `store_email_original`.
+1. Fetch. For IMAP, store the original with `store_email_original`. Record the whole-original hash as `provenance.source_sha256`: the `.eml`'s sha256, or the Drive file's `sha256Checksum` read from its metadata. Rule 1 needs only that hash, so it works whether or not the Drive file is ever adopted (the ingest design's `archive: false` default leaves Drive originals `pending`).
 2. **Whole-original match before extraction.** If the whole original's hash links to an existing receipt under rule 1 ([section 8](#8-provenance-and-duplicates)), the item joins that receipt and the LLM call is skipped. Identical bytes mean an identical receipt, so the kind, vendor and amount are the same by construction. No other rule runs before extraction.
 3. Otherwise extract, then apply rules 2 to 4, which need the extracted kind, vendor, paid amount and receipt document. If the item joins an existing receipt, it stores no rendition. Otherwise render, validate the PDF ([section 9](#9-pdf-validation-at-ingest)), and store the new receipt's rendition.
-4. For Drive, adopt the original. This is the same step as the ingest design's archive move.
+4. For a Drive source with `archive: true`, adopt the original. This is the same step as the ingest design's archive move. With `archive: false`, nothing moves and `original_status` stays `pending` until `backfill --originals-only` adopts it.
 5. One transaction: the receipt (if new), the provenance row, its `provenance_files`, any order-number link or duplicate candidate, the link history row, and the `ingest_log` row.
 6. After the commit, the IMAP tidy-up `MOVE` to the mail archive folder (owned by the ingest design).
 
@@ -405,7 +438,7 @@ def store_rendition(pdf: bytes, *, receipt_date: date, vendor: str,
 | Crash or failure after | State left | Recovery |
 |------------------------|-----------|----------|
 | An IMAP original was stored (step 1) | Stored files with no provenance | The retry's `put` finds the hashes and reuses them. `verify --orphans` reports any left for good |
-| A rendition was stored (step 3) | A rendition with no receipt | The same: the retry reuses it, or `verify --orphans` reports it |
+| A rendition was uploaded (step 3) | A Drive rendition file with no location row | The retry uploads a fresh one (the receipt ID is new each attempt). `verify --orphans` reports the unrecorded file |
 | A Drive adopt (step 4) | The file in `originals/` (or, under the copy fallback, copied, with the dropoff file in `processed/`), no receipt | The changes feed can't be relied on, since the file's parents no longer include the dropoff folder. The ingest design's retry scheduler requeues the item from its started record, finds the file by its ID, and the idempotent adopt returns the existing record before the commit |
 | Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's retry policy |
 | The commit (step 5) | Nothing committed | The whole item is retried. Every earlier step is idempotent |
@@ -431,16 +464,18 @@ A receipt is one purchase (or one refund). A provenance record is one source ite
 
 | # | Match | Result |
 |---|-------|--------|
-| 1 | **Whole original:** the new item's original (the `.eml`, the Drive file or a native Doc's export) has the same sha256 as an existing provenance record's original | Link (`original_hash`) |
+| 1 | **Whole original:** the new item's `source_sha256` (the `.eml`, the Drive file's checksum, or a native Doc's export) equals an existing provenance record's | Link (`original_hash`) |
 | 2 | **Receipt document:** the new item's receipt document has the same sha256 as an existing provenance record's receipt document, *and* both are `certain` (see [The receipt document](#2-what-is-stored)), *and* the guard below passes | Link (`document_hash`) |
-| 3 | **Order number:** the same order or invoice number, the same normalized vendor and the same paid amount | Link (`order_number`) |
+| 3 | **Order number:** the same order or invoice number, the same normalized vendor, the same paid amount (non-null and greater than zero on both sides), the same receipt date, and, where both receipts have line items, the same items | Link (`order_number`). If the order number, vendor and amount match but the date or the items differ, flag (`order_number_conflict`) and don't link |
 | 4 | **Metadata only:** the same normalized vendor and paid amount, and dates within three days, with nothing above matching | Flag in `duplicate_candidates` (`metadata`). Never link |
 
-**What rule 1 covers in practice.** A repeated email is caught before rule 1 by idempotency: `provenance.source_id` (the Message-ID) is unique across every source, as `receipts.source_id` is today, so the same message arriving in a second mailbox is skipped. Two different emails always differ in bytes, since each mail server adds its own headers. Rule 1 therefore links mainly identical Drive files (the same scan dropped twice, with two file IDs), and a re-fetched item whose first attempt crashed.
+**What rule 1 covers in practice.** A repeated email is caught before rule 1 by idempotency: `provenance.source_id` (the Message-ID) is unique across every source, as `receipts.source_id` is today, so the same message arriving in a second mailbox is skipped. Two different emails always differ in bytes, since each mail server adds its own headers. Rule 1 therefore links identical Drive files: the same scan dropped twice, with two file IDs. (A retried item never reaches it, because its crashed attempt left no provenance row.) A native Doc that isn't adopted has no export and no hash, so rule 1 skips it.
 
 **Attachments other than the receipt document never match.** Unrelated receipts often share boilerplate attachments: a vendor's terms-and-conditions PDF, a logo, an inline image. Rule 2 compares receipt documents only, never "any attachment", and an ambiguous receipt document takes no part in it.
 
 **The guard on rule 2.** Rule 2 links only when the new item's extracted kind, normalized vendor and paid amount all match the existing receipt. If the hashes match but any of those differ, the bytes aren't the receipt on their own: perhaps a generic invoice template, a refund that re-attaches the original invoice, or a mis-picked boilerplate PDF. The item becomes a new receipt, and the pair is flagged with `document_hash_conflict`.
+
+**Why rule 3 checks the date and the items.** An order shipped in parts and charged once per shipment, in equal amounts, has one order number, one vendor and one amount, but two charges. A forward or a rescan of one charge has the same date and the same items. A split shipment almost always differs in one of them, so it is flagged for review, never linked. A null or zero paid amount (a receipt the extraction couldn't price, or a zero-amount receipt) never links by order number.
 
 **Only rule 1 runs before extraction.** Rules 2 to 4 need the kind, vendor, paid amount, order number and receipt document that extraction produces, so they run after it, in step 3 of the write path. Until the data-model design's extraction reports which attachment held the receipt, every email receipt document is `ambiguous`, so rule 2 applies only to Drive sources.
 
@@ -448,9 +483,11 @@ A receipt is one purchase (or one refund). A provenance record is one source ite
 
 **Undo and manual links:**
 
-- `receipt-index unlink <provenance-id> --reason TEXT` moves a provenance record out to a new receipt of its own. The new receipt starts as a copy of the old receipt's fields, marked for re-extraction (the data-model design's `reextract`), and its primary is the moved provenance. It gets its own rendition location, rendered from the moved provenance's original, so renaming either receipt's rendition never touches the other's. If the old receipt's primary moves, its oldest remaining provenance becomes primary.
-- `receipt-index link <provenance-id> <receipt-id> --reason TEXT` merges by hand (`manual`). The receipt that is left with no provenance is deleted in the same transaction. Its rendition file isn't deleted: it moves to `renditions/superseded/`, and its location row is removed with the receipt (the `stored_files` row stays). If that receipt carries anything a person or agent set (tags, external links, edited fields, or refunds pointing at it, all from the data-model design), the command refuses and names them, so nothing is lost silently.
-- `receipt-index duplicates scan` runs rules 1 to 4, with the same guards and the same-kind rule, over receipts that already exist. Today's duplicates were ingested before any rule existed, so without a scan they would go on double-counting past periods. It runs once after the rendition hash backfill and the originals backfill, and again at will. Its links are recorded with actor `duplicates-scan`, kind `system`, and a reason.
+**A merge keeps the emptied receipt.** When a link moves a receipt's last provenance record to another receipt, the emptied receipt isn't deleted. It is marked `merged_into_id` (the receipt that remains) with `merged_at`, and the link history records a `merge`. Everything attached to it stays where it is: its extractions and events (the data-model design's `ON DELETE CASCADE` tables never fire, since nothing is deleted), its rendition and rendition location (for a back-catalogue receipt whose original is `unavailable`, that rendition is the only evidence), and its `refund_of`. Merged receipts are left out of search, totals and packets. The data-model design's `receipt_net` view counts a refund against the purchase that remains (`COALESCE(purchase.merged_into_id, purchase.id)`), and leaves a merged refund out, so net paid stays right without rewriting `refund_of`. `show` on a merged receipt says what it was merged into, and `show` on the receipt that remains lists what was merged into it.
+
+- `receipt-index link <provenance-id> <receipt-id> --reason TEXT` merges by hand (`manual`). A merge is refused, and names what blocks it, when the receipt it would empty carries anything a person or agent set: tags, external links or hand-edited fields (the data-model design's records). Those would drop out of search with the merged receipt, so a person moves or removes them first. A refund pointing at it doesn't block, since the view follows the merge.
+- `receipt-index unlink <provenance-id> --reason TEXT` moves a provenance record out to a receipt of its own. If the record has a `home_receipt_id` that was merged, that receipt is restored: `merged_into_id` cleared and an `unmerge` recorded, with its fields, extractions, events and rendition as they were. Otherwise (the item joined an existing receipt at ingest, so no receipt was ever created for it), a new receipt is created as a copy of the old receipt's fields, marked for re-extraction (the data-model design's `reextract`), with its own rendition location rendered from the moved provenance's original. Such an item always has a stored original, since rules 1 to 3 run at ingest, when the original is in hand. If the old receipt's primary moves, its oldest remaining provenance becomes primary.
+- `receipt-index duplicates scan` runs rules 1 to 4, with the same guards and the same-kind rule, over receipts that already exist. Today's duplicates were ingested before any rule existed, so without a scan they would go on double-counting past periods. It runs once after the rendition hash backfill and the originals backfill, and again at will. Its links are recorded with actor `duplicates-scan`, kind `system`, and a reason. It applies the same refusal as `link`: a pair whose merge is blocked is flagged (`merge_blocked`) rather than linked.
 - `receipt-index duplicates [--status open]` lists flagged pairs. `duplicates dismiss <id>` and `duplicates link <id>` decide them.
 - Every link and unlink writes `provenance_link_history` with the actor, the actor kind (system, person or agent) and the reason. An agent may run `duplicates` and `unlink`, recorded as `agent`. Search and `show --output json` gain `provenance` (the list) and `suspected_duplicate_of` (open candidates), so a packet builder can see both.
 
@@ -504,6 +541,15 @@ The command prints the counts. The runbook records them as the cutover's evidenc
 | `stored_files`, `file_locations`, `provenance`, `provenance_files`, `duplicate_candidates`, `provenance_link_history` | The receipt's own fields: paid amount, `kind`, `refund_of`, order number, payment fields, field confidence, `search_document` |
 | `receipts.rendition_file_id`, replacing `pdf_path` | Line items, tags and tag history, external links |
 | Moving `source_*`, `file_name` and `email_*` off `receipts` onto `provenance` | `receipt.extractions` (extraction history), with an `input_file_id` referencing `stored_files`, so each run records which file it read |
+| `receipts.merged_into_id` and `merged_at`, and what a merge does | Leaving merged receipts out of search, totals and `receipt_net`, and counting a refund against the purchase that remains |
+
+**Dependencies on the data-model design.** It has agreed to provide these, and this design relies on them:
+- the extraction's `receipt_document` field (ticket 2 there);
+- `extractions.input_file_id` (the migration that lands second adds its foreign key to `stored_files`);
+- `receipt.forbid_history_change()`;
+- leaving merged receipts out of search, totals and `receipt_net`.
+
+Until the `receipt_document` field exists, rule 2 applies to Drive sources only.
 
 Where they meet:
 
@@ -543,7 +589,11 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 - A refund email that re-attaches its purchase's invoice PDF: not linked (rule 2 guard, `document_hash_conflict`).
 - Attachment naming: a `../` filename, a filename with control characters, and a very long one, all stored under safe names inside the store root, with the raw names kept in `provenance_files`.
 - Duplicate rules: each rule's positive and negative cases, including two identical parking charges (flagged, not linked), a shared terms-and-conditions PDF across two vendors (not linked), the rule 2 guard (`document_hash_conflict`), and a refund with the purchase's order number and amount (not linked).
-- `link` and `unlink` round trip, including a primary that moves, with history rows written.
+- `link` and `unlink` round trip, including a primary that moves, with history rows written. A merge keeps the emptied receipt's extractions, events and rendition. `unlink` restores a merged receipt exactly, including one whose original is `unavailable`.
+- A merge is refused when the emptied receipt has tags, links or hand edits, and `duplicates scan` flags that pair as `merge_blocked`.
+- Rule 3: two equal charges on one order on different dates, and two with different line items, are flagged, not linked. A null or zero paid amount never links.
+- The application role can't UPDATE, DELETE or TRUNCATE `provenance_link_history`, tested as the owning role, as in production.
+- An email attachment whose bytes match an adopted (operator-owned) Drive file still gets its own store-owned copy.
 - The Drive guard: one test per row of the guard table, plus the import check.
 - PDF validation: a clean PDF, a PDF with a broken header that repairs, and an unparseable one, each a committed fixture.
 
@@ -555,7 +605,7 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 - The same Message-ID in a second source is skipped by idempotency.
 - Two receipts whose renditions have identical bytes each get their own rendition location, and renaming one leaves the other alone.
 - `link` on a flagged pair deletes the emptied receipt, and the candidate row survives as `linked`.
-- Append-only history: the `_write` role can't UPDATE or DELETE `provenance_link_history`.
+- Two concurrent `put`s of the same bytes end with one `stored_files` row.
 
 ### Drive Backend
 
@@ -597,5 +647,5 @@ Each new check is first seen to fail against a planted defect, per the project's
 |---|----------|-----------------------|
 | 1 | **Can the store account move an operator-owned file out of the shared dropoff folder into a folder it owns, and set a read-only restriction on it?** Google's documentation doesn't say so clearly for My Drive. Even if it can, the moved file stays owned by the operator's account: it counts against the operator's quota, and the operator can still delete it. The fallback is for the store account to **copy** the file into `originals/` (a file it owns, verified by `sha256Checksum`) and move the dropoff file into the dropoff's own `processed/` subfolder, which leaves a second copy in the operator's Drive. **The fallback's contract:** adoption stays keyed on the *dropoff* file ID, which stays the provenance `source_id`; the copy's own file ID is the `drive` location's locator. Before copying, a retry looks in the target `originals/` folder for a file with the same `sha256Checksum` and records that copy rather than making another. The guard's two fallback rows (copy into `originals/`, move into `processed/`) are on only when the config selects the fallback. | The Drive backend ticket checks it against a scratch folder as its first step and reports the result on its issue. The operator then confirms the move as signed off, or chooses the copy fallback. The always-on ingest design's archive step follows whichever is chosen |
 | 2 | The date window for rule 4 (three days proposed) | The operator, at the review of the duplicates ticket, with data from the first `duplicates scan` |
-| 3 | **Should rule 3 (order number) also require dates within a window?** If the extraction reads a stable number (a permit, account or subscription number) as the order number, monthly charges for the same amount would link. A window would narrow a rule the operator settled, so it is not in this design | The operator, at the review of the duplicates ticket, once the data-model design's extraction shows how well it tells order numbers from account numbers |
+| 3 | **Is rule 3's same-date-and-items condition right?** It keeps equal split-shipment charges from linking, and also stops monthly charges that share a stable number (a permit, account or subscription number read as the order number) from linking. It narrows a rule the operator settled, so the operator confirms it | The operator, at the review of the duplicates ticket, once the data-model design's extraction shows how well it tells order numbers from account numbers |
 | 4 | When to retire the local tree and its Dropbox mirror | The operator, after the second-copy feature lands |
