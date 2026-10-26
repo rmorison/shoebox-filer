@@ -62,6 +62,9 @@ class ItemRef:
     drive_meta: dict[str, Any] | None = None
     file_name: str | None = None
     skip_reason: str | None = None
+    # Set when the source refused even this item's headers: fetching it
+    # fails as an item error, so it gets a failed row and the cursor passes.
+    unreadable: str | None = None
 
 
 @dataclass

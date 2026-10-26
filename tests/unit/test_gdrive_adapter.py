@@ -642,6 +642,17 @@ class TestPoll:
         with pytest.raises(RuntimeError, match="bad page token"):
             _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
 
+    def test_a_repeating_listing_token_fails_instead_of_looping(self) -> None:
+        drive = FakeDrive()
+
+        def repeating(**_: Any) -> _Req:
+            return _Req(lambda: {"files": [], "nextPageToken": "same"})
+
+        drive.list = repeating  # type: ignore[method-assign]
+        adapter = _adapter(drive)
+        with pytest.raises(RuntimeError, match="bad page token"):
+            adapter._list_files(drive)
+
     def test_other_errors_propagate(self) -> None:
         error = _http_error(400, b'{"error": {"message": "Bad fields"}}')
         drive = FakeDrive(list_error=error)
@@ -707,6 +718,15 @@ class TestDownloadErrors:
                 403,
                 b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}',
             ),
+            _http_error(401, b'{"error": {"message": "Invalid Credentials"}}'),
+            _http_error(
+                403, b'{"error": {"errors": [{"reason": "dailyLimitExceeded"}]}}'
+            ),
+            _http_error(403, b'{"error": {"errors": [{"reason": "quotaExceeded"}]}}'),
+            _http_error(
+                403, b'{"error": {"errors": [{"reason": "insufficientPermissions"}]}}'
+            ),
+            _http_error(403, b'{"error": {"errors": [{"reason": "domainPolicy"}]}}'),
             TimeoutError("timed out"),
             http.client.IncompleteRead(b"partial"),
             httplib2.ServerNotFoundError("Unable to find the server"),
@@ -718,6 +738,11 @@ class TestDownloadErrors:
             "500",
             "429",
             "403-rate-limit",
+            "401",
+            "403-daily-limit",
+            "403-quota",
+            "403-insufficient-permissions",
+            "403-domain-policy",
             "timeout",
             "cut-off-body",
             "dns",

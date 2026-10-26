@@ -18,7 +18,7 @@ from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from imapclient import IMAPClient
-from imapclient.exceptions import IMAPClientError
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import Attachment, ItemRef, RawReceipt, SourceRead
@@ -46,6 +46,10 @@ _BODY_KEY = b"BODY[]"
 _FETCH_BATCH = 500
 
 
+class MessageRefusedError(Exception):
+    """The server, on a healthy session, refused one message: an item error."""
+
+
 def _header_bytes(data: dict[bytes, Any]) -> bytes | None:
     """Find the header-fields section in one message's FETCH response.
 
@@ -70,6 +74,9 @@ class ImapAdapter:
         # The folder's UIDVALIDITY as list_new saw it: the UIDs in its refs
         # mean something only while it is unchanged.
         self._uidvalidity: int | None = None
+        # Whether the last reconnect logged in and re-selected the folder, so
+        # an error after it is the message's, not the session's.
+        self._selected_ok = False
 
     @property
     def folder(self) -> str:
@@ -185,8 +192,11 @@ class ImapAdapter:
         items: list[ItemRef] = []
         for i in range(0, len(uids), _FETCH_BATCH):
             batch = uids[i : i + _FETCH_BATCH]
-            response = client.fetch(batch, [_HEADER_FETCH])
+            response, refused = self._fetch_headers(client, batch)
             for uid in batch:
+                if uid in refused:
+                    items.append(self._unreadable_ref(uid, uidvalidity, refused[uid]))
+                    continue
                 data = response.get(uid)
                 headers = _header_bytes(data) if data else None
                 if headers is None:
@@ -200,6 +210,54 @@ class ImapAdapter:
             uidvalidity=uidvalidity,
             start_uid=start_uid,
             searched_uids=uids,
+        )
+
+    @staticmethod
+    def _fetch_headers(
+        client: IMAPClient, batch: list[int]
+    ) -> tuple[dict[int, dict[bytes, Any]], dict[int, str]]:
+        """Fetch a batch's headers; fall back to one UID at a time on a NO.
+
+        A server that refuses one message (a tagged NO or BAD, for example a
+        corrupt message file) fails the whole batch command. Fetching each
+        UID alone keeps the others readable and names the refused ones. A
+        dropped connection still propagates: that is the source's problem.
+        """
+        try:
+            response: dict[int, dict[bytes, Any]] = client.fetch(batch, [_HEADER_FETCH])
+            return response, {}
+        except IMAPClientAbortError:
+            raise
+        except IMAPClientError as exc:
+            logger.warning(
+                "Header fetch of %d UIDs refused (%s); fetching one at a time",
+                len(batch),
+                exc,
+            )
+        response = {}
+        refused: dict[int, str] = {}
+        for uid in batch:
+            try:
+                response.update(client.fetch([uid], [_HEADER_FETCH]))
+            except IMAPClientAbortError:
+                raise
+            except IMAPClientError as exc:
+                refused[uid] = str(exc)
+        return response, refused
+
+    def _unreadable_ref(self, uid: int, uidvalidity: int, reason: str) -> ItemRef:
+        """A ref for a message whose headers the server refuses.
+
+        It has no Message-ID to key on, so its ID names the folder position.
+        Recording it as failed lets the cursor pass it rather than stall the
+        source on it every run.
+        """
+        logger.warning("Server refused the headers of UID %d: %s", uid, reason)
+        return ItemRef(
+            source_id=f"imap-uid:{self.config.folder}:{uidvalidity}:{uid}",
+            source_type="imap",
+            imap_uid=uid,
+            unreadable=f"server refused the message headers: {reason}",
         )
 
     def _ref(self, uid: int, headers: bytes) -> ItemRef:
@@ -229,6 +287,8 @@ class ImapAdapter:
         """
         if ref.imap_uid is None:
             raise ValueError(f"IMAP ref without a UID: {ref.source_id}")
+        if ref.unreadable is not None:
+            raise MessageRefusedError(ref.unreadable)
         response = self._fetch_body(ref.imap_uid)
         data = response.get(ref.imap_uid)
         raw = data.get(_BODY_KEY) if data else None
@@ -239,10 +299,14 @@ class ImapAdapter:
     def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:
         """Fetch one body, reconnecting once if the connection fails.
 
-        Any connection or protocol error is the server's, not the message's
-        (a message that has gone comes back as an empty response). After one
-        reconnect, which re-selects the folder and checks its UIDVALIDITY, a
-        second failure raises ``SourceUnavailableError``.
+        A first failure of any kind gets one reconnect, which re-selects the
+        folder and checks its UIDVALIDITY (a message that has gone comes back
+        as an empty response, not an error). After that:
+
+        - a dropped connection, or a reconnect that fails, is the server's
+          problem: ``SourceUnavailableError``;
+        - a tagged NO or BAD on the healthy new session is this message's
+          problem: ``MessageRefusedError``, an item error.
         """
         try:
             result: dict[int, dict[bytes, Any]] = self._session().fetch(
@@ -256,7 +320,14 @@ class ImapAdapter:
             self._reselect()
             result = self._session().fetch([uid], [_BODY_FETCH])
             return result
-        except (OSError, IMAPClientError, ConnectionError) as exc:
+        except (OSError, IMAPClientAbortError, ConnectionError) as exc:
+            self._drop_client()
+            raise SourceUnavailableError(
+                f"IMAP connection to {self.config.host} failed: {exc}"
+            ) from exc
+        except IMAPClientError as exc:
+            if self._client is not None and self._selected_ok:
+                raise MessageRefusedError(f"server refused UID {uid}: {exc}") from exc
             self._drop_client()
             raise SourceUnavailableError(
                 f"IMAP connection to {self.config.host} failed: {exc}"
@@ -277,6 +348,7 @@ class ImapAdapter:
         A changed UIDVALIDITY means the UIDs in hand point at other messages:
         stop the source, and the next run's list_new resets the cursor.
         """
+        self._selected_ok = False
         info = self._session().select_folder(self.config.folder, readonly=True)
         uidvalidity = int(info[b"UIDVALIDITY"])
         if self._uidvalidity is not None and uidvalidity != self._uidvalidity:
@@ -284,6 +356,7 @@ class ImapAdapter:
                 f"UIDVALIDITY of {self.config.folder} changed during the run "
                 f"({self._uidvalidity} -> {uidvalidity})"
             )
+        self._selected_ok = True
 
     def _parse_message(self, msg: Message, source_id: str) -> RawReceipt:
         """Convert an email Message to a RawReceipt."""
@@ -316,7 +389,8 @@ class ImapAdapter:
         """
         message_id = msg.get("Message-ID")
         if message_id:
-            return message_id.strip()
+            # 8-bit bytes come back as an email.header.Header, not a str.
+            return str(message_id).strip()
 
         subject = msg.get("Subject", "")
         date = msg.get("Date", "")

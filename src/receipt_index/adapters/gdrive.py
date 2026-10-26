@@ -46,6 +46,18 @@ UNSUPPORTED_REASON = "unsupported file type"
 # A changes feed longer than this is treated as an API error rather than paged
 # for ever (at 1000 changes a page, that is ten million changes).
 _MAX_CHANGE_PAGES = 10_000
+# The same guard for the bootstrap listing (at 100 files a page, a million).
+_MAX_LIST_PAGES = 10_000
+
+# 403 reasons that refuse the whole account or project, not one file.
+_ACCOUNT_WIDE_403 = (
+    b"rateLimitExceeded",
+    b"userRateLimitExceeded",
+    b"dailyLimitExceeded",
+    b"quotaExceeded",
+    b"insufficientPermissions",
+    b"domainPolicy",
+)
 
 
 def _parse_drive_date(date_str: str) -> datetime:
@@ -81,9 +93,10 @@ def _is_invalid_token_error(exc: Exception) -> bool:
 def _is_transient_error(exc: Exception) -> bool:
     """Whether a download error is the service's, not the file's.
 
-    Rate limits (429, or a 403 naming a rate limit), server errors (5xx) and
-    network or credential failures are the service's; a 404 means the file
-    itself is gone.
+    Rate limits (429), revoked credentials (401), a 403 naming an
+    account-wide limit or policy, server errors (5xx) and network or
+    credential failures are the service's; a 404, or a 403 on one file, is
+    that file's.
     """
     import http.client
 
@@ -106,15 +119,13 @@ def _is_transient_error(exc: Exception) -> bool:
     if not isinstance(exc, HttpError):
         return False
     status = int(exc.resp.status)
-    if status == 429 or status >= 500:
+    # 401: the credentials no longer work, for every file.
+    if status in (401, 429) or status >= 500:
         return True
     content = exc.content or b""
     if isinstance(content, str):
         content = content.encode()
-    rate_limited = (
-        b"rateLimitExceeded" in content or b"userRateLimitExceeded" in content
-    )
-    return status == 403 and rate_limited
+    return status == 403 and any(reason in content for reason in _ACCOUNT_WIDE_403)
 
 
 def _skip_reason(mime_type: str) -> str | None:
@@ -348,7 +359,7 @@ class GdriveAdapter:
         page_token: str | None = None
         query = f"'{self.config.folder_id}' in parents and trashed = false"
 
-        while True:
+        for _page in range(_MAX_LIST_PAGES):
             request_kwargs: dict[str, Any] = {
                 "q": query,
                 "fields": _FILE_FIELDS,
@@ -361,9 +372,18 @@ class GdriveAdapter:
             files = response.get("files", [])
             all_files.extend(files)
 
-            page_token = response.get("nextPageToken")
-            if page_token is None:
+            next_page = response.get("nextPageToken")
+            if next_page is None:
                 break
+            if not isinstance(next_page, str) or next_page == page_token:
+                raise RuntimeError(
+                    f"Drive folder listing returned a bad page token: {next_page!r}"
+                )
+            page_token = next_page
+        else:
+            raise RuntimeError(
+                f"Drive folder listing longer than {_MAX_LIST_PAGES} pages"
+            )
 
         logger.info(
             "Listed %d files in Drive folder %s",

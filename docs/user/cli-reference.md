@@ -90,7 +90,7 @@ At the start of each run, `ingest` logs a warning listing any item whose process
 
 Useful for cron job monitoring.
 
-**Note on `--dry-run`**: In dry-run mode, all items that would be processed are counted as "Skipped" in the output summary. A dry run reads only the new range and writes nothing: no records and no change to the stored read position.
+**Note on `--dry-run`**: In dry-run mode, all items that would be processed are counted as "Skipped" in the output summary. A dry run reads only the new range and writes nothing: no records and no change to the stored read position. It still takes each source's lock while it reads, so a scheduled `ingest` that starts during a dry run exits with code 3 for that source.
 
 ---
 

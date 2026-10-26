@@ -18,7 +18,7 @@ import pytest
 from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginError
 
 from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
-from receipt_index.adapters.imap import ImapAdapter
+from receipt_index.adapters.imap import ImapAdapter, MessageRefusedError
 from receipt_index.models import ItemRef, SyncState
 
 if TYPE_CHECKING:
@@ -275,6 +275,8 @@ class FakeIMAPClient:
         self.fetches: list[tuple[list[int], list[str]]] = []
         self.logged_out = False
         self.drop_headers: set[int] = set()
+        # UIDs the server answers with a tagged NO (e.g. a corrupt file).
+        self.refuse: set[int] = set()
 
     def login(self, username: str, password: str) -> None:
         pass
@@ -298,6 +300,8 @@ class FakeIMAPClient:
     def fetch(self, uids: list[int], items: list[str]) -> dict[int, dict[bytes, Any]]:
         if self.selected is None:  # a real server answers BAD
             raise IMAPClientError("FETCH command error: BAD [No mailbox selected]")
+        if self.refuse & set(uids):
+            raise IMAPClientError("FETCH command error: NO [Message file corrupt]")
         self.fetches.append((list(uids), list(items)))
         out: dict[int, dict[bytes, Any]] = {}
         for uid in uids:
@@ -700,3 +704,122 @@ class TestHeaderBatches:
             uids for uids, items in fake.fetches if items != ["BODY.PEEK[]"]
         ]
         assert header_batches == [[1, 2], [3, 4], [5]]
+
+
+class TestRefusedMessages:
+    """A server that refuses one message stalls nothing but that message."""
+
+    def test_refused_body_after_a_good_reconnect_is_an_item_error(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        first = FakeIMAPClient({1: _mail(1)})
+        first.selected = ("INBOX", True)
+        first.refuse = {1}
+        fresh = FakeIMAPClient({1: _mail(1)})
+        fresh.refuse = {1}
+        adapter = ImapAdapter(imap_config)
+        adapter._client = first  # type: ignore[assignment]
+        adapter._uidvalidity = 7
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+
+        with (
+            patch.object(adapter, "_connect", return_value=fresh),
+            pytest.raises(MessageRefusedError, match="corrupt"),
+        ):
+            adapter.fetch(ref)
+        assert fresh.selected == ("INBOX", True)
+
+    def test_refused_header_batch_falls_back_one_uid_at_a_time(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient
+    ) -> None:
+        fake.refuse = {2}
+        read = adapter.list_new(None)
+
+        assert [r.imap_uid for r in read.items] == [1, 2, 5]
+        good = [r for r in read.items if r.unreadable is None]
+        assert [r.source_id for r in good] == [
+            "<msg-1@example.com>",
+            "<msg-5@example.com>",
+        ]
+        (bad,) = [r for r in read.items if r.unreadable is not None]
+        assert bad.source_id == "imap-uid:INBOX:7:2"
+        assert "corrupt" in bad.unreadable
+        with pytest.raises(MessageRefusedError):
+            adapter.fetch(bad)
+
+    def test_dropped_connection_during_headers_still_fails_the_read(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient
+    ) -> None:
+        def drop(*_: Any, **__: Any) -> Any:
+            raise IMAPClientAbortError("socket error: EOF")
+
+        fake.fetch = drop  # type: ignore[method-assign]
+        with pytest.raises(IMAPClientAbortError):
+            adapter.list_new(None)
+
+    def test_cursor_passes_a_refused_message(
+        self,
+        imap_config: ImapSourceConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """End to end through the pipeline with the real adapter."""
+        from receipt_index import pipeline
+        from tests.unit.test_pipeline import FakeRepo, _extraction
+
+        fake = FakeIMAPClient({1: _mail(1), 2: _mail(2), 3: _mail(3)})
+        fake.refuse = {2}
+        adapter = ImapAdapter(imap_config)
+        adapter._client = fake  # type: ignore[assignment]
+        repo = FakeRepo()
+        for name in (
+            "get_sync_state",
+            "record_poll",
+            "get_processed_source_ids",
+            "is_source_id_known",
+            "insert_ingest_log",
+            "insert_receipt",
+            "save_imap_cursor",
+            "save_drive_cursor",
+            "item_lock",
+        ):
+            monkeypatch.setattr(pipeline, name, getattr(repo, name))
+        monkeypatch.setattr(
+            pipeline, "extract_metadata", MagicMock(return_value=_extraction())
+        )
+        monkeypatch.setattr(pipeline, "render_pdf", MagicMock(return_value=b"%PDF"))
+        store = MagicMock()
+        store.save.return_value = "x.pdf"
+
+        result = pipeline.run_ingest(
+            conn=MagicMock(),
+            adapter=adapter,
+            store=store,
+            source_name="test-imap",
+            source_type="imap",
+        )
+
+        assert result.source_error is None
+        assert result.processed == 2
+        assert result.failed == 1
+        assert repo.statuses("imap-uid:INBOX:7:2") == ["started", "failed"]
+        assert repo.imap_saves[-1] == (7, 3, False)
+
+
+class TestNonAsciiMessageId:
+    def test_eight_bit_message_id_gives_a_ref(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        msg = (
+            b"Message-ID: <caf\xe9-1@example.com>\r\n"
+            b"Subject: Receipt\r\n"
+            b"From: shop@example.com\r\n\r\nbody\r\n"
+        )
+        fake = FakeIMAPClient({1: msg})
+        adapter = ImapAdapter(imap_config)
+        adapter._client = fake  # type: ignore[assignment]
+
+        (ref,) = adapter.list_new(None).items
+
+        assert ref.source_id.startswith("<caf")
+        assert ref.source_id.endswith("-1@example.com>")
+        assert ref.source_id == ImapAdapter._get_message_id(message_from_bytes(msg))
