@@ -269,6 +269,7 @@ def seed_email(
     text_body: str | None = None,
     html_body: str | None = None,
     pdf_attachment: tuple[str, bytes] | None = None,
+    message_id: str | None = None,
 ) -> None:
     """Send a test email to GreenMail via SMTP.
 
@@ -292,6 +293,8 @@ def seed_email(
     msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
+    if message_id is not None:
+        msg["Message-ID"] = message_id
 
     with smtplib.SMTP("localhost", _GREENMAIL_SMTP_PORT) as smtp:
         smtp.send_message(msg)
