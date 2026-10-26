@@ -37,8 +37,9 @@ this document says was charged.
   - When the document shows that nothing has been paid (an unpaid invoice), \
 use 0.
   - For a refund, what was returned to the payer's payment methods, excluding \
-any part returned as store credit, a gift card or points, as a positive \
-number, never negative.
+any part returned as store credit, a gift card or points. It is never \
+negative: use 0 when all of it was returned as store credit, a gift card or \
+points.
   - When the document does not say what was paid or returned, use null. \
 Never copy amount into paid_amount: null means not known, and 0 means nothing \
 was charged.

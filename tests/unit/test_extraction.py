@@ -629,7 +629,8 @@ _PAID_AMOUNT_RULES = {
     "refund excludes store credit": "returned as store credit, a gift card or points",
     "unknown is null": "does not say what was paid or returned, use null",
     "never copied from amount": "Never copy amount into paid_amount",
-    "refund is a positive number": "as a positive number, never negative",
+    "refund is never negative": "never negative",
+    "store-credit refund is 0": "0 when all of it was returned as store credit",
 }
 
 
