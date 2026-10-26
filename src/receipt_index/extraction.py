@@ -305,8 +305,7 @@ def extract_from_rendition(
     logger.info("Rendition text insufficient, using vision")
     result = agent.run_sync(
         [
-            "Extract receipt metadata from this stored receipt document.\n\n"
-            f"{header}",
+            f"Extract receipt metadata from this stored receipt document.\n\n{header}",
             BinaryContent(data=pdf_bytes, media_type="application/pdf"),
         ]
     )
