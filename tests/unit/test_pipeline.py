@@ -103,6 +103,9 @@ class FakeRepo:
     # Became known between listing and locking (finished by someone else).
     known_after_listing: set[str] = field(default_factory=set)
     fail_on_started: set[str] = field(default_factory=set)
+    extractions: list[dict[str, Any]] = field(default_factory=list)
+    # Every write in order, to check what commits with what.
+    writes: list[str] = field(default_factory=list)
 
     def known(self) -> set[str]:
         return {sid for sid, _ in self.rows} | self.receipts
@@ -127,12 +130,18 @@ class FakeRepo:
         if status == "started" and source_id in self.fail_on_started:
             raise RuntimeError("database went away")
         self.rows.append((source_id, status))
+        self.writes.append(f"ingest_log:{status}")
         self.row_kwargs.append({"source_id": source_id, "status": status, **kwargs})
 
     def insert_receipt(self, conn: Any, *, source_id: str, **kwargs: Any) -> Receipt:
         self.receipts.add(source_id)
+        self.writes.append("receipt")
         self.receipt_kwargs.append({"source_id": source_id, **kwargs})
         return Receipt.model_validate({**_RECEIPT_ROW, "source_id": source_id})
+
+    def insert_extraction(self, conn: Any, **kwargs: Any) -> None:
+        self.writes.append("extraction")
+        self.extractions.append(kwargs)
 
     def save_imap_cursor(
         self, conn: Any, *, uidvalidity: int, last_uid: int, reset: bool, **_: Any
@@ -302,6 +311,7 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
         "is_source_id_known",
         "insert_ingest_log",
         "insert_receipt",
+        "insert_extraction",
         "save_imap_cursor",
         "save_drive_cursor",
         "item_lock",
@@ -330,6 +340,7 @@ def _store() -> MagicMock:
 
 
 def _run(adapter: FakeAdapter, **kwargs: Any) -> IngestResult:
+    kwargs.setdefault("llm_model", "test-model")
     return run_ingest(
         conn=MagicMock(),
         adapter=adapter,  # type: ignore[arg-type]
@@ -485,6 +496,7 @@ class TestFetchErrors:
             store=_store(),
             source_name="personal-email",
             source_type="imap",
+            llm_model="test-model",
         )
         assert events[:2] == ["commit", "fetch"]
 
@@ -738,6 +750,7 @@ class TestPaidAmountPassThrough:
             store=store,
             source_name="personal-email",
             source_type="imap",
+            llm_model="test-model",
         )
 
         (receipt_kwargs,) = repo.receipt_kwargs
@@ -771,3 +784,77 @@ class TestPaidAmountPassThrough:
         assert result.skipped == 1
         skipped = next(k for k in repo.row_kwargs if k["status"] == "skipped")
         assert skipped["paid_amount"] == Decimal("30.00")
+
+
+# ---------------------------------------------------------------------------
+# Extraction history (receipt data-model design, §3)
+# ---------------------------------------------------------------------------
+
+
+class TestIngestRecordsItsExtraction:
+    def test_success_writes_an_ingest_extraction(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+
+        _run(FakeAdapter(_imap_read([1])), llm_model="claude-test")
+
+        (row,) = repo.extractions
+        assert row["receipt_id"] == _RECEIPT_ROW["id"]
+        assert row["origin"] == "ingest"
+        assert row["input_kind"] == "source"
+        assert row["prompt_version"] == EXTRACTION_PROMPT_VERSION
+        assert row["llm_model"] == "claude-test"
+        assert row["output"]["vendor"] == "Amazon"
+        assert row["output"]["amount"] == "42.99"
+        assert "receipt_document" in row["output"]
+        assert (row["llm_input_tokens"], row["llm_output_tokens"]) == (150, 50)
+        assert row["replaced"] == {}
+
+    def test_applied_fields_are_what_ingest_wrote(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        _run(FakeAdapter(_imap_read([1])))
+        applied = repo.extractions[0]["applied_fields"]
+        assert set(applied) == {
+            "vendor",
+            "amount",
+            "currency",
+            "receipt_date",
+            "description",
+            "confidence",
+            "field_confidence.vendor",
+            "field_confidence.amount",
+            "field_confidence.paid_amount",
+            "field_confidence.date",
+        }  # paid_amount is None in this extraction, so it wasn't written
+
+    def test_receipt_and_extraction_commit_with_the_success_row(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        _run(FakeAdapter(_imap_read([1])))
+        assert repo.writes == [
+            "ingest_log:started",
+            "receipt",
+            "extraction",
+            "ingest_log:success",
+        ]
+        # insert_receipt leaves the commit to insert_ingest_log.
+        assert repo.receipt_kwargs[0]["commit"] is False
+
+    def test_skip_writes_no_extraction(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _extraction(confidence=0.2)
+        _run(FakeAdapter(_imap_read([1])))
+        assert repo.extractions == []
+
+    def test_llm_model_is_required(self) -> None:
+        with pytest.raises(TypeError, match="llm_model"):
+            run_ingest(  # type: ignore[call-arg]
+                conn=MagicMock(),
+                adapter=FakeAdapter(_imap_read([1])),  # type: ignore[arg-type]
+                store=_store(),
+                source_name="personal-email",
+                source_type="imap",
+            )

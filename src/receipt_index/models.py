@@ -146,6 +146,27 @@ class ReceiptMetadata(BaseModel):
     field_confidence: FieldConfidence
 
 
+def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
+    """The receipt fields an extraction gives, keyed by their applied name.
+
+    Columns by name (``receipt_date`` for the model's ``date``), and each
+    field confidence as ``field_confidence.<field>``: the names that
+    ``extractions.applied_fields`` and ``receipts.manual_fields`` use.
+    """
+    values: dict[str, Any] = {
+        "vendor": metadata.vendor,
+        "amount": metadata.amount,
+        "paid_amount": metadata.paid_amount,
+        "currency": metadata.currency,
+        "receipt_date": metadata.date,
+        "description": metadata.description,
+        "confidence": metadata.confidence,
+    }
+    for name, value in metadata.field_confidence.model_dump().items():
+        values[f"field_confidence.{name}"] = value
+    return values
+
+
 @dataclass
 class ExtractionResult:
     """Metadata plus LLM usage from an extraction run."""

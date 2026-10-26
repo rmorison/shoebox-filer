@@ -235,8 +235,13 @@ def insert_receipt(
     file_name: str | None = None,
     paid_amount: Decimal | None = None,
     field_confidence: dict[str, float] | None = None,
+    commit: bool = True,
 ) -> Receipt:
-    """Insert a receipt row and return the validated Receipt model."""
+    """Insert a receipt row and return the validated Receipt model.
+
+    With ``commit=False`` the caller commits, so that the receipt and its
+    extraction row land together.
+    """
     cur = conn.execute(
         """\
         INSERT INTO receipt.receipts (
@@ -273,8 +278,62 @@ def insert_receipt(
         },
     )
     row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return Receipt.model_validate(row)
+
+
+def insert_extraction(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    origin: str,
+    input_kind: str,
+    prompt_version: int,
+    llm_model: str,
+    output: dict[str, Any],
+    applied_fields: list[str],
+    replaced: dict[str, Any],
+    llm_input_tokens: int | None,
+    llm_output_tokens: int | None,
+    llm_cache_read_tokens: int | None,
+    llm_requests: int | None,
+    input_file_id: UUID | None = None,
+) -> None:
+    """Append one extraction run to the history. The caller commits.
+
+    The table is append-only: the guard trigger refuses any later change.
+    """
+    conn.execute(
+        """\
+        INSERT INTO receipt.extractions (
+            receipt_id, origin, input_kind, input_file_id, prompt_version,
+            llm_model, output, applied_fields, replaced,
+            llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
+            llm_requests
+        ) VALUES (
+            %(receipt_id)s, %(origin)s, %(input_kind)s, %(input_file_id)s,
+            %(prompt_version)s, %(llm_model)s, %(output)s, %(applied_fields)s,
+            %(replaced)s, %(llm_input_tokens)s, %(llm_output_tokens)s,
+            %(llm_cache_read_tokens)s, %(llm_requests)s
+        )
+        """,
+        {
+            "receipt_id": receipt_id,
+            "origin": origin,
+            "input_kind": input_kind,
+            "input_file_id": input_file_id,
+            "prompt_version": prompt_version,
+            "llm_model": llm_model,
+            "output": Jsonb(output),
+            "applied_fields": applied_fields,
+            "replaced": Jsonb(replaced),
+            "llm_input_tokens": llm_input_tokens,
+            "llm_output_tokens": llm_output_tokens,
+            "llm_cache_read_tokens": llm_cache_read_tokens,
+            "llm_requests": llm_requests,
+        },
+    )
 
 
 def _receipt_filters(

@@ -442,3 +442,55 @@ class TestInsertIngestLogSourceName:
         assert entry.status == "started"
         assert entry.source_name == "personal-email"
         conn.commit.assert_called_once()
+
+
+class TestInsertExtraction:
+    def test_inserts_without_committing(self) -> None:
+        from receipt_index.repository import insert_extraction
+
+        conn = _mock_conn()
+        receipt_id = UUID("019572a0-0000-7000-8000-000000000001")
+        insert_extraction(
+            conn,
+            receipt_id=receipt_id,
+            origin="reextract",
+            input_kind="rendition",
+            prompt_version=2,
+            llm_model="claude-test",
+            output={"vendor": "Acme Parking (U.S.), LLC"},
+            applied_fields=["paid_amount"],
+            replaced={"paid_amount": None},
+            llm_input_tokens=1200,
+            llm_output_tokens=180,
+            llm_cache_read_tokens=0,
+            llm_requests=1,
+        )
+        sql, params = conn.execute.call_args[0]
+        assert "INSERT INTO receipt.extractions" in sql
+        assert params["receipt_id"] == receipt_id
+        assert params["applied_fields"] == ["paid_amount"]
+        assert params["output"].obj == {"vendor": "Acme Parking (U.S.), LLC"}
+        assert params["replaced"].obj == {"paid_amount": None}
+        assert params["input_file_id"] is None
+        conn.commit.assert_not_called()
+
+    def test_insert_receipt_can_leave_the_commit(self) -> None:
+        conn = _mock_conn([_RECEIPT_ROW])
+        insert_receipt(
+            conn,
+            source_id="<msg-1@example.com>",
+            source_type="imap",
+            source_name="test-email",
+            vendor="Amazon",
+            amount=Decimal("42.99"),
+            currency="USD",
+            receipt_date=date(2025, 6, 15),
+            description=None,
+            confidence=0.95,
+            pdf_path="2025/06/x.pdf",
+            email_subject=None,
+            email_sender=None,
+            email_date=None,
+            commit=False,
+        )
+        conn.commit.assert_not_called()

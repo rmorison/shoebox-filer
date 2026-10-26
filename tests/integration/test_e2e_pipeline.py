@@ -111,6 +111,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
 
         assert result.processed == 1
@@ -160,6 +161,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
         assert r1.processed == 1
 
@@ -171,6 +173,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
         assert r2.processed == 0
         assert r2.skipped == 0  # not dry_run, just no unprocessed messages
@@ -205,6 +208,7 @@ class TestFullPipelineE2E:
             source_type="imap",
             agent=_make_mock_agent(),
             dry_run=True,
+            llm_model="test-model",
         )
 
         assert result.skipped == 1
@@ -241,6 +245,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
 
         assert result.processed == 3
@@ -275,6 +280,7 @@ class TestFullPipelineE2E:
             source_type="imap",
             agent=agent,
             limit=2,
+            llm_model="test-model",
         )
 
         assert result.processed == 2
@@ -312,6 +318,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
 
         assert result.processed == 1
@@ -380,6 +387,7 @@ class TestFullPipelineE2E:
             source_name="greenmail-test",
             source_type="imap",
             agent=agent,
+            llm_model="test-model",
         )
 
         # Search by vendor

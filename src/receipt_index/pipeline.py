@@ -14,13 +14,15 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from receipt_index.adapters.base import SourceUnavailableError
-from receipt_index.extraction import extract_metadata
+from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
 from receipt_index.locks import SourceLockLostError, item_lock
+from receipt_index.models import receipt_values
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
     get_processed_source_ids,
     get_stale_started,
     get_sync_state,
+    insert_extraction,
     insert_ingest_log,
     insert_receipt,
     is_source_id_known,
@@ -127,8 +129,8 @@ def process_item(
     store: EvidenceStore,
     source_name: str,
     source_type: str,
+    llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
-    llm_model: str | None = None,
 ) -> ItemOutcome:
     """Extract, render, store and index one fetched item.
 
@@ -197,6 +199,27 @@ def process_item(
             email_sender=raw.sender,
             email_date=_email_date(raw.source_type, raw),
             file_name=raw.file_name,
+            commit=False,
+        )
+        # The receipt, its extraction row and the success row commit together.
+        insert_extraction(
+            conn,
+            receipt_id=receipt.id,
+            origin="ingest",
+            input_kind="source",
+            prompt_version=EXTRACTION_PROMPT_VERSION,
+            llm_model=llm_model,
+            output=metadata.model_dump(mode="json"),
+            applied_fields=[
+                name
+                for name, value in receipt_values(metadata).items()
+                if value is not None
+            ],
+            replaced={},
+            llm_input_tokens=extraction.input_tokens,
+            llm_output_tokens=extraction.output_tokens,
+            llm_cache_read_tokens=extraction.cache_read_tokens,
+            llm_requests=extraction.requests,
         )
         insert_ingest_log(
             conn,
@@ -257,8 +280,8 @@ def handle_item(
     store: EvidenceStore,
     source_name: str,
     source_type: str,
+    llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
-    llm_model: str | None = None,
 ) -> ItemOutcome:
     """Take the item lock, re-check, write ``started``, fetch and process.
 
@@ -460,8 +483,8 @@ def run_ingest(
     store: EvidenceStore,
     source_name: str,
     source_type: str,
+    llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
-    llm_model: str | None = None,
     dry_run: bool = False,
     limit: int | None = None,
     source_lock: SourceLock | None = None,
