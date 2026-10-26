@@ -50,6 +50,16 @@ class MessageRefusedError(Exception):
     """The server, on a healthy session, refused one message: an item error."""
 
 
+# RFC 5530 response codes that describe the session or the mailbox, not one
+# message: a NO carrying one is an outage, never a refused message.
+_SESSION_CODES = ("UNAVAILABLE", "SERVERBUG", "LIMIT", "INUSE", "OVERQUOTA")
+
+
+def _is_session_refusal(exc: Exception) -> bool:
+    text = str(exc).upper()
+    return any(f"[{code}" in text for code in _SESSION_CODES)
+
+
 def _header_bytes(data: dict[bytes, Any]) -> bytes | None:
     """Find the header-fields section in one message's FETCH response.
 
@@ -229,6 +239,8 @@ class ImapAdapter:
         except IMAPClientAbortError:
             raise
         except IMAPClientError as exc:
+            if _is_session_refusal(exc):
+                raise SourceUnavailableError(f"IMAP server refused: {exc}") from exc
             logger.warning(
                 "Header fetch of %d UIDs refused (%s); fetching one at a time",
                 len(batch),
@@ -242,7 +254,15 @@ class ImapAdapter:
             except IMAPClientAbortError:
                 raise
             except IMAPClientError as exc:
+                if _is_session_refusal(exc):
+                    raise SourceUnavailableError(f"IMAP server refused: {exc}") from exc
                 refused[uid] = str(exc)
+        if len(batch) > 1 and len(refused) == len(batch):
+            # Every message refused at once points at the mailbox, not at
+            # each message: stop the source rather than fail them all.
+            raise SourceUnavailableError(
+                f"IMAP server refused every message in a batch of {len(batch)}"
+            )
         return response, refused
 
     def _unreadable_ref(self, uid: int, uidvalidity: int, reason: str) -> ItemRef:
@@ -254,7 +274,7 @@ class ImapAdapter:
         """
         logger.warning("Server refused the headers of UID %d: %s", uid, reason)
         return ItemRef(
-            source_id=f"imap-uid:{self.config.folder}:{uidvalidity}:{uid}",
+            source_id=f"imap-uid:{self.name}:{self.config.folder}:{uidvalidity}:{uid}",
             source_type="imap",
             imap_uid=uid,
             unreadable=f"server refused the message headers: {reason}",
@@ -326,7 +346,11 @@ class ImapAdapter:
                 f"IMAP connection to {self.config.host} failed: {exc}"
             ) from exc
         except IMAPClientError as exc:
-            if self._client is not None and self._selected_ok:
+            if (
+                self._client is not None
+                and self._selected_ok
+                and not _is_session_refusal(exc)
+            ):
                 raise MessageRefusedError(f"server refused UID {uid}: {exc}") from exc
             self._drop_client()
             raise SourceUnavailableError(

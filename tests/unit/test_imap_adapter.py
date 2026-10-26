@@ -742,10 +742,50 @@ class TestRefusedMessages:
             "<msg-5@example.com>",
         ]
         (bad,) = [r for r in read.items if r.unreadable is not None]
-        assert bad.source_id == "imap-uid:INBOX:7:2"
+        assert bad.source_id == "imap-uid:test-imap:INBOX:7:2"
         assert "corrupt" in bad.unreadable
         with pytest.raises(MessageRefusedError):
             adapter.fetch(bad)
+
+    def test_every_uid_refused_is_a_source_outage(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient
+    ) -> None:
+        fake.refuse = {1, 2, 5}
+        with pytest.raises(SourceUnavailableError, match="every message"):
+            adapter.list_new(None)
+
+    @pytest.mark.parametrize("code", ["UNAVAILABLE", "SERVERBUG", "OVERQUOTA"])
+    def test_session_code_on_headers_is_a_source_outage(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient, code: str
+    ) -> None:
+        def refuse(*_: Any, **__: Any) -> Any:
+            raise IMAPClientError(f"FETCH command error: NO [{code}] try later")
+
+        fake.fetch = refuse  # type: ignore[method-assign]
+        with pytest.raises(SourceUnavailableError, match=code):
+            adapter.list_new(None)
+
+    def test_session_code_on_body_after_reconnect_is_a_source_outage(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        first = FakeIMAPClient({1: _mail(1)})
+        first.selected = ("INBOX", True)
+        first.refuse = {1}
+        fresh = FakeIMAPClient({1: _mail(1)})
+
+        def unavailable(uids: list[int], items: list[str]) -> Any:
+            raise IMAPClientError("FETCH command error: NO [UNAVAILABLE] backend down")
+
+        fresh.fetch = unavailable  # type: ignore[method-assign]
+        adapter = ImapAdapter(imap_config)
+        adapter._client = first  # type: ignore[assignment]
+        adapter._uidvalidity = 7
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+        with (
+            patch.object(adapter, "_connect", return_value=fresh),
+            pytest.raises(SourceUnavailableError, match="UNAVAILABLE"),
+        ):
+            adapter.fetch(ref)
 
     def test_dropped_connection_during_headers_still_fails_the_read(
         self, adapter: ImapAdapter, fake: FakeIMAPClient
@@ -801,7 +841,7 @@ class TestRefusedMessages:
         assert result.source_error is None
         assert result.processed == 2
         assert result.failed == 1
-        assert repo.statuses("imap-uid:INBOX:7:2") == ["started", "failed"]
+        assert repo.statuses("imap-uid:test-imap:INBOX:7:2") == ["started", "failed"]
         assert repo.imap_saves[-1] == (7, 3, False)
 
 
