@@ -482,7 +482,9 @@ def build_server(
         with snapshot() as conn:
             receipt = repository.get_receipt_by_id(conn, uid)
         if receipt is None:
-            msg = f"Receipt not found: {receipt_id}"
+            # The canonical form: UUID() accepts padded input (any number of
+            # hyphens, braces, a urn: prefix), which must not be echoed back.
+            msg = f"Receipt not found: {uid}"
             raise ToolError(msg)
         return receipt_out(receipt)
 
@@ -528,6 +530,10 @@ def build_server(
             uid = UUID(receipt_id)
         except ValueError:
             raise fail("invalid_id", f"Invalid UUID: {_clip(receipt_id)}") from None
+        # From here on, use the canonical form: UUID() accepts padded input
+        # (any number of hyphens, braces, a urn: prefix).
+        receipt_id = str(uid)
+        entry["receipt_id"] = receipt_id
 
         try:
             with snapshot() as conn:

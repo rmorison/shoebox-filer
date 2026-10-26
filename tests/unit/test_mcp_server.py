@@ -751,3 +751,38 @@ class TestClientIdClipping:
         from receipt_index.mcp_server import _clip
 
         assert _clip("not-a-uuid") == "not-a-uuid"
+
+
+class TestPaddedUuid:
+    """UUID() strips hyphens, so a padded ID parses; it must not be echoed."""
+
+    _PADDED = "-" * 5000 + _MISSING_ID.replace("-", "")
+
+    def test_get_receipt_not_found_uses_canonical_id(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=None):
+            result = _call(
+                _server(store_root, log_path),
+                "get_receipt",
+                {"receipt_id": self._PADDED},
+            )
+        assert result.is_error is True
+        assert _text(result).endswith(f"Receipt not found: {_MISSING_ID}")
+        assert len(_text(result)) < 200
+
+    def test_get_receipt_file_uses_canonical_id(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=None):
+            result = _call(
+                _server(store_root, log_path),
+                "get_receipt_file",
+                {"receipt_id": self._PADDED},
+            )
+        assert result.is_error is True
+        assert _text(result).endswith(f"Receipt not found: {_MISSING_ID}")
+        assert len(_text(result)) < 200
+        (entry,) = _log_lines(log_path)
+        assert entry["receipt_id"] == _MISSING_ID
+        assert entry["outcome"] == "not_found"
