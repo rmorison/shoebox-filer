@@ -137,6 +137,10 @@ class ReceiptMetadata(BaseModel):
     currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     date: date
     description: str | None = None
+    # Which part of an email held the receipt: an attachment's file name as
+    # listed, or "body". None when the extractor can't tell, and always None
+    # for a Drive document or a rendition.
+    receipt_document: str | None = None
     # Whether this is a receipt at all; below 0.5 the item is skipped.
     confidence: float = Field(ge=0.0, le=1.0)
     field_confidence: FieldConfidence
@@ -168,6 +172,8 @@ class Receipt(BaseModel):
     description: str | None
     confidence: float
     field_confidence: dict[str, float] = Field(default_factory=dict)
+    # Fields a person has edited; re-extraction never writes them.
+    manual_fields: list[str] = Field(default_factory=list)
     pdf_path: str
     email_subject: str | None
     email_sender: str | None

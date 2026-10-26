@@ -17,6 +17,11 @@ from receipt_index.models import (
 
 logger = logging.getLogger(__name__)
 
+# Raised whenever the prompts or the output model change; every extraction
+# run records it. 0 means a receipt has no extraction history; 1 was the
+# paid-amount prompt, which was never recorded.
+EXTRACTION_PROMPT_VERSION = 2
+
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
 _AMOUNT_RULES = """\
@@ -69,7 +74,12 @@ a receipt, extract the following fields:
 - description: Brief summary of what was purchased (optional)
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if the email may not be a receipt or key fields are uncertain.
-{_FIELD_CONFIDENCE_RULE}
+{_FIELD_CONFIDENCE_RULE}\
+- receipt_document: Which part of the email holds the receipt: the file name \
+of the attachment exactly as listed under "Attachments", or "body" when the \
+receipt is in the email text itself. Use null when you can't tell, for \
+example when the only attachment holds terms and conditions.
+
 If PDF attachment content is provided below the email body, use it as additional \
 context for extraction. The PDF content often contains the detailed receipt with \
 amounts and line items that may not appear in the email body.
@@ -167,8 +177,8 @@ def _extract_from_email(
         msg = "No extraction agent provided."
         raise ValueError(msg)
 
-    pdf_text = _extract_pdf_text(raw.attachments)
-    prompt = _build_prompt(raw, pdf_text=pdf_text)
+    pdf_name, pdf_text = _first_pdf_text(raw.attachments)
+    prompt = _build_prompt(raw, pdf_text=pdf_text, pdf_name=pdf_name)
 
     images = _image_attachments(raw.attachments)
     if images:
@@ -268,13 +278,50 @@ def _extract_from_image(
     return _to_extraction_result(result)
 
 
+def extract_from_rendition(
+    pdf_bytes: bytes,
+    *,
+    subject: str,
+    sender: str,
+    agent: Agent[None, ReceiptMetadata],
+) -> ExtractionResult:
+    """Extract metadata from a stored rendition (the receipt's PDF).
+
+    The same text-first, vision-fallback path as a Drive PDF, with the
+    stored subject and sender put first, since the rendition of an email
+    with a PDF attachment is that attachment alone.
+    """
+    from receipt_index.pdf_reader import extract_text
+
+    header = f"Subject: {subject}\nFrom: {sender}"
+    text = extract_text(pdf_bytes)
+    if _has_sufficient_text(text):
+        result: Any = agent.run_sync(
+            "Extract receipt metadata from this stored receipt document.\n\n"
+            f"{header}\n\n--- Document text ---\n{text}"
+        )
+        return _to_extraction_result(result)
+
+    logger.info("Rendition text insufficient, using vision")
+    result = agent.run_sync(
+        [
+            "Extract receipt metadata from this stored receipt document.\n\n"
+            f"{header}",
+            BinaryContent(data=pdf_bytes, media_type="application/pdf"),
+        ]
+    )
+    return _to_extraction_result(result)
+
+
 def _has_sufficient_text(text: str) -> bool:
     """Check if extracted text meets the minimum quality threshold."""
     stripped = "".join(text.split())
     return len(stripped) >= _MIN_TEXT_LENGTH
 
 
-def _build_prompt(raw: RawReceipt, *, pdf_text: str | None = None) -> str:
+def _build_prompt(
+    raw: RawReceipt, *, pdf_text: str | None = None, pdf_name: str | None = None
+) -> str:
     """Build the user prompt from raw receipt data."""
     parts = [
         f"Subject: {raw.subject}",
@@ -291,9 +338,17 @@ def _build_prompt(raw: RawReceipt, *, pdf_text: str | None = None) -> str:
     else:
         parts.append("(no body content)")
 
+    if raw.attachments:
+        # Listed by name so the extractor can say which one holds the receipt.
+        parts.append("")
+        parts.append("--- Attachments ---")
+        for att in raw.attachments:
+            parts.append(f"- {att.filename} ({_base_content_type(att.content_type)})")
+
     if pdf_text:
         parts.append("")
-        parts.append("--- PDF Attachment Content ---")
+        heading = "--- PDF Attachment Content"
+        parts.append(f"{heading}: {pdf_name} ---" if pdf_name else f"{heading} ---")
         parts.append(pdf_text)
 
     return "\n".join(parts)
@@ -301,13 +356,18 @@ def _build_prompt(raw: RawReceipt, *, pdf_text: str | None = None) -> str:
 
 def _extract_pdf_text(attachments: list[Attachment]) -> str | None:
     """Extract text from the first PDF attachment, if any."""
+    return _first_pdf_text(attachments)[1]
+
+
+def _first_pdf_text(attachments: list[Attachment]) -> tuple[str | None, str | None]:
+    """The first PDF attachment's file name and text, or (None, None)."""
     from receipt_index.pdf_reader import extract_text
 
     for att in attachments:
         if _base_content_type(att.content_type) == "application/pdf":
             text = extract_text(att.data)
-            return text if text else None
-    return None
+            return att.filename, (text if text else None)
+    return None, None
 
 
 def _base_content_type(content_type: str) -> str:

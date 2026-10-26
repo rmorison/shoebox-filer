@@ -148,6 +148,13 @@ class ReceiptOut(BaseModel):
             "ordering a review, not a measured probability."
         )
     )
+    manual_fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Fields a person has edited by hand; re-extraction never "
+            "overwrites them."
+        ),
+    )
     pdf_path: str = Field(description="PDF path relative to the file store.")
     email_subject: str | None
     email_sender: str | None
