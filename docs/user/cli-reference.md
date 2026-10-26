@@ -263,7 +263,7 @@ At least one of these, `--limit` or `--all` is required, so that a bare command 
 | `--all` | Every receipt |
 | `--limit N` | At most `N` receipts, oldest first |
 
-A receipt whose latest extraction already used the current prompt version **and** the configured model (`llm.model`) is left out, unless `--force` is given. So after a prompt change, or after changing the model, the same command picks up every receipt that is now stale, and an interrupted run can be started again with the same arguments. A run that failed doesn't count: the next run tries that receipt again.
+A receipt whose latest extraction already used the current prompt version **and** the configured model (`llm.model`) is left out, unless `--force` is given. So after a prompt change, or after changing the model, the same command picks up every receipt that is now stale, and an interrupted run can be started again with the same arguments. A run that failed doesn't count: the next run tries that receipt again. Each receipt is checked again once its lock is held, so two runs that overlap never re-extract the same receipt twice.
 
 ### Options
 
@@ -296,11 +296,11 @@ Under `--input auto`, the source item is fetched again by its ID: IMAP searches 
 
 ### Output
 
-Each receipt gets one line: its status, the input used and the extracted paid amount with its confidence, whether or not it was applied. Changed fields follow, old and new. The statuses are `applied`, `unchanged`, `gated`, `failed`, `locked` (another process is working on the item) and `unavailable`. JSON output has the same per receipt (`changes`, `extracted_paid_amount`, `paid_amount_confidence`, `error`).
+Each receipt gets one line: its status, the input used and the extracted paid amount with its confidence, whether or not it was applied. Changed fields follow, old and new. The statuses are `applied`, `unchanged`, `current` (another run finished it after this one selected it), `gated`, `failed`, `locked` (another process is working on the item) and `unavailable`. JSON output has the same per receipt (`changes`, `extracted_paid_amount`, `paid_amount_confidence`, `error`).
 
 A run stops after 5 failures in a row, since the model or the store is then most likely down; the receipts it didn't reach are tried by the next run.
 
-Exit codes: 0 when every receipt was applied or unchanged; 1 when any failed, was gated, locked or unavailable, or the run stopped early. [`search --needs-review`](#search) lists what is still missing a paid amount afterwards.
+Exit codes: 0 when every receipt was applied, unchanged or current; 1 when any failed, was gated, locked or unavailable, or the run stopped early. [`search --needs-review`](#search) lists what is still missing a paid amount afterwards.
 
 ### Cost estimates
 
