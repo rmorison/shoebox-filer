@@ -277,9 +277,9 @@ A receipt whose latest extraction already used the current prompt version **and*
 
 ### What a run writes
 
-By default a run fills only **empty** fields: a `null` `paid_amount` or `description`, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (no extraction history and an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)).
+By default a run fills only **empty** fields: a `null` `paid_amount` or `description`, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (ingested before extraction history was recorded, with an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)). A gated or failed run doesn't change that; the first run that applies a result does.
 
-With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. A receipt with no extraction history counts as entirely machine-extracted.
+With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. On a receipt ingested before extraction history was recorded, every field counts as machine-extracted, before and after its first re-extraction: only `manual_fields` marks a hand edit.
 
 In both modes:
 
