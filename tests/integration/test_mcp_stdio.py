@@ -30,9 +30,17 @@ from mcp.client.stdio import StdioServerParameters
 from mcp_types import Implementation
 
 from receipt_index.db import get_connection
-from receipt_index.repository import insert_receipt
+from receipt_index.mcp_server import (
+    AccessLog,
+    RoleCheckError,
+    build_server,
+    check_read_only_role,
+    startup_check,
+)
+from receipt_index.repository import insert_ingest_log, insert_receipt
 
 if TYPE_CHECKING:
+    from mcp.server.mcpserver import MCPServer
     from mcp_types import CallToolResult
 
 pytestmark = pytest.mark.integration
@@ -285,3 +293,118 @@ def test_read_only_connection_rejects_writes() -> None:
         pytest.raises(psycopg.errors.ReadOnlySqlTransaction),
     ):
         conn.execute("DELETE FROM receipt.receipts")
+
+
+# ---------------------------------------------------------------------------
+# In-process: the same tools against the real database, as the read role
+# ---------------------------------------------------------------------------
+
+
+def _in_process(store: Path, log: Path) -> MCPServer:
+    return build_server(
+        database_url=_dsn(_READ_ROLE),
+        store_root=store,
+        access_log=AccessLog(log),
+    )
+
+
+@pytest.mark.usefixtures("roles")
+def test_tools_against_database_in_process(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    store: Path,
+    tmp_path: Path,
+    seeded: list[str],
+) -> None:
+    for n in range(3):
+        insert_ingest_log(
+            pg_conn,
+            source_id=f"<fail-{n}@example.com>",
+            source_type="imap",
+            status="failed",
+            error_message="extraction failed",
+        )
+    insert_ingest_log(
+        pg_conn, source_id="<skip@example.com>", source_type="imap", status="skipped"
+    )
+    log = tmp_path / "mcp-access.jsonl"
+    with pg_conn_as(_READ_ROLE) as reader:
+        check_read_only_role(reader)
+
+    async def session() -> dict[str, CallToolResult]:
+        async with Client(_in_process(store, log)) as client:
+            return {
+                "exact": await client.call_tool("search_receipts", {"amount": "42.99"}),
+                "range": await client.call_tool(
+                    "search_receipts",
+                    {
+                        "amount_min": "7.00",
+                        "amount_max": "12.50",
+                        "date_from": "2025-06-10",
+                        "date_to": "2025-06-15",
+                        "source": "test-email",
+                    },
+                ),
+                "none": await client.call_tool(
+                    "search_receipts", {"vendor": "no-such-vendor"}
+                ),
+                "one": await client.call_tool("get_receipt", {"receipt_id": seeded[0]}),
+                "file": await client.call_tool(
+                    "get_receipt_file", {"receipt_id": seeded[2]}
+                ),
+                "failures": await client.call_tool(
+                    "list_failures", {"limit": 2, "offset": 1}
+                ),
+            }
+
+    r = anyio.run(session)
+
+    exact = r["exact"].structured_content
+    assert exact is not None
+    assert [x["id"] for x in exact["receipts"]] == [seeded[1]]
+    assert exact["total"] == 1
+
+    in_range = r["range"].structured_content
+    assert in_range is not None
+    # 2025-06-15 is 42.99 (over the max), 2025-06-10 is 7.00 (in range).
+    assert [x["id"] for x in in_range["receipts"]] == [seeded[2]]
+
+    none = r["none"].structured_content
+    assert none == {
+        "receipts": [],
+        "total": 0,
+        "limit": 50,
+        "offset": 0,
+        "next_offset": None,
+    }
+
+    one = r["one"].structured_content
+    assert one is not None
+    assert one["amount"] == "12.50"
+    assert one["file"]["exists"] is True
+
+    file_result = r["file"].structured_content
+    assert file_result is not None
+    assert file_result["content_omitted_reason"] == "not_requested"
+    assert file_result["size_bytes"] == len(b"%PDF-1.4 7.00")
+
+    failures = r["failures"].structured_content
+    assert failures is not None
+    assert failures["total"] == 3
+    assert len(failures["failures"]) == 2
+    assert failures["next_offset"] is None
+    assert all(f["status"] == "failed" for f in failures["failures"])
+
+    (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["receipt_id"] == seeded[2]
+    assert entry["outcome"] == "ok"
+
+
+def pg_conn_as(role: str) -> psycopg.Connection[dict[str, Any]]:
+    return psycopg.connect(_dsn(role), row_factory=psycopg.rows.dict_row)
+
+
+@pytest.mark.usefixtures("roles")
+def test_startup_check_in_process() -> None:
+    startup_check(_dsn(_READ_ROLE))
+    with pytest.raises(RoleCheckError, match=r"receipt\.receipts: INSERT"):
+        startup_check(_dsn(_COLUMN_WRITER))
