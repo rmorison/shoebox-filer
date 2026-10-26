@@ -754,7 +754,7 @@ class TestRefusedMessages:
         with pytest.raises(SourceUnavailableError, match="every message"):
             adapter.list_new(None)
 
-    @pytest.mark.parametrize("code", ["UNAVAILABLE", "SERVERBUG", "OVERQUOTA"])
+    @pytest.mark.parametrize("code", ["UNAVAILABLE", "INUSE", "OVERQUOTA"])
     def test_session_code_on_headers_is_a_source_outage(
         self, adapter: ImapAdapter, fake: FakeIMAPClient, code: str
     ) -> None:
@@ -786,6 +786,27 @@ class TestRefusedMessages:
             pytest.raises(SourceUnavailableError, match="UNAVAILABLE"),
         ):
             adapter.fetch(ref)
+
+    @pytest.mark.parametrize("code", ["SERVERBUG", "LIMIT"])
+    def test_per_message_codes_on_one_uid_stay_item_failures(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient, code: str
+    ) -> None:
+        """Dovecot answers a corrupt message's FETCH with NO [SERVERBUG]."""
+        real_fetch = fake.fetch
+
+        def fetch(uids: list[int], items: list[str]) -> Any:
+            if 2 in uids:
+                raise IMAPClientError(
+                    f"FETCH command error: NO [{code}] Internal error"
+                )
+            return real_fetch(uids, items)
+
+        fake.fetch = fetch  # type: ignore[method-assign]
+        read = adapter.list_new(None)
+
+        unreadable = [r.imap_uid for r in read.items if r.unreadable is not None]
+        assert unreadable == [2]
+        assert len(read.items) == 3
 
     def test_dropped_connection_during_headers_still_fails_the_read(
         self, adapter: ImapAdapter, fake: FakeIMAPClient

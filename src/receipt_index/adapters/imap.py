@@ -52,7 +52,10 @@ class MessageRefusedError(Exception):
 
 # RFC 5530 response codes that describe the session or the mailbox, not one
 # message: a NO carrying one is an outage, never a refused message.
-_SESSION_CODES = ("UNAVAILABLE", "SERVERBUG", "LIMIT", "INUSE", "OVERQUOTA")
+# SERVERBUG and LIMIT are left out on purpose: Dovecot uses them for a FETCH
+# that fails on one message (a corrupt file), so they stay item errors. A
+# mailbox-wide failure under them is caught by the all-refused-batch rule.
+_SESSION_CODES = ("UNAVAILABLE", "INUSE", "OVERQUOTA")
 
 
 def _is_session_refusal(exc: Exception) -> bool:
