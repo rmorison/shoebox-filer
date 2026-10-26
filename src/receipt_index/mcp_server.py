@@ -276,8 +276,9 @@ SELECT 'schema receipt', 'CREATE'
 def check_read_only_role(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Raise :class:`RoleCheckError` unless the role can read and not write.
 
-    Write privileges are checked first, so a role that can write is always
-    reported as such.
+    Checks run in order: USAGE on schema receipt (without it the privilege
+    functions below can't resolve the table names), then write privileges
+    (so a role that can write is always reported as such), then SELECT.
     """
     # Without USAGE on the schema, the privilege functions below can't even
     # resolve the table names, so check it first.
