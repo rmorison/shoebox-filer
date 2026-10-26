@@ -29,8 +29,9 @@
 */15 * * * * receipt-index ingest
 
 # Mirror rendered receipts to Dropbox, offset from the ingest boundaries.
-# `copy` is additive: it never deletes at the destination.
-7,22,37,52 * * * * rclone copy /app/data/receipts dropbox:receipt-index/receipts --config /app/.rclone/rclone.conf -v
+# `copy` is additive: it never deletes at the destination. The store writes
+# each file to a `.tmp` name first, so those are skipped.
+7,22,37,52 * * * * rclone copy /app/data/receipts dropbox:receipt-index/receipts --exclude "*.tmp" --config /app/.rclone/rclone.conf -v
 
 # Mirror the rotating database dumps. Same additive semantics; the fixed set of
 # 7 day-of-week filenames is what bounds the destination.

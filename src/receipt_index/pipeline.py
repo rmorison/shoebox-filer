@@ -28,6 +28,7 @@ from receipt_index.repository import (
     save_drive_cursor,
     save_imap_cursor,
 )
+from receipt_index.store import pdf_path_for, store_rendition
 
 if TYPE_CHECKING:
     import psycopg
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
         SourceRead,
         SyncState,
     )
-    from receipt_index.store import FileStore
+    from receipt_index.store import EvidenceStore
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ def process_item(
     conn: psycopg.Connection[dict[str, Any]],
     raw: RawReceipt,
     *,
-    store: FileStore,
+    store: EvidenceStore,
     source_name: str,
     source_type: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
@@ -171,7 +172,13 @@ def process_item(
             return ItemOutcome("skipped")
 
         pdf_data = render_pdf(raw)
-        pdf_path = store.save(metadata.date, metadata.vendor, metadata.amount, pdf_data)
+        stored = store_rendition(
+            store,
+            pdf_data,
+            receipt_date=metadata.date,
+            vendor=metadata.vendor,
+            amount=metadata.amount,
+        )
         receipt = insert_receipt(
             conn,
             source_id=raw.source_id,
@@ -185,7 +192,7 @@ def process_item(
             description=metadata.description,
             confidence=metadata.confidence,
             field_confidence=metadata.field_confidence.model_dump(exclude_none=True),
-            pdf_path=pdf_path,
+            pdf_path=pdf_path_for(stored.ref),
             email_subject=raw.subject,
             email_sender=raw.sender,
             email_date=_email_date(raw.source_type, raw),
@@ -247,7 +254,7 @@ def handle_item(
     adapter: SourceAdapter,
     ref: ItemRef,
     *,
-    store: FileStore,
+    store: EvidenceStore,
     source_name: str,
     source_type: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
@@ -450,7 +457,7 @@ def run_ingest(
     *,
     conn: psycopg.Connection[dict[str, Any]],
     adapter: SourceAdapter,
-    store: FileStore,
+    store: EvidenceStore,
     source_name: str,
     source_type: str,
     agent: Agent[None, ReceiptMetadata] | None = None,

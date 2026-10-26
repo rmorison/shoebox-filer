@@ -36,9 +36,10 @@ database:
   url: ${DATABASE_URL}                 # e.g. postgresql://user:pass@localhost:5432/receipt_index  # pragma: allowlist secret
 
 # ---------------------------------------------------------------------------
-# File store — where rendered PDF receipts are saved
+# Evidence store — where rendered PDF receipts are saved
 # ---------------------------------------------------------------------------
 store:
+  backend: local                       # default: local (the only backend so far)
   path: ./data/receipts                # default: ./data/receipts
 
 # ---------------------------------------------------------------------------

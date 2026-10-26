@@ -593,8 +593,15 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
     psql "$DATABASE_URL" -At -c "SELECT pdf_path FROM receipt.receipts" | sort > /tmp/db.txt
-    ( cd /app/data/receipts && find . -type f | sed "s|^\./||" ) | sort > /tmp/fs.txt
+    ( cd /app/data/receipts && find . -path ./originals -prune -o -type f ! -name ".put.*.tmp" -print | sed "s|^\./||" ) | sort > /tmp/fs.txt
     echo "orphan files: $(comm -13 /tmp/db.txt /tmp/fs.txt | wc -l)"'
+```
+
+The count leaves out temp files, and `originals/`, whose files aren't renditions and so never appear in `pdf_path`. The store writes each file to a `.put.<random>.tmp` name in its folder and links it into place, so a temp file is left behind only when an ingest is killed mid-write. Nothing references one, and the Dropbox mirror skips them. Delete any older than an hour, when no write can still be using it:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
+    find /app/data/receipts -name ".put.*.tmp" -mmin +60 -print -delete'
 ```
 
 **6. First-cycle duplicate check** — run after Gate G's first automatic ticks. Duplicates cannot appear as double rows (`uq_receipts_source_id` forbids it); they appear as *fresh log rows for old items*. Substitute the cutover timestamp:
@@ -771,8 +778,9 @@ Only worth doing for **environmental** causes — a rendering gap, a permissions
            SELECT source_id, email_subject, error_message, created_at
            FROM receipt.ingest_log WHERE status = '\''failed'\''
            ORDER BY created_at DESC;"'
-   # then look for a plausibly-matching file under the vendor/date path:
-   ls -l data/receipts/<YYYY>/<MM>/
+   # then look for a plausibly-matching file under the receipt's year and month
+   # (receipts stored before the renditions/ layout are under data/receipts/<YYYY>/<MM>/):
+   ls -l data/receipts/renditions/<YYYY>/<MM>/
    ```
 
 3. **Delete the log rows to force a retry.** Scope it — never `DELETE FROM receipt.ingest_log WHERE status = 'failed'` wholesale, which would also resurrect genuine content failures:

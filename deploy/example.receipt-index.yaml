@@ -38,6 +38,7 @@ database:
   url: ${DATABASE_URL}
 
 store:
+  backend: local
   path: /app/data/receipts
 
 llm:

@@ -32,6 +32,7 @@ from receipt_index.models import (
     SyncState,
 )
 from receipt_index.pipeline import IngestResult, run_ingest, warn_stale_started
+from receipt_index.store import StoredFile
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -319,7 +320,12 @@ def extract(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 def _store() -> MagicMock:
     store = MagicMock()
-    store.save.return_value = "2025/06/2025-06-15__amazon__42.99.pdf"
+    store.put.return_value = StoredFile(
+        sha256=b"\x00" * 32,
+        byte_size=4,
+        media_type="application/pdf",
+        ref="local:renditions/2025/06/2025-06-15__amazon__42.99.pdf",
+    )
     return store
 
 
@@ -747,7 +753,16 @@ class TestPaidAmountPassThrough:
         assert success["amount"] == Decimal("50.00")
         assert success["paid_amount"] == Decimal("30.00")
         # The file name keeps the total; naming belongs to the evidence store.
-        assert store.save.call_args.args[2] == Decimal("50.00")
+        put_kwargs = store.put.call_args.kwargs
+        assert put_kwargs["name"].endswith("__50.00.pdf")
+        assert put_kwargs["purpose"] == "rendition"
+        assert put_kwargs["media_type"] == "application/pdf"
+        assert store.put.call_args.args == (b"%PDF",)
+        # The receipt's pdf_path is the reference's relative path.
+        assert (
+            receipt_kwargs["pdf_path"]
+            == "renditions/2025/06/2025-06-15__amazon__42.99.pdf"
+        )
 
     def test_skip_logs_paid_amount(self, repo: FakeRepo, extract: MagicMock) -> None:
         extract.return_value = _paid_extraction(confidence=0.3)

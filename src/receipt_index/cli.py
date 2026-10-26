@@ -106,7 +106,7 @@ def ingest(
     from receipt_index.extraction import create_extraction_agent
     from receipt_index.locks import SourceLock
     from receipt_index.pipeline import IngestResult, run_ingest, warn_stale_started
-    from receipt_index.store import LocalFileStore
+    from receipt_index.store import open_store
 
     config = _load_config_or_exit(ctx)
 
@@ -125,7 +125,7 @@ def ingest(
             )
             sys.exit(1)
 
-    store = LocalFileStore(Path(config.store.path).resolve())
+    store = open_store(config.store)
 
     # Create extraction agents — email and document prompts differ
     from receipt_index.extraction import DOCUMENT_SYSTEM_PROMPT
@@ -390,6 +390,7 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
     """Show details for a specific receipt."""
     from receipt_index.db import get_connection
     from receipt_index.repository import get_receipt_by_id
+    from receipt_index.store import rendition_ref
 
     config = _load_config_or_exit(ctx)
 
@@ -437,6 +438,7 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             )
             click.echo(f"Field Conf:   {fields}")
         click.echo(f"PDF:          {receipt.pdf_path}")
+        click.echo(f"Rendition:    {rendition_ref(receipt.pdf_path)}")
         click.echo(f"Source:       {receipt.source_type} ({receipt.source_id})")
         if receipt.source_name:
             click.echo(f"Source Name:  {receipt.source_name}")
@@ -489,6 +491,7 @@ def mcp_command(
         default_access_log_path,
         startup_check,
     )
+    from receipt_index.store import open_store
 
     config = _load_config_or_exit(ctx)
 
@@ -520,7 +523,7 @@ def mcp_command(
 
     server = build_server(
         database_url=database_url,
-        store_root=Path(config.store.path),
+        store=open_store(config.store),
         access_log=access_log,
         max_content_bytes=(
             DEFAULT_MAX_CONTENT_BYTES

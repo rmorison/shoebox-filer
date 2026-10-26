@@ -6,11 +6,13 @@ import textwrap
 from pathlib import Path  # noqa: TC003
 
 import pytest
+from pydantic import ValidationError
 
 from receipt_index.config import (
     AppConfig,
     ConfigError,
     ImapSourceConfig,
+    StoreConfig,
     load_config,
     load_config_dict,
 )
@@ -211,6 +213,7 @@ class TestLoadConfig:
         )
         config = load_config(str(config_file))
         assert config.store.path == "./data/receipts"
+        assert config.store.backend == "local"
         assert config.logging.level == "INFO"
         assert config.llm.model == "claude-haiku-4-5-20251001"
 
@@ -240,3 +243,15 @@ class TestIngestConfig:
 
         with pytest.raises(pydantic.ValidationError):
             IngestConfig(drive_settle_seconds=-1)
+
+
+class TestStoreBackend:
+    """store.backend selects the evidence store; only local exists so far."""
+
+    def test_local_is_accepted(self) -> None:
+        assert StoreConfig(backend="local").backend == "local"
+
+    @pytest.mark.parametrize("backend", ["drive", "Local", "s3", ""])
+    def test_anything_else_is_rejected(self, backend: str) -> None:
+        with pytest.raises(ValidationError, match="backend"):
+            StoreConfig.model_validate({"backend": backend})

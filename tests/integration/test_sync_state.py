@@ -38,7 +38,7 @@ from receipt_index.repository import (
     save_drive_cursor,
     save_imap_cursor,
 )
-from receipt_index.store import LocalFileStore
+from receipt_index.store import LocalEvidenceStore
 
 from .conftest import _DB_DSN, GREENMAIL_IMAP_PORT, seed_email
 
@@ -107,7 +107,7 @@ def _ingest(conn: Conn, adapter: ImapAdapter, tmp_path: Path) -> Any:
     return run_ingest(
         conn=conn,
         adapter=adapter,
-        store=LocalFileStore(tmp_path),
+        store=LocalEvidenceStore(tmp_path),
         source_name=adapter.name,
         source_type="imap",
         agent=_agent(),  # type: ignore[arg-type]

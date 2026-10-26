@@ -212,7 +212,8 @@ Date:         2026-01-15
 Description:  Order #123-4567890 - Wireless keyboard
 Confidence:   0.95
 Field Conf:   vendor 0.98, amount 0.95, paid_amount 0.90, date 0.97
-PDF:          2026/01/2026-01-15__amazon__47.99.pdf
+PDF:          renditions/2026/01/2026-01-15__amazon__47.99.pdf
+Rendition:    local:renditions/2026/01/2026-01-15__amazon__47.99.pdf
 Source:       imap (msg-id-12345@mail.example.com)
 Subject:      Your Amazon.com order has shipped
 Sender:       ship-confirm@amazon.com
@@ -221,7 +222,19 @@ Email Date:   2026-01-15T10:30:00
 
 `Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded.
 
-The `PDF` path is relative to your configured `RECEIPT_STORE_PATH`. PDFs are stored using the naming convention `{YYYY}/{MM}/{YYYY-MM-DD}__{vendor-slug}__{amount}.pdf`.
+The `PDF` path is relative to the store root, `store.path` in the config. `Rendition` is the same file's evidence-store reference: `local:` followed by that path.
+
+New PDFs are stored as `renditions/{YYYY}/{MM}/{YYYY-MM-DD}__{vendor-slug}__{amount}.pdf`. Receipts stored before this layout keep their path, `{YYYY}/{MM}/{YYYY-MM-DD}__{vendor-slug}__{amount}.pdf`, and are read where they are: no file is moved. A new PDF never reuses a name that an older PDF in the same month already has, so it gets a numeric suffix (`_2`) instead.
+
+#### Store configuration
+
+```yaml
+store:
+  backend: local          # the only backend so far, and the default
+  path: ./data/receipts   # the store root
+```
+
+`store.backend` selects the evidence store. Any value other than `local` is a config error.
 
 ---
 
@@ -348,7 +361,7 @@ uv run receipt-index search --amount 47.99 --date-from 2026-01-01 --date-to 2026
 uv run receipt-index show 01942a3b-1234-7def-8abc-567890abcdef
 ```
 
-The PDF is at `$RECEIPT_STORE_PATH/2026/01/2026-01-15__amazon__47.99.pdf`.
+The PDF is under the store root (`store.path`), at the `PDF` path `show` prints, for example `renditions/2026/01/2026-01-15__amazon__47.99.pdf`.
 
 ### Finding All Receipts from a Vendor
 
