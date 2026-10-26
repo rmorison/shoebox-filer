@@ -1,6 +1,8 @@
 """End-to-end integration tests for the receipt ingestion pipeline.
 
-Requires Docker services: Postgres (port 15432) and GreenMail (ports 3025/3143).
+Requires Docker services: Postgres and GreenMail, on the host ports set by
+POSTGRES_HOST_PORT, GREENMAIL_SMTP_PORT and GREENMAIL_IMAP_PORT
+(defaults 15432, 3025 and 3143).
 Start with: docker compose up -d
 """
 

@@ -22,9 +22,10 @@ if TYPE_CHECKING:
 
 # TODO: Tests run as superuser (main). Ideally bootstrap schema as main,
 # then run pipeline tests as receipt_index_dev_write to catch missing GRANTs.
+_POSTGRES_HOST_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
 _DB_DSN = (
     "postgresql://main:localpass@localhost:"  # pragma: allowlist secret
-    f"{os.environ.get('POSTGRES_HOST_PORT', '15432')}/receipt_index_dev"
+    f"{_POSTGRES_HOST_PORT}/receipt_index_dev"
 )
 
 
@@ -144,7 +145,7 @@ def pg_conn() -> Iterator[psycopg.Connection[dict[str, Any]]]:
     try:
         conn = psycopg.connect(_DB_DSN, row_factory=psycopg.rows.dict_row)
     except psycopg.OperationalError:
-        pytest.skip("Postgres not available at localhost:15432")
+        pytest.skip(f"Postgres not available at localhost:{_POSTGRES_HOST_PORT}")
 
     _run_migrations(conn)
     yield conn
