@@ -629,6 +629,7 @@ _PAID_AMOUNT_RULES = {
     "refund excludes store credit": "returned as store credit, a gift card or points",
     "unknown is null": "does not say what was paid or returned, use null",
     "never copied from amount": "Never copy amount into paid_amount",
+    "refund is a positive number": "as a positive number, never negative",
 }
 
 
@@ -657,3 +658,6 @@ class TestPaidAmountPrompts:
         assert "field_confidence:" in flat
         assert "vendor, amount, paid_amount and date" in flat
         assert "below 0.5 when a figure is inferred rather than printed" in flat
+        # A null paid_amount still gets a numeric confidence; null would fail
+        # validation and lose the receipt.
+        assert "always a number, even when paid_amount is null" in flat

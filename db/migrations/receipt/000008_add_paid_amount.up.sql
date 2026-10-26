@@ -3,8 +3,9 @@
 -- paid_amount is what was charged (or, for a refund, returned); NULL means
 -- not known, 0 means nothing was charged.
 ALTER TABLE receipt.receipts
-    ADD COLUMN paid_amount      NUMERIC(12,2),
-    ADD COLUMN field_confidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS paid_amount      NUMERIC(12,2),
+    ADD COLUMN IF NOT EXISTS field_confidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    DROP CONSTRAINT IF EXISTS ck_receipts_paid_amount_non_negative,
     ADD CONSTRAINT ck_receipts_paid_amount_non_negative
         CHECK (paid_amount IS NULL OR paid_amount >= 0);
 
@@ -13,7 +14,7 @@ CREATE INDEX IF NOT EXISTS idx_receipts_effective_amount
     ON receipt.receipts ((COALESCE(paid_amount, amount)));
 
 ALTER TABLE receipt.ingest_log
-    ADD COLUMN paid_amount NUMERIC(12,2);
+    ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2);
 
 -- Grant access to new columns
 GRANT INSERT (paid_amount, field_confidence), UPDATE (paid_amount, field_confidence)

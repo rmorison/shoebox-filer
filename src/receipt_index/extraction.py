@@ -37,7 +37,8 @@ this document says was charged.
   - When the document shows that nothing has been paid (an unpaid invoice), \
 use 0.
   - For a refund, what was returned to the payer's payment methods, excluding \
-any part returned as store credit, a gift card or points.
+any part returned as store credit, a gift card or points, as a positive \
+number, never negative.
   - When the document does not say what was paid or returned, use null. \
 Never copy amount into paid_amount: null means not known, and 0 means nothing \
 was charged.
@@ -45,8 +46,9 @@ was charged.
 
 _FIELD_CONFIDENCE_RULE = """\
 - field_confidence: Your confidence in each of vendor, amount, paid_amount and \
-date, from 0.0 to 1.0. Go below 0.5 when a figure is inferred rather than \
-printed on the document.
+date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
+(then it is your confidence that the document does not say what was paid). Go \
+below 0.5 when a figure is inferred rather than printed on the document.
 """
 
 _SYSTEM_PROMPT = f"""\

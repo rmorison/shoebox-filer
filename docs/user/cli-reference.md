@@ -23,7 +23,7 @@ Each receipt has three amounts:
 | `paid_amount` | What the transaction charged to the payer's card, bank account, wallet or cash; for a refund, what it returned to them. `null` when the document doesn't say; `0` when nothing was charged, such as on an unpaid invoice |
 | `effective_amount` | `paid_amount` when it is known, otherwise `amount` |
 
-`paid_amount` includes tax, shipping and tip, and is after discounts. It leaves out anything paid with gift cards, store credit, points or vouchers, since those never reach a bank or card statement; the description says when they were used. It is never copied from `amount`: a receipt whose paid amount isn't known has `null`, not its total.
+`paid_amount` includes tax, shipping and tip, and is after discounts. It leaves out anything paid with gift cards, store credit, points or vouchers, since those never reach a bank or card statement; the description says when they were used. It is never copied from `amount`: a receipt whose paid amount isn't known has `null`, not its total. A refund's `paid_amount` is what it returned, as a positive number, so a sum of effective amounts counts refunds as spending, not as money back.
 
 The search amount filters and the `Amount` column in text output use the effective amount. JSON output keeps `amount` as the total and adds `paid_amount` and `effective_amount`, so a script that reads `amount` keeps working; read `effective_amount` for what was paid.
 
