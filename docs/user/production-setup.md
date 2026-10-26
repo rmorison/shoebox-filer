@@ -102,7 +102,7 @@ Update your `.env` to point at the native PostgreSQL instance instead of Docker:
 DATABASE_URL=postgresql://receipt_index_dev_write:your-secure-password@localhost:5432/receipt_index  # pragma: allowlist secret
 
 # Database — migrations (superuser, used by make migrate-up)
-MIGRATION_DATABASE_URL=postgresql://postgres@localhost:5432/receipt_index
+MIGRATION_DATABASE_URL=postgresql://postgres@localhost:5432/receipt_index?sslmode=disable
 ```
 
 Key differences from the Docker dev setup:

@@ -1,6 +1,8 @@
 """Phase 2 integration tests: config-based sources, multi-source ingest, Drive adapter.
 
-Requires Docker services: Postgres (port 15432) and GreenMail (ports 3025/3143).
+Requires Docker services: Postgres and GreenMail, on the host ports set by
+POSTGRES_HOST_PORT, GREENMAIL_SMTP_PORT and GREENMAIL_IMAP_PORT
+(defaults 15432, 3025 and 3143).
 Start with: docker compose up -d
 
 These tests exercise:
@@ -31,7 +33,7 @@ from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
 from receipt_index.store import LocalFileStore
 
-from .conftest import GREENMAIL_IMAP_PORT, seed_email
+from .conftest import _DB_DSN, _POSTGRES_HOST_PORT, GREENMAIL_IMAP_PORT, seed_email
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -132,14 +134,6 @@ def _make_app_config(sources: list[Any], db_url: str, store_path: str) -> Any:
         store=StoreConfig(path=store_path),
         llm=LlmConfig(api_key="test-key"),  # pragma: allowlist secret
     )
-
-
-# DB URL used by conftest for the test Postgres instance — unused at module level
-# but kept as a reference for any test that needs to open its own connection.
-_DB_URL = (
-    "postgresql://main:localpass@localhost:15432/"  # pragma: allowlist secret
-    "receipt_index_dev"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -1062,11 +1056,7 @@ class TestMigration000005:
     pg_conn fixture to avoid corrupting other tests' state.
     """
 
-    # DSN matches conftest._DB_DSN
-    _DSN = (
-        "postgresql://main:localpass@localhost:15432/"  # pragma: allowlist secret
-        "receipt_index_dev"
-    )
+    _DSN = _DB_DSN
 
     def _fresh_conn(self) -> Any:
         """Open a new connection (caller is responsible for closing)."""
@@ -1075,7 +1065,10 @@ class TestMigration000005:
         try:
             conn = pg.connect(self._DSN, row_factory=pg.rows.dict_row)
         except Exception:
-            pytest.skip("Postgres not available for migration test")
+            pytest.skip(
+                "Postgres not available for migration test at "
+                f"localhost:{_POSTGRES_HOST_PORT}"
+            )
         return conn
 
     def _schema_exists_pre_migration(self, conn: Any) -> bool:
