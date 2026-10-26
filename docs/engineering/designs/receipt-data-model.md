@@ -421,8 +421,6 @@ This stops application code. It doesn't stop the owning role from dropping the t
 
 Deleting a receipt deletes its history with it (`ON DELETE CASCADE`), which is the one exception to the rule above. The CLI has no command that deletes a receipt, and merging duplicates deletes nothing, so this only happens through SQL run by hand. Deleting a purchase that way also sets its refunds' `refund_of` to `NULL` with no event, since a cascade writes none; that is part of the same exception.
 
-`receipt.forbid_history_change()` is shared with the evidence-store design, which guards its own link-history table with it. Whichever design's migration lands first creates it, and the other uses `CREATE OR REPLACE` with the same body. Every table it guards has a `receipt_id` column referencing `receipt.receipts`.
-
 ### 5. Line items
 
 ```sql
@@ -623,7 +621,7 @@ The evidence-store design marks a merged receipt with `merged_into_id` instead o
 - Search, `--needs-review`, `--untagged`, `--not-linked`, text search, totals and the JSON output leave out merged receipts (`merged_into_id IS NULL`). `show` on a merged receipt still works, and says which receipt it was merged into.
 - `receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
 - The refund linking rule and `reextract` skip merged receipts.
-- A merge always points at a receipt that isn't itself merged; the evidence-store design keeps it so, which is why one `COALESCE` is enough.
+- A merge always points at a receipt that isn't itself merged; the evidence-store design keeps it so (it flattens merges and checks this with a trigger), which is why one `COALESCE` is enough.
 - These conditions need the evidence-store design's columns. Whichever ticket lands second, this design's or that design's merge, adds them.
 
 ### 11. The finished `receipts` table
