@@ -635,10 +635,9 @@ _PAID_AMOUNT_RULES = {
         "Don't assume the total was paid when no payment is shown"
     ),
     "shown-payment rule is for purchases": "For a purchase, when the document shows",
-    "one payment method without an amount": (
-        "one payment method with no amount next to it"
+    "payment method without an amount is not a payment": (
+        "A payment method named with no amount"
     ),
-    "charge later is not a payment yet": "will be charged later",
     "cash is net of change": "not the cash tendered",
     "refund is never negative": "It is never negative",
     "store-credit refund is 0": "0 when all of it was returned as store credit",
@@ -664,6 +663,12 @@ class TestPaidAmountPrompts:
         # "Never copy amount into paid_amount" can read as "paid must differ
         # from the total", which empties the field on plain card receipts.
         assert "Never copy amount" not in " ".join(prompt.split())
+
+    @_PROMPTS
+    def test_total_not_inferred_from_payment_method(self, prompt: str) -> None:
+        # Design §1: paid_amount is never inferred from amount. A card named
+        # without an amount (on file, a guarantee) must not mean "total paid".
+        assert "the total was charged to it" not in " ".join(prompt.split())
 
     @_PROMPTS
     def test_old_total_rule_removed(self, prompt: str) -> None:
