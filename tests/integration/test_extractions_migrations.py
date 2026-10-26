@@ -51,8 +51,9 @@ def _run(conn: psycopg.Connection[Any], path: Path) -> None:
 def scratch() -> Iterator[tuple[psycopg.Connection[dict[str, Any]], str]]:
     """A fresh database with every up migration, and a role that owns nothing.
 
-    Yields the superuser connection and the name of a scratch login role
-    that the tests make the owner of ``receipt.extractions``.
+    Yields the superuser connection and the name of a scratch role that the
+    tests make the owner of the receipt tables. Every role it creates is
+    dropped with the database.
     """
     try:
         admin = psycopg.connect(_ADMIN_DSN, autocommit=True)
@@ -61,14 +62,19 @@ def scratch() -> Iterator[tuple[psycopg.Connection[dict[str, Any]], str]]:
     suffix = uuid.uuid4().hex[:8]
     name = f"receipt_index_test_extr_{suffix}"
     owner = f"receipt_index_test_owner_{suffix}"
-    for role in _ROLES:  # CI's Postgres has no application roles
-        admin.execute(
-            sql.SQL(
-                "DO $$ BEGIN IF NOT EXISTS "
-                "(SELECT FROM pg_roles WHERE rolname = {lit}) THEN "
-                "CREATE ROLE {ident} NOLOGIN; END IF; END $$"
-            ).format(lit=sql.Literal(role), ident=sql.Identifier(role))
-        )
+    # CI's Postgres has no application roles. Create the missing ones for the
+    # grants, and drop them afterwards: roles are cluster-wide, and a later
+    # test (the MCP stdio tests) creates them with a login if they're absent.
+    created: list[str] = []
+    for role in _ROLES:
+        exists = admin.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)
+        ).fetchone()
+        if exists is None:
+            admin.execute(
+                sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role))
+            )
+            created.append(role)
     admin.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(owner)))
     admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     dsn = _ADMIN_DSN.rsplit("/", 1)[0] + f"/{name}"
@@ -85,7 +91,10 @@ def scratch() -> Iterator[tuple[psycopg.Connection[dict[str, Any]], str]]:
                 sql.Identifier(name)
             )
         )
-        admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner)))
+        for role in (owner, *created):
+            admin.execute(
+                sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))
+            )
         admin.close()
 
 
