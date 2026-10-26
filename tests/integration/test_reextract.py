@@ -265,6 +265,46 @@ class TestFirstRun:
         assert after.amount == Decimal("30.00")
 
 
+class TestAfterAGatedRun:
+    def test_the_old_prompt_amount_is_still_replaced(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        store = LocalEvidenceStore(tmp_path)
+        old = _seed(pg_conn, store, "Gated first")  # amount 30.00, the payment
+        gated = Llm({"Gated first": _meta("Gated first", confidence=0.3)})
+        first = _run(pg_conn, store, gated, _select(pg_conn, ids=[old.id]))
+        assert first.outcomes[0].status == "gated"
+
+        # A gated run is a real result: the receipt is current until --force.
+        assert _select(pg_conn, ids=[old.id]) == []
+        _run(pg_conn, store, Llm(), _select(pg_conn, ids=[old.id], force=True))
+
+        after = get_receipt_by_id(pg_conn, old.id)
+        assert after is not None
+        assert after.amount == Decimal("50.00")  # replaced by the total
+        assert after.paid_amount == Decimal("30.00")
+        second = _history(pg_conn, old.id)[1]
+        assert second["replaced"]["amount"] == "30.00"
+
+    def test_a_legacy_receipt_stays_overwritable_after_a_run(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        store = LocalEvidenceStore(tmp_path)
+        old = _seed(pg_conn, store, "Legacy")
+        _run(pg_conn, store, Llm(), _select(pg_conn, ids=[old.id]))
+        corrected = Llm({"Legacy": _meta("Legacy", vendor="Acme Parking")})
+        _run(
+            pg_conn,
+            store,
+            corrected,
+            _select(pg_conn, ids=[old.id], force=True),
+            overwrite=True,
+        )
+        after = get_receipt_by_id(pg_conn, old.id)
+        assert after is not None
+        assert after.vendor == "Acme Parking"
+
+
 class TestSelection:
     def test_current_version_and_model_are_skipped(
         self, pg_conn: Conn, tmp_path: Path

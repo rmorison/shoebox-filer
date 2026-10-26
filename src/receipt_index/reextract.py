@@ -24,7 +24,11 @@ from receipt_index.extraction import (
     extract_metadata,
 )
 from receipt_index.locks import item_lock
-from receipt_index.models import receipt_values
+from receipt_index.models import (
+    FAILED_RUN_KEY,
+    MIN_RECEIPT_CONFIDENCE,
+    receipt_values,
+)
 from receipt_index.repository import (
     get_extraction_history,
     insert_extraction,
@@ -53,7 +57,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MIN_CONFIDENCE = 0.5
+_MIN_CONFIDENCE = MIN_RECEIPT_CONFIDENCE
 
 # A run stops after this many failures in a row: the LLM (or the store) is
 # most likely down, and every further receipt would only fail too. The
@@ -71,9 +75,7 @@ _CONFIDENCE_OF = {
     "field_confidence.date": "receipt_date",
 }
 
-Status = Literal[
-    "applied", "unchanged", "gated", "failed", "locked", "unavailable", "planned"
-]
+Status = Literal["applied", "unchanged", "gated", "failed", "locked", "unavailable"]
 InputKind = Literal["original", "source", "rendition"]
 
 
@@ -81,8 +83,10 @@ InputKind = Literal["original", "source", "rendition"]
 class History:
     """What a receipt's earlier extractions did."""
 
-    # Whether any earlier extraction succeeded (failed runs don't count).
-    has_history: bool
+    # Whether ingest recorded this receipt's extraction. A receipt ingested
+    # before the history existed has no such row: its fields came from an
+    # unrecorded machine extraction and count as machine-extracted.
+    ingested: bool
     # Every field any earlier extraction applied.
     applied: frozenset[str]
 
@@ -110,10 +114,13 @@ def plan_changes(
 
     - Fill-only (the default) writes a field only when it is empty: NULL, or
       a missing ``field_confidence`` entry. ``amount`` is empty too on a
-      receipt extracted under the old prompt (no history and an empty
-      ``field_confidence``), whose amount may be the payment, not the total.
-    - ``overwrite`` also replaces a field an earlier run applied. A receipt
-      with no history counts as entirely machine-extracted.
+      receipt extracted under the old prompt (ingested before the history
+      existed, with an empty ``field_confidence`` and no run that applied
+      ``amount``), whose amount may be the payment, not the total. A gated or
+      failed run changes neither, so it doesn't end that treatment.
+    - ``overwrite`` also replaces a field an earlier run applied. On a
+      receipt ingested before the history existed, every field counts as
+      machine-extracted (only ``manual_fields`` marks a hand edit).
     - A field in ``manual_fields`` is never written, nor its confidence.
     - A field's confidence entry moves with the field. An entry is otherwise
       written only when the stored value equals the extracted one, so that
@@ -124,14 +131,17 @@ def plan_changes(
     """
     values = receipt_values(metadata)
     manual = set(receipt.manual_fields)
-    old_prompt = not history.has_history and not receipt.field_confidence
+    legacy = not history.ingested
+    old_prompt = (
+        legacy and not receipt.field_confidence and "amount" not in history.applied
+    )
 
     def allowed(name: str, current: Any) -> bool:
         if current is None and name not in _NEVER_EMPTY:
             return True
         if name == "amount" and old_prompt:
             return True
-        return overwrite and (not history.has_history or name in history.applied)
+        return overwrite and (legacy or name in history.applied)
 
     changes: dict[str, tuple[Any, Any]] = {}
     for name, new in values.items():
@@ -332,7 +342,7 @@ def _record_failure(
         input_kind=input_kind,
         prompt_version=EXTRACTION_PROMPT_VERSION,
         llm_model=llm_model,
-        output={"error": error},
+        output={FAILED_RUN_KEY: error},
         applied_fields=[],
         replaced={},
         llm_input_tokens=extraction.input_tokens if extraction else None,
@@ -368,7 +378,7 @@ def _apply(
     if current is None:
         conn.rollback()
         return _outcome(receipt, "failed", error="receipt was deleted", **extracted)
-    has_history, applied = get_extraction_history(conn, receipt.id)
+    ingested, applied = get_extraction_history(conn, receipt.id)
     gated = metadata.confidence < _MIN_CONFIDENCE
     changes = (
         {}
@@ -376,7 +386,7 @@ def _apply(
         else plan_changes(
             current,
             metadata,
-            History(has_history=has_history, applied=frozenset(applied)),
+            History(ingested=ingested, applied=frozenset(applied)),
             overwrite=overwrite,
         )
     )

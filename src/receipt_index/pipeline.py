@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
 from receipt_index.locks import SourceLockLostError, item_lock
-from receipt_index.models import receipt_values
+from receipt_index.models import MIN_RECEIPT_CONFIDENCE, receipt_values
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
     get_processed_source_ids,
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MIN_CONFIDENCE = 0.5
+_MIN_CONFIDENCE = MIN_RECEIPT_CONFIDENCE
 
 # A started row older than this, with no later row, belongs to a process that
 # died mid-item.

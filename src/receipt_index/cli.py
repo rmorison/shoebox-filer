@@ -18,10 +18,12 @@ from receipt_index.config import AppConfig, ConfigError, load_config
 load_dotenv()
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
     from decimal import Decimal
 
     from receipt_index.adapters.base import SourceAdapter
+    from receipt_index.config import SourceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -492,10 +494,10 @@ def _parse_confidence_below(value: str | None) -> tuple[str | None, float] | Non
     return (field_name or None, threshold)
 
 
-def _source_adapter(config: AppConfig) -> Any:
+def _source_adapter(config: AppConfig) -> Callable[[SourceConfig], SourceAdapter]:
     """A factory that builds the adapter for one configured source."""
 
-    def build(source_config: Any) -> SourceAdapter:
+    def build(source_config: SourceConfig) -> SourceAdapter:
         from receipt_index.adapters.imap import ImapAdapter
         from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
 

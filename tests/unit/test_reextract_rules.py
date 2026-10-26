@@ -17,9 +17,9 @@ from receipt_index.models import FieldConfidence, Receipt, ReceiptMetadata
 from receipt_index.reextract import History, plan_changes
 
 _NOW = datetime(2026, 1, 15, tzinfo=UTC)
-_NO_HISTORY = History(has_history=False, applied=frozenset())
+_NO_HISTORY = History(ingested=False, applied=frozenset())
 _INGESTED = History(
-    has_history=True,
+    ingested=True,
     applied=frozenset(
         {
             "vendor",
@@ -136,6 +136,22 @@ class TestOldPrompt:
         assert changes["amount"] == (Decimal("30.00"), Decimal("50.00"))
         assert changes["field_confidence.amount"] == (None, 0.9)
 
+    def test_a_gated_earlier_run_doesnt_end_old_prompt_treatment(self) -> None:
+        # A gated run applied nothing and filled no field_confidence: the
+        # amount is still the old prompt's and is still replaced.
+        receipt = _receipt(amount=Decimal("30.00"))
+        gated = History(ingested=False, applied=frozenset())
+        changes = plan_changes(receipt, _meta(), gated, overwrite=False)
+        assert changes["amount"] == (Decimal("30.00"), Decimal("50.00"))
+
+    def test_amount_is_kept_once_a_run_applied_it(self) -> None:
+        receipt = _receipt(amount=Decimal("50.00"))
+        history = History(ingested=False, applied=frozenset({"amount"}))
+        changes = plan_changes(
+            receipt, _meta(amount=Decimal("51.00")), history, overwrite=False
+        )
+        assert "amount" not in changes
+
     def test_amount_is_kept_once_there_is_history(self) -> None:
         receipt = _receipt(amount=Decimal("30.00"))
         changes = plan_changes(receipt, _meta(), _INGESTED, overwrite=False)
@@ -180,7 +196,7 @@ class TestOverwrite:
             vendor="Acme", paid_amount=Decimal("25.00"), field_confidence=_FC_FULL
         )
         history = History(
-            has_history=True,
+            ingested=True,
             applied=frozenset({"vendor", "paid_amount", "field_confidence.vendor"}),
         )
         changes = plan_changes(receipt, _meta(), history, overwrite=True)
@@ -189,9 +205,21 @@ class TestOverwrite:
 
     def test_leaves_fields_no_earlier_run_applied(self) -> None:
         receipt = _receipt(description="Edited", field_confidence=_FC_FULL)
-        history = History(has_history=True, applied=frozenset({"vendor"}))
+        history = History(ingested=True, applied=frozenset({"vendor"}))
         changes = plan_changes(receipt, _meta(), history, overwrite=True)
         assert "description" not in changes
+
+    def test_a_legacy_receipt_stays_machine_extracted_after_a_run(self) -> None:
+        # Its first run filled only the paid amount; its vendor came from
+        # the original ingest, which no row records, and nothing marks it
+        # as hand-edited, so --overwrite may still correct it.
+        receipt = _receipt(vendor="Acme", field_confidence=_FC_FULL)
+        history = History(
+            ingested=False,
+            applied=frozenset({"paid_amount", "field_confidence.paid_amount"}),
+        )
+        changes = plan_changes(receipt, _meta(), history, overwrite=True)
+        assert changes["vendor"] == ("Acme", "Acme Parking (U.S.), LLC")
 
     def test_no_history_counts_as_machine_extracted(self) -> None:
         receipt = _receipt(vendor="Acme", receipt_date=date(2026, 1, 1))

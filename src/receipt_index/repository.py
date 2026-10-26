@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 from psycopg.types.json import Jsonb
 
-from receipt_index.models import IngestLogEntry, Receipt, SyncState
+from receipt_index.models import (
+    FAILED_RUN_KEY,
+    MIN_RECEIPT_CONFIDENCE,
+    IngestLogEntry,
+    Receipt,
+    SyncState,
+)
 
 if TYPE_CHECKING:
     from datetime import date, datetime
@@ -579,19 +585,25 @@ def get_receipt_by_id(
 # Re-extraction (receipt data-model design, §3)
 # ---------------------------------------------------------------------------
 
+
+def _failed(output: str = "output") -> str:
+    """SQL that is true for a failed extraction run's ``output``."""
+    return f"{output} ? '{FAILED_RUN_KEY}'"
+
+
 # Each receipt's latest extraction that didn't fail. A failed run (its output
 # holds an "error") never makes a receipt current, so the next run retries it.
-_LATEST_GOOD = """\
+_LATEST_GOOD = f"""\
 SELECT DISTINCT ON (receipt_id) receipt_id, prompt_version, llm_model
 FROM receipt.extractions
-WHERE NOT (output ? 'error')
+WHERE NOT ({_failed()})
 ORDER BY receipt_id, created_at DESC, id DESC
 """
 
 # A receipt still needs review when its paid amount isn't known, or when its
 # latest run (failed ones included) applied nothing because it failed or was
 # gated. A run that applied nothing because nothing was empty doesn't count.
-_NEEDS_REVIEW = """\
+_NEEDS_REVIEW = f"""\
 (paid_amount IS NULL OR EXISTS (
     SELECT 1 FROM (
         SELECT e.output FROM receipt.extractions e
@@ -599,8 +611,8 @@ _NEEDS_REVIEW = """\
         ORDER BY e.created_at DESC, e.id DESC
         LIMIT 1
     ) latest
-    WHERE latest.output ? 'error'
-       OR (latest.output->>'confidence')::numeric < 0.5
+    WHERE {_failed("latest.output")}
+       OR (latest.output->>'confidence')::numeric < {MIN_RECEIPT_CONFIDENCE}
 ))"""
 
 # Lowest paid-amount confidence first; receipts with no such entry first of all.
@@ -695,11 +707,11 @@ def lock_receipt(
 def get_extraction_history(
     conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
 ) -> tuple[bool, set[str]]:
-    """Whether a receipt has an extraction that didn't fail, and every field
-    any of its extractions applied."""
+    """Whether ingest recorded the receipt's extraction, and every field any
+    of its extractions applied."""
     cur = conn.execute(
         """\
-        SELECT count(*) FILTER (WHERE NOT (output ? 'error')) AS good,
+        SELECT bool_or(origin = 'ingest') AS ingested,
                COALESCE(array_agg(DISTINCT f) FILTER (WHERE f IS NOT NULL),
                         '{}') AS applied
         FROM receipt.extractions
@@ -711,7 +723,7 @@ def get_extraction_history(
     row = cur.fetchone()
     if row is None:
         return False, set()
-    return bool(row["good"]), set(row["applied"] or [])
+    return bool(row["ingested"]), set(row["applied"] or [])
 
 
 # The receipt columns re-extraction may write (field_confidence apart).
@@ -775,13 +787,13 @@ def token_averages(
     Returns ``runs``, ``avg_input``, ``avg_output`` and ``basis``.
     """
     cur = conn.execute(
-        """\
+        f"""\
         SELECT count(*) AS runs,
                avg(llm_input_tokens) AS avg_input,
                avg(llm_output_tokens) AS avg_output
         FROM receipt.extractions
         WHERE llm_model = %(model)s AND prompt_version = %(version)s
-          AND NOT (output ? 'error') AND llm_input_tokens IS NOT NULL
+          AND NOT ({_failed()}) AND llm_input_tokens IS NOT NULL
         """,
         {"model": llm_model, "version": prompt_version},
     )

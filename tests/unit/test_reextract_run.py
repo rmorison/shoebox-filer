@@ -110,8 +110,8 @@ class FakeDb:
         self, conn: Any, receipt_id: UUID
     ) -> tuple[bool, set[str]]:
         rows = [e for e in self.extractions if e["receipt_id"] == receipt_id]
-        good = [e for e in rows if "error" not in e["output"]]
-        return bool(good), {f for e in rows for f in e["applied_fields"]}
+        ingested = any(e["origin"] == "ingest" for e in rows)
+        return ingested, {f for e in rows for f in e["applied_fields"]}
 
     def update_receipt_fields(
         self,
@@ -435,3 +435,52 @@ class TestApplying:
         result, _ = _run(db, [db.receipts[receipt.id]], adapter=None)
         assert result.outcomes[0].status == "unchanged"
         assert len(db.updates) == 1
+
+
+class TestApplyFailures:
+    def test_a_failed_write_rolls_back_and_records_an_error_row(
+        self, db: FakeDb, llm: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def broken(*_: Any, **__: Any) -> None:
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(reextract, "update_receipt_fields", broken)
+        conn = MagicMock()
+        receipt = _receipt()
+        db.receipts[receipt.id] = receipt
+        outcome = reextract.reextract_receipt(
+            conn,
+            receipt,
+            pool=None,
+            store=_store(),
+            agents=_AGENTS,
+            llm_model="claude-test",
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.error == "RuntimeError: disk full"
+        conn.rollback.assert_called()  # the half-applied transaction is dropped
+        (row,) = db.extractions
+        assert row["output"] == {"error": "RuntimeError: disk full"}
+        assert row["applied_fields"] == []
+        # The LLM call was paid for: its tokens are still recorded.
+        assert (row["llm_input_tokens"], row["llm_output_tokens"]) == (1200, 180)
+
+    def test_a_receipt_deleted_during_the_run_writes_nothing(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        receipt = _receipt()
+        conn = MagicMock()
+        outcome = reextract.reextract_receipt(
+            conn,
+            receipt,  # selected, but no longer in the table
+            pool=None,
+            store=_store(),
+            agents=_AGENTS,
+            llm_model="claude-test",
+        )
+        assert outcome.status == "failed"
+        assert outcome.error == "receipt was deleted"
+        assert db.extractions == []
+        assert db.updates == []
+        conn.rollback.assert_called()

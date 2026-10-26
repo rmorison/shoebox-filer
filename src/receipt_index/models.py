@@ -146,6 +146,16 @@ class ReceiptMetadata(BaseModel):
     field_confidence: FieldConfidence
 
 
+# Below this overall confidence an extraction isn't treated as a receipt:
+# ingest skips the item, and re-extraction records the run and applies
+# nothing (it is "gated"). One value for ingest, reextract and --needs-review.
+MIN_RECEIPT_CONFIDENCE = 0.5
+
+# An extraction run that failed records only this key in its output. Such a
+# run never makes a receipt current, and --needs-review lists it.
+FAILED_RUN_KEY = "error"
+
+
 def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
     """The receipt fields an extraction gives, keyed by their applied name.
 

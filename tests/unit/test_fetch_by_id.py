@@ -45,6 +45,13 @@ class SearchingIMAPClient(FakeIMAPClient):
         super().__init__(messages)
         self.raw_searches: list[Any] = []
         self.search_error: Exception | None = None
+        # Raised by the next header FETCH (the exact-ID check after SEARCH).
+        self.header_error: Exception | None = None
+
+    def fetch(self, uids: list[int], items: list[str]) -> dict[int, dict[bytes, Any]]:
+        if items != ["BODY.PEEK[]"] and self.header_error is not None:
+            raise self.header_error
+        return super().fetch(uids, items)
 
     def search(self, criteria: Any) -> list[int]:
         self.raw_searches.append(criteria)
@@ -150,6 +157,23 @@ class TestImapFetchById:
         fake.search_error = IMAPClientAbortError("socket closed")
         with pytest.raises(SourceUnavailableError):
             _imap(imap_config, fake).fetch_by_id("<a@example.com>")
+
+    @pytest.mark.parametrize(
+        "error",
+        [IMAPClientAbortError("socket closed"), OSError("connection reset")],
+        ids=["abort", "oserror"],
+    )
+    def test_drop_after_search_is_unavailable(
+        self, imap_config: ImapSourceConfig, error: Exception
+    ) -> None:
+        # The connection drops during the exact-ID header check, after SEARCH
+        # succeeded: still an outage, not this message's fault.
+        fake = SearchingIMAPClient({7: _mail("<a@example.com>")})
+        fake.header_error = error
+        adapter = _imap(imap_config, fake)
+        with pytest.raises(SourceUnavailableError):
+            adapter.fetch_by_id("<a@example.com>")
+        assert adapter._client is None  # the broken session was dropped
 
     def test_connect_failure_is_unavailable(
         self, imap_config: ImapSourceConfig, monkeypatch: pytest.MonkeyPatch

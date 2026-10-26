@@ -359,14 +359,11 @@ class ImapAdapter:
         criteria = _message_id_search(source_id)
         if criteria is None:
             return None
+        # Everything up to the body fetch: SEARCH, the exact-ID check and the
+        # re-select. A dropped connection anywhere here is the source's
+        # problem, never this message's (the body fetch handles its own).
         try:
-            matches: list[tuple[str, int, int]] = []
-            for folder in self._lookup_folders():
-                client = self._session()
-                info = client.select_folder(folder, readonly=True)  # EXAMINE
-                uidvalidity = int(info[b"UIDVALIDITY"])
-                for uid in client.search(criteria):
-                    matches.append((folder, uidvalidity, int(uid)))
+            found = self._find_exact(criteria, source_id)
         except (OSError, IMAPClientAbortError, ConnectionError) as exc:
             self._drop_client()
             raise SourceUnavailableError(
@@ -379,6 +376,28 @@ class ImapAdapter:
             raise MessageRefusedError(
                 f"server refused the search for {source_id}: {exc}"
             ) from exc
+        if found is None:
+            return None
+        uid = found
+        response = self._fetch_body(uid)
+        data = response.get(uid)
+        raw = data.get(_BODY_KEY) if data else None
+        if not isinstance(raw, bytes):
+            return None
+        return self._parse_message(message_from_bytes(raw), source_id)
+
+    def _find_exact(self, criteria: str, source_id: str) -> int | None:
+        """The UID of the one message with exactly this Message-ID, selected.
+
+        None when none or several match. Leaves its folder selected.
+        """
+        matches: list[tuple[str, int, int]] = []
+        for folder in self._lookup_folders():
+            client = self._session()
+            info = client.select_folder(folder, readonly=True)  # EXAMINE
+            uidvalidity = int(info[b"UIDVALIDITY"])
+            for hit in client.search(criteria):
+                matches.append((folder, uidvalidity, int(hit)))
 
         # SEARCH HEADER matches substrings: keep exact matches only.
         exact = [m for m in matches if self._has_message_id(m, source_id)]
@@ -393,12 +412,7 @@ class ImapAdapter:
         folder, uidvalidity, uid = exact[0]
         self._session().select_folder(folder, readonly=True)
         self._uidvalidity = uidvalidity
-        response = self._fetch_body(uid)
-        data = response.get(uid)
-        raw = data.get(_BODY_KEY) if data else None
-        if not isinstance(raw, bytes):
-            return None
-        return self._parse_message(message_from_bytes(raw), source_id)
+        return uid
 
     def _has_message_id(self, match: tuple[str, int, int], source_id: str) -> bool:
         """Whether a search hit's own Message-ID is exactly ``source_id``."""
