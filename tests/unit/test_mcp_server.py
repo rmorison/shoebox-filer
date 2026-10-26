@@ -16,6 +16,7 @@ from mcp import Client
 from mcp_types import Implementation
 
 from receipt_index.mcp_server import (
+    _INSTRUCTIONS,
     AccessLog,
     AccessLogError,
     FailureOut,
@@ -850,6 +851,10 @@ class TestPaidAmountOutput:
         data = result.structured_content
         assert data is not None
         assert data["failures"][0]["paid_amount"] == "0"
+
+    def test_instructions_cover_refunds(self) -> None:
+        flat = " ".join(_INSTRUCTIONS.split())
+        assert "for a refund, what was returned to them" in flat
 
     def test_amount_descriptions_follow_the_design(self) -> None:
         schema = ReceiptOut.model_json_schema()["properties"]

@@ -40,9 +40,11 @@ use 0.
 any part returned as store credit, a gift card or points. It is never \
 negative: use 0 when all of it was returned as store credit, a gift card or \
 points.
-  - When the document does not say what was paid or returned, use null. \
-Never copy amount into paid_amount: null means not known, and 0 means nothing \
-was charged.
+  - When the document shows a payment (a card or account line, "paid", \
+"amount charged"), give it, even when it equals the total. Don't assume the \
+total was paid when no payment is shown. When the document does not say what \
+was paid or returned, use null: null means not known, and 0 means nothing was \
+charged.
 """
 
 _FIELD_CONFIDENCE_RULE = """\

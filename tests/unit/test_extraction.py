@@ -628,7 +628,12 @@ _PAID_AMOUNT_RULES = {
     "refund returned to payment methods": "for a refund, what was returned",
     "refund excludes store credit": "excluding any part returned as store credit",
     "unknown is null": "does not say what was paid or returned, use null",
-    "never copied from amount": "Never copy amount into paid_amount",
+    "payment shown is given even when equal": (
+        "give it, even when it equals the total"
+    ),
+    "total not assumed paid": (
+        "Don't assume the total was paid when no payment is shown"
+    ),
     "refund is never negative": "It is never negative",
     "store-credit refund is 0": "0 when all of it was returned as store credit",
 }
@@ -647,6 +652,12 @@ class TestPaidAmountPrompts:
     @_PROMPTS
     def test_amount_is_the_total(self, prompt: str) -> None:
         assert "amount: The order, invoice or statement total" in prompt
+
+    @_PROMPTS
+    def test_no_rule_forbids_paid_equal_to_total(self, prompt: str) -> None:
+        # "Never copy amount into paid_amount" can read as "paid must differ
+        # from the total", which empties the field on plain card receipts.
+        assert "Never copy amount" not in " ".join(prompt.split())
 
     @_PROMPTS
     def test_old_total_rule_removed(self, prompt: str) -> None:
