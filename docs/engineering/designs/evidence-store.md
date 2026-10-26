@@ -365,15 +365,44 @@ ALTER TABLE receipt.receipts
     ADD CONSTRAINT ck_receipts_merged_at CHECK ((merged_into_id IS NULL) = (merged_at IS NULL));
 CREATE INDEX idx_receipts_merged_into_id ON receipt.receipts (merged_into_id);
 
+-- Refuses every change. No cascade exception: nothing deletes provenance or receipts.
+CREATE OR REPLACE FUNCTION receipt.forbid_link_history_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION '% on %.% is not allowed: history is append-only',
+        TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE TRIGGER trg_provenance_link_history_append_only
     BEFORE UPDATE OR DELETE ON receipt.provenance_link_history
-    FOR EACH ROW EXECUTE FUNCTION receipt.forbid_history_change();
+    FOR EACH ROW EXECUTE FUNCTION receipt.forbid_link_history_change();
 CREATE OR REPLACE TRIGGER trg_provenance_link_history_no_truncate
     BEFORE TRUNCATE ON receipt.provenance_link_history
-    FOR EACH STATEMENT EXECUTE FUNCTION receipt.forbid_history_change();
+    FOR EACH STATEMENT EXECUTE FUNCTION receipt.forbid_link_history_change();
+
+-- merged_into_id never names a receipt that is itself merged, and a merged
+-- receipt can't be merged into. A merge flattens chains (below) before setting it.
+CREATE OR REPLACE FUNCTION receipt.check_merged_into()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.merged_into_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM receipt.receipts
+        WHERE id = NEW.merged_into_id AND merged_into_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'receipt % would be merged into merged receipt %',
+            NEW.id, NEW.merged_into_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_receipts_check_merged_into
+    BEFORE INSERT OR UPDATE OF merged_into_id ON receipt.receipts
+    FOR EACH ROW EXECUTE FUNCTION receipt.check_merged_into();
 ```
 
-**Append-only, and what that guarantees.** Grants alone don't make `provenance_link_history` append-only in production, where the application connects as `receipt_index`, the owner of every table, and an owner can update and delete regardless of grants. The guard triggers above refuse UPDATE, DELETE and TRUNCATE for every role, the owner included. They use `receipt.forbid_history_change()` from the receipt data-model design. Whichever of the two designs' migrations lands first creates that function, and the other uses `CREATE OR REPLACE` with the same body. Nothing here deletes a provenance record or a receipt, so the triggers need no cascade exception. What isn't guaranteed: a superuser, or the owner disabling the triggers by hand, can still change the history. The triggers stop the application and mistakes, not an administrator.
+**Append-only, and what that guarantees.** Grants alone don't make `provenance_link_history` append-only in production, where the application connects as `receipt_index`, the owner of every table, and an owner can update and delete regardless of grants. The guard triggers above refuse UPDATE, DELETE and TRUNCATE for every role, the owner included. They use this design's own `receipt.forbid_link_history_change()`, which always refuses. The data-model design's `forbid_history_change()` reads `OLD.receipt_id` for its cascade exception, and this table has neither that column nor a cascade, so the two designs share no function. What isn't guaranteed: a superuser, or the owner disabling the triggers by hand, can still change the history. The triggers stop the application and mistakes, not an administrator.
 
 **Migration sequence** (each step is its own migration file, so each can roll back alone):
 
@@ -483,7 +512,7 @@ A receipt is one purchase (or one refund). A provenance record is one source ite
 
 **Undo and manual links:**
 
-**A merge keeps the emptied receipt.** When a link moves a receipt's last provenance record to another receipt, the emptied receipt isn't deleted. It is marked `merged_into_id` (the receipt that remains) with `merged_at`, and the link history records a `merge`. Everything attached to it stays where it is: its extractions and events (the data-model design's `ON DELETE CASCADE` tables never fire, since nothing is deleted), its rendition and rendition location (for a back-catalogue receipt whose original is `unavailable`, that rendition is the only evidence), and its `refund_of`. Merged receipts are left out of search, totals and packets. The data-model design's `receipt_net` view counts a refund against the purchase that remains (`COALESCE(purchase.merged_into_id, purchase.id)`), and leaves a merged refund out, so net paid stays right without rewriting `refund_of`. `show` on a merged receipt says what it was merged into, and `show` on the receipt that remains lists what was merged into it.
+**A merge keeps the emptied receipt.** When a link moves a receipt's last provenance record to another receipt, the emptied receipt isn't deleted. **`merged_into_id` always names a receipt that isn't itself merged**, so the data-model design's `receipt_net` needs only one `COALESCE`. A link always targets the receipt that remains (a link to a merged receipt goes to the receipt it was merged into). When the receipt a merge empties already has receipts merged into it, the same transaction re-points them to the new target and records a `merge` for each. The `trg_receipts_check_merged_into` trigger refuses any write that would break this. It is marked `merged_into_id` (the receipt that remains) with `merged_at`, and the link history records a `merge`. Everything attached to it stays where it is: its extractions and events (the data-model design's `ON DELETE CASCADE` tables never fire, since nothing is deleted), its rendition and rendition location (for a back-catalogue receipt whose original is `unavailable`, that rendition is the only evidence), and its `refund_of`. Merged receipts are left out of search, totals and packets. The data-model design's `receipt_net` view counts a refund against the purchase that remains (`COALESCE(purchase.merged_into_id, purchase.id)`), and leaves a merged refund out, so net paid stays right without rewriting `refund_of`. `show` on a merged receipt says what it was merged into, and `show` on the receipt that remains lists what was merged into it.
 
 - `receipt-index link <provenance-id> <receipt-id> --reason TEXT` merges by hand (`manual`). A merge is refused, and names what blocks it, when the receipt it would empty carries anything a person or agent set: tags, external links or hand-edited fields (the data-model design's records). Those would drop out of search with the merged receipt, so a person moves or removes them first. A refund pointing at it doesn't block, since the view follows the merge.
 - `receipt-index unlink <provenance-id> --reason TEXT` moves a provenance record out to a receipt of its own. If the record has a `home_receipt_id` that was merged, that receipt is restored: `merged_into_id` cleared and an `unmerge` recorded, with its fields, extractions, events and rendition as they were. Otherwise (the item joined an existing receipt at ingest, so no receipt was ever created for it), a new receipt is created as a copy of the old receipt's fields, marked for re-extraction (the data-model design's `reextract`), with its own rendition location rendered from the moved provenance's original. Such an item always has a stored original, since rules 1 to 3 run at ingest, when the original is in hand. If the old receipt's primary moves, its oldest remaining provenance becomes primary.
@@ -546,7 +575,6 @@ The command prints the counts. The runbook records them as the cutover's evidenc
 **Dependencies on the data-model design.** It has agreed to provide these, and this design relies on them:
 - the extraction's `receipt_document` field (ticket 2 there);
 - `extractions.input_file_id` (the migration that lands second adds its foreign key to `stored_files`);
-- `receipt.forbid_history_change()`;
 - leaving merged receipts out of search, totals and `receipt_net`.
 
 Until the `receipt_document` field exists, rule 2 applies to Drive sources only.
@@ -591,6 +619,7 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 - Duplicate rules: each rule's positive and negative cases, including two identical parking charges (flagged, not linked), a shared terms-and-conditions PDF across two vendors (not linked), the rule 2 guard (`document_hash_conflict`), and a refund with the purchase's order number and amount (not linked).
 - `link` and `unlink` round trip, including a primary that moves, with history rows written. A merge keeps the emptied receipt's extractions, events and rendition. `unlink` restores a merged receipt exactly, including one whose original is `unavailable`.
 - A merge is refused when the emptied receipt has tags, links or hand edits, and `duplicates scan` flags that pair as `merge_blocked`.
+- Merge chains: merging B into C when A is already merged into B leaves both A and B pointing at C, and a direct write of a `merged_into_id` naming a merged receipt is refused by the trigger.
 - Rule 3: two equal charges on one order on different dates, and two with different line items, are flagged, not linked. A null or zero paid amount never links.
 - The application role can't UPDATE, DELETE or TRUNCATE `provenance_link_history`, tested as the owning role, as in production.
 - An email attachment whose bytes match an adopted (operator-owned) Drive file still gets its own store-owned copy.
