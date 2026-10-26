@@ -21,11 +21,16 @@ Ingest from a configured IMAP receipts folder. For each message: extract vendor,
 
 Replace per-source environment variables with a unified YAML configuration file that defines named sources. Add Google Drive ingestion: ingest from configured Drive folders containing scanned receipts and print-to-PDF captures. Extract metadata via vision-capable LLM, index and store alongside email-sourced receipts. Support multiple sources of each type (e.g., two IMAP accounts, three Drive folders).
 
+### Always-On Ingestion
+
+Run ingestion as a long-running service rather than a scheduled one-shot command, so new receipts are searchable within minutes of arriving (the target is configurable). Read each source incrementally, retry failed items, move processed items out of the input folders (opt-in for each source), backfill a source over a date range, and report health to the operator. See the [Always-On Ingest technical design](../../engineering/designs/always-on-ingest.md).
+
 ### Future
 
 - Direct accounting software integration (attach receipts from index to transactions)
 - Automated matching suggestions (fuzzy join unreconciled transactions against index)
 - Cloud storage backend (S3/GCS) behind the same file store interface
+- Google Drive push notifications (`changes.watch`), if a latency target under about a minute is ever needed
 
 ## Functional Requirements
 
@@ -122,7 +127,7 @@ Replace per-source environment variables with a unified YAML configuration file 
 | RD-03 | **CLI output:** Human-friendly text by default; structured output (JSON/Pydantic models) via `--output json` flag for agent consumption. |
 | RD-04 | **PDF rendition:** Single human-readable PDF per receipt — rendered HTML with embedded images/attachments. Target audience is bookkeeper during reconciliation and claims adjuster during documentation review. |
 | RD-05 | **Project scope:** Standalone project. |
-| RD-06 | **Ingestion mode:** One-shot CLI command. Future expansion via workflow system (e.g., Dagster), not daemon mode. |
+| RD-06 | **Ingestion mode:** Always-on service (`receipt-index serve`) that watches every source: IMAP IDLE with a safety poll, and the Google Drive changes feed polled. Each source is read from a stored position, and failed items are retried. The default target is a new receipt searchable within 5 minutes; the intervals that set it are configurable. The one-shot `ingest` command remains for development, catch-up and rollback. Replaces the earlier one-shot-only decision. See [ADR-0007](../../engineering/adr/0007-always-on-ingest-service.md) and [ADR-0008](../../engineering/adr/0008-incremental-source-sync-state.md). |
 | RD-07 | **Idempotency:** Track processed items by unique ID (e.g., IMAP message ID, Drive file ID) to skip on re-runs. Duplicate receipt detection is out of scope. |
 | RD-08 | **Config file:** YAML configuration for source definitions. Secrets stay in environment variables. Supports `${ENV_VAR}` interpolation for non-secret config values. |
 | RD-09 | **Google Drive auth:** OAuth2 with offline refresh token stored as environment variable. Service accounts require folder sharing, which is less natural for personal Drive usage. |
