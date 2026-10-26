@@ -265,6 +265,21 @@ class TestFirstRun:
         assert after.amount == Decimal("30.00")
 
 
+class TestOverlappingRuns:
+    def test_a_second_run_with_a_stale_selection_doesnt_pay_again(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        store = LocalEvidenceStore(tmp_path)
+        receipt = _seed(pg_conn, store, "Overlap")
+        selected_by_b = _select(pg_conn, ids=[receipt.id])  # B selects first
+        llm = Llm()
+        _run(pg_conn, store, llm, _select(pg_conn, ids=[receipt.id]))  # A runs
+        result = _run(pg_conn, store, llm, selected_by_b)  # then B
+        assert result.outcomes[0].status == "current"
+        assert llm.calls == ["Overlap"]  # paid once
+        assert len(_history(pg_conn, receipt.id)) == 1
+
+
 class TestAfterAGatedRun:
     def test_the_old_prompt_amount_is_still_replaced(
         self, pg_conn: Conn, tmp_path: Path
@@ -277,7 +292,13 @@ class TestAfterAGatedRun:
 
         # A gated run is a real result: the receipt is current until --force.
         assert _select(pg_conn, ids=[old.id]) == []
-        _run(pg_conn, store, Llm(), _select(pg_conn, ids=[old.id], force=True))
+        _run(
+            pg_conn,
+            store,
+            Llm(),
+            _select(pg_conn, ids=[old.id], force=True),
+            force=True,
+        )
 
         after = get_receipt_by_id(pg_conn, old.id)
         assert after is not None
@@ -299,6 +320,7 @@ class TestAfterAGatedRun:
             corrected,
             _select(pg_conn, ids=[old.id], force=True),
             overwrite=True,
+            force=True,
         )
         after = get_receipt_by_id(pg_conn, old.id)
         assert after is not None
@@ -450,6 +472,7 @@ class TestThroughGreenMail:
                 store=store,
                 agents=llm.agents,
                 llm_model=_MODEL,
+                force=True,
             )
         assert result.outcomes[0].input_kind == "source"
         assert result.outcomes[0].status == "unchanged"

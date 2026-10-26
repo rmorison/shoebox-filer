@@ -61,6 +61,9 @@ _SCHEMA_CREATOR = "receipt_index_mcp_test_schema_creator"
 _NO_USAGE = "receipt_index_mcp_test_no_usage"
 _NOINHERIT_MEMBER = "receipt_index_mcp_test_noinherit_member"
 _INHERIT_FALSE_MEMBER = "receipt_index_mcp_test_inherit_false_member"
+# Read roles that can also write one of the newer tables.
+_HISTORY_WRITER = "receipt_index_mcp_test_history_writer"
+_CURSOR_WRITER = "receipt_index_mcp_test_cursor_writer"
 
 _CLI = str(Path(sys.executable).parent / "receipt-index")
 
@@ -131,6 +134,16 @@ def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
             f"GRANT USAGE ON SCHEMA receipt TO {role}; "
             f"GRANT SELECT ON receipt.receipts, receipt.ingest_log TO {role}"
         )
+    for role in (_HISTORY_WRITER, _CURSOR_WRITER):
+        _ensure_login_role(pg_conn, role)
+        pg_conn.execute(
+            f"GRANT USAGE ON SCHEMA receipt TO {role}; "
+            f"GRANT SELECT ON receipt.receipts, receipt.ingest_log TO {role}"
+        )
+    pg_conn.execute(
+        f"GRANT INSERT (output) ON receipt.extractions TO {_HISTORY_WRITER}"
+    )
+    pg_conn.execute(f"GRANT UPDATE ON receipt.sync_state TO {_CURSOR_WRITER}")
     pg_conn.execute(f"ALTER ROLE {_NOINHERIT_MEMBER} NOINHERIT")
     pg_conn.execute(f"GRANT {_WRITE_ROLE} TO {_NOINHERIT_MEMBER}")
     pg_conn.execute(f"ALTER ROLE {_INHERIT_FALSE_MEMBER} INHERIT")
@@ -456,6 +469,8 @@ def test_startup_check_passes_read_role() -> None:
         (_NO_USAGE, r"lacks SELECT"),
         (_NOINHERIT_MEMBER, r"receipt\.receipts: DELETE"),
         (_INHERIT_FALSE_MEMBER, r"receipt\.receipts: DELETE"),
+        (_HISTORY_WRITER, r"receipt\.extractions: INSERT"),
+        (_CURSOR_WRITER, r"receipt\.sync_state: UPDATE"),
     ],
 )
 def test_startup_check_refuses_in_process(role: str, match: str) -> None:

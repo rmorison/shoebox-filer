@@ -791,6 +791,7 @@ def reextract(
                 agents=agents,
                 llm_model=model,
                 overwrite=overwrite,
+                force=force,
                 on_outcome=report,
             )
 
@@ -808,6 +809,7 @@ def reextract(
         shown: tuple[Status, ...] = (
             "applied",
             "unchanged",
+            "current",
             "gated",
             "failed",
             "locked",

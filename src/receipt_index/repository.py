@@ -692,6 +692,25 @@ def select_for_reextract(
     return [Receipt.model_validate(row) for row in cur.fetchall()]
 
 
+def is_current(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    *,
+    prompt_version: int,
+    llm_model: str,
+) -> bool:
+    """Whether a receipt's latest extraction that didn't fail used this
+    prompt version and model: the staleness test ``select_for_reextract``
+    applies, for one receipt, re-checked under its item lock."""
+    cur = conn.execute(
+        f"WITH l AS ({_LATEST_GOOD}) SELECT 1 FROM l "
+        "WHERE l.receipt_id = %(id)s AND l.prompt_version = %(version)s "
+        "AND l.llm_model = %(model)s",
+        {"id": receipt_id, "version": prompt_version, "model": llm_model},
+    )
+    return cur.fetchone() is not None
+
+
 def lock_receipt(
     conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
 ) -> Receipt | None:

@@ -345,14 +345,19 @@ class GdriveAdapter:
     def fetch_by_id(self, source_id: str) -> RawReceipt | None:
         """Get one file by its ID, wherever it is now, and download it.
 
-        None if it no longer exists or its type can't be ingested.
+        None if it no longer exists or its type can't be ingested. A service
+        that can't be built (bad or missing credentials) is an outage for the
+        whole source, never one file's fault.
         """
         try:
+            service = self._session()
+        except Exception as exc:
+            raise SourceUnavailableError(
+                f"Drive source {self.config.name} can't be reached: {exc}"
+            ) from exc
+        try:
             meta: dict[str, Any] = (
-                self._session()
-                .files()
-                .get(fileId=source_id, fields=_GET_FIELDS)
-                .execute()
+                service.files().get(fileId=source_id, fields=_GET_FIELDS).execute()
             )
         except Exception as exc:
             if _is_not_found(exc):

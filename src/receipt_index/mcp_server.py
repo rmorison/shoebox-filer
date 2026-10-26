@@ -315,7 +315,13 @@ WITH member_of AS (
 held AS (
     SELECT t.name AS object, p.priv AS privilege
       FROM member_of m
-     CROSS JOIN (VALUES ('receipt.receipts'), ('receipt.ingest_log')) AS t(name)
+     CROSS JOIN (
+         -- Every table in the schema, so a table added later is checked too.
+         SELECT format('%I.%I', n.nspname, c.relname)
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'receipt' AND c.relkind IN ('r', 'p')
+     ) AS t(name)
      CROSS JOIN (VALUES ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE')) AS p(priv)
      WHERE CASE WHEN p.priv IN ('INSERT', 'UPDATE')
                 THEN has_any_column_privilege(m.oid, t.name, p.priv)

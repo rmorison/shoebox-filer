@@ -91,12 +91,19 @@ class FakeDb:
         self.extractions: list[dict[str, Any]] = []
         self.updates: list[tuple[UUID, dict[str, Any], dict[str, float] | None]] = []
         self.locked: set[str] = set()
+        # Became current (another run finished it) after this run selected it.
+        self.current: set[UUID] = set()
         # Applied between the extraction and the apply (a hand edit).
         self.edit_before_apply: dict[UUID, dict[str, Any]] = {}
 
     @contextmanager
     def item_lock(self, conn: Any, source_id: str) -> Iterator[bool]:
         yield source_id not in self.locked
+
+    def is_current(
+        self, conn: Any, receipt_id: UUID, *, prompt_version: int, llm_model: str
+    ) -> bool:
+        return receipt_id in self.current
 
     def lock_receipt(self, conn: Any, receipt_id: UUID) -> Receipt | None:
         receipt = self.receipts.get(receipt_id)
@@ -174,6 +181,7 @@ def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
     fake = FakeDb([])
     for name in (
         "item_lock",
+        "is_current",
         "lock_receipt",
         "get_extraction_history",
         "update_receipt_fields",
@@ -214,6 +222,7 @@ def _run(
     configs: list[ImapSourceConfig] | None = None,
     store: MagicMock | None = None,
     overwrite: bool = False,
+    force: bool = False,
 ) -> tuple[reextract.ReextractResult, MagicMock]:
     db.receipts.update({r.id: r for r in receipts})
     store = store or _store()
@@ -232,6 +241,7 @@ def _run(
             agents=_AGENTS,
             llm_model="claude-test",
             overwrite=overwrite,
+            force=force,
         )
     return result, factory
 
@@ -484,3 +494,23 @@ class TestApplyFailures:
         assert db.extractions == []
         assert db.updates == []
         conn.rollback.assert_called()
+
+
+class TestRecheckUnderTheLock:
+    def test_a_receipt_another_run_finished_is_skipped(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        # Stale when selected; current by the time this run holds its lock.
+        receipt = _receipt()
+        db.current.add(receipt.id)
+        result, _ = _run(db, [receipt], adapter=None)
+        assert result.outcomes[0].status == "current"
+        llm["rendition"].assert_not_called()
+        assert db.extractions == []
+        assert result.ok
+
+    def test_force_runs_it_anyway(self, db: FakeDb, llm: dict[str, MagicMock]) -> None:
+        receipt = _receipt()
+        db.current.add(receipt.id)
+        result, _ = _run(db, [receipt], adapter=None, force=True)
+        assert result.outcomes[0].status == "applied"

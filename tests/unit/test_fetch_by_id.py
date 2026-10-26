@@ -280,3 +280,22 @@ class TestDriveFetchById:
         with pytest.raises(Exception) as caught:
             _drive(service).fetch_by_id("f1")
         assert not isinstance(caught.value, SourceUnavailableError)
+
+
+class TestDriveSetupFailures:
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("bad token_json"), KeyError("refresh_token")],
+        ids=["value", "key"],
+    )
+    def test_a_service_that_cant_be_built_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        adapter = GdriveAdapter(_make_gdrive_config())
+
+        def broken() -> Any:
+            raise error
+
+        monkeypatch.setattr(adapter, "_build_service", broken)
+        with pytest.raises(SourceUnavailableError, match="Drive"):
+            adapter.fetch_by_id("f1")

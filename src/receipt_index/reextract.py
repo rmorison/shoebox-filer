@@ -32,6 +32,7 @@ from receipt_index.models import (
 from receipt_index.repository import (
     get_extraction_history,
     insert_extraction,
+    is_current,
     lock_receipt,
     update_receipt_fields,
 )
@@ -75,7 +76,9 @@ _CONFIDENCE_OF = {
     "field_confidence.date": "receipt_date",
 }
 
-Status = Literal["applied", "unchanged", "gated", "failed", "locked", "unavailable"]
+Status = Literal[
+    "applied", "unchanged", "current", "gated", "failed", "locked", "unavailable"
+]
 InputKind = Literal["original", "source", "rendition"]
 
 
@@ -431,15 +434,26 @@ def reextract_receipt(
     agents: Mapping[str, Agent[None, ReceiptMetadata]],
     llm_model: str,
     overwrite: bool = False,
+    force: bool = False,
 ) -> ReceiptOutcome:
     """Re-extract one receipt. ``pool`` None means ``--input rendition``.
 
     ``agents`` maps ``"email"`` and ``"document"`` to their agents. Takes the
-    item lock on the receipt's source ID, the key ingest and retries use.
+    item lock on the receipt's source ID, the key ingest and retries use,
+    then re-checks that the receipt is still stale (unless ``force``): an
+    overlapping run may have finished it since this run selected it.
     """
     with item_lock(conn, receipt.source_id) as locked:
         if not locked:
             return _outcome(receipt, "locked")
+        if not force and is_current(
+            conn,
+            receipt.id,
+            prompt_version=EXTRACTION_PROMPT_VERSION,
+            llm_model=llm_model,
+        ):
+            conn.commit()
+            return _outcome(receipt, "current")
         # End the lock's read transaction: none is held during the network
         # fetch or the LLM call.
         conn.commit()
@@ -504,6 +518,7 @@ def run_reextract(
     agents: Mapping[str, Agent[None, ReceiptMetadata]],
     llm_model: str,
     overwrite: bool = False,
+    force: bool = False,
     on_outcome: Callable[[ReceiptOutcome], None] | None = None,
 ) -> ReextractResult:
     """Re-extract each receipt in turn; each is its own transaction."""
@@ -518,6 +533,7 @@ def run_reextract(
             agents=agents,
             llm_model=llm_model,
             overwrite=overwrite,
+            force=force,
         )
         result.outcomes.append(outcome)
         if on_outcome is not None:
