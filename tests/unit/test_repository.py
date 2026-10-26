@@ -8,12 +8,15 @@ from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
 
+from psycopg.types.json import Jsonb
+
 from receipt_index.repository import (
     count_ingest_failures,
     count_receipts,
     get_ingest_failures,
     get_processed_source_ids,
     get_receipt_by_id,
+    insert_ingest_log,
     insert_receipt,
     search_receipts,
 )
@@ -176,7 +179,7 @@ class TestSearchReceipts:
         args = conn.execute.call_args
         sql = args[0][0]
         params = args[0][1]
-        assert "amount = %(amount)s" in sql
+        assert "COALESCE(paid_amount, amount) = %(amount)s" in sql
         assert params["amount"] == Decimal("42.99")
 
     def test_amount_range_filter(self) -> None:
@@ -185,8 +188,8 @@ class TestSearchReceipts:
         args = conn.execute.call_args
         sql = args[0][0]
         params = args[0][1]
-        assert "amount >= %(amount_min)s" in sql
-        assert "amount <= %(amount_max)s" in sql
+        assert "COALESCE(paid_amount, amount) >= %(amount_min)s" in sql
+        assert "COALESCE(paid_amount, amount) <= %(amount_max)s" in sql
         assert params["amount_min"] == Decimal("10")
         assert params["amount_max"] == Decimal("100")
 
@@ -216,7 +219,7 @@ class TestSearchReceipts:
         args = conn.execute.call_args
         sql = args[0][0]
         assert "vendor ILIKE" in sql
-        assert "amount >=" in sql
+        assert "COALESCE(paid_amount, amount) >=" in sql
         assert "receipt_date >=" in sql
         assert " AND " in sql
 
@@ -292,7 +295,7 @@ class TestSearchPaging:
         assert n == 7
         assert sql.startswith("SELECT COUNT(*) AS n FROM receipt.receipts WHERE ")
         assert "vendor ILIKE %(vendor)s" in sql
-        assert "amount >= %(amount_min)s" in sql
+        assert "COALESCE(paid_amount, amount) >= %(amount_min)s" in sql
         assert "receipt_date <= %(date_to)s" in sql
         assert "source_name = %(source_name)s" in sql
         assert params == {
@@ -329,3 +332,76 @@ class TestFailuresPaging:
         conn = _mock_conn([{"n": 3}])
         assert count_ingest_failures(conn) == 3
         assert "status = 'failed'" in conn.execute.call_args.args[0]
+
+
+_INSERT_ARGS: dict[str, Any] = {
+    "source_id": "<msg-2@example.com>",
+    "source_type": "imap",
+    "source_name": "test-email",
+    "vendor": "Acme Parking (U.S.), LLC",
+    "amount": Decimal("50.00"),
+    "currency": "USD",
+    "receipt_date": date(2025, 6, 15),
+    "description": None,
+    "confidence": 0.9,
+    "pdf_path": "path.pdf",
+    "email_subject": None,
+    "email_sender": None,
+    "email_date": None,
+}
+
+
+class TestPaidAmountWrites:
+    """insert_receipt and insert_ingest_log write the paid amount."""
+
+    def test_insert_receipt_writes_paid_amount_and_field_confidence(self) -> None:
+        conn = _mock_conn([_RECEIPT_ROW])
+        insert_receipt(
+            conn,
+            **_INSERT_ARGS,
+            paid_amount=Decimal("30.00"),
+            field_confidence={"vendor": 0.9, "paid_amount": 0.6},
+        )
+        sql, params = conn.execute.call_args.args
+        assert "%(paid_amount)s" in sql
+        assert "%(field_confidence)s" in sql
+        assert params["paid_amount"] == Decimal("30.00")
+        assert isinstance(params["field_confidence"], Jsonb)
+        assert params["field_confidence"].obj == {"vendor": 0.9, "paid_amount": 0.6}
+
+    def test_insert_receipt_defaults_to_unknown_paid_amount(self) -> None:
+        conn = _mock_conn([_RECEIPT_ROW])
+        insert_receipt(conn, **_INSERT_ARGS)
+        params = conn.execute.call_args.args[1]
+        assert params["paid_amount"] is None
+        assert params["field_confidence"].obj == {}
+
+    def test_insert_ingest_log_writes_paid_amount(self) -> None:
+        row = {
+            "id": UUID("019572a0-0000-7000-8000-000000000002"),
+            "source_id": "<msg-2@example.com>",
+            "source_type": "imap",
+            "status": "success",
+            "receipt_id": None,
+            "vendor": None,
+            "amount": Decimal("50.00"),
+            "paid_amount": Decimal("0"),
+            "email_subject": None,
+            "email_sender": None,
+            "email_date": None,
+            "error_message": None,
+            "created_at": datetime(2025, 6, 15, tzinfo=UTC),
+        }
+        conn = _mock_conn([row])
+        entry = insert_ingest_log(
+            conn,
+            source_id="<msg-2@example.com>",
+            source_type="imap",
+            status="success",
+            amount=Decimal("50.00"),
+            paid_amount=Decimal("0"),
+        )
+        sql, params = conn.execute.call_args.args
+        assert "%(paid_amount)s" in sql
+        assert params["paid_amount"] == Decimal("0")
+        assert entry.paid_amount == Decimal("0")

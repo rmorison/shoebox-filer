@@ -16,6 +16,7 @@ from mcp import Client
 from mcp_types import Implementation
 
 from receipt_index.mcp_server import (
+    _INSTRUCTIONS,
     AccessLog,
     AccessLogError,
     FailureOut,
@@ -64,9 +65,10 @@ def _receipt(**overrides: Any) -> Receipt:
     return Receipt.model_validate(row)
 
 
-def _failure(n: int) -> IngestLogEntry:
+def _failure(n: int, **overrides: Any) -> IngestLogEntry:
     return IngestLogEntry.model_validate(
-        {
+        overrides
+        | {
             "id": UUID(f"019572a0-0000-7000-8000-{n:012d}"),
             "source_id": f"<fail-{n}@example.com>",
             "source_type": "imap",
@@ -714,7 +716,8 @@ class TestOutputModelsMatchDomainModels:
     """A new column on Receipt or IngestLogEntry must reach the MCP output."""
 
     def test_receipt_out_fields(self) -> None:
-        assert set(ReceiptOut.model_fields) - {"file"} == set(Receipt.model_fields)
+        domain = set(Receipt.model_fields) | set(Receipt.model_computed_fields)
+        assert set(ReceiptOut.model_fields) - {"file"} == domain
 
     def test_failure_out_fields(self) -> None:
         assert set(FailureOut.model_fields) == set(IngestLogEntry.model_fields)
@@ -786,3 +789,77 @@ class TestPaddedUuid:
         (entry,) = _log_lines(log_path)
         assert entry["receipt_id"] == _MISSING_ID
         assert entry["outcome"] == "not_found"
+
+
+class TestPaidAmountOutput:
+    """The MCP output carries the total, the paid amount and the effective amount."""
+
+    def test_get_receipt_paid_known(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        receipt = _receipt(
+            amount=Decimal("50.00"),
+            paid_amount=Decimal("30.00"),
+            field_confidence={"vendor": 0.9, "paid_amount": 0.6},
+        )
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+            result = _call(
+                _server(store_root, log_path), "get_receipt", {"receipt_id": str(_ID)}
+            )
+
+        assert result.is_error is False, _text(result)
+        data = result.structured_content
+        assert data is not None
+        assert data["amount"] == "50.00"
+        assert data["paid_amount"] == "30.00"
+        assert data["effective_amount"] == "30.00"
+        assert data["field_confidence"] == {"vendor": 0.9, "paid_amount": 0.6}
+
+    def test_search_paid_unknown(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with (
+            patch(
+                "receipt_index.repository.search_receipts",
+                return_value=[_receipt(amount=Decimal("75.00"))],
+            ),
+            patch("receipt_index.repository.count_receipts", return_value=1),
+        ):
+            result = _call(_server(store_root, log_path), "search_receipts", {})
+
+        assert result.is_error is False, _text(result)
+        data = result.structured_content
+        assert data is not None
+        (receipt,) = data["receipts"]
+        assert receipt["amount"] == "75.00"
+        assert receipt["paid_amount"] is None
+        assert receipt["effective_amount"] == "75.00"
+
+    def test_failure_paid_amount_is_a_string(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with (
+            patch(
+                "receipt_index.repository.get_ingest_failures",
+                return_value=[_failure(1, paid_amount=Decimal("0"))],
+            ),
+            patch("receipt_index.repository.count_ingest_failures", return_value=1),
+        ):
+            result = _call(_server(store_root, log_path), "list_failures", {})
+
+        assert result.is_error is False, _text(result)
+        data = result.structured_content
+        assert data is not None
+        assert data["failures"][0]["paid_amount"] == "0"
+
+    def test_instructions_cover_refunds(self) -> None:
+        flat = " ".join(_INSTRUCTIONS.split())
+        assert "for a refund, what was returned to them" in flat
+        assert "a sum of effective_amount values counts them as charges" in flat
+
+    def test_amount_descriptions_follow_the_design(self) -> None:
+        schema = ReceiptOut.model_json_schema()["properties"]
+        assert "total" in schema["amount"]["description"]
+        assert "Paid amount" not in schema["amount"]["description"]
+        assert "null" in schema["paid_amount"]["description"].lower()
+        assert "otherwise the total" in schema["effective_amount"]["description"]

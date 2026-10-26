@@ -17,18 +17,59 @@ from receipt_index.models import (
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """\
+# The amount, paid-amount and field-confidence rules, shared by both prompts
+# so that they can't drift apart. See the receipt data-model design, §1 and §2.
+_AMOUNT_RULES = """\
+- amount: The order, invoice or statement total as the document states it \
+(numeric, e.g. 42.99). May be 0 for prepaid items (e.g. prepaid postage).
+- paid_amount: What this transaction charged to the payer's payment methods \
+(card, bank account, wallet or cash), or for a refund, what was returned to \
+them. Rules:
+  - Include tax, shipping and tip; it is after discounts and coupons.
+  - Exclude anything paid with gift cards, store credit, points or vouchers; \
+they never reach a bank or card statement. When they were used, say in the \
+description how much and with what.
+  - For an invoice or statement that shows a payment, use the payment, not \
+the balance or the invoice total.
+  - For an order charged in parts (for example on each shipment), use what \
+this document says was charged.
+  - A pre-authorization or hold is not a payment.
+  - When the document shows that nothing has been paid (an unpaid invoice), \
+use 0.
+  - For a refund, what was returned to the payer's payment methods, excluding \
+any part returned as store credit, a gift card or points. It is never \
+negative: use 0 when all of it was returned as store credit, a gift card or \
+points.
+  - For a purchase, when the document shows a payment (a card or account \
+line with an amount, "paid", "amount charged"), give it, even when it equals \
+the total. For \
+cash, it is the amount charged, net of change, not the cash tendered. A \
+payment method named with no amount (a card on file, a guarantee, "payment \
+method: card ending 1234") does not show what was paid. Don't assume the \
+total was paid when no payment is shown. When the document does not say what \
+was paid or returned, use null: null means not known, and 0 means nothing was \
+charged.
+"""
+
+_FIELD_CONFIDENCE_RULE = """\
+- field_confidence: Your confidence in each of vendor, amount, paid_amount and \
+date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
+(then it is your confidence that the document does not say what was paid). Go \
+below 0.5 when a figure is inferred rather than printed on the document.
+"""
+
+_SYSTEM_PROMPT = f"""\
 You are a receipt metadata extractor. Given an email that contains or forwards \
 a receipt, extract the following fields:
 
 - vendor: The canonical business name (e.g. "Amazon", not "no-reply@amazon.com")
-- amount: The total amount charged (numeric, e.g. 42.99)
+{_AMOUNT_RULES}\
 - currency: ISO 4217 currency code (e.g. "USD", "CAD", "EUR")
 - date: The purchase/transaction date (YYYY-MM-DD), NOT the email send date
 - description: Brief summary of what was purchased (optional)
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if the email may not be a receipt or key fields are uncertain.
-
+{_FIELD_CONFIDENCE_RULE}
 If PDF attachment content is provided below the email body, use it as additional \
 context for extraction. The PDF content often contains the detailed receipt with \
 amounts and line items that may not appear in the email body.
@@ -42,29 +83,26 @@ valid receipts; the vendor is the payment recipient. Use high confidence when th
 amount, recipient, and date are clearly visible.
 
 Handle forwarded receipts by looking at the original receipt content. \
-For multi-item orders, use the total amount. If the currency is not stated, \
-assume USD.\
+If the currency is not stated, assume USD.\
 """
 
-DOCUMENT_SYSTEM_PROMPT = """\
+DOCUMENT_SYSTEM_PROMPT = f"""\
 You are a receipt metadata extractor. Given a receipt document (scanned image \
 or PDF), extract the following fields:
 
 - vendor: The business name on the receipt (or payment recipient)
-- amount: The total amount charged (numeric, e.g. 42.99). May be 0 for \
-prepaid items (e.g. prepaid postage).
+{_AMOUNT_RULES}\
 - currency: ISO 4217 currency code (e.g. "USD")
 - date: The transaction date (YYYY-MM-DD)
 - description: Brief summary of what was purchased (optional)
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if this does not appear to be a receipt or key fields are unclear.
-
+{_FIELD_CONFIDENCE_RULE}
 Payment confirmations (Zelle, Venmo, PayPal, bank transfers, wire transfers) \
 are valid receipts. The vendor is the payment recipient. Use high confidence \
 if the amount, recipient, and date are clearly visible.
 
-For multi-item receipts, use the total amount. If the currency is not stated, \
-assume USD.\
+If the currency is not stated, assume USD.\
 """
 
 # Minimum non-whitespace characters for PDF text to be considered sufficient.

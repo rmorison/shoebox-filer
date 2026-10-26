@@ -197,9 +197,13 @@ def ingest(
 @cli.command()
 @click.option("--source", "source_name", default=None, help="Filter by source name.")
 @click.option("--vendor", default=None, help="Filter by vendor name (substring).")
-@click.option("--amount", default=None, help="Filter by exact amount.")
-@click.option("--amount-min", default=None, help="Filter by minimum amount.")
-@click.option("--amount-max", default=None, help="Filter by maximum amount.")
+@click.option(
+    "--amount",
+    default=None,
+    help="Filter by exact effective amount (paid when known, else the total).",
+)
+@click.option("--amount-min", default=None, help="Filter by minimum effective amount.")
+@click.option("--amount-max", default=None, help="Filter by maximum effective amount.")
 @click.option(
     "--date-from",
     type=click.DateTime(formats=["%Y-%m-%d"]),
@@ -278,8 +282,11 @@ def search(
         if not results:
             click.echo("No receipts found.")
             return
-        click.echo(f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Amount':>10}")
-        click.echo("-" * 82)
+        # Amount is the effective amount (paid when known, else the total).
+        click.echo(
+            f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Amount':>10} {'Total':>10}"
+        )
+        click.echo("-" * 93)
         for r in results:
             vendor_display = (
                 r.vendor[:19] + "\u2026" if len(r.vendor) > 20 else r.vendor
@@ -288,6 +295,7 @@ def search(
                 f"{r.id!s:<38} "
                 f"{r.receipt_date.isoformat():<12} "
                 f"{vendor_display:<20} "
+                f"{r.effective_amount!s:>10} "
                 f"{r.amount!s:>10}"
             )
         click.echo(f"\n{len(results)} receipt(s) found.")
@@ -371,11 +379,29 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
     else:
         click.echo(f"ID:           {receipt.id}")
         click.echo(f"Vendor:       {receipt.vendor}")
-        click.echo(f"Amount:       {receipt.amount} {receipt.currency}")
+        basis = (
+            "total; paid amount not known" if receipt.paid_amount is None else "paid"
+        )
+        click.echo(
+            f"Amount:       {receipt.effective_amount} {receipt.currency} ({basis})"
+        )
+        paid = (
+            "\u2014 (not known)"
+            if receipt.paid_amount is None
+            else str(receipt.paid_amount)
+        )
+        click.echo(f"Paid:         {paid}")
+        click.echo(f"Total:        {receipt.amount}")
         click.echo(f"Date:         {receipt.receipt_date}")
         desc = receipt.description or "\u2014"
         click.echo(f"Description:  {desc}")
         click.echo(f"Confidence:   {receipt.confidence}")
+        if receipt.field_confidence:
+            fields = ", ".join(
+                f"{name} {value:.2f}"
+                for name, value in receipt.field_confidence.items()
+            )
+            click.echo(f"Field Conf:   {fields}")
         click.echo(f"PDF:          {receipt.pdf_path}")
         click.echo(f"Source:       {receipt.source_type} ({receipt.source_id})")
         if receipt.source_name:

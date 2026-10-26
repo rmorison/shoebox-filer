@@ -32,7 +32,8 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000007.
+    Mirrors: public/000001, receipt/000001-000008 (tables, indexes and
+    constraints; not the grants, since CI's Postgres has no application roles).
     Keep in sync with db/migrations/ when schema changes.
     """
     # public/000001 — set_updated_at trigger function
@@ -72,12 +73,16 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
             file_name       TEXT,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            paid_amount     NUMERIC(12,2),
+            field_confidence JSONB NOT NULL DEFAULT '{}'::jsonb,
 
             CONSTRAINT pk_receipts PRIMARY KEY (id),
             CONSTRAINT uq_receipts_source_id UNIQUE (source_id),
             CONSTRAINT ck_receipts_amount_non_negative CHECK (amount >= 0),
             CONSTRAINT ck_receipts_confidence_range
-                CHECK (confidence >= 0 AND confidence <= 1)
+                CHECK (confidence >= 0 AND confidence <= 1),
+            CONSTRAINT ck_receipts_paid_amount_non_negative
+                CHECK (paid_amount IS NULL OR paid_amount >= 0)
         )
         """
     )
@@ -88,6 +93,11 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     conn.execute("CREATE INDEX idx_receipts_amount ON receipt.receipts (amount)")
     conn.execute(
         "CREATE INDEX idx_receipts_receipt_date ON receipt.receipts (receipt_date)"
+    )
+    # receipt/000008 — effective amount index
+    conn.execute(
+        "CREATE INDEX idx_receipts_effective_amount"
+        " ON receipt.receipts ((COALESCE(paid_amount, amount)))"
     )
     conn.execute(
         """\
@@ -120,6 +130,7 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
             llm_requests       INTEGER,
             llm_model          TEXT,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            paid_amount     NUMERIC(12,2),
 
             CONSTRAINT pk_ingest_log PRIMARY KEY (id),
             CONSTRAINT ck_ingest_log_status

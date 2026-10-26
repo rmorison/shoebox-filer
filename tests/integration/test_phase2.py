@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from receipt_index.adapters.imap import ImapAdapter
-from receipt_index.models import ReceiptMetadata
+from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
 from receipt_index.store import LocalFileStore
@@ -44,6 +44,8 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Helpers shared across test classes
 # ---------------------------------------------------------------------------
+
+_FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
 
 def _unique_user(prefix: str = "p2") -> str:
@@ -64,6 +66,7 @@ def _make_mock_agent(
         amount=amount,
         date=receipt_date or date(2025, 6, 15),
         confidence=confidence,
+        field_confidence=_FIELD_CONFIDENCE,
     )
     mock_usage = MagicMock()
     mock_usage.input_tokens = 100
@@ -91,6 +94,7 @@ def _make_alternating_agent(
             amount=amount,
             date=rcpt_date,
             confidence=0.90,
+            field_confidence=_FIELD_CONFIDENCE,
         )
         mock_usage = MagicMock()
         mock_usage.input_tokens = 100

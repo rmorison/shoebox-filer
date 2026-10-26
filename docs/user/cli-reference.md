@@ -13,6 +13,26 @@ The CLI is installed into a uv-managed virtual environment by `make setup`. Run 
 
 ---
 
+## Amounts
+
+Each receipt has three amounts:
+
+| Field | Meaning |
+|---|---|
+| `amount` | The order, invoice or statement total, as the document states it |
+| `paid_amount` | What the transaction charged to the payer's card, bank account, wallet or cash; for a refund, what it returned to them. `null` when the document doesn't say; `0` when nothing was charged, such as on an unpaid invoice |
+| `effective_amount` | `paid_amount` when it is known, otherwise `amount` |
+
+`paid_amount` includes tax, shipping and tip, and is after discounts. It leaves out anything paid with gift cards, store credit, points or vouchers, since those never reach a bank or card statement; the description says when they were used. It is never assumed from `amount`. When the document shows a payment, such as a card line or an amount charged, that is the paid amount even when it equals the total; for cash, it is the amount charged, not the cash handed over. A payment method named without an amount, such as a card on file or a guarantee, doesn't show a payment. When the document shows no payment, `paid_amount` is `null`, not the total. A refund's `paid_amount` is what it returned to the payer's card or account, never negative, so a sum of effective amounts counts refunds as spending, not as money back.
+
+The search amount filters and the `Amount` column in text output use the effective amount. JSON output keeps `amount` as the total and adds `paid_amount` and `effective_amount`, so a script that reads `amount` keeps working; read `effective_amount` for what was paid.
+
+Receipts ingested before the paid amount was added have `paid_amount: null`, so their effective amount is their `amount`. Their `amount` may be the payment rather than the total, because the earlier extraction prompt asked for "the total amount charged". When these receipts are re-extracted, `paid_amount` is filled in and `amount` can be corrected to the total, so an `amount` already read from an old receipt can change.
+
+**Field confidence.** `field_confidence` holds the extractor's own confidence, from 0 to 1, for each of `vendor`, `amount`, `paid_amount` and `date`; it is below 0.5 when a figure was inferred rather than printed. It is the model's estimate, not a measured probability: use it to choose which receipts to check first, not as a pass mark. It is empty (`{}`) for receipts ingested before it was recorded.
+
+---
+
 ## ingest
 
 Fetch unprocessed receipts from the configured IMAP folder, extract metadata using an LLM, render PDFs, and store everything in the database and file store.
@@ -46,7 +66,7 @@ uv run receipt-index ingest
 1. Connects to your IMAP server and fetches messages from the configured folder
 2. Skips messages already ingested (tracked by message ID for idempotency)
 3. For each new message:
-   - Sends the email content to Claude Haiku to extract vendor, amount, date, and description
+   - Sends the email content to Claude Haiku to extract vendor, total, paid amount, date, description and per-field confidence (see [Amounts](#amounts))
    - If the LLM confidence is too low, the message is skipped (not a receipt)
    - Renders the email as a PDF (using Playwright headless Chromium, with weasyprint fallback)
    - Stores the metadata in PostgreSQL and the PDF in the file store
@@ -73,9 +93,9 @@ uv run receipt-index search [OPTIONS]
 | Option | Description |
 |---|---|
 | `--vendor TEXT` | Filter by vendor name (case-insensitive substring match) |
-| `--amount DECIMAL` | Filter by exact amount |
-| `--amount-min DECIMAL` | Filter by minimum amount (inclusive) |
-| `--amount-max DECIMAL` | Filter by maximum amount (inclusive) |
+| `--amount DECIMAL` | Filter by exact effective amount (the paid amount when known, otherwise the total; see [Amounts](#amounts)) |
+| `--amount-min DECIMAL` | Filter by minimum effective amount (inclusive) |
+| `--amount-max DECIMAL` | Filter by maximum effective amount (inclusive) |
 | `--date-from YYYY-MM-DD` | Filter by start date (inclusive) |
 | `--date-to YYYY-MM-DD` | Filter by end date (inclusive) |
 | `--output text\|json` | Output format (default: `text`) |
@@ -99,7 +119,7 @@ uv run receipt-index search --date-from 2026-01-01 --date-to 2026-01-31
 # Combine filters: vendor + date range
 uv run receipt-index search --vendor "whole foods" --date-from 2026-01-01
 
-# Find an exact amount (useful for reconciliation)
+# Find an exact amount paid (useful for reconciliation)
 uv run receipt-index search --amount 47.99
 
 # Output as JSON for scripting
@@ -108,13 +128,13 @@ uv run receipt-index search --vendor amazon --output json
 
 ### Text Output
 
-The default text output shows a table:
+The default text output shows a table. `Amount` is the effective amount and `Total` is `amount`; they differ when, for example, part of an order was paid with a gift card:
 
 ```
-ID                                     Date         Vendor               Amount
-----------------------------------------------------------------------------------
-01942a3b-...                           2026-01-15   Amazon               47.99
-01942a3c-...                           2026-01-22   Amazon Web Services  129.00
+ID                                     Date         Vendor                   Amount      Total
+---------------------------------------------------------------------------------------------
+01942a3b-...                           2026-01-15   Amazon                    47.99      47.99
+01942a3c-...                           2026-01-22   Acme Parking (U.S.)…      30.00      50.00
 
 2 receipt(s) found.
 ```
@@ -129,8 +149,11 @@ Use `--output json` for machine-readable output:
     "id": "01942a3b-...",
     "vendor": "Amazon",
     "amount": "47.99",
+    "paid_amount": "47.99",
+    "effective_amount": "47.99",
     "currency": "USD",
     "receipt_date": "2026-01-15",
+    "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97},
     "pdf_path": "2026/01/2026-01-15__amazon__47.99.pdf",
     ...
   }
@@ -168,16 +191,21 @@ uv run receipt-index show 01942a3b-1234-7def-8abc-567890abcdef --output json
 ```
 ID:           01942a3b-1234-7def-8abc-567890abcdef
 Vendor:       Amazon
-Amount:       47.99 USD
+Amount:       47.99 USD (paid)
+Paid:         47.99
+Total:        47.99
 Date:         2026-01-15
 Description:  Order #123-4567890 - Wireless keyboard
 Confidence:   0.95
+Field Conf:   vendor 0.98, amount 0.95, paid_amount 0.90, date 0.97
 PDF:          2026/01/2026-01-15__amazon__47.99.pdf
 Source:       imap (msg-id-12345@mail.example.com)
 Subject:      Your Amazon.com order has shipped
 Sender:       ship-confirm@amazon.com
 Email Date:   2026-01-15T10:30:00
 ```
+
+`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded.
 
 The `PDF` path is relative to your configured `RECEIPT_STORE_PATH`. PDFs are stored using the naming convention `{YYYY}/{MM}/{YYYY-MM-DD}__{vendor-slug}__{amount}.pdf`.
 
@@ -208,7 +236,7 @@ Every connection is also opened read-only (`default_transaction_read_only`), and
 
 ### Tools
 
-All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both directions, so a paid amount never passes through a float. Dates are `YYYY-MM-DD`.
+All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both directions, so an amount never passes through a float. Dates are `YYYY-MM-DD`. Each receipt carries `amount` (the total), `paid_amount` and `effective_amount`, with the meanings in [Amounts](#amounts), and the `amount` filters match the effective amount.
 
 | Tool | Inputs | Returns |
 |---|---|---|
@@ -325,8 +353,8 @@ uv run receipt-index search --vendor amazon --output json > amazon-receipts.json
 # Count receipts per vendor with jq
 uv run receipt-index search --date-from 2026-01-01 --output json | jq 'group_by(.vendor) | map({vendor: .[0].vendor, count: length})'
 
-# Sum amounts with jq
-uv run receipt-index search --vendor amazon --output json | jq '[.[].amount | tonumber] | add'
+# Sum the amounts paid with jq (effective_amount: paid when known, else the total)
+uv run receipt-index search --vendor amazon --output json | jq '[.[].effective_amount | tonumber] | add'
 ```
 
 ### Weekly Ingestion

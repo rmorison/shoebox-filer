@@ -937,3 +937,163 @@ class TestMcpCommandDatabaseErrors:
         assert message in result.output
         assert "Traceback" not in result.output
         mock_build.assert_not_called()
+
+
+_PAID_RECEIPT = Receipt.model_validate(
+    {
+        **_RECEIPT_ROW,
+        "vendor": "Acme Parking (U.S.), LLC",
+        "amount": Decimal("50.00"),
+        "paid_amount": Decimal("30.00"),
+        "field_confidence": {
+            "vendor": 0.95,
+            "amount": 0.9,
+            "paid_amount": 0.7,
+            "date": 0.99,
+        },
+    }
+)
+_UNKNOWN_PAID_RECEIPT = Receipt.model_validate(
+    {**_RECEIPT_ROW, "vendor": "Acme Parking (U.S.), LLC", "amount": Decimal("75.00")}
+)
+
+
+def _invoke(config_file: Path, *args: str) -> Any:
+    return CliRunner().invoke(cli, ["--config", str(config_file), *args])
+
+
+class TestPaidAmountOutput:
+    """search and show show the effective amount, the paid amount and the total."""
+
+    @patch("receipt_index.repository.search_receipts", return_value=[_PAID_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_search_text_shows_effective_and_total(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(config_file, "search")
+        assert result.exit_code == 0, result.output
+        header = result.output.splitlines()[0]
+        assert header.split()[-2:] == ["Amount", "Total"]
+        row = next(
+            line for line in result.output.splitlines() if "Acme Parking" in line
+        )
+        assert row.split()[-2:] == ["30.00", "50.00"]
+
+    @patch(
+        "receipt_index.repository.search_receipts",
+        return_value=[_UNKNOWN_PAID_RECEIPT],
+    )
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_search_text_falls_back_to_total(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(config_file, "search")
+        assert result.exit_code == 0, result.output
+        row = next(
+            line for line in result.output.splitlines() if "Acme Parking" in line
+        )
+        assert row.split()[-2:] == ["75.00", "75.00"]
+
+    @patch("receipt_index.repository.search_receipts", return_value=[_PAID_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_search_json_keeps_amount_and_adds_both(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(config_file, "search", "--output", "json")
+        assert result.exit_code == 0, result.output
+        (item,) = json.loads(result.output)
+        assert item["amount"] == "50.00"
+        assert item["paid_amount"] == "30.00"
+        assert item["effective_amount"] == "30.00"
+        assert item["field_confidence"]["paid_amount"] == 0.7
+
+    @patch("receipt_index.repository.get_receipt_by_id", return_value=_PAID_RECEIPT)
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_show_text_paid_known(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_get: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(config_file, "show", "019572a0-0000-7000-8000-000000000001")
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert "Amount:       30.00 USD (paid)" in lines
+        assert "Paid:         30.00" in lines
+        assert "Total:        50.00" in lines
+        assert (
+            "Field Conf:   vendor 0.95, amount 0.90, paid_amount 0.70, date 0.99"
+            in lines
+        )
+
+    @patch(
+        "receipt_index.repository.get_receipt_by_id",
+        return_value=_UNKNOWN_PAID_RECEIPT,
+    )
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_show_text_paid_unknown(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_get: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(config_file, "show", "019572a0-0000-7000-8000-000000000001")
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert "Amount:       75.00 USD (total; paid amount not known)" in lines
+        assert "Paid:         — (not known)" in lines
+        assert "Total:        75.00" in lines
+        assert not any(line.startswith("Field Conf:") for line in lines)
+
+    @patch("receipt_index.repository.get_receipt_by_id", return_value=_PAID_RECEIPT)
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_show_json_keeps_amount_and_adds_both(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_get: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = _invoke(
+            config_file,
+            "show",
+            "019572a0-0000-7000-8000-000000000001",
+            "--output",
+            "json",
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["amount"] == "50.00"
+        assert data["paid_amount"] == "30.00"
+        assert data["effective_amount"] == "30.00"
+
+    def test_search_help_says_effective_amount(self) -> None:
+        result = CliRunner().invoke(cli, ["search", "--help"])
+        assert result.exit_code == 0
+        assert "effective amount" in " ".join(result.output.split())
