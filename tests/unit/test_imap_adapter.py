@@ -15,9 +15,9 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from imapclient.exceptions import LoginError
+from imapclient.exceptions import IMAPClientAbortError, LoginError
 
-from receipt_index.adapters.base import SourceAdapter
+from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
 from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.models import ItemRef, SyncState
 
@@ -582,3 +582,81 @@ class TestFetch:
         raw = a.fetch(ref)
         assert raw is not None
         assert [x.filename for x in raw.attachments] == ["receipt.pdf"]
+
+
+class TestTransportErrors:
+    def _broken(self, error: Exception) -> FakeIMAPClient:
+        broken = FakeIMAPClient({1: _mail(1)})
+
+        def fail(*_: Any, **__: Any) -> Any:
+            raise error
+
+        broken.fetch = fail  # type: ignore[method-assign]
+        return broken
+
+    @pytest.mark.parametrize(
+        "error",
+        [OSError("connection reset"), IMAPClientAbortError("socket error: EOF")],
+        ids=["oserror", "abort"],
+    )
+    def test_reconnects_once_after_a_dropped_connection(
+        self, imap_config: ImapSourceConfig, error: Exception
+    ) -> None:
+        fresh = FakeIMAPClient({1: _mail(1)})
+        adapter = ImapAdapter(imap_config)
+        adapter._client = self._broken(error)  # type: ignore[assignment]
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+
+        with patch.object(adapter, "_connect", return_value=fresh) as connect:
+            raw = adapter.fetch(ref)
+
+        connect.assert_called_once()
+        assert raw is not None
+        assert raw.source_id == "<msg-1@example.com>"
+        assert adapter._client is fresh
+
+    def test_second_failure_is_a_source_outage(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        adapter = ImapAdapter(imap_config)
+        adapter._client = self._broken(OSError("reset"))  # type: ignore[assignment]
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+
+        with (
+            patch.object(
+                adapter, "_connect", return_value=self._broken(OSError("reset again"))
+            ),
+            pytest.raises(SourceUnavailableError, match="reset again"),
+        ):
+            adapter.fetch(ref)
+        assert adapter._client is None
+
+    def test_a_bad_message_is_not_a_source_outage(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        adapter = ImapAdapter(imap_config)
+        adapter._client = FakeIMAPClient({1: _mail(1)})  # type: ignore[assignment]
+        ref = ItemRef(source_id="<msg-1@example.com>", source_type="imap", imap_uid=1)
+        with (
+            patch.object(adapter, "_parse_message", side_effect=ValueError("bad MIME")),
+            pytest.raises(ValueError, match="bad MIME"),
+        ):
+            adapter.fetch(ref)
+
+
+class TestHeaderBatches:
+    def test_header_fetch_spans_several_batches(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        fake = FakeIMAPClient({u: _mail(u) for u in range(1, 6)})
+        adapter = ImapAdapter(imap_config)
+        adapter._client = fake  # type: ignore[assignment]
+
+        with patch("receipt_index.adapters.imap._FETCH_BATCH", 2):
+            read = adapter.list_new(None)
+
+        assert [r.imap_uid for r in read.items] == [1, 2, 3, 4, 5]
+        header_batches = [
+            uids for uids, items in fake.fetches if items != ["BODY.PEEK[]"]
+        ]
+        assert header_batches == [[1, 2], [3, 4], [5]]

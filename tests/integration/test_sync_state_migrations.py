@@ -202,6 +202,55 @@ class TestGrants:
             conn.execute("DELETE FROM receipt.sync_state")
         conn.rollback()
 
+    def test_write_role_cannot_set_database_owned_columns(
+        self, scratch_db: psycopg.Connection[dict[str, Any]]
+    ) -> None:
+        conn = scratch_db
+        conn.execute("SET ROLE receipt_index_dev_write")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(
+                "INSERT INTO receipt.sync_state "
+                "(source_name, source_type, folder, created_at) "
+                "VALUES ('x', 'imap', 'INBOX', '2000-01-01')"
+            )
+        conn.rollback()
+        conn.execute("SET ROLE receipt_index_dev_write")
+        conn.execute(
+            "INSERT INTO receipt.sync_state (source_name, source_type, folder) "
+            "VALUES ('x', 'imap', 'INBOX')"
+        )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE receipt.sync_state SET folder = 'Other'")
+        conn.rollback()
+
+    def test_write_role_can_run_the_repository_upserts(
+        self, scratch_db: psycopg.Connection[dict[str, Any]]
+    ) -> None:
+        """The cursor and poll upserts need exactly the granted columns."""
+        from receipt_index.repository import (
+            record_poll,
+            save_drive_cursor,
+            save_imap_cursor,
+        )
+
+        conn = scratch_db
+        conn.execute("SET ROLE receipt_index_dev_write")
+        conn.commit()
+        record_poll(conn, source_name="m", source_type="imap", folder="I", error=None)
+        record_poll(conn, source_name="m", source_type="imap", folder="I", error="x")
+        save_imap_cursor(conn, source_name="m", folder="I", uidvalidity=1, last_uid=2)
+        save_imap_cursor(
+            conn, source_name="m", folder="I", uidvalidity=3, last_uid=0, reset=True
+        )
+        save_drive_cursor(
+            conn, source_name="d", folder="F", page_token="t", account_id="a"
+        )
+        save_drive_cursor(
+            conn, source_name="d", folder="F", page_token="u", account_id="a"
+        )
+        conn.execute("RESET ROLE")
+        conn.commit()
+
     def test_read_role_cannot_write_sync_state(
         self, scratch_db: psycopg.Connection[dict[str, Any]]
     ) -> None:

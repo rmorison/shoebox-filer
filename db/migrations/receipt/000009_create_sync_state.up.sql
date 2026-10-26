@@ -38,8 +38,19 @@ CREATE OR REPLACE TRIGGER trg_sync_state_set_updated_at
 -- _all: full DDL access (runs migrations)
 GRANT ALL PRIVILEGES ON receipt.sync_state TO receipt_index_dev_all;
 
--- _write: read and advance cursors (no DELETE; resetting a source is an operator step)
-GRANT SELECT, INSERT, UPDATE ON receipt.sync_state TO receipt_index_dev_write;
+-- _write: read and advance cursors, on business columns only (id and the
+-- timestamps stay database-owned). No DELETE: resetting a source is an
+-- operator step.
+GRANT SELECT ON receipt.sync_state TO receipt_index_dev_write;
+GRANT INSERT (source_name, source_type, folder,
+              imap_uidvalidity, imap_last_uid, drive_page_token, drive_account_id,
+              archive_enabled_at, last_poll_at, last_success_at,
+              last_error, last_error_at, resets)
+    ON receipt.sync_state TO receipt_index_dev_write;
+GRANT UPDATE (imap_uidvalidity, imap_last_uid, drive_page_token, drive_account_id,
+              archive_enabled_at, last_poll_at, last_success_at,
+              last_error, last_error_at, resets)
+    ON receipt.sync_state TO receipt_index_dev_write;
 
 -- _read: SELECT only
 GRANT SELECT ON receipt.sync_state TO receipt_index_dev_read;

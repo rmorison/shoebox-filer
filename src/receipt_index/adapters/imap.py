@@ -18,8 +18,9 @@ from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from imapclient import IMAPClient
-from imapclient.exceptions import IMAPClientError
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
+from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import Attachment, ItemRef, RawReceipt, SourceRead
 
 if TYPE_CHECKING:
@@ -224,12 +225,33 @@ class ImapAdapter:
         """
         if ref.imap_uid is None:
             raise ValueError(f"IMAP ref without a UID: {ref.source_id}")
-        response = self._session().fetch([ref.imap_uid], [_BODY_FETCH])
+        response = self._fetch_body(ref.imap_uid)
         data = response.get(ref.imap_uid)
         raw = data.get(_BODY_KEY) if data else None
         if not isinstance(raw, bytes):
             return None
         return self._parse_message(message_from_bytes(raw), ref.source_id)
+
+    def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:
+        """Fetch one body, reconnecting once if the connection has dropped.
+
+        A connection that fails twice means the server is unreachable, not
+        that the message is bad: raise ``SourceUnavailableError``.
+        """
+        for attempt in (1, 2):
+            try:
+                result: dict[int, dict[bytes, Any]] = self._session().fetch(
+                    [uid], [_BODY_FETCH]
+                )
+                return result
+            except (OSError, IMAPClientAbortError) as exc:
+                self._client = None  # dead: the next _session() reconnects
+                if attempt == 2:
+                    raise SourceUnavailableError(
+                        f"IMAP connection to {self.config.host} failed: {exc}"
+                    ) from exc
+                logger.warning("IMAP connection dropped (%s); reconnecting", exc)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _parse_message(self, msg: Message, source_id: str) -> RawReceipt:
         """Convert an email Message to a RawReceipt."""

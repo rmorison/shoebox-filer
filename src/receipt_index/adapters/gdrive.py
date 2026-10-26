@@ -14,6 +14,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Self
 
+from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import ItemRef, RawReceipt, SourceRead
 
 if TYPE_CHECKING:
@@ -75,6 +76,30 @@ def _is_invalid_token_error(exc: Exception) -> bool:
     if isinstance(content, str):
         content = content.encode()
     return status == 400 and b"pageToken" in content
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Whether a download error is the service's, not the file's.
+
+    Rate limits (429, or a 403 naming a rate limit) and server errors (5xx)
+    pass; a 404 means the file itself is gone.
+    """
+    from googleapiclient.errors import HttpError
+
+    if isinstance(exc, OSError):
+        return True
+    if not isinstance(exc, HttpError):
+        return False
+    status = int(exc.resp.status)
+    if status == 429 or status >= 500:
+        return True
+    content = exc.content or b""
+    if isinstance(content, str):
+        content = content.encode()
+    rate_limited = (
+        b"rateLimitExceeded" in content or b"userRateLimitExceeded" in content
+    )
+    return status == 403 and rate_limited
 
 
 def _skip_reason(mime_type: str) -> str | None:
@@ -260,7 +285,14 @@ class GdriveAdapter:
         """Download one file. None if its type can't be ingested."""
         if ref.drive_meta is None:
             raise ValueError(f"Drive ref without metadata: {ref.source_id}")
-        result = self._download_file(self._session(), ref.drive_meta)
+        try:
+            result = self._download_file(self._session(), ref.drive_meta)
+        except Exception as exc:
+            if _is_transient_error(exc):
+                raise SourceUnavailableError(
+                    f"Drive download of {ref.source_id} failed: {exc}"
+                ) from exc
+            raise
         if result is None:
             return None
         content, mime_type = result

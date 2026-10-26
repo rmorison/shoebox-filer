@@ -19,6 +19,7 @@ from uuid import UUID
 import pytest
 
 from receipt_index import pipeline
+from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.locks import SourceLockLostError
 from receipt_index.models import (
     ExtractionResult,
@@ -161,12 +162,15 @@ class FakeAdapter:
         fail_fetch: set[str] | None = None,
         gone: set[str] | None = None,
         list_error: Exception | None = None,
+        unavailable_from: str | None = None,
     ) -> None:
         self.read = read
         self.source_type = source_type
         self.fail_fetch = fail_fetch or set()
         self.gone = gone or set()
         self.list_error = list_error
+        self.unavailable_from = unavailable_from
+        self.down = False
         self.fetched: list[str] = []
         self.closed = False
 
@@ -181,6 +185,10 @@ class FakeAdapter:
 
     def fetch(self, ref: ItemRef) -> RawReceipt | None:
         self.fetched.append(ref.source_id)
+        if ref.source_id == self.unavailable_from:
+            self.down = True
+        if self.down:
+            raise SourceUnavailableError("IMAP connection to mail.example.com failed")
         if ref.source_id in self.fail_fetch:
             raise ValueError("cannot parse message")
         if ref.source_id in self.gone:
@@ -427,6 +435,40 @@ class TestFetchErrors:
         assert result.failed == 1
         assert result.processed == 1  # the next item still ran
         assert repo.imap_saves[-1] == (7, 2, False)
+
+    def test_unreachable_source_stops_without_failing_items(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        """A dropped connection is the source's fault, not the items'."""
+        repo.state = _imap_state(7, 0)
+        adapter = FakeAdapter(
+            _imap_read([1, 2, 3]), unavailable_from="<msg-2@example.com>"
+        )
+
+        result = _run(adapter)
+
+        assert repo.statuses("<msg-1@example.com>") == ["started", "success"]
+        # No row for the item that hit the outage, or for any later item.
+        assert repo.statuses("<msg-2@example.com>") == []
+        assert repo.statuses("<msg-3@example.com>") == []
+        assert result.failed == 0
+        assert result.source_error is not None
+        assert "connection" in result.source_error
+        assert repo.polls[-1] == result.source_error
+        # The cursor stays below the unreached items, so the next run retries.
+        assert repo.imap_saves[-1] == (7, 1, False)
+        assert adapter.fetched == ["<msg-1@example.com>", "<msg-2@example.com>"]
+
+    def test_unreachable_drive_keeps_the_token(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        adapter = FakeAdapter(
+            _drive_read(["f1", "f2"]), source_type="gdrive", unavailable_from="f2"
+        )
+        result = _run(adapter)
+        assert result.source_error is not None
+        assert repo.statuses("f2") == []
+        assert repo.drive_saves == []
 
     def test_gone_item_writes_failed(self, repo: FakeRepo, extract: MagicMock) -> None:
         adapter = FakeAdapter(_imap_read([1]), gone={"<msg-1@example.com>"})

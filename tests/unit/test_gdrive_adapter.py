@@ -11,7 +11,7 @@ import httplib2
 import pytest
 from googleapiclient.errors import HttpError
 
-from receipt_index.adapters.base import SourceAdapter
+from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
 from receipt_index.adapters.gdrive import (
     UNSUPPORTED_REASON,
     GdriveAdapter,
@@ -481,6 +481,12 @@ class TestBootstrap:
         assert read.reset is None
         assert read.held_back is False
 
+    def test_token_without_account_is_a_first_run(self) -> None:
+        drive = FakeDrive()
+        read = _adapter(drive).list_new(_drive_state("tok-9", None))
+        assert drive.calls == ["getStartPageToken", "files.list"]
+        assert read.reset is None
+
     def test_row_without_token_is_a_first_run(self) -> None:
         drive = FakeDrive()
         read = _adapter(drive).list_new(_drive_state(None, None))
@@ -675,3 +681,45 @@ class TestFetchFile:
 
     def test_conforms_to_source_adapter_protocol(self) -> None:
         assert isinstance(GdriveAdapter(_make_gdrive_config()), SourceAdapter)
+
+
+class TestDownloadErrors:
+    def _failing(self, error: Exception) -> tuple[GdriveAdapter, Any]:
+        drive = FakeDrive(files=[_make_file_meta(file_id="f1")])
+        adapter = _adapter(drive)
+        (ref,) = adapter.list_new(None).items
+
+        def fail(*_: Any, **__: Any) -> Any:
+            raise error
+
+        drive.get_media = fail  # type: ignore[method-assign]
+        return adapter, ref
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _http_error(503),
+            _http_error(500),
+            _http_error(429),
+            _http_error(
+                403,
+                b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}',
+            ),
+            TimeoutError("timed out"),
+        ],
+        ids=["503", "500", "429", "403-rate-limit", "timeout"],
+    )
+    def test_service_errors_are_a_source_outage(self, error: Exception) -> None:
+        adapter, ref = self._failing(error)
+        with pytest.raises(SourceUnavailableError):
+            adapter.fetch(ref)
+
+    @pytest.mark.parametrize(
+        "error",
+        [_http_error(404), _http_error(403, b'{"error": {"message": "Forbidden"}}')],
+        ids=["404", "403-forbidden"],
+    )
+    def test_file_errors_stay_item_errors(self, error: HttpError) -> None:
+        adapter, ref = self._failing(error)
+        with pytest.raises(HttpError):
+            adapter.fetch(ref)

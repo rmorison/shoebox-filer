@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.extraction import extract_metadata
 from receipt_index.locks import SourceLockLostError, item_lock
 from receipt_index.renderer import render_pdf
@@ -257,6 +258,11 @@ def handle_item(
     Returns ``locked`` when another process holds the item, and ``known``
     when the item gained a record between listing and locking. Once the
     ``started`` row is committed, every error path ends in an outcome row.
+
+    The body is fetched before the ``started`` row is written, so a source
+    that can't be reached (``SourceUnavailableError``, re-raised to the caller)
+    leaves no row at all: the cursor stays below the item and the next run
+    tries it again, as it would after a crash at the same point.
     """
     with item_lock(conn, ref.source_id) as locked:
         if not locked:
@@ -283,8 +289,19 @@ def handle_item(
             logger.info("Skipped %s: %s (%s)", ref.source_id, ref.skip_reason, mime)
             return ItemOutcome("skipped")
 
-        # Committed before any work, so a crash leaves a trace and the cursor
-        # may pass the item.
+        fetch_error: Exception | None = None
+        raw: RawReceipt | None = None
+        try:
+            raw = adapter.fetch(ref)
+            if raw is None:
+                fetch_error = LookupError("item is no longer in the source")
+        except SourceUnavailableError:
+            raise
+        except Exception as err:  # the item itself is at fault (e.g. parse)
+            fetch_error = err
+
+        # Committed before any processing, so a crash leaves a trace and the
+        # cursor may pass the item.
         insert_ingest_log(
             conn,
             source_id=ref.source_id,
@@ -296,12 +313,7 @@ def handle_item(
             email_date=email_date,
         )
 
-        try:
-            raw = adapter.fetch(ref)
-            if raw is None:
-                raise LookupError("item is no longer in the source")
-        except Exception as exc:
-            conn.rollback()
+        if fetch_error is not None or raw is None:
             _record_failure(
                 conn,
                 source_id=ref.source_id,
@@ -310,11 +322,11 @@ def handle_item(
                 subject=ref.subject,
                 sender=ref.sender,
                 email_date=email_date,
-                exc=exc,
+                exc=fetch_error or LookupError("item is no longer in the source"),
                 extraction=None,
                 llm_model=llm_model,
             )
-            logger.warning("Failed to fetch %s", ref.source_id, exc_info=True)
+            logger.warning("Failed to fetch %s", ref.source_id, exc_info=fetch_error)
             return ItemOutcome("failed")
 
         return process_item(
@@ -539,7 +551,7 @@ def run_ingest(
 
             if not dry_run:
                 cursor.finish()
-        except SourceLockLostError as exc:
+        except (SourceLockLostError, SourceUnavailableError) as exc:
             logger.error("Source %s: %s; stopping this source", source_name, exc)
             result.source_error = str(exc)
             record_poll(
