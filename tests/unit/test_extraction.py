@@ -626,10 +626,10 @@ _PAID_AMOUNT_RULES = {
     "hold is not a payment": "pre-authorization or hold is not a payment",
     "unpaid invoice is 0": "nothing has been paid (an unpaid invoice), use 0",
     "refund returned to payment methods": "for a refund, what was returned",
-    "refund excludes store credit": "returned as store credit, a gift card or points",
+    "refund excludes store credit": "excluding any part returned as store credit",
     "unknown is null": "does not say what was paid or returned, use null",
     "never copied from amount": "Never copy amount into paid_amount",
-    "refund is never negative": "never negative",
+    "refund is never negative": "It is never negative",
     "store-credit refund is 0": "0 when all of it was returned as store credit",
 }
 
