@@ -36,7 +36,7 @@ The boundary is enforced by a database role. Migrations grant to a `NOLOGIN` rol
 
 Every change after extraction writes one row to `receipt.receipt_events` in the same transaction as the change: the event type, a JSON payload (such as the old and new value, or the tag's ID and name), the actor, the actor kind (`person`, `agent` or `rule`) and an optional reason. The current state (`receipt_tags`, `external_links`, the receipt's fields) is kept in its own tables for querying; the history is the record of how it got there, and the only place that says who made a change.
 
-- **Tag and link events are written by triggers** on `receipt_tags` and `external_links`, so no caller can skip one or write one that doesn't match. The triggers take the actor from a transaction-local setting, refuse a change with no actor, and record `agent` for any session whose login is a member of the annotate role.
+- **Tag and link events are written by triggers** on `receipt_tags` and `external_links`, so no caller can skip one or write one that doesn't match. The triggers take the actor from a transaction-local setting, refuse a change with no actor, refuse to apply a deactivated tag, and record `agent` for any session whose login is a member of the annotate role (checked through role membership, so a superuser doesn't count). They write nothing once the receipt itself is gone, so deleting a receipt still cascades. The annotate role is never granted to the application's own login.
 - **History can't be changed by application code.** No application role has `UPDATE` or `DELETE` on it, and since production connects as the role that owns the tables, a guard trigger also refuses every update, delete and truncate, apart from the cascade when a receipt itself is deleted. The owning role could still drop the trigger by a deliberate schema change; whether to separate the owner from the application's login is left to the operator.
 
 The actor's name is attribution, not authentication: the CLI records a configured name, and an agent tool records the MCP client's name.
@@ -55,7 +55,7 @@ The actor's name is attribution, not authentication: the CLI records a configure
 - **A person must define a tag before an agent can use it**, which adds a step when a new category comes up.
 - **A new database role** to create and grant in devtest and production, by a superuser step outside the migrations.
 - **Triggers carry logic** (writing events, guarding history) that would otherwise sit in Python, and need their own tests.
-- **Deleting a receipt deletes its history.** The CLI has no delete command, and merging duplicates moves history first.
+- **Deleting a receipt deletes its history.** The CLI has no delete command, and a duplicate merge deletes only a receipt it leaves empty, never one with tags, links, edits or refunds.
 - **Attribution can be wrong.** Whoever runs the CLI can give any name; this is accepted for a household tool.
 - **The history grows without bound.** At household volumes this is small; there is no pruning.
 

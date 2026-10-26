@@ -13,7 +13,7 @@ The same consumer matches some purchases item by item, by description or product
 Key factors:
 
 - **Existing rows can't be relabelled.** Without re-extraction, nobody can tell whether a stored `amount` is the total or the payment.
-- **Compatibility.** The CLI's JSON output and the read-only MCP server already return `amount`, and consumers read it.
+- **Compatibility.** The CLI's JSON output already returns `amount`, consumers read it, and a planned read-only MCP server will return the same fields.
 - **Unknown is a real value.** An unpaid invoice has a total and no payment.
 - **Line items are searched and matched one by one**, by description and by SKU.
 - **Re-extraction replaces a receipt's line items as a set.**
@@ -24,7 +24,7 @@ Key factors:
 
 Keep `amount` as the order, invoice or statement total, and add a nullable `paid_amount` for what the transaction charged to the payer's payment methods, or for a refund what it returned to them. Gift cards, store credit, points and vouchers are excluded, since they never reach a bank or card statement. `NULL` means "not known" and is never filled in from `amount`; `0` means nothing was charged, as on an unpaid invoice.
 
-The first re-extraction of a receipt with no extraction history also replaces its `amount`, since the old prompt sometimes stored the payment there. Each replaced value is kept in the extraction record.
+The first re-extraction of a receipt extracted under the old prompt also replaces its `amount`, since the old prompt sometimes stored the payment there. Each replaced value is printed and kept in the extraction record. A consumer that has already read such an `amount` can see it change.
 
 Search, sorting and the text output use `COALESCE(paid_amount, amount)`, the effective amount, with an expression index. JSON output keeps `amount` unchanged and adds `paid_amount` and `effective_amount`.
 

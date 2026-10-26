@@ -69,7 +69,8 @@ Where they meet:
 - **Text search reads the email subject** from wherever the evidence-store design puts it. Until that design's migration lands, it is `receipts.email_subject`.
 - **Refunds are not duplicates.** A refund shares a vendor and an order number with its purchase. Duplicate detection excludes pairs whose `kind` differs.
 - **Re-extraction reads originals** from the evidence store once they exist, and falls back as described under [Re-extraction](#re-extraction).
-- **Merging duplicates keeps history.** Before a merge deletes a receipt, it moves that receipt's events, tags and links to the receipt that remains; see [Deleting a receipt](#deleting-a-receipt).
+- **Merging duplicates.** How a merge works is the evidence-store design's decision. As it stands, a merge moves provenance records, deletes a receipt it leaves empty, and is refused when it would remove tags, links, hand-edited fields or refunds pointing at that receipt. The receipt's events and extractions go with it through the cascade; see [Deleting a receipt](#deleting-a-receipt).
+- **Which document held the receipt.** The evidence-store design treats an email's receipt document as certain only when the extraction names it, so the extraction reports it; see [Output model](#output-model).
 - **Renaming renditions.** The rendition's file name includes the vendor and amount. Renaming it after a re-extraction changes either is the evidence-store design's business. This design only changes the fields.
 
 ### Alternatives considered
@@ -109,11 +110,13 @@ The extraction rules for `paid_amount`:
 
 #### The effective amount
 
-Search filters, sort order, the text output and the JSON output's `effective_amount` all use `COALESCE(paid_amount, amount)`. The JSON output keeps `amount` and adds `paid_amount` and `effective_amount`, so a consumer that reads `amount` today keeps working.
+Search filters, sort order, the text output and the JSON output's `effective_amount` all use `COALESCE(paid_amount, amount)`. The JSON output keeps `amount` and adds `paid_amount` and `effective_amount`, so a consumer that reads `amount` today keeps working. The approach had output use the effective amount; it gets its own key instead, because putting it under `amount` would make that key mean the payment on some rows and the total on others, which is the mixing ADR-0011 rejects.
 
 #### Existing totals
 
-The old prompt asked for "the total amount charged", so an existing `amount` is sometimes the total and sometimes the payment, and nothing records which. The first re-extraction of a receipt that has no extraction history (see [Applying a result](#the-command)) therefore replaces `amount` as well, so that after the back-catalogue run `amount` means the total on every row. Each replaced value is printed and kept in the run's `extractions` row.
+The old prompt asked for "the total amount charged", so an existing `amount` is sometimes the total and sometimes the payment, and nothing records which. The first re-extraction of a receipt extracted under the old prompt therefore replaces `amount` as well, so that after the back-catalogue run `amount` means the total on every row. A receipt was extracted under the old prompt when it has no extraction history and an empty `field_confidence`, which ticket 1's prompt always fills. Each replaced value is printed and kept in the run's `extractions` row.
+
+This differs from the signed-off approach, which kept every existing `amount`. The effect for consumers: a figure already read from `amount` for an old receipt can change after the back-catalogue run. A consumer that has copied amounts elsewhere should re-read them, or compare against the run's printed changes.
 
 The file-store naming (`{date}__{vendor}__{amount}.pdf`) is left as it is. New file names, and renaming, belong to the evidence-store design.
 
@@ -184,12 +187,13 @@ class ReceiptMetadata(BaseModel):
     order_number: str | None = None
     payment: Payment | None = None
     kind: Literal["purchase", "refund"] = "purchase"
+    receipt_document: str | None = None             # attachment file name, or "body"
     line_items: list[LineItem] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)        # is this a receipt at all
     field_confidence: FieldConfidence
 ```
 
-Ticket 1 adds only `paid_amount` and `field_confidence` (with its first four entries). Later tickets add the rest.
+Ticket 1 adds only `paid_amount` and `field_confidence` (with its first four entries). Ticket 2 adds `receipt_document`, which names the attachment that held the receipt (its file name), or `body` when the receipt was in the email itself; it is `null` when the extractor can't tell, for example when a lone PDF holds only terms and conditions. It is kept in the extraction record, where the evidence-store design's duplicate rules read it. Later tickets add the rest.
 
 #### Prompt changes
 
@@ -245,6 +249,7 @@ CREATE TABLE IF NOT EXISTS receipt.extractions (
     receipt_id            UUID NOT NULL,
     origin                TEXT NOT NULL,
     input_kind            TEXT NOT NULL,
+    input_file_id         UUID,
     prompt_version        INTEGER NOT NULL,
     llm_model             TEXT NOT NULL,
     output                JSONB NOT NULL,
@@ -271,13 +276,14 @@ ALTER TABLE receipt.receipts
     ADD COLUMN manual_fields TEXT[] NOT NULL DEFAULT '{}';
 ```
 
+- `input_file_id` records which stored file the run read, when it read one from the evidence store (an original or the rendition), so a run shows what it worked from. Its foreign key to `receipt.stored_files` is added by whichever of the two designs' migrations lands second.
 - `output` is the whole validated output model, so a run can be inspected or compared later.
 - `applied_fields` lists the fields this run actually wrote to the receipt, and `replaced` holds the values those fields had before, so any run can be undone by hand.
 - `manual_fields` lists the fields a person has edited. Re-extraction never writes them.
 - Ingest writes an `extractions` row with `origin = 'ingest'` for every receipt it creates. `ingest_log` keeps its token columns, since it also covers runs that produced no receipt.
 - The application roles get `INSERT` and `SELECT` on `extractions` and no `UPDATE` or `DELETE`. Grants alone aren't enough in production, where the application connects as the role that owns the tables, so the table is also guarded by a trigger; see [Keeping history append-only](#keeping-history-append-only).
 
-Existing receipts have no `extractions` row, and count as prompt version 0. That includes receipts ingested between tickets 1 and 2, which already have a paid amount; re-extracting them costs a little and, in the default fill-only mode, changes nothing they already have.
+Existing receipts have no `extractions` row, and count as prompt version 0. That includes receipts ingested between tickets 1 and 2. They already have a paid amount and a filled `field_confidence`, so they don't count as extracted under the old prompt and their `amount` isn't replaced; re-extracting them costs a little and, in the default fill-only mode, changes nothing they already have.
 
 #### The command
 
@@ -291,8 +297,8 @@ receipt-index reextract [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
 
 - **Selection.** By receipt date range, source and IDs, combined with AND. `--stale` keeps only receipts whose latest extraction has an older prompt version than the current one.
 - **Repeat runs.** A receipt whose latest extraction already has the current prompt version is skipped unless `--force` is given. An interrupted run can be started again with the same arguments.
-- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt with no extraction history, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
-- **Refund links.** When a run sets `kind = 'refund'` or an order number, it runs the same linking rule as ingest; see [Refunds and returns](#6-refunds-and-returns).
+- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt extracted under the old prompt, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
+- **Refund links.** When a run sets `kind = 'refund'` or an order number, it runs the same linking rule as ingest; see [Refunds and returns](#6-refunds-and-returns). A run never changes the kind of a refund that is linked to a purchase (the constraint `ck_receipts_refund_of_kind` would refuse it); it lists the receipt instead, and a person unlinks it with `refund unlink` before editing it.
 - **Confidence gate.** If the new overall confidence is below 0.5, the run records the extraction and applies nothing, and the summary lists the receipt.
 - **What still needs review.** `search --needs-review` lists receipts whose `paid_amount` is `NULL`, or whose latest extraction applied nothing (the confidence gate or a failure), lowest paid-amount confidence first. It is the list success criterion 6 is checked against, and it survives after the run's own output has gone.
 - **Transactions.** Each receipt is its own transaction: the `extractions` row, the receipt update and any line items commit together. A failure is logged and the run moves on.
@@ -413,7 +419,7 @@ This stops application code. It doesn't stop the owning role from dropping the t
 
 #### Deleting a receipt
 
-Deleting a receipt deletes its history with it (`ON DELETE CASCADE`), which is the one exception to the rule above. The CLI has no command that deletes a receipt, so today this only happens through SQL run by hand. When the evidence-store design merges duplicates, it moves the merged receipt's events, tags and links to the receipt that remains before deleting anything, so that merging never loses history.
+Deleting a receipt deletes its history with it (`ON DELETE CASCADE`), which is the one exception to the rule above. The CLI has no command that deletes a receipt, so today this only happens through SQL run by hand. Merging duplicates can delete a receipt, under the evidence-store design's rules: only a receipt the merge leaves empty, and never one with tags, links, hand-edited fields or refunds pointing at it. Its events and extractions are deleted with it; that is part of the same exception. Deleting a purchase by hand sets its refunds' `refund_of` to `NULL` with no event, since a cascade writes none; that is part of the exception too.
 
 ### 5. Line items
 
@@ -478,7 +484,7 @@ GROUP BY p.id;
 
 - **A refund is its own receipt**, with `kind = 'refund'`, its own date and its own evidence. Its amounts are stored as positive numbers; `kind` gives the direction. A bank feed shows a refund as a credit, and the consumer maps the sign. Its `paid_amount` is what went back to the payer's card or account, so a refund given as store credit doesn't lower the net paid.
 - **Net paid is computed, not stored**, so it can't fall out of step with the refunds. A purchase with several partial refunds gets the sum.
-- **The linking rule.** An unlinked refund is linked to a purchase when exactly one purchase has the same order number, the same vendor (compared case-insensitively), the same currency and a known paid amount (`paid_amount IS NOT NULL`). The paid-amount condition leaves out confirmation and shipping emails that charged nothing, which share an order number with the purchase that did. If several purchases still match (an order charged on each shipment), or none does, the refund stays unlinked.
+- **The linking rule.** An unlinked refund is linked to a purchase when exactly one purchase has the same order number, the same vendor (compared case-insensitively), the same currency and a paid amount above zero (`paid_amount > 0`). The paid-amount condition leaves out confirmation and shipping emails, and unpaid invoices, that charged nothing, which share an order number with the purchase that did. If several purchases still match (an order charged on each shipment), or none does, the refund stays unlinked.
 - **When the rule runs.** Whenever an unlinked refund gains its kind or order number (at ingest, re-extraction or a hand edit), and whenever a purchase is ingested or re-extracted with an order number that matches an unlinked refund. Each link it makes is recorded as a `refund_linked` event with `actor_kind = 'rule'`.
 - **The rule trusts the email.** An email in the watched folder that claims to be a refund for a known order is linked, and lowers that purchase's net paid. The event, `refund list` and `history` make every automatic link visible, and `refund unlink` undoes it.
 - **Linking by hand.** `receipt-index refund link <refund-id> <purchase-id>` and `refund unlink <refund-id>`, both recorded. `refund list --unlinked` shows refunds with no purchase. Linking checks that the currencies match.
@@ -504,7 +510,7 @@ The document is built by one SQL function, `receipt.build_search_document(receip
 | Description | B | `english` |
 | Email subject | C | `english` |
 
-Triggers keep it current: on `receipts` (insert, and update of the columns it reads), and on `line_items` (insert, update and delete, which refresh the parent). The function and the trigger functions are `SECURITY DEFINER`, owned by the migration role, with `SET search_path = receipt, pg_catalog`. A trigger otherwise runs with the privileges of whoever fired it, and the `_write` role has no `UPDATE` on `search_document`, so without this every write of line items would fail in devtest. When the evidence-store design moves the subject to its provenance table, the function reads the subject of every provenance record of the receipt, and a trigger on that table joins these. Whichever of the two migrations lands second makes that change. The migration that adds the column fills it for every existing row.
+Triggers keep it current. They are `AFTER` triggers that update the receipt's `search_document`, since `build_search_document(receipt_id)` reads the stored rows: on `receipts` (insert, and update of the columns it reads, which don't include `search_document`, so the update doesn't fire it again), and on `line_items` (insert, update and delete, which refresh the parent). The function and the trigger functions are `SECURITY DEFINER`, owned by the migration role, with `SET search_path = receipt, pg_catalog`. A trigger otherwise runs with the privileges of whoever fired it, and the `_write` role has no `UPDATE` on `search_document`, so without this every write of line items would fail in devtest. When the evidence-store design moves the subject to its provenance table, the function reads the subject of every provenance record of the receipt, and a trigger on that table joins these. Whichever of the two migrations lands second makes that change. The migration that adds the column fills it for every existing row.
 
 Search gains `--text "query"`, parsed with `websearch_to_tsquery` in both configurations and combined with OR. With `--text`, results are ordered by `ts_rank` and then by date. The trigram index on vendor stays, and `--vendor` keeps working as a substring match.
 
@@ -552,12 +558,13 @@ CREATE INDEX IF NOT EXISTS idx_receipt_tags_tag ON receipt.receipt_tags (tag_id)
   | Edit an extracted field, link a refund | Yes | No |
   | Read tags, links and history | Yes | Yes |
 
-- **How changes are recorded.** Triggers on `receipt_tags` and `external_links` write the `tag_added`, `tag_removed`, `link_added` and `link_removed` events, after each insert and delete, in the same transaction. Application code can't skip an event or write one that doesn't match the change. The trigger functions are `SECURITY DEFINER`, owned by the migration role, with a fixed `search_path`. They read the actor and the reason from transaction-local settings (`SET LOCAL receipt_index.actor = ...`, `receipt_index.actor_kind`, `receipt_index.reason`), and refuse the change if no actor is set. A tag event's payload holds the tag's ID, name and tracking code at the time, so a later rename doesn't change what old events mean. Defining, renaming or deactivating a tag is rare and isn't per receipt; `tags.updated_at` records it.
+- **How changes are recorded.** Triggers on `receipt_tags` and `external_links` write the `tag_added`, `tag_removed`, `link_added` and `link_removed` events, after each insert and delete, in the same transaction. Application code can't skip an event or write one that doesn't match the change. The trigger functions are `SECURITY DEFINER`, owned by the migration role, with a fixed `search_path`. They read the actor and the reason from transaction-local settings (`SET LOCAL receipt_index.actor = ...`, `receipt_index.actor_kind`, `receipt_index.reason`), and refuse the change if no actor is set. They write nothing when the parent receipt no longer exists, the same test the history guard uses, so the cascade from deleting a receipt still works. The trigger on `receipt_tags` also refuses to apply a deactivated tag, so the database, not only the CLI, keeps the vocabulary rule. A tag event's payload holds the tag's ID, name and tracking code at the time, so a later rename doesn't change what old events mean. Defining, renaming or deactivating a tag is rare and isn't per receipt; `tags.updated_at` records it.
 - **Who the actor is.** The CLI sets the name in its configuration (`annotations.actor`, default `operator`), or the one given with `--as`, with `actor_kind = 'person'`. An agent tool sets the MCP client's name. This is attribution, not authentication: the tool runs for one household.
 - **How it is enforced.** Agent write tools connect through a role that can do only what the table above allows:
   - The migrations grant to a new `NOLOGIN` role, `receipt_index_dev_annotate`, following the `_dev_` names the existing migrations use as grant targets. It gets `USAGE` on the schema, `SELECT` on the receipt tables and the vocabulary, and `INSERT` and `DELETE` on `receipt_tags` and `external_links`. It gets nothing on `receipt_events`: the triggers write the events for it. It can't define tags, edit receipt fields or touch history.
-  - When the session's login role is a member of `receipt_index_dev_annotate`, the triggers record `actor_kind = 'agent'` whatever the setting says, so an agent can't pass itself off as a person.
-  - A migration can't create a role: in production it runs as `receipt_index`, which has no `CREATEROLE`, and the init scripts run only on an empty data directory. So ticket 7 adds an idempotent SQL step, run once by the database superuser before `migrate-up`, that creates `receipt_index_dev_annotate` if it doesn't exist and grants it `CONNECT`. The same block goes into `db/init/01-create-roles.sql` and `deploy/db-init/01-create-roles.sh` for new databases, and the step is documented in the server deployment guide and the devtest notes.
+  - When the session's login role is a member of `receipt_index_dev_annotate`, the triggers record `actor_kind = 'agent'` whatever the setting says, so an agent can't pass itself off as a person. Membership is checked through `pg_auth_members`, directly or through other roles, and not with `pg_has_role`, which is true for every superuser; devtest and the integration conftest connect as one, and would otherwise record every change as an agent's.
+  - `receipt_index_dev_annotate` is never granted to `receipt_index`, the production application login, nor to the `_dev_all`, `_dev_write` or `_dev_read` roles. Otherwise every CLI change in production would be recorded as an agent's.
+  - A migration can't create a role: in production it runs as `receipt_index`, which has no `CREATEROLE`, and the init scripts run only on an empty data directory. So ticket 7 adds an idempotent SQL step, run once by the database superuser before `migrate-up`, that creates `receipt_index_dev_annotate` if it doesn't exist and grants it `CONNECT`. The same block goes into `db/init/01-create-roles.sql` and `deploy/db-init/01-create-roles.sh` for new databases, outside the loop in the production script that grants each `_dev_` role to `receipt_index`, and the step is documented in the server deployment guide and the devtest notes.
   - The login that agent tools use (for example `receipt_index_annotate`, a member of `receipt_index_dev_annotate` only, owning nothing, with its own password and its own connection string, never `DATABASE_URL`) comes with the MCP write tools, which are the first thing to use it. That ticket adds a post-deploy check, run as that login, that an update of `receipt.receipts` and an insert into `receipt.tags` are refused.
   - The CLI keeps the `_write` role.
 - **Commands.** `tags define NAME [--tracking-code CODE] [--description TEXT]`, `tags rename OLD NEW`, `tags deactivate NAME`, `tags list`, `tag <id> add|remove NAME [--reason TEXT]`.
@@ -595,7 +602,7 @@ CREATE INDEX IF NOT EXISTS idx_external_links_system_id
 
 ### 10. Output and other consumers
 
-`Receipt` (the model) gains every new column, and `show` and the JSON output include them, with line items, tags, links and, for purchases, net paid. The read-only MCP server returns the same model, so it picks up the new fields without its own change; its write tools for tags and links are a follow-up after tickets 7 and 8.
+`Receipt` (the model) gains every new column, and `show` and the JSON output include them, with line items, tags, links and, for purchases, net paid. A read-only MCP server is being built separately. If it returns this model, it picks up the new fields without its own change; either way, its output follows the same meanings for `amount`, `paid_amount` and `effective_amount`. Write tools for tags and links are a follow-up after tickets 7 and 8.
 
 ### 11. The finished `receipts` table
 
@@ -627,11 +634,11 @@ These tickets are proposed here and filed only after the operator signs off this
 | # | Ticket | Files | Depends on |
 |---|---|---|---|
 | 1 | **Paid amount.** Column, field confidence, extraction rules, search and output on the effective amount, measured token cost | new migration; `models.py`, `extraction.py`, `pipeline.py`, `repository.py`, `cli.py`; `tests/integration/conftest.py`; unit and integration tests; `docs/user/cli-reference.md` | — |
-| 2 | **Re-extract and extraction history.** `extractions` table with its append-only guard, `manual_fields`, prompt version, `fetch_by_id` on both adapters, the `reextract` command, `search --needs-review` | new migration; `extraction.py`, `pipeline.py`, `repository.py`, `cli.py`, `config.py`, `adapters/base.py`, `adapters/imap.py`, `adapters/gdrive.py`; tests; CLI reference | 1 |
+| 2 | **Re-extract and extraction history.** `extractions` table with its append-only guard, `manual_fields`, prompt version, `receipt_document` in the output, `fetch_by_id` on both adapters, the `reextract` command, `search --needs-review` | new migration; `extraction.py`, `pipeline.py`, `repository.py`, `cli.py`, `config.py`, `adapters/base.py`, `adapters/imap.py`, `adapters/gdrive.py`; tests; CLI reference | 1 |
 | 3 | **Order number, payment and hand edits.** Columns, `receipt_events` with its append-only guard, the `edit` and `history` commands, new search filters | new migration; `models.py`, `extraction.py`, `repository.py`, `cli.py`; tests; CLI reference | 2 |
 | 4 | **Line items.** Table, extraction, `--sku` and `--item` | new migration; `models.py`, `extraction.py`, `pipeline.py`, `repository.py`, `cli.py`; tests; CLI reference | 2 |
 | 5 | **Refunds and net paid.** `kind`, `refund_of`, the view, linking at ingest, the `refund` commands | new migration; `models.py`, `extraction.py`, `pipeline.py`, `repository.py`, `cli.py`; tests; CLI reference | 3 |
-| 6 | **Text search.** Column, function, triggers, backfill, `--text` | new migration; `repository.py`, `cli.py`; tests; CLI reference | 4 |
+| 6 | **Text search.** Column, function, triggers, backfill, `--text` | new migration; `repository.py`, `cli.py`; tests; CLI reference | 3, 4 |
 | 7 | **Tags.** Vocabulary, `receipt_tags`, the event triggers, the annotate grant-target role and its superuser setup step, commands, `--tag` and `--untagged` | new migration; `db/init/01-create-roles.sql`, `deploy/db-init/01-create-roles.sh`; `models.py`, `repository.py`, `cli.py`, `config.py`; tests; CLI reference and server deployment guide | 3 |
 | 8 | **External links.** Table, event triggers, commands, `--linked-to` and `--not-linked` | new migration; `models.py`, `repository.py`, `cli.py`; tests; CLI reference | 3, 7 (role) |
 
