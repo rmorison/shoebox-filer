@@ -32,7 +32,7 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000008 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000010 (tables, indexes and
     constraints; not the grants, since CI's Postgres has no application roles).
     Keep in sync with db/migrations/ when schema changes.
     """
@@ -129,12 +129,13 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
             llm_cache_read_tokens INTEGER,
             llm_requests       INTEGER,
             llm_model          TEXT,
+            source_name     TEXT,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             paid_amount     NUMERIC(12,2),
 
             CONSTRAINT pk_ingest_log PRIMARY KEY (id),
             CONSTRAINT ck_ingest_log_status
-                CHECK (status IN ('success', 'failed', 'skipped')),
+                CHECK (status IN ('started', 'success', 'failed', 'skipped')),
             CONSTRAINT fk_ingest_log_receipt FOREIGN KEY (receipt_id)
                 REFERENCES receipt.receipts (id) ON DELETE SET NULL
         )
@@ -146,6 +147,51 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     )
     conn.execute(
         "CREATE INDEX idx_ingest_log_created_at ON receipt.ingest_log (created_at)"
+    )
+
+    # receipt/000009 — sync_state table and trigger
+    # (receipt/000010 — ingest_log 'started' status and source_name — is above)
+    conn.execute("DROP TABLE IF EXISTS receipt.sync_state CASCADE")
+    conn.execute(
+        """\
+        CREATE TABLE receipt.sync_state (
+            id                 UUID NOT NULL DEFAULT uuidv7(),
+            source_name        TEXT NOT NULL,
+            source_type        TEXT NOT NULL,
+            folder             TEXT NOT NULL,
+            imap_uidvalidity   BIGINT,
+            imap_last_uid      BIGINT,
+            drive_page_token   TEXT,
+            drive_account_id   TEXT,
+            archive_enabled_at TIMESTAMPTZ,
+            last_poll_at       TIMESTAMPTZ,
+            last_success_at    TIMESTAMPTZ,
+            last_error         TEXT,
+            last_error_at      TIMESTAMPTZ,
+            resets             INTEGER NOT NULL DEFAULT 0,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT pk_sync_state PRIMARY KEY (id),
+            CONSTRAINT uq_sync_state_source_folder UNIQUE (source_name, folder),
+            CONSTRAINT ck_sync_state_source_type
+                CHECK (source_type IN ('imap', 'gdrive')),
+            CONSTRAINT ck_sync_state_imap_cursor CHECK (
+                source_type <> 'imap'
+                OR (drive_page_token IS NULL AND drive_account_id IS NULL)),
+            CONSTRAINT ck_sync_state_drive_cursor CHECK (
+                source_type <> 'gdrive'
+                OR (imap_uidvalidity IS NULL AND imap_last_uid IS NULL))
+        )
+        """
+    )
+    conn.execute(
+        """\
+        CREATE OR REPLACE TRIGGER trg_sync_state_set_updated_at
+            BEFORE UPDATE ON receipt.sync_state
+            FOR EACH ROW
+            EXECUTE FUNCTION public.set_updated_at()
+        """
     )
     conn.commit()
 
@@ -165,9 +211,11 @@ def pg_conn() -> Iterator[psycopg.Connection[dict[str, Any]]]:
 
 @pytest.fixture(autouse=True)
 def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
-    """Clear the receipts and ingest_log tables before each test."""
+    """Clear the receipts, ingest_log and sync_state tables before each test."""
     pg_conn.rollback()  # clear any dangling transaction from a prior test failure
-    pg_conn.execute("TRUNCATE receipt.ingest_log, receipt.receipts CASCADE")
+    pg_conn.execute(
+        "TRUNCATE receipt.ingest_log, receipt.receipts, receipt.sync_state CASCADE"
+    )
     pg_conn.commit()
 
 

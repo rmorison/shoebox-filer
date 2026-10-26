@@ -21,6 +21,7 @@ dependencies = [
     "python-slugify>=8.0",
     "weasyprint>=62.0",
     "mcp>=2.3",
+    "imapclient>=4.1",
 ]
 
 [project.scripts]
@@ -83,11 +84,11 @@ warn_unused_configs = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "yaml.*"]
+module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "yaml.*", "imapclient.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["receipt_index.adapters.gdrive"]
+module = ["receipt_index.adapters.gdrive", "receipt_index.adapters.imap"]
 disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
