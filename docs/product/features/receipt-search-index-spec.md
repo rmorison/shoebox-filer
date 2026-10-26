@@ -61,6 +61,23 @@ Run ingestion as a long-running service rather than a scheduled one-shot command
 | FR-16 | CLI `ingest` command accepts `--source <name>` to ingest from a specific named source, or all sources by default |
 | FR-17 | Search results include source name so users can identify which source a receipt came from |
 
+### Receipt Data Model
+
+Designed in the [receipt data-model design](../../engineering/designs/receipt-data-model.md).
+
+| ID | Requirement |
+|----|-------------|
+| FR-18 | Extract the amount actually paid (or, for a refund, returned) separately from the order or statement total. Search, sorting and output use the paid amount where it is known, and the total otherwise |
+| FR-19 | Report a confidence for each key field (vendor, total, paid amount, date and, where present, order number, payment, line items and kind), as well as overall |
+| FR-20 | Re-extract existing receipts, selected by date range, source or ID, so that they gain new fields. A dry run estimates the cost first; repeat runs skip receipts already at the current extraction version; fields a person has edited are never overwritten; receipts still without a paid amount can be listed for review |
+| FR-21 | Extract line items: description, quantity, unit price, line total and SKU or product ID where present. Search by item description and by SKU |
+| FR-22 | Extract the order or invoice number, the payment method, the card or account's last four digits and the payer as printed. Never store a full card or account number |
+| FR-23 | Record a refund or return as its own receipt, linked to the purchase it reverses, automatically when the vendor and order number identify one charged purchase and by hand otherwise. Report each purchase's net paid amount |
+| FR-24 | Tag receipts from a controlled vocabulary whose tags can carry accounting tracking codes. A person defines tags; a person or an agent applies them. Search by tag and for untagged receipts |
+| FR-25 | Record links from a receipt to records in other systems (system, external ID, optional URL). Look up receipts by link, and list receipts not yet linked in a given system |
+| FR-26 | Search text across vendor, description, email subject, order number and line items |
+| FR-27 | Edit a receipt's fields by hand. Every edit, tag change, link change and refund link is recorded with who made it, when and why, in a history that application code can't alter |
+
 ## Non-Functional Requirements
 
 | ID | Requirement |
@@ -118,6 +135,10 @@ Run ingestion as a long-running service rather than a scheduled one-shot command
 2. Existing ~200 email receipts are indexed and searchable
 3. PDF renditions are clean enough to attach directly to accounting transactions
 4. Incremental runs complete in under 60 seconds for a typical week's receipts
+5. In a hand-checked sample of at least 30 re-extracted receipts, including gift cards, invoices, statements and refunds, the paid amount matches what was charged for at least 95%
+6. After the back-catalogue re-extraction, every receipt either has a paid amount or is on the list of receipts that need review
+7. A refund that names its order number, where one charged purchase has that vendor and order number, appears linked to it, and the purchase's net paid amount is correct
+8. For every tag and link on a receipt, the history shows who set it and when
 
 ## Resolved Decisions
 
