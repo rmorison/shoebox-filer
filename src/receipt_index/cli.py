@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import click
@@ -251,6 +251,15 @@ def ingest(
     help="Filter by end date (YYYY-MM-DD).",
 )
 @click.option(
+    "--needs-review",
+    is_flag=True,
+    help=(
+        "Only receipts still missing a paid amount, or whose latest extraction "
+        "failed or was below the confidence gate; lowest paid-amount "
+        "confidence first."
+    ),
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -267,6 +276,7 @@ def search(
     amount_max: str | None,
     date_from: datetime | None,
     date_to: datetime | None,
+    needs_review: bool,
     output_format: str,
 ) -> None:
     """Search indexed receipts."""
@@ -307,6 +317,7 @@ def search(
             date_from=date_from.date() if date_from else None,
             date_to=date_to.date() if date_to else None,
             source_name=source_name,
+            needs_review=needs_review,
         )
 
     if output_format == "json":
@@ -437,6 +448,8 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
                 for name, value in receipt.field_confidence.items()
             )
             click.echo(f"Field Conf:   {fields}")
+        if receipt.manual_fields:
+            click.echo(f"Hand-edited:  {', '.join(receipt.manual_fields)}")
         click.echo(f"PDF:          {receipt.pdf_path}")
         click.echo(f"Rendition:    {rendition_ref(receipt.pdf_path)}")
         click.echo(f"Source:       {receipt.source_type} ({receipt.source_id})")
@@ -450,6 +463,364 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             click.echo(f"Email Date:   {receipt.email_date.isoformat()}")
         if receipt.file_name:
             click.echo(f"File:         {receipt.file_name}")
+
+
+# The per-field confidences --confidence-below can name.
+_CONFIDENCE_FIELDS = ("vendor", "amount", "paid_amount", "date")
+
+
+def _parse_confidence_below(value: str | None) -> tuple[str | None, float] | None:
+    """``0.6`` (overall) or ``paid_amount=0.6`` (one field's entry)."""
+    if value is None:
+        return None
+    field_name, _, number = value.rpartition("=")
+    if field_name and field_name not in _CONFIDENCE_FIELDS:
+        raise click.BadParameter(
+            f"unknown field {field_name!r}; use one of {', '.join(_CONFIDENCE_FIELDS)}",
+            param_hint="--confidence-below",
+        )
+    try:
+        threshold = float(number)
+    except ValueError:
+        raise click.BadParameter(
+            f"not a number: {number!r}", param_hint="--confidence-below"
+        ) from None
+    if not 0.0 <= threshold <= 1.0:
+        raise click.BadParameter(
+            "must be between 0 and 1", param_hint="--confidence-below"
+        )
+    return (field_name or None, threshold)
+
+
+def _source_adapter(config: AppConfig) -> Any:
+    """A factory that builds the adapter for one configured source."""
+
+    def build(source_config: Any) -> SourceAdapter:
+        from receipt_index.adapters.imap import ImapAdapter
+        from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
+
+        if isinstance(source_config, ImapSourceConfig):
+            return ImapAdapter(source_config)
+        if isinstance(source_config, GdriveSourceConfig):
+            from receipt_index.adapters.gdrive import GdriveAdapter
+
+            return GdriveAdapter(
+                source_config, settle_seconds=config.ingest.drive_settle_seconds
+            )
+        raise click.ClickException(f"unknown source type: {source_config.name}")
+
+    return build
+
+
+def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
+    from decimal import Decimal
+
+    if price is None:
+        return None
+    return tokens * price / Decimal(1_000_000)
+
+
+@cli.command()
+@click.option(
+    "--date-from",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Receipts dated on or after this day (YYYY-MM-DD).",
+)
+@click.option(
+    "--date-to",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Receipts dated on or before this day (YYYY-MM-DD).",
+)
+@click.option("--source", "source_name", default=None, help="Only this source.")
+@click.option("--id", "ids", multiple=True, help="Only this receipt (repeatable).")
+@click.option(
+    "--model-not",
+    default=None,
+    help="Only receipts whose latest extraction used a different model.",
+)
+@click.option(
+    "--confidence-below",
+    default=None,
+    help=(
+        "Only receipts whose overall confidence is below X (`0.6`), or whose "
+        "confidence for one field is below X or missing (`paid_amount=0.6`)."
+    ),
+)
+@click.option(
+    "--all", "select_all", is_flag=True, help="Select every receipt (no filter)."
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    help="Also replace fields an earlier extraction set (never hand-edited ones).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Include receipts already at the current prompt version and model.",
+)
+@click.option(
+    "--input",
+    "input_mode",
+    type=click.Choice(["auto", "rendition"]),
+    default="auto",
+    help="auto: the source item, else the stored PDF. rendition: the PDF only.",
+)
+@click.option("--limit", type=int, default=None, help="At most N receipts.")
+@click.option(
+    "--dry-run", is_flag=True, help="List the selection and estimate its cost."
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def reextract(
+    ctx: click.Context,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    source_name: str | None,
+    ids: tuple[str, ...],
+    model_not: str | None,
+    confidence_below: str | None,
+    select_all: bool,
+    overwrite: bool,
+    force: bool,
+    input_mode: str,
+    limit: int | None,
+    dry_run: bool,
+    output_format: str,
+) -> None:
+    """Re-extract existing receipts with the current prompt and model.
+
+    By default a run fills only empty fields (and, on a receipt extracted
+    under the old prompt, replaces its amount with the total). Fields a
+    person edited are never written. Every run is recorded in the receipt's
+    extraction history. Receipts already extracted at the current prompt
+    version with the configured model are skipped, so an interrupted run can
+    be started again with the same arguments.
+
+    Exits 1 when any receipt failed, was below the confidence gate, was
+    locked, or its source couldn't be reached.
+    """
+    from contextlib import ExitStack
+    from decimal import Decimal
+
+    from receipt_index.db import get_connection
+    from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+    from receipt_index.reextract import (
+        ReceiptOutcome,
+        SourcePool,
+        Status,
+        planned_input,
+        run_reextract,
+    )
+    from receipt_index.repository import select_for_reextract, token_averages
+    from receipt_index.store import open_store
+
+    selectors = (date_from, date_to, source_name, ids, model_not, confidence_below)
+    if not select_all and limit is None and not any(selectors):
+        raise click.UsageError(
+            "Select receipts with --date-from, --date-to, --source, --id, "
+            "--model-not, --confidence-below or --limit, or pass --all."
+        )
+    below = _parse_confidence_below(confidence_below)
+    try:
+        receipt_ids = [UUID(i) for i in ids]
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--id") from None
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    model = config.llm.model
+
+    with get_connection(config.database.url) as conn:
+        receipts = select_for_reextract(
+            conn,
+            prompt_version=EXTRACTION_PROMPT_VERSION,
+            llm_model=model,
+            date_from=date_from.date() if date_from else None,
+            date_to=date_to.date() if date_to else None,
+            source_name=source_name,
+            ids=receipt_ids,
+            force=force,
+            model_not=model_not,
+            confidence_below=below,
+            limit=limit,
+        )
+        conn.commit()
+
+        with ExitStack() as stack:
+            pool = (
+                None
+                if input_mode == "rendition"
+                else SourcePool(config.sources, _source_adapter(config), stack)
+            )
+
+            if dry_run:
+                averages = token_averages(
+                    conn, llm_model=model, prompt_version=EXTRACTION_PROMPT_VERSION
+                )
+                planned = [(r, planned_input(pool, r)) for r in receipts]
+                estimate: dict[str, Any] | None = None
+                if averages is not None:
+                    n = Decimal(len(receipts))
+                    tokens_in = n * Decimal(str(averages["avg_input"]))
+                    tokens_out = n * Decimal(str(averages["avg_output"]))
+                    cost_in = _cost(tokens_in, config.llm.price_per_mtok_input)
+                    cost_out = _cost(tokens_out, config.llm.price_per_mtok_output)
+                    estimate = {
+                        "basis": averages["basis"],
+                        "measured_runs": int(averages["runs"]),
+                        "avg_input_tokens": round(float(averages["avg_input"])),
+                        "avg_output_tokens": round(float(averages["avg_output"])),
+                        "input_tokens": int(tokens_in),
+                        "output_tokens": int(tokens_out),
+                        "cost": (
+                            str((cost_in + cost_out).quantize(Decimal("0.0001")))
+                            if cost_in is not None and cost_out is not None
+                            else None
+                        ),
+                    }
+                if output_format == "json":
+                    click.echo(
+                        json.dumps(
+                            {
+                                "dry_run": True,
+                                "model": model,
+                                "prompt_version": EXTRACTION_PROMPT_VERSION,
+                                "receipts": [
+                                    {
+                                        "receipt_id": str(r.id),
+                                        "receipt_date": r.receipt_date.isoformat(),
+                                        "vendor": r.vendor,
+                                        "source_name": r.source_name,
+                                        "input": how,
+                                    }
+                                    for r, how in planned
+                                ],
+                                "estimate": estimate,
+                            },
+                            indent=2,
+                        )
+                    )
+                    return
+                for r, how in planned:
+                    click.echo(
+                        f"{r.id}  {r.receipt_date}  {r.vendor[:30]:<30}  "
+                        f"{r.source_name}  [{how}]"
+                    )
+                click.echo(
+                    f"\n{len(receipts)} receipt(s) selected "
+                    f"(model {model}, prompt version {EXTRACTION_PROMPT_VERSION})."
+                )
+                if estimate is None:
+                    click.echo("Estimate: no measured token figures yet.")
+                else:
+                    click.echo(
+                        f"Estimate: {estimate['input_tokens']:,} input and "
+                        f"{estimate['output_tokens']:,} output tokens "
+                        f"(averages of {estimate['measured_runs']} runs from "
+                        f"{estimate['basis']})."
+                    )
+                    if estimate["cost"] is not None:
+                        click.echo(f"Estimated cost: ${estimate['cost']}")
+                    else:
+                        click.echo(
+                            "Set llm.price_per_mtok_input and "
+                            "llm.price_per_mtok_output for a cost estimate."
+                        )
+                return
+
+            if not receipts:
+                if output_format == "json":
+                    click.echo(json.dumps({"receipts": [], "stopped": None}))
+                else:
+                    click.echo("No receipts selected.")
+                return
+
+            from receipt_index.extraction import (
+                DOCUMENT_SYSTEM_PROMPT,
+                create_extraction_agent,
+            )
+
+            agents = {
+                "email": create_extraction_agent(
+                    api_key=config.llm.api_key, model=model
+                ),
+                "document": create_extraction_agent(
+                    api_key=config.llm.api_key,
+                    model=model,
+                    system_prompt=DOCUMENT_SYSTEM_PROMPT,
+                ),
+            }
+
+            def report(outcome: ReceiptOutcome) -> None:
+                if output_format == "json":
+                    return
+                paid = outcome.extracted_paid_amount
+                conf = outcome.paid_amount_confidence
+                extracted = (
+                    "paid ?"
+                    if outcome.status in ("locked", "unavailable")
+                    else f"paid {paid if paid is not None else 'null'}"
+                    + (f" ({conf:.2f})" if conf is not None else "")
+                )
+                click.echo(
+                    f"{outcome.receipt_id}  {outcome.receipt_date}  "
+                    f"{outcome.vendor[:30]:<30}  {outcome.status:<11} "
+                    f"[{outcome.input_kind or '-'}]  {extracted}"
+                )
+                for name, (old, new) in outcome.changes.items():
+                    click.echo(f"    {name}: {old} -> {new}")
+                if outcome.error:
+                    click.echo(f"    error: {outcome.error}")
+
+            result = run_reextract(
+                conn,
+                receipts,
+                pool=pool,
+                store=open_store(config.store),
+                agents=agents,
+                llm_model=model,
+                overwrite=overwrite,
+                on_outcome=report,
+            )
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "receipts": [o.to_json() for o in result.outcomes],
+                    "stopped": result.stopped,
+                },
+                indent=2,
+            )
+        )
+    else:
+        shown: tuple[Status, ...] = (
+            "applied",
+            "unchanged",
+            "gated",
+            "failed",
+            "locked",
+            "unavailable",
+        )
+        counts = ", ".join(
+            f"{status} {result.count(status)}"
+            for status in shown
+            if result.count(status)
+        )
+        click.echo(f"\n{len(result.outcomes)} receipt(s): {counts or 'none'}")
+        if result.stopped:
+            click.echo(f"Run {result.stopped}", err=True)
+    if not result.ok:
+        sys.exit(1)
 
 
 @cli.command("mcp")

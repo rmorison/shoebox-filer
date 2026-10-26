@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -121,6 +122,10 @@ class LlmConfig(BaseModel):
 
     model: str = "claude-haiku-4-5-20251001"
     api_key: str
+    # List prices per million tokens, for `reextract --dry-run` cost
+    # estimates. Optional: prices change, so they are configuration.
+    price_per_mtok_input: Decimal | None = Field(default=None, ge=0)
+    price_per_mtok_output: Decimal | None = Field(default=None, ge=0)
 
 
 class LoggingConfig(BaseModel):
