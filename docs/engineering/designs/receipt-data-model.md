@@ -69,7 +69,7 @@ Where they meet:
 - **Text search reads the email subject** from wherever the evidence-store design puts it. Until that design's migration lands, it is `receipts.email_subject`.
 - **Refunds are not duplicates.** A refund shares a vendor and an order number with its purchase. Duplicate detection excludes pairs whose `kind` differs.
 - **Re-extraction reads originals** from the evidence store once they exist, and falls back as described under [Re-extraction](#re-extraction).
-- **Merging duplicates.** How a merge works is the evidence-store design's decision. As it stands, a merge moves provenance records, deletes a receipt it leaves empty, and is refused when it would remove tags, links, hand-edited fields or refunds pointing at that receipt. The receipt's events and extractions go with it through the cascade; see [Deleting a receipt](#deleting-a-receipt).
+- **Merging duplicates.** How a merge works is the evidence-store design's decision. A merge moves provenance records and deletes nothing: the receipt it empties keeps its history, extractions, rendition and `refund_of`, and gets `merged_into_id` (the receipt that remains) and `merged_at`, columns owned by the evidence-store design. A merge is refused when the emptied receipt has tags, external links or hand-edited fields. This design treats a merged receipt as described in [Merged receipts](#merged-receipts).
 - **Which document held the receipt.** The evidence-store design treats an email's receipt document as certain only when the extraction names it, so the extraction reports it; see [Output model](#output-model).
 - **Renaming renditions.** The rendition's file name includes the vendor and amount. Renaming it after a re-extraction changes either is the evidence-store design's business. This design only changes the fields.
 
@@ -419,7 +419,9 @@ This stops application code. It doesn't stop the owning role from dropping the t
 
 #### Deleting a receipt
 
-Deleting a receipt deletes its history with it (`ON DELETE CASCADE`), which is the one exception to the rule above. The CLI has no command that deletes a receipt, so today this only happens through SQL run by hand. Merging duplicates can delete a receipt, under the evidence-store design's rules: only a receipt the merge leaves empty, and never one with tags, links, hand-edited fields or refunds pointing at it. Its events and extractions are deleted with it; that is part of the same exception. Deleting a purchase by hand sets its refunds' `refund_of` to `NULL` with no event, since a cascade writes none; that is part of the exception too.
+Deleting a receipt deletes its history with it (`ON DELETE CASCADE`), which is the one exception to the rule above. The CLI has no command that deletes a receipt, and merging duplicates deletes nothing, so this only happens through SQL run by hand. Deleting a purchase that way also sets its refunds' `refund_of` to `NULL` with no event, since a cascade writes none; that is part of the same exception.
+
+`receipt.forbid_history_change()` is shared with the evidence-store design, which guards its own link-history table with it. Whichever design's migration lands first creates it, and the other uses `CREATE OR REPLACE` with the same body. Every table it guards has a `receipt_id` column referencing `receipt.receipts`.
 
 ### 5. Line items
 
@@ -470,15 +472,25 @@ ALTER TABLE receipt.receipts
 CREATE INDEX IF NOT EXISTS idx_receipts_refund_of ON receipt.receipts (refund_of);
 
 CREATE OR REPLACE VIEW receipt.receipt_net AS
-SELECT p.id                                                    AS receipt_id,
-       COALESCE(p.paid_amount, p.amount)                       AS paid,
-       COALESCE(SUM(COALESCE(r.paid_amount, r.amount)), 0)     AS refunded,
+WITH live_refunds AS (
+    -- A refund counts against the purchase that remains after any merge,
+    -- and not at all if the refund was itself merged away.
+    SELECT r.id,
+           COALESCE(r.paid_amount, r.amount)  AS refund_amount,
+           COALESCE(t.merged_into_id, t.id)   AS purchase_id
+    FROM receipt.receipts r
+    JOIN receipt.receipts t ON t.id = r.refund_of
+    WHERE r.kind = 'refund' AND r.merged_into_id IS NULL
+)
+SELECT p.id                                          AS receipt_id,
+       COALESCE(p.paid_amount, p.amount)             AS paid,
+       COALESCE(SUM(lr.refund_amount), 0)            AS refunded,
        COALESCE(p.paid_amount, p.amount)
-         - COALESCE(SUM(COALESCE(r.paid_amount, r.amount)), 0) AS net_paid,
-       COUNT(r.id)                                             AS refund_count
+         - COALESCE(SUM(lr.refund_amount), 0)        AS net_paid,
+       COUNT(lr.id)                                  AS refund_count
 FROM receipt.receipts p
-LEFT JOIN receipt.receipts r ON r.refund_of = p.id AND r.kind = 'refund'
-WHERE p.kind = 'purchase'
+LEFT JOIN live_refunds lr ON lr.purchase_id = p.id
+WHERE p.kind = 'purchase' AND p.merged_into_id IS NULL
 GROUP BY p.id;
 ```
 
@@ -603,6 +615,16 @@ CREATE INDEX IF NOT EXISTS idx_external_links_system_id
 ### 10. Output and other consumers
 
 `Receipt` (the model) gains every new column, and `show` and the JSON output include them, with line items, tags, links and, for purchases, net paid. A read-only MCP server is being built separately. If it returns this model, it picks up the new fields without its own change; either way, its output follows the same meanings for `amount`, `paid_amount` and `effective_amount`. Write tools for tags and links are a follow-up after tickets 7 and 8.
+
+### Merged receipts
+
+The evidence-store design marks a merged receipt with `merged_into_id` instead of deleting it. In this design:
+
+- Search, `--needs-review`, `--untagged`, `--not-linked`, text search, totals and the JSON output leave out merged receipts (`merged_into_id IS NULL`). `show` on a merged receipt still works, and says which receipt it was merged into.
+- `receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
+- The refund linking rule and `reextract` skip merged receipts.
+- A merge always points at a receipt that isn't itself merged; the evidence-store design keeps it so, which is why one `COALESCE` is enough.
+- These conditions need the evidence-store design's columns. Whichever ticket lands second, this design's or that design's merge, adds them.
 
 ### 11. The finished `receipts` table
 

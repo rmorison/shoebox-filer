@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -55,7 +55,7 @@ The actor's name is attribution, not authentication: the CLI records a configure
 - **A person must define a tag before an agent can use it**, which adds a step when a new category comes up.
 - **A new database role** to create and grant in devtest and production, by a superuser step outside the migrations.
 - **Triggers carry logic** (writing events, guarding history) that would otherwise sit in Python, and need their own tests.
-- **Deleting a receipt deletes its history.** The CLI has no delete command, and a duplicate merge deletes only a receipt it leaves empty, never one with tags, links, edits or refunds.
+- **Deleting a receipt deletes its history.** The CLI has no delete command, and merging duplicates deletes nothing, so this happens only through SQL run by hand.
 - **Attribution can be wrong.** Whoever runs the CLI can give any name; this is accepted for a household tool.
 - **The history grows without bound.** At household volumes this is small; there is no pruning.
 
