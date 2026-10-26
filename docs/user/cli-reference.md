@@ -35,7 +35,7 @@ Receipts ingested before the paid amount was added have `paid_amount: null`, so 
 
 ## ingest
 
-Fetch unprocessed receipts from the configured IMAP folder, extract metadata using an LLM, render PDFs, and store everything in the database and file store.
+Fetch new receipts from the configured sources (IMAP folders and Google Drive folders), extract metadata using an LLM, render PDFs, and store everything in the database and file store.
 
 ```bash
 uv run receipt-index ingest [OPTIONS]
@@ -46,7 +46,8 @@ uv run receipt-index ingest [OPTIONS]
 | Option | Description |
 |---|---|
 | `--dry-run` | Preview what would be processed without making any changes |
-| `--limit N` | Process at most N messages |
+| `--source NAME` | Ingest from one named source only |
+| `--limit N` | Process at most N new items per source |
 
 ### Examples
 
@@ -63,20 +64,33 @@ uv run receipt-index ingest
 
 ### How It Works
 
-1. Connects to your IMAP server and fetches messages from the configured folder
-2. Skips messages already ingested (tracked by message ID for idempotency)
-3. For each new message:
-   - Sends the email content to Claude Haiku to extract vendor, total, paid amount, date, description and per-field confidence (see [Amounts](#amounts))
-   - If the LLM confidence is too low, the message is skipped (not a receipt)
+1. Takes a lock on each source, so two runs never read the same source at once. A source that another process holds is skipped (see the exit codes below).
+2. Reads each source from where the last run stopped, using the read position stored in `receipt.sync_state`:
+   - **IMAP**: only messages with a UID above the stored one, and only their headers at first. A message whose ID was already processed is skipped before its body is downloaded. If the folder's `UIDVALIDITY` changes (the server rebuilt the folder), the run rescans the folder's headers once; message IDs, not UIDs, decide what is new, so nothing is processed twice.
+   - **Google Drive**: the Drive changes feed since the stored page token, filtered to the configured folder. The first run lists the folder instead. A file changed less than `ingest.drive_settle_seconds` ago (default 60) is left for the next run, because scanner apps can upload a file's content after creating it. A file of a type that can't be ingested is recorded as skipped.
+3. For each new item:
+   - Records that work on it has started, so the run's position can move past it safely
+   - Sends the email or file content to Claude Haiku to extract vendor, total, paid amount, date, description and per-field confidence (see [Amounts](#amounts))
+   - If the LLM confidence is too low, the item is skipped (not a receipt)
    - Renders the email as a PDF (using Playwright headless Chromium, with weasyprint fallback)
    - Stores the metadata in PostgreSQL and the PDF in the file store
-4. Reports processed/skipped/failed counts
+4. Saves each source's new read position, and reports processed/skipped/failed counts
 
-Re-running `ingest` is safe — previously processed messages are automatically skipped.
+Re-running `ingest` is safe — previously processed items are automatically skipped. Deleting a source's row from `receipt.sync_state` is safe too: the next run rescans that source from the start and skips everything already processed.
 
-**Exit codes**: Returns 0 on success (even if some messages are skipped), 1 if any messages fail to process. Useful for cron job monitoring.
+At the start of each run, `ingest` logs a warning listing any item whose processing started more than an hour ago with no outcome recorded, which means the run handling it stopped mid-item. Such an item isn't retried automatically yet.
 
-**Note on `--dry-run`**: In dry-run mode, all messages that would be processed are counted as "Skipped" in the output summary.
+**Exit codes**:
+
+| Code | Meaning |
+|---|---|
+| 0 | Success, even if some items were skipped |
+| 1 | An item failed to process, or a source couldn't be read |
+| 3 | A source was skipped because another process holds it (a running `ingest`). The other sources still run |
+
+Useful for cron job monitoring.
+
+**Note on `--dry-run`**: In dry-run mode, all items that would be processed are counted as "Skipped" in the output summary. A dry run reads only the new range and writes nothing: no records and no change to the stored read position.
 
 ---
 

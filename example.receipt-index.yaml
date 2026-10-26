@@ -53,3 +53,9 @@ llm:
 # ---------------------------------------------------------------------------
 logging:
   level: INFO                          # DEBUG | INFO | WARNING | ERROR | CRITICAL
+
+# ---------------------------------------------------------------------------
+# Ingest — timing (every key has a default; the block is optional)
+# ---------------------------------------------------------------------------
+ingest:
+  drive_settle_seconds: 60             # leave a Drive change this young for the next run
