@@ -83,11 +83,17 @@ def _config(user: str, name: str = "greenmail-sync") -> ImapSourceConfig:
 
 
 class SpyImapAdapter(ImapAdapter):
-    """Records which bodies were downloaded."""
+    """Records each read and which bodies were downloaded."""
 
     def __init__(self, config: ImapSourceConfig) -> None:
         super().__init__(config)
         self.fetched: list[str] = []
+        self.reads: list[Any] = []
+
+    def list_new(self, state: Any) -> Any:
+        read = super().list_new(state)
+        self.reads.append(read)
+        return read
 
     def fetch(self, ref: Any) -> Any:
         self.fetched.append(ref.source_id)
@@ -314,6 +320,10 @@ class TestIncrementalImap:
 
         assert r2.processed == 1
         assert len(second.fetched) == 1  # no body re-downloaded
+        # Only the new UID was listed: the search started above the cursor.
+        (read,) = second.reads
+        assert read.start_uid == last_after_first
+        assert len(read.items) == 1
         state = get_sync_state(pg_conn, "greenmail-sync", "INBOX")
         assert state is not None
         assert state.imap_last_uid is not None
