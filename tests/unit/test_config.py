@@ -213,3 +213,30 @@ class TestLoadConfig:
         assert config.store.path == "./data/receipts"
         assert config.logging.level == "INFO"
         assert config.llm.model == "claude-haiku-4-5-20251001"
+
+
+class TestIngestConfig:
+    def test_defaults_when_block_absent(self) -> None:
+        from receipt_index.config import AppConfig
+
+        cfg = AppConfig.model_validate(
+            {
+                "sources": [],
+                "database": {"url": "postgresql://localhost/x"},
+                "llm": {"api_key": "k"},  # pragma: allowlist secret
+            }
+        )
+        assert cfg.ingest.drive_settle_seconds == 60
+
+    def test_explicit_value(self) -> None:
+        from receipt_index.config import IngestConfig
+
+        assert IngestConfig(drive_settle_seconds=0).drive_settle_seconds == 0
+
+    def test_negative_rejected(self) -> None:
+        import pydantic
+
+        from receipt_index.config import IngestConfig
+
+        with pytest.raises(pydantic.ValidationError):
+            IngestConfig(drive_settle_seconds=-1)

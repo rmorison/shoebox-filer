@@ -123,6 +123,18 @@ class LoggingConfig(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
 
+class IngestConfig(BaseModel):
+    """Ingest timing (the ``ingest:`` block).
+
+    Only the keys the current ingest uses are defined; later keys arrive
+    with the features that read them. Every key has a default.
+    """
+
+    # A Drive change younger than this is left for the next run, because
+    # scanner apps can create a file and upload its content in a second step.
+    drive_settle_seconds: int = Field(default=60, ge=0)
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -131,6 +143,7 @@ class AppConfig(BaseModel):
     store: StoreConfig = StoreConfig(path="./data/receipts")
     llm: LlmConfig
     logging: LoggingConfig = LoggingConfig()
+    ingest: IngestConfig = IngestConfig()
 
 
 # ---------------------------------------------------------------------------

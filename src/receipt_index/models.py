@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
@@ -42,6 +42,71 @@ class RawReceipt:
     file_name: str | None = None
     file_content: bytes | None = None
     file_content_type: str | None = None
+
+
+@dataclass
+class ItemRef:
+    """One item a source listed: enough to identify it without its body.
+
+    IMAP refs come from a header-only fetch; Drive refs from file metadata.
+    ``skip_reason`` marks an item the pipeline records as skipped without
+    fetching it (a Drive file of an unsupported type).
+    """
+
+    source_id: str
+    source_type: str
+    subject: str = ""
+    sender: str = ""
+    date: datetime | None = None
+    imap_uid: int | None = None
+    drive_meta: dict[str, Any] | None = None
+    file_name: str | None = None
+    skip_reason: str | None = None
+
+
+@dataclass
+class SourceRead:
+    """What one read of a source returned: its items and cursor candidates.
+
+    ``reset`` names why a stored cursor was discarded ("uidvalidity changed",
+    "invalid page token", "account changed"); a source with no stored cursor
+    yet is a first run, not a reset.
+    """
+
+    items: list[ItemRef]
+    reset: str | None = None
+    # IMAP: the folder's UIDVALIDITY, the UID the search started above, and
+    # every UID the search returned (a UID with no ref holds the cursor).
+    uidvalidity: int | None = None
+    start_uid: int = 0
+    searched_uids: list[int] = field(default_factory=list)
+    # Drive: the token to save once every item is handled, and its account.
+    drive_page_token: str | None = None
+    drive_account_id: str | None = None
+    # Drive: something was left for a later read (settle time), so the
+    # token must not move.
+    held_back: bool = False
+
+
+class SyncState(BaseModel):
+    """A source's stored read position (``receipt.sync_state``)."""
+
+    id: UUID
+    source_name: str
+    source_type: str
+    folder: str
+    imap_uidvalidity: int | None = None
+    imap_last_uid: int | None = None
+    drive_page_token: str | None = None
+    drive_account_id: str | None = None
+    archive_enabled_at: datetime | None = None
+    last_poll_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_error: str | None = None
+    last_error_at: datetime | None = None
+    resets: int = 0
+    created_at: datetime
+    updated_at: datetime
 
 
 class FieldConfidence(BaseModel):
@@ -124,7 +189,7 @@ class IngestLogEntry(BaseModel):
     id: UUID
     source_id: str
     source_type: str
-    status: Literal["success", "failed", "skipped"]
+    status: Literal["started", "success", "failed", "skipped"]
     receipt_id: UUID | None
     vendor: str | None
     amount: Decimal | None
@@ -138,4 +203,5 @@ class IngestLogEntry(BaseModel):
     llm_cache_read_tokens: int | None = None
     llm_requests: int | None = None
     llm_model: str | None = None
+    source_name: str | None = None
     created_at: datetime

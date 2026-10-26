@@ -95,12 +95,17 @@ def ingest(
     dry_run: bool,
     limit: int | None,
 ) -> None:
-    """Ingest receipts from configured sources."""
+    """Ingest receipts from configured sources.
+
+    Each source is read from where the last run stopped. A source that a
+    running process holds is skipped; the exit code is then 3.
+    """
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
     from receipt_index.db import get_connection
     from receipt_index.extraction import create_extraction_agent
-    from receipt_index.pipeline import IngestResult, run_ingest
+    from receipt_index.locks import SourceLock
+    from receipt_index.pipeline import IngestResult, run_ingest, warn_stale_started
     from receipt_index.store import LocalFileStore
 
     config = _load_config_or_exit(ctx)
@@ -137,6 +142,11 @@ def ingest(
 
     totals = IngestResult()
     source_results: list[tuple[str, IngestResult]] = []
+    locked_sources: list[str] = []
+    failed_sources: list[str] = []
+
+    with get_connection(config.database.url) as conn:
+        warn_stale_started(conn)
 
     for source_config in sources:
         if isinstance(source_config, ImapSourceConfig):
@@ -145,29 +155,49 @@ def ingest(
         elif isinstance(source_config, GdriveSourceConfig):
             from receipt_index.adapters.gdrive import GdriveAdapter
 
-            adapter = GdriveAdapter(source_config)
+            adapter = GdriveAdapter(
+                source_config,
+                settle_seconds=config.ingest.drive_settle_seconds,
+            )
             agent = document_agent
         else:
             logger.warning("Unknown source type, skipping %r", source_config.name)
             continue
 
-        with get_connection(config.database.url) as conn:
-            result = run_ingest(
-                conn=conn,
-                adapter=adapter,
-                store=store,
-                source_name=source_config.name,
-                source_type=source_config.type,
-                agent=agent,
-                llm_model=config.llm.model,
-                dry_run=dry_run,
-                limit=limit,
-            )
+        with SourceLock(config.database.url, source_config.name) as source_lock:
+            if not source_lock.acquire():
+                click.echo(
+                    f"source {source_config.name} is being watched by a running "
+                    "serve; see `receipt-index status`",
+                    err=True,
+                )
+                locked_sources.append(source_config.name)
+                continue
 
-            source_results.append((source_config.name, result))
-            totals.processed += result.processed
-            totals.skipped += result.skipped
-            totals.failed += result.failed
+            with get_connection(config.database.url) as conn:
+                result = run_ingest(
+                    conn=conn,
+                    adapter=adapter,
+                    store=store,
+                    source_name=source_config.name,
+                    source_type=source_config.type,
+                    agent=agent,
+                    llm_model=config.llm.model,
+                    dry_run=dry_run,
+                    limit=limit,
+                    source_lock=source_lock,
+                )
+
+        if result.source_error is not None:
+            click.echo(
+                f"Error: source {source_config.name}: {result.source_error}",
+                err=True,
+            )
+            failed_sources.append(source_config.name)
+        source_results.append((source_config.name, result))
+        totals.processed += result.processed
+        totals.skipped += result.skipped
+        totals.failed += result.failed
 
     # Report per-source summaries when multiple sources
     if len(source_results) > 1:
@@ -190,7 +220,11 @@ def ingest(
             f"Failed: {totals.failed}"
         )
 
-    if totals.failed > 0:
+    # 3 if any source was held by another process, otherwise 1 if any item
+    # or source failed.
+    if locked_sources:
+        sys.exit(3)
+    if totals.failed > 0 or failed_sources:
         sys.exit(1)
 
 

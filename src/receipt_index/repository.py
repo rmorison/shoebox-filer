@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from psycopg.types.json import Jsonb
 
-from receipt_index.models import IngestLogEntry, Receipt
+from receipt_index.models import IngestLogEntry, Receipt, SyncState
 
 if TYPE_CHECKING:
     from datetime import date, datetime
@@ -34,6 +34,186 @@ def get_processed_source_ids(
         "SELECT source_id FROM receipt.ingest_log"
     )
     return {str(row["source_id"]) for row in cur.fetchall()}
+
+
+def is_source_id_known(
+    conn: psycopg.Connection[dict[str, Any]], source_id: str
+) -> bool:
+    """Return whether a source ID has a receipt or any ingest_log row.
+
+    The same rule as ``get_processed_source_ids``, for one ID: the re-check
+    made after taking an item lock.
+    """
+    cur = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM receipt.receipts WHERE source_id = %(id)s) "
+        "OR EXISTS (SELECT 1 FROM receipt.ingest_log WHERE source_id = %(id)s) "
+        "AS known",
+        {"id": source_id},
+    )
+    row = cur.fetchone()
+    return bool(row and row["known"])
+
+
+def get_stale_started(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    older_than_seconds: int = 3600,
+) -> list[dict[str, Any]]:
+    """Return items whose latest ingest_log row is an old ``started`` row.
+
+    Such an item was being processed when its process died. It counts as
+    known, so nothing picks it up again until the retry machinery exists;
+    the one-shot ingest lists these in a warning.
+    """
+    cur = conn.execute(
+        """\
+        SELECT l.source_id, l.source_name, l.created_at
+        FROM receipt.ingest_log l
+        WHERE l.status = 'started'
+          AND l.created_at < now() - make_interval(secs => %(secs)s)
+          AND NOT EXISTS (
+              SELECT 1 FROM receipt.ingest_log later
+              WHERE later.source_id = l.source_id
+                AND (later.created_at, later.id) > (l.created_at, l.id))
+          AND NOT EXISTS (
+              SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)
+        ORDER BY l.created_at, l.id
+        """,
+        {"secs": older_than_seconds},
+    )
+    return list(cur.fetchall())
+
+
+def get_sync_state(
+    conn: psycopg.Connection[dict[str, Any]],
+    source_name: str,
+    folder: str,
+) -> SyncState | None:
+    """Return a source's stored read position, or None if it has none."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.sync_state "
+        "WHERE source_name = %(source_name)s AND folder = %(folder)s",
+        {"source_name": source_name, "folder": folder},
+    )
+    row = cur.fetchone()
+    conn.commit()
+    return SyncState.model_validate(row) if row else None
+
+
+def save_imap_cursor(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    source_name: str,
+    folder: str,
+    uidvalidity: int,
+    last_uid: int,
+    reset: bool = False,
+) -> None:
+    """Store an IMAP source's cursor.
+
+    ``uidvalidity`` and ``last_uid`` are always written together: a row must
+    never hold a new UIDVALIDITY with a UID from the old numbering.
+    ``reset`` counts a UIDVALIDITY change.
+    """
+    conn.execute(
+        """\
+        INSERT INTO receipt.sync_state (
+            source_name, source_type, folder, imap_uidvalidity, imap_last_uid,
+            resets
+        ) VALUES (
+            %(source_name)s, 'imap', %(folder)s, %(uidvalidity)s, %(last_uid)s,
+            %(resets)s
+        )
+        ON CONFLICT ON CONSTRAINT uq_sync_state_source_folder DO UPDATE SET
+            imap_uidvalidity = EXCLUDED.imap_uidvalidity,
+            imap_last_uid = EXCLUDED.imap_last_uid,
+            resets = receipt.sync_state.resets + EXCLUDED.resets
+        """,
+        {
+            "source_name": source_name,
+            "folder": folder,
+            "uidvalidity": uidvalidity,
+            "last_uid": last_uid,
+            "resets": 1 if reset else 0,
+        },
+    )
+    conn.commit()
+
+
+def save_drive_cursor(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    source_name: str,
+    folder: str,
+    page_token: str,
+    account_id: str,
+    reset: bool = False,
+) -> None:
+    """Store a Drive source's changes-feed token and the account it belongs to.
+
+    ``reset`` counts a re-bootstrap (an invalid token or a changed account).
+    """
+    conn.execute(
+        """\
+        INSERT INTO receipt.sync_state (
+            source_name, source_type, folder, drive_page_token, drive_account_id,
+            resets
+        ) VALUES (
+            %(source_name)s, 'gdrive', %(folder)s, %(page_token)s, %(account_id)s,
+            %(resets)s
+        )
+        ON CONFLICT ON CONSTRAINT uq_sync_state_source_folder DO UPDATE SET
+            drive_page_token = EXCLUDED.drive_page_token,
+            drive_account_id = EXCLUDED.drive_account_id,
+            resets = receipt.sync_state.resets + EXCLUDED.resets
+        """,
+        {
+            "source_name": source_name,
+            "folder": folder,
+            "page_token": page_token,
+            "account_id": account_id,
+            "resets": 1 if reset else 0,
+        },
+    )
+    conn.commit()
+
+
+def record_poll(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    source_name: str,
+    source_type: str,
+    folder: str,
+    error: str | None,
+) -> None:
+    """Record that a source was read: ``last_poll_at``, then success or error."""
+    conn.execute(
+        """\
+        INSERT INTO receipt.sync_state (
+            source_name, source_type, folder, last_poll_at,
+            last_success_at, last_error, last_error_at
+        ) VALUES (
+            %(source_name)s, %(source_type)s, %(folder)s, now(),
+            CASE WHEN %(error)s::text IS NULL THEN now() END,
+            %(error)s::text,
+            CASE WHEN %(error)s::text IS NOT NULL THEN now() END
+        )
+        ON CONFLICT ON CONSTRAINT uq_sync_state_source_folder DO UPDATE SET
+            last_poll_at = EXCLUDED.last_poll_at,
+            last_success_at = COALESCE(
+                EXCLUDED.last_success_at, receipt.sync_state.last_success_at),
+            last_error = COALESCE(EXCLUDED.last_error, receipt.sync_state.last_error),
+            last_error_at = COALESCE(
+                EXCLUDED.last_error_at, receipt.sync_state.last_error_at)
+        """,
+        {
+            "source_name": source_name,
+            "source_type": source_type,
+            "folder": folder,
+            "error": error,
+        },
+    )
+    conn.commit()
 
 
 def insert_receipt(
@@ -227,6 +407,7 @@ def insert_ingest_log(
     source_id: str,
     source_type: str,
     status: str,
+    source_name: str | None = None,
     receipt_id: UUID | None = None,
     vendor: str | None = None,
     amount: Decimal | None = None,
@@ -248,13 +429,13 @@ def insert_ingest_log(
             source_id, source_type, status, receipt_id, vendor, amount,
             email_subject, email_sender, email_date, error_message,
             llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
-            llm_requests, llm_model, paid_amount
+            llm_requests, llm_model, paid_amount, source_name
         ) VALUES (
             %(source_id)s, %(source_type)s, %(status)s, %(receipt_id)s,
             %(vendor)s, %(amount)s, %(email_subject)s, %(email_sender)s,
             %(email_date)s, %(error_message)s,
             %(llm_input_tokens)s, %(llm_output_tokens)s, %(llm_cache_read_tokens)s,
-            %(llm_requests)s, %(llm_model)s, %(paid_amount)s
+            %(llm_requests)s, %(llm_model)s, %(paid_amount)s, %(source_name)s
         )
         RETURNING *
         """,
@@ -275,6 +456,7 @@ def insert_ingest_log(
             "llm_requests": llm_requests,
             "llm_model": llm_model,
             "paid_amount": paid_amount,
+            "source_name": source_name,
         },
     )
     row = cur.fetchone()

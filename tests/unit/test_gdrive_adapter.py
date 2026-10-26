@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from receipt_index.adapters.gdrive import GdriveAdapter, _parse_drive_date
+import httplib2
+import pytest
+from googleapiclient.errors import HttpError
+
+from receipt_index.adapters.base import SourceAdapter
+from receipt_index.adapters.gdrive import (
+    UNSUPPORTED_REASON,
+    GdriveAdapter,
+    _is_invalid_token_error,
+    _parse_drive_date,
+)
 from receipt_index.config import GdriveSourceConfig
+from receipt_index.models import SyncState
 
 
 def _make_gdrive_config(
@@ -305,82 +316,362 @@ class TestDownloadFile:
         assert result is None
 
 
-class TestFetchUnprocessed:
-    """Tests for the full fetch_unprocessed flow."""
+# ---------------------------------------------------------------------------
+# Changes feed
+# ---------------------------------------------------------------------------
 
-    def test_yields_unprocessed_files(self) -> None:
-        config = _make_gdrive_config(name="my-drive")
-        files = [
-            _make_file_meta(file_id="f1", name="receipt1.pdf"),
-            _make_file_meta(
-                file_id="f2",
-                name="receipt2.jpg",
-                mime_type="image/jpeg",
-                modified_time="2024-03-20T15:00:00.000Z",
-            ),
-        ]
-        pdf_content = b"%PDF-1.4"
-        service = _mock_drive_service(files=files, download_content=pdf_content)
+FOLDER = "folder_abc123"
+OLD = "2024-01-15T10:30:00.000Z"
 
-        adapter = GdriveAdapter(config)
-        adapter._build_service = MagicMock(return_value=service)  # type: ignore[method-assign]
-        results = list(adapter.fetch_unprocessed(set()))
+# Drive v3's documented answer to a bad or expired pageToken. Recording the
+# live response is deferred to the evidence store's Drive ticket.
+INVALID_TOKEN_BODY = json.dumps(
+    {
+        "error": {
+            "code": 400,
+            "message": "Invalid Value",
+            "errors": [
+                {
+                    "message": "Invalid Value",
+                    "domain": "global",
+                    "reason": "invalid",
+                    "location": "pageToken",
+                    "locationType": "parameter",
+                }
+            ],
+        }
+    }
+).encode()
 
-        assert len(results) == 2
-        assert results[0].source_id == "f1"
-        assert results[0].source_name == "my-drive"
-        assert results[0].source_type == "gdrive"
-        assert results[0].file_name == "receipt1.pdf"
-        assert results[0].file_content == pdf_content
-        assert results[0].file_content_type == "application/pdf"
 
-        assert results[1].source_id == "f2"
-        assert results[1].date == datetime(2024, 3, 20, 15, 0, 0, tzinfo=UTC)
+def _http_error(status: int, body: bytes = b"{}") -> HttpError:
+    return HttpError(httplib2.Response({"status": status}), body)
 
-    def test_skips_already_processed_files(self) -> None:
-        config = _make_gdrive_config()
-        files = [
-            _make_file_meta(file_id="f1"),
-            _make_file_meta(file_id="f2"),
-            _make_file_meta(file_id="f3"),
-        ]
-        service = _mock_drive_service(files=files, download_content=b"data")
 
-        adapter = GdriveAdapter(config)
-        adapter._build_service = MagicMock(return_value=service)  # type: ignore[method-assign]
-        results = list(adapter.fetch_unprocessed({"f1", "f3"}))
+def _iso(when: datetime) -> str:
+    return when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        assert len(results) == 1
-        assert results[0].source_id == "f2"
 
-    def test_skips_unsupported_files_in_flow(self) -> None:
-        config = _make_gdrive_config()
-        files = [
-            _make_file_meta(file_id="f1", mime_type="application/pdf"),
-            _make_file_meta(file_id="f2", mime_type="application/zip", name="data.zip"),
-        ]
-        service = _mock_drive_service(files=files, download_content=b"pdf-data")
+class _Req:
+    def __init__(self, fn: Any) -> None:
+        self._fn = fn
 
-        adapter = GdriveAdapter(config)
-        adapter._build_service = MagicMock(return_value=service)  # type: ignore[method-assign]
-        results = list(adapter.fetch_unprocessed(set()))
+    def execute(self) -> Any:
+        return self._fn()
 
-        assert len(results) == 1
-        assert results[0].source_id == "f1"
 
-    def test_empty_folder_yields_nothing(self) -> None:
-        config = _make_gdrive_config()
-        service = _mock_drive_service(files=[])
+class FakeDrive:
+    """A Drive v3 service for the adapter: about, changes and files."""
 
-        adapter = GdriveAdapter(config)
-        adapter._build_service = MagicMock(return_value=service)  # type: ignore[method-assign]
-        results = list(adapter.fetch_unprocessed(set()))
+    def __init__(
+        self,
+        *,
+        account: str = "acct-1",
+        files: list[dict[str, Any]] | None = None,
+        pages: dict[str, dict[str, Any]] | None = None,
+        start_token: str = "start-1",
+        list_error: HttpError | None = None,
+    ) -> None:
+        self.account = account
+        self.files_in_folder = files or []
+        self.pages = pages or {}
+        self.start_token = start_token
+        self.list_error = list_error
+        self.calls: list[str] = []
 
-        assert results == []
+    def about(self) -> FakeDrive:
+        return self
+
+    def get(self, fields: str) -> _Req:
+        return _Req(lambda: {"user": {"permissionId": self.account}})
+
+    def changes(self) -> FakeDrive:
+        return self
+
+    def getStartPageToken(self) -> _Req:  # noqa: N802 (Drive API name)
+        def run() -> dict[str, Any]:
+            self.calls.append("getStartPageToken")
+            return {"startPageToken": self.start_token}
+
+        return _Req(run)
+
+    def list(self, **kwargs: Any) -> _Req:
+        if "pageToken" in kwargs and "spaces" in kwargs:  # changes.list
+
+            def run_changes() -> dict[str, Any]:
+                self.calls.append(f"changes.list:{kwargs['pageToken']}")
+                if self.list_error is not None:
+                    raise self.list_error
+                assert kwargs["spaces"] == "drive"
+                return self.pages[kwargs["pageToken"]]
+
+            return _Req(run_changes)
+
+        def run_files() -> dict[str, Any]:  # files.list
+            self.calls.append("files.list")
+            assert f"'{FOLDER}' in parents" in kwargs["q"]
+            return {"files": self.files_in_folder}
+
+        return _Req(run_files)
+
+    def files(self) -> FakeDrive:
+        return self
+
+    def get_media(self, fileId: str) -> _Req:  # noqa: N803
+        return _Req(lambda: b"%PDF-" + fileId.encode())
+
+    def export_media(self, fileId: str, mimeType: str) -> _Req:  # noqa: N803
+        return _Req(lambda: b"%PDF-export-" + fileId.encode())
+
+
+def _drive_state(token: str | None, account: str | None) -> SyncState:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    return SyncState.model_validate(
+        {
+            "id": "019572a0-0000-7000-8000-000000000002",
+            "source_name": "test-drive",
+            "source_type": "gdrive",
+            "folder": FOLDER,
+            "drive_page_token": token,
+            "drive_account_id": account,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+
+def _change(
+    file_id: str,
+    *,
+    parents: list[str] | None = None,
+    mime_type: str = "application/pdf",
+    trashed: bool = False,
+    removed: bool = False,
+    time: str = OLD,
+    name: str | None = None,
+) -> dict[str, Any]:
+    change: dict[str, Any] = {"fileId": file_id, "removed": removed, "time": time}
+    if not removed:
+        change["file"] = {
+            "id": file_id,
+            "name": name or f"{file_id}.pdf",
+            "mimeType": mime_type,
+            "parents": [FOLDER] if parents is None else parents,
+            "trashed": trashed,
+            "modifiedTime": OLD,
+        }
+    return change
+
+
+def _adapter(drive: FakeDrive, settle: int = 60) -> GdriveAdapter:
+    adapter = GdriveAdapter(_make_gdrive_config(), settle_seconds=settle)
+    adapter._service = drive
+    return adapter
+
+
+class TestBootstrap:
+    def test_takes_the_start_token_before_listing(self) -> None:
+        drive = FakeDrive(files=[_make_file_meta(file_id="f1")])
+        read = _adapter(drive).list_new(None)
+
+        assert drive.calls == ["getStartPageToken", "files.list"]
+        assert [r.source_id for r in read.items] == ["f1"]
+        assert read.drive_page_token == "start-1"
+        assert read.drive_account_id == "acct-1"
+        assert read.reset is None
+        assert read.held_back is False
+
+    def test_row_without_token_is_a_first_run(self) -> None:
+        drive = FakeDrive()
+        read = _adapter(drive).list_new(_drive_state(None, None))
+        assert drive.calls == ["getStartPageToken", "files.list"]
+        assert read.reset is None
+
+    def test_drops_subfolders(self) -> None:
+        drive = FakeDrive(
+            files=[
+                _make_file_meta(file_id="f1"),
+                _make_file_meta(
+                    file_id="needs-attention",
+                    name="needs-attention",
+                    mime_type="application/vnd.google-apps.folder",
+                ),
+            ]
+        )
+        read = _adapter(drive).list_new(None)
+        assert [r.source_id for r in read.items] == ["f1"]
+
+    def test_settles_on_modified_time(self) -> None:
+        fresh = _iso(datetime.now(tz=UTC) - timedelta(seconds=5))
+        drive = FakeDrive(
+            files=[
+                _make_file_meta(file_id="old"),
+                _make_file_meta(file_id="new", modified_time=fresh),
+            ]
+        )
+        read = _adapter(drive).list_new(None)
+        assert [r.source_id for r in read.items] == ["old"]
+        assert read.held_back is True
+
+    def test_unsupported_type_becomes_a_skip_ref(self) -> None:
+        drive = FakeDrive(
+            files=[_make_file_meta(file_id="z", mime_type="application/zip")]
+        )
+        (ref,) = _adapter(drive).list_new(None).items
+        assert ref.skip_reason == UNSUPPORTED_REASON
+
+    def test_changed_account_rebootstraps(self) -> None:
+        drive = FakeDrive(account="acct-2")
+        read = _adapter(drive).list_new(_drive_state("tok-9", "acct-1"))
+        assert drive.calls == ["getStartPageToken", "files.list"]
+        assert read.reset == "account changed"
+        assert read.drive_account_id == "acct-2"
+
+
+class TestPoll:
+    def test_reads_from_the_stored_token_and_filters(self) -> None:
+        drive = FakeDrive(
+            pages={
+                "tok-1": {
+                    "nextPageToken": "tok-2",
+                    "changes": [
+                        _change("keep-1"),
+                        _change("elsewhere", parents=["other-folder"]),
+                        _change("binned", trashed=True),
+                        _change(
+                            "sub",
+                            mime_type="application/vnd.google-apps.folder",
+                        ),
+                    ],
+                },
+                "tok-2": {
+                    "newStartPageToken": "tok-3",
+                    "changes": [_change("gone", removed=True), _change("keep-2")],
+                },
+            }
+        )
+        read = _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
+
+        assert drive.calls == ["changes.list:tok-1", "changes.list:tok-2"]
+        assert [r.source_id for r in read.items] == ["keep-1", "keep-2"]
+        assert read.drive_page_token == "tok-3"
+        assert read.held_back is False
+        assert read.reset is None
+
+    def test_latest_change_for_a_file_wins(self) -> None:
+        drive = FakeDrive(
+            pages={
+                "tok-1": {
+                    "newStartPageToken": "tok-2",
+                    "changes": [_change("f1"), _change("f1", trashed=True)],
+                }
+            }
+        )
+        read = _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
+        assert read.items == []
+
+    def test_settles_on_the_change_time_not_modified_time(self) -> None:
+        fresh = _iso(datetime.now(tz=UTC) - timedelta(seconds=10))
+        drive = FakeDrive(
+            pages={
+                "tok-1": {
+                    "newStartPageToken": "tok-2",
+                    # The file claims an old modifiedTime; the change is fresh.
+                    "changes": [_change("young", time=fresh), _change("old")],
+                }
+            }
+        )
+        read = _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
+        assert [r.source_id for r in read.items] == ["old"]
+        assert read.held_back is True
+
+    def test_zero_settle_takes_everything(self) -> None:
+        fresh = _iso(datetime.now(tz=UTC))
+        drive = FakeDrive(
+            pages={
+                "tok-1": {
+                    "newStartPageToken": "tok-2",
+                    "changes": [_change("young", time=fresh)],
+                }
+            }
+        )
+        read = _adapter(drive, settle=0).list_new(_drive_state("tok-1", "acct-1"))
+        assert [r.source_id for r in read.items] == ["young"]
+        assert read.held_back is False
+
+    def test_unsupported_type_is_kept_as_a_skip_ref(self) -> None:
+        drive = FakeDrive(
+            pages={
+                "tok-1": {
+                    "newStartPageToken": "tok-2",
+                    "changes": [_change("doc.zip", mime_type="application/zip")],
+                }
+            }
+        )
+        (ref,) = _adapter(drive).list_new(_drive_state("tok-1", "acct-1")).items
+        assert ref.skip_reason == UNSUPPORTED_REASON
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _http_error(400, INVALID_TOKEN_BODY),
+            _http_error(404),
+            _http_error(410),
+        ],
+        ids=["400-pageToken", "404", "410"],
+    )
+    def test_invalid_token_rebootstraps(self, error: HttpError) -> None:
+        drive = FakeDrive(files=[_make_file_meta(file_id="f1")], list_error=error)
+        read = _adapter(drive).list_new(_drive_state("stale", "acct-1"))
+
+        assert drive.calls == ["changes.list:stale", "getStartPageToken", "files.list"]
+        assert read.reset == "invalid page token"
+        assert read.drive_page_token == "start-1"
+        assert [r.source_id for r in read.items] == ["f1"]
+
+    def test_a_repeating_page_token_fails_instead_of_looping(self) -> None:
+        drive = FakeDrive(pages={"tok-1": {"nextPageToken": "tok-1", "changes": []}})
+        with pytest.raises(RuntimeError, match="bad page token"):
+            _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
+
+    def test_other_errors_propagate(self) -> None:
+        error = _http_error(400, b'{"error": {"message": "Bad fields"}}')
+        drive = FakeDrive(list_error=error)
+        with pytest.raises(HttpError):
+            _adapter(drive).list_new(_drive_state("tok-1", "acct-1"))
+        assert _is_invalid_token_error(_http_error(500)) is False
+        assert _is_invalid_token_error(ValueError("x")) is False
+
+
+class TestFetchFile:
+    def test_downloads_the_ref(self) -> None:
+        drive = FakeDrive(files=[_make_file_meta(file_id="f1", name="r.pdf")])
+        adapter = _adapter(drive)
+        (ref,) = adapter.list_new(None).items
+        raw = adapter.fetch(ref)
+
+        assert raw is not None
+        assert raw.source_id == "f1"
+        assert raw.source_name == "test-drive"
+        assert raw.source_type == "gdrive"
+        assert raw.file_name == "r.pdf"
+        assert raw.file_content == b"%PDF-f1"
+        assert raw.file_content_type == "application/pdf"
+        assert raw.date == datetime(2024, 1, 15, 10, 30, tzinfo=UTC)
+
+    def test_exports_google_doc(self) -> None:
+        drive = FakeDrive(
+            files=[
+                _make_file_meta(
+                    file_id="d1", mime_type="application/vnd.google-apps.document"
+                )
+            ]
+        )
+        adapter = _adapter(drive)
+        (ref,) = adapter.list_new(None).items
+        raw = adapter.fetch(ref)
+        assert raw is not None
+        assert raw.file_content == b"%PDF-export-d1"
 
     def test_conforms_to_source_adapter_protocol(self) -> None:
-        from receipt_index.adapters.base import SourceAdapter
-
-        config = _make_gdrive_config()
-        adapter = GdriveAdapter(config)
-        assert isinstance(adapter, SourceAdapter)
+        assert isinstance(GdriveAdapter(_make_gdrive_config()), SourceAdapter)

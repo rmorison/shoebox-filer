@@ -789,6 +789,25 @@ class TestGdriveAdapterMocked:
             token_json=token_json,
         )
 
+    @staticmethod
+    def _wire_changes_feed(service: MagicMock) -> None:
+        """Answer the account, start-token and changes-feed calls.
+
+        A bare MagicMock would answer ``nextPageToken`` with another mock, and
+        the adapter would page through the feed for ever.
+        """
+        service.about.return_value.get.return_value.execute.return_value = {
+            "user": {"permissionId": "acct-test"}
+        }
+        changes = service.changes.return_value
+        changes.getStartPageToken.return_value.execute.return_value = {
+            "startPageToken": "start-1"
+        }
+        changes.list.return_value.execute.return_value = {
+            "newStartPageToken": "start-2",
+            "changes": [],
+        }
+
     def _make_fake_pdf(self) -> bytes:
         """Return a minimal valid PDF bytes for testing."""
         # A real single-page PDF generated via weasyprint or a hard-coded minimal stub.
@@ -834,6 +853,7 @@ class TestGdriveAdapterMocked:
 
         # Mock the Drive service: list files, download content
         mock_service = MagicMock()
+        self._wire_changes_feed(mock_service)
         mock_build_service.return_value = mock_service
 
         # _list_files response
@@ -908,6 +928,7 @@ class TestGdriveAdapterMocked:
         fake_pdf = self._make_fake_pdf()
 
         mock_service = MagicMock()
+        self._wire_changes_feed(mock_service)
         mock_build_service.return_value = mock_service
         mock_service.files.return_value.list.return_value.execute.return_value = {
             "files": [
@@ -984,6 +1005,7 @@ class TestGdriveAdapterMocked:
         from receipt_index.adapters.gdrive import GdriveAdapter
 
         mock_service = MagicMock()
+        self._wire_changes_feed(mock_service)
         mock_build_service.return_value = mock_service
         mock_service.files.return_value.list.return_value.execute.return_value = {
             "files": [
@@ -1009,9 +1031,18 @@ class TestGdriveAdapterMocked:
             source_type="gdrive",
         )
 
-        # Nothing processed or failed — unsupported files are silently skipped
+        # Nothing processed or failed: the unsupported file is recorded as
+        # skipped, so it has an outcome and the Drive cursor can pass it.
         assert result.processed == 0
         assert result.failed == 0
+        assert result.skipped == 1
+        row = pg_conn.execute(
+            "SELECT status, error_message FROM receipt.ingest_log "
+            "WHERE source_id = 'drive-file-id-zip'"
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "skipped"
+        assert "unsupported file type" in row["error_message"]
 
     @patch("receipt_index.adapters.gdrive.GdriveAdapter._build_service")
     def test_gdrive_empty_folder_produces_no_results(
@@ -1024,6 +1055,7 @@ class TestGdriveAdapterMocked:
         from receipt_index.adapters.gdrive import GdriveAdapter
 
         mock_service = MagicMock()
+        self._wire_changes_feed(mock_service)
         mock_build_service.return_value = mock_service
         mock_service.files.return_value.list.return_value.execute.return_value = {
             "files": []

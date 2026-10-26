@@ -9,7 +9,7 @@ from collections.abc import Iterator  # noqa: TC003
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path  # noqa: TC003
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -147,6 +147,166 @@ def _make_config() -> AppConfig:
         },
         logging={"level": "INFO"},  # type: ignore[arg-type]
     )
+
+
+class FakeSourceLock:
+    """Stands in for receipt_index.locks.SourceLock: no database needed."""
+
+    held: ClassVar[set[str]] = set()  # names another process holds
+    acquired: ClassVar[list[str]] = []
+
+    def __init__(self, database_url: str, source_name: str) -> None:
+        self.source_name = source_name
+
+    def acquire(self) -> bool:
+        if self.source_name in FakeSourceLock.held:
+            return False
+        FakeSourceLock.acquired.append(self.source_name)
+        return True
+
+    def check(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+    def __enter__(self) -> FakeSourceLock:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+@pytest.fixture(autouse=True)
+def fake_source_lock() -> Iterator[type[FakeSourceLock]]:
+    """Ingest takes a real advisory lock; keep unit tests off any database."""
+    FakeSourceLock.held = set()
+    FakeSourceLock.acquired = []
+    with (
+        patch("receipt_index.locks.SourceLock", FakeSourceLock),
+        patch("receipt_index.pipeline.warn_stale_started", return_value=[]),
+    ):
+        yield FakeSourceLock
+
+
+def _two_source_config() -> AppConfig:
+    config = _make_config()
+    second = config.sources[0].model_copy(update={"name": "other-email"})
+    return config.model_copy(update={"sources": [*config.sources, second]})
+
+
+class TestIngestLocking:
+    """Source locks and exit codes."""
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_locked_source_exits_3_and_others_still_run(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+        fake_source_lock: type[FakeSourceLock],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_source_lock.held = {"test-email"}
+        mock_run.return_value = IngestResult(processed=1)
+
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+
+        assert result.exit_code == 3, result.output
+        assert (
+            "source test-email is being watched by a running serve; "
+            "see `receipt-index status`"
+        ) in result.output
+        assert fake_source_lock.acquired == ["other-email"]
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.kwargs["source_name"] == "other-email"
+        assert isinstance(mock_run.call_args.kwargs["source_lock"], FakeSourceLock)
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_locked_wins_over_failed_items(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+        fake_source_lock: type[FakeSourceLock],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_source_lock.held = {"test-email"}
+        mock_run.return_value = IngestResult(failed=1)
+
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+
+        assert result.exit_code == 3, result.output
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_failed_source_exits_1_and_others_still_run(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        mock_run.side_effect = [
+            IngestResult(source_error="read failed: refused"),
+            IngestResult(processed=2),
+        ]
+
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+
+        assert result.exit_code == 1, result.output
+        assert "Error: source test-email: read failed: refused" in result.output
+        assert mock_run.call_count == 2
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.LocalFileStore")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_warns_about_stale_started_rows(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        mock_run.return_value = IngestResult()
+        with patch(
+            "receipt_index.pipeline.warn_stale_started", return_value=[]
+        ) as warn:
+            CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        warn.assert_called_once()
 
 
 class TestIngestCommand:
@@ -332,7 +492,7 @@ class TestIngestCommand:
             ],
         )
         assert result.exit_code == 0, result.output
-        mock_gdrive_cls.assert_called_once_with(gdrive_source)
+        mock_gdrive_cls.assert_called_once_with(gdrive_source, settle_seconds=60)
 
 
 class TestSearchCommand:
