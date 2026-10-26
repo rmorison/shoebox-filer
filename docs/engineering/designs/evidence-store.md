@@ -406,7 +406,7 @@ def store_rendition(pdf: bytes, *, receipt_date: date, vendor: str,
 |------------------------|-----------|----------|
 | An IMAP original was stored (step 1) | Stored files with no provenance | The retry's `put` finds the hashes and reuses them. `verify --orphans` reports any left for good |
 | A rendition was stored (step 3) | A rendition with no receipt | The same: the retry reuses it, or `verify --orphans` reports it |
-| A Drive adopt (step 4) | The file in `originals/`, no receipt | The changes feed reports it again. The retry adopts it (a no-op) and commits |
+| A Drive adopt (step 4) | The file in `originals/` (or, under the copy fallback, copied, with the dropoff file in `processed/`), no receipt | The changes feed can't be relied on, since the file's parents no longer include the dropoff folder. The ingest design's retry scheduler requeues the item from its started record, finds the file by its ID, and the idempotent adopt returns the existing record before the commit |
 | Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's retry policy |
 | The commit (step 5) | Nothing committed | The whole item is retried. Every earlier step is idempotent |
 
