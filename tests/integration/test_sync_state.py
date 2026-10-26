@@ -27,7 +27,7 @@ from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.cli import cli
 from receipt_index.config import ImapSourceConfig
 from receipt_index.locks import SourceLock, SourceLockLostError, item_lock
-from receipt_index.models import ReceiptMetadata
+from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import (
     get_stale_started,
@@ -56,6 +56,9 @@ def _agent() -> MagicMock:
         amount=Decimal("12.00"),
         date=date(2025, 6, 15),
         confidence=0.95,
+        field_confidence=FieldConfidence(
+            vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9
+        ),
     )
     usage = MagicMock(input_tokens=100, output_tokens=50, cache_read_tokens=0)
     usage.requests = 1
