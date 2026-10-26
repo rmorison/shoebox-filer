@@ -17,6 +17,7 @@ This is the canonical operations document for the always-on deployment — provi
 7. [Weekly monitoring](#7-weekly-monitoring)
 8. [Routine operations](#8-routine-operations)
 9. [Searching from the laptop](#9-searching-from-the-laptop)
+10. [Read-only MCP server](#10-read-only-mcp-server)
 
 ---
 
@@ -40,7 +41,8 @@ Layout after provisioning:
 ├── .env                         <- secrets (git-ignored, chmod 600)
 ├── data/
 │   ├── receipts/                <- rendered PDF tree      (uid 1000)
-│   └── backups/                 <- nightly pg_dump files  (uid 1000)
+│   ├── backups/                 <- nightly pg_dump files  (uid 1000)
+│   └── mcp-logs/                <- MCP access log, never mirrored (uid 1000)
 ├── rclone-config/               <- Dropbox token          (uid 1000, chmod 700)
 └── deploy/
     ├── docker-compose.yml       <- the production compose file
@@ -173,8 +175,8 @@ The two digests must match. Repeat for `ANTHROPIC_API_KEY`. Do this **before** G
 Docker creates a missing bind-mount source as an empty directory owned by `root:root`. The container runs as uid 1000 and cannot write to it — and a store-write failure dead-letters receipts exactly like a render gap does. Create them first:
 
 ```bash
-mkdir -p data/receipts data/backups rclone-config
-chown -R 1000:1000 data/receipts data/backups rclone-config   # sudo if not your uid
+mkdir -p data/receipts data/backups data/mcp-logs rclone-config
+chown -R 1000:1000 data/receipts data/backups data/mcp-logs rclone-config   # sudo if not your uid
 chmod 700 rclone-config                                        # holds a standing Dropbox refresh token
 ```
 
@@ -828,7 +830,9 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
 
-5. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
+5. If the MCP server was set up, recreate its read-only role: all of [10.1](#101-one-time-setup) step 2, with the password already in `RECEIPT_INDEX_MCP_DATABASE_URL` in the restored `.env`. Then run its check, step 5.
+
+6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
 
 ---
 
@@ -864,3 +868,72 @@ Two details worth knowing when it misbehaves:
 - Arguments are re-quoted client-side before being handed to SSH, because SSH flattens its argument list into a single string that the remote shell re-parses. That is what keeps `--vendor "Acme Parking (U.S.), LLC"` intact as one argument.
 
 Anything the CLI can do is available this way, including `ingest`, but leave scheduled ingest to supercronic — a manual run that overlaps a scheduled tick is not protected by the no-overlap guarantee (which is per cron line, inside the scheduler).
+
+## 10. Read-only MCP server
+
+`receipt-index mcp` serves the index to MCP clients (agents) over stdio, read-only. See [CLI Reference: mcp](cli-reference.md#mcp) for the tools and for registering it with a client. In production the client launches it **as the account that holds the production credentials**: it SSHes in as the deploy user and execs into the scheduler container, the same route `scripts/receipt-search` takes.
+
+```bash
+ssh receipt-server docker compose -p receipt-index exec -T scheduler receipt-index mcp
+```
+
+The server refuses to start unless its database role is read-only. The only login role db-init creates is `receipt_index`, which owns everything, so production needs a one-time setup first.
+
+### 10.1 One-time setup
+
+**1. Create the access-log directory.** Fetches are logged to `data/mcp-logs`, a separate bind mount. It is deliberately outside `data/receipts` and `data/backups`, because the crontab copies both of those to Dropbox and a fetch log has no business leaving the host. Skip this if you provisioned with the current [3.4](#34-create-the-bind-mount-directories-before-the-first-up--d).
+
+```bash
+cd ~/receipt-index
+mkdir -p data/mcp-logs
+chown 1000:1000 data/mcp-logs   # sudo if not your uid
+```
+
+**2. Create a read-only login role.** Create it as a member of `receipt_index_dev_read`, which the migrations grant `SELECT` on both tables and nothing else. Open psql in the db container, then run the statements and type the password at the `\password` prompt, so it never appears in a command line or the shell history:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec db sh -c 'psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
+```
+
+```sql
+CREATE ROLE receipt_index_mcp LOGIN;
+GRANT receipt_index_dev_read TO receipt_index_mcp;
+GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_mcp;
+\password receipt_index_mcp
+\q
+```
+
+Generate the password from an alphanumeric alphabet (`openssl rand -hex 24`), as for the other Postgres passwords ([3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password)). The role is cluster-level. It survives a `DROP DATABASE` but its `CONNECT` grant doesn't, so after recreating the database in 6.3, run the `GRANT CONNECT` line again. Disaster recovery (8.3) starts a new cluster, and `pg_dump` doesn't carry roles, so there the role is gone: redo all of this step, setting the password already in the restored `.env`.
+
+**3. Add two lines to the clone-root `.env`:**
+
+```bash
+RECEIPT_INDEX_MCP_DATABASE_URL=postgresql://receipt_index_mcp:<password>@db:5432/receipt_index  # pragma: allowlist secret
+RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
+```
+
+Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`.
+
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+docker compose -f deploy/docker-compose.yml stop scheduler
+docker compose -f deploy/docker-compose.yml up -d scheduler
+```
+
+**5. Check it.** Run the startup check with stdin closed, so the server starts and exits at once:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index mcp </dev/null; echo "exit=$?"
+```
+
+**Pass:** `MCP server ready on stdio (access log: /app/data/mcp-logs/mcp-access.jsonl)` and `exit=0`. `Error: the database role can write (...)` means it is still connecting as `receipt_index`: the variable is unset in the container (step 4) or the URL names the wrong role. `lacks SELECT` means the role isn't a member of `receipt_index_dev_read`, or the migrations' grants are missing.
+
+### 10.2 The access log
+
+One JSON line per `get_receipt_file` call: timestamp, receipt ID, stored path, size, whether content was returned, the outcome, and the client's name and version. If the log can't be written, the server withholds the file. The log is small and isn't rotated. Read it with:
+
+```bash
+tail -n 20 data/mcp-logs/mcp-access.jsonl
+```

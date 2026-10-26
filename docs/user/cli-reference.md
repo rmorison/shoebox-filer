@@ -5,6 +5,7 @@
 - [`uv run receipt-index ingest`](#ingest) — Fetch and process receipts from email
 - [`uv run receipt-index search`](#search) — Find receipts by metadata
 - [`uv run receipt-index show`](#show) — View full details for a receipt
+- [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
 All commands require a configured `.env` file (see [Getting Started](getting-started.md)).
 
@@ -179,6 +180,98 @@ Email Date:   2026-01-15T10:30:00
 ```
 
 The `PDF` path is relative to your configured `RECEIPT_STORE_PATH`. PDFs are stored using the naming convention `{YYYY}/{MM}/{YYYY-MM-DD}__{vendor-slug}__{amount}.pdf`.
+
+---
+
+## mcp
+
+Run a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so that agents can search receipts and fetch their PDFs. It uses the same search and repository code as the commands above. It never changes the database or the file store.
+
+```bash
+uv run receipt-index mcp [OPTIONS]
+```
+
+An MCP client normally starts this command itself (see [MCP client setup](#mcp-client-setup)). Stdout carries the MCP protocol; logs go to stderr.
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--access-log PATH` | JSON-lines file that records every file fetch. Env: `RECEIPT_INDEX_MCP_ACCESS_LOG`. Default: `$XDG_STATE_HOME/receipt-index/mcp-access.jsonl` (`~/.local/state/...`) |
+| `--max-content-bytes N` | Largest PDF returned as content (default: 10 MiB, 10485760 bytes) |
+
+### Database role
+
+The server connects with `RECEIPT_INDEX_MCP_DATABASE_URL`, or with `database.url` from the config when that is unset. **It refuses to start unless the role is read-only:** the role must hold `SELECT` on `receipt.receipts` and `receipt.ingest_log`, and no `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on either (column-level grants count), nor `CREATE` on schema `receipt`. That includes privileges of any role it is a member of, even one whose privileges it doesn't inherit, since it could `SET ROLE` to that role. In devtest, use `receipt_index_dev_read`. For production, see [Server Deployment: Read-only MCP server](server-deployment.md#10-read-only-mcp-server).
+
+Every connection is also opened read-only (`default_transaction_read_only`), and each tool call runs in one `REPEATABLE READ, READ ONLY` transaction, so a page and its `total` come from the same snapshot.
+
+### Tools
+
+All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both directions, so a paid amount never passes through a float. Dates are `YYYY-MM-DD`.
+
+| Tool | Inputs | Returns |
+|---|---|---|
+| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source` (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. |
+| `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
+| `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
+| `list_failures` | `limit`, `offset` | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives, newest first |
+
+Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. The `source` filter is an exact match on `source_name`. Results carry no file content; only `get_receipt_file` returns content.
+
+**Paging.** Call again with `offset` set to `next_offset` until `next_offset` is `null`, then check that you received `total` results. Results are ordered newest first, then by vendor, then by ID. If an ingest commits between two calls, rows can shift between pages, and `total` changes with them. Re-run from offset 0, or narrow the date range, when you need a complete set.
+
+**File content.** `content_omitted_reason` is `null` when the content is included, `"not_requested"` when `include_content` is false, and `"too_large"` when the PDF is over `--max-content-bytes`; the path is returned either way. A receipt whose PDF is missing from the store, or whose stored path points outside it, is a tool error.
+
+### Access log
+
+Every `get_receipt_file` call appends one JSON line to the access log, and the same line is logged at INFO on stderr:
+
+```json
+{"client": {"name": "example-agent", "version": "1.0"}, "content_included": true, "outcome": "ok", "pdf_path": "2026/01/2026-01-15__acme-parking-u-s-llc__12.50.pdf", "receipt_id": "01942a3b-1234-7def-8abc-567890abcdef", "size_bytes": 48213, "tool": "get_receipt_file", "ts": "2026-01-20T09:12:44.512408+00:00"}
+```
+
+`outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged. A `receipt_id` that isn't a UUID is cut to its first 64 characters in the log line and the error. One kind of call writes no line: one the SDK rejects before the tool runs, because an argument is missing or has the wrong type. It gets a protocol error and no file.
+
+### MCP client setup
+
+Register the command with your MCP client. Most clients take a JSON entry like these; for Claude Code, `claude mcp add receipt-index -- <command> <args...>` does the same.
+
+**Local (devtest or a laptop install).** `uv run --directory` runs from the checkout, so the CLI finds its `.env` and config there:
+
+```json
+{
+  "mcpServers": {
+    "receipt-index": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/receipt-index", "receipt-index", "mcp"],
+      "env": {
+        "RECEIPT_INDEX_MCP_DATABASE_URL": "postgresql://receipt_index_dev_read:<password>@localhost:15432/receipt_index_dev"
+      }
+    }
+  }
+}
+```
+
+**Production.** The client launches the server **as the account that holds the production credentials**: over SSH as the deploy user, inside the scheduler container, the same way `scripts/receipt-search` reaches it. The container already has `RECEIPT_INDEX_MCP_DATABASE_URL` and `RECEIPT_INDEX_MCP_ACCESS_LOG` from the one-time setup in [Server Deployment](server-deployment.md#10-read-only-mcp-server).
+
+```json
+{
+  "mcpServers": {
+    "receipt-index": {
+      "command": "ssh",
+      "args": ["receipt-server", "docker", "compose", "-p", "receipt-index",
+               "exec", "-T", "scheduler", "receipt-index", "mcp"]
+    }
+  }
+}
+```
+
+In production, `path` values are paths inside the container. A client on another machine should fetch PDFs with `include_content: true`.
+
+**Treat results as untrusted input.** Vendor names, descriptions, subjects, senders and the PDFs all come from inbound email, so anyone who can send mail to the receipts inbox controls that text. A client should treat it as data, never as instructions, especially an agent that has other tools.
+
+Out of scope for now: write tools, MCP over HTTP, and authentication.
 
 ---
 

@@ -798,3 +798,142 @@ class TestConfigOption:
         )
         assert result.exit_code != 0
         assert "Error" in result.output
+
+
+class TestMcpCommand:
+    """Tests for the mcp CLI command."""
+
+    def test_help(self) -> None:
+        result = CliRunner().invoke(cli, ["mcp", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "read-only MCP server" in result.output
+        assert "--access-log" in result.output
+        assert "--max-content-bytes" in result.output
+
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_refuses_writable_role(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        from receipt_index.mcp_server import RoleCheckError
+
+        mock_load_config.return_value = _make_config()
+        mock_check.side_effect = RoleCheckError("the database role can write")
+        result = CliRunner().invoke(
+            cli, ["mcp", "--access-log", str(tmp_path / "log.jsonl")]
+        )
+        assert result.exit_code == 1
+        assert "the database role can write" in result.output
+        mock_build.assert_not_called()
+
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_refuses_unwritable_access_log(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        blocker = tmp_path / "blocker"
+        blocker.write_text("a file")
+        result = CliRunner().invoke(
+            cli, ["mcp", "--access-log", str(blocker / "log.jsonl")]
+        )
+        assert result.exit_code == 1
+        assert "not writable" in result.output
+        mock_build.assert_not_called()
+
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_prefers_mcp_database_url(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        reader_url = "postgresql://reader@localhost/test"  # pragma: allowlist secret
+        monkeypatch.setenv("RECEIPT_INDEX_MCP_DATABASE_URL", reader_url)
+        result = CliRunner().invoke(
+            cli,
+            [
+                "mcp",
+                "--access-log",
+                str(tmp_path / "log.jsonl"),
+                "--max-content-bytes",
+                "2048",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        mock_check.assert_called_once_with(reader_url)
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs["database_url"] == reader_url
+        assert kwargs["max_content_bytes"] == 2048
+        assert kwargs["access_log"].path == tmp_path / "log.jsonl"
+        mock_build.return_value.run.assert_called_once_with("stdio")
+
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_falls_back_to_config_database_url(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        monkeypatch.delenv("RECEIPT_INDEX_MCP_DATABASE_URL", raising=False)
+        result = CliRunner().invoke(
+            cli, ["mcp", "--access-log", str(tmp_path / "log.jsonl")]
+        )
+        assert result.exit_code == 0, result.output
+        mock_check.assert_called_once_with("postgresql://localhost/test")
+        assert mock_build.call_args.kwargs["max_content_bytes"] == 10 * 1024 * 1024
+
+
+class TestMcpCommandDatabaseErrors:
+    """The mcp command turns database errors at startup into a short message."""
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            ("OperationalError", "cannot connect to the database"),
+            ("ProgrammingError", "startup check failed"),
+        ],
+    )
+    @patch("receipt_index.mcp_server.build_server")
+    @patch("receipt_index.mcp_server.startup_check")
+    @patch("receipt_index.cli.load_config")
+    def test_database_error_exits_1(
+        self,
+        mock_load_config: MagicMock,
+        mock_check: MagicMock,
+        mock_build: MagicMock,
+        tmp_path: Path,
+        error: str,
+        message: str,
+    ) -> None:
+        import psycopg
+
+        mock_load_config.return_value = _make_config()
+        mock_check.side_effect = getattr(psycopg, error)("boom")
+        result = CliRunner().invoke(
+            cli, ["mcp", "--access-log", str(tmp_path / "log.jsonl")]
+        )
+        assert result.exit_code == 1
+        assert message in result.output
+        assert "Traceback" not in result.output
+        mock_build.assert_not_called()

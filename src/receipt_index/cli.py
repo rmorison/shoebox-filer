@@ -390,6 +390,88 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             click.echo(f"File:         {receipt.file_name}")
 
 
+@cli.command("mcp")
+@click.option(
+    "--access-log",
+    "access_log_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    envvar="RECEIPT_INDEX_MCP_ACCESS_LOG",
+    help=(
+        "JSON-lines file recording every file fetch "
+        "[default: $XDG_STATE_HOME/receipt-index/mcp-access.jsonl]."
+    ),
+)
+@click.option(
+    "--max-content-bytes",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Largest PDF returned as content [default: 10 MiB].",
+)
+@click.pass_context
+def mcp_command(
+    ctx: click.Context,
+    access_log_path: str | None,
+    max_content_bytes: int | None,
+) -> None:
+    """Run a read-only MCP server over stdio.
+
+    Connects with RECEIPT_INDEX_MCP_DATABASE_URL, or database.url from the
+    config when it is unset, and refuses to start unless that role is
+    read-only. Logs go to stderr; stdout carries the MCP protocol.
+    """
+    from receipt_index.mcp_server import (
+        DEFAULT_MAX_CONTENT_BYTES,
+        AccessLog,
+        AccessLogError,
+        RoleCheckError,
+        build_server,
+        default_access_log_path,
+        startup_check,
+    )
+
+    config = _load_config_or_exit(ctx)
+
+    _configure_logging(config)
+
+    import os
+
+    import psycopg
+
+    database_url = (
+        os.environ.get("RECEIPT_INDEX_MCP_DATABASE_URL") or config.database.url
+    )
+    access_log = AccessLog(
+        Path(access_log_path) if access_log_path else default_access_log_path()
+    )
+
+    try:
+        startup_check(database_url)
+        access_log.check_writable()
+    except (RoleCheckError, AccessLogError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except psycopg.OperationalError as exc:
+        click.echo(f"Error: cannot connect to the database: {exc}", err=True)
+        sys.exit(1)
+    except psycopg.Error as exc:
+        click.echo(f"Error: startup check failed: {exc}", err=True)
+        sys.exit(1)
+
+    server = build_server(
+        database_url=database_url,
+        store_root=Path(config.store.path),
+        access_log=access_log,
+        max_content_bytes=(
+            DEFAULT_MAX_CONTENT_BYTES
+            if max_content_bytes is None
+            else max_content_bytes
+        ),
+    )
+    logger.info("MCP server ready on stdio (access log: %s)", access_log.path)
+    server.run("stdio")
+
+
 @cli.group()
 def auth() -> None:
     """Manage authentication for external services."""

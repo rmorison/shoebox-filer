@@ -85,18 +85,17 @@ def insert_receipt(
     return Receipt.model_validate(row)
 
 
-def search_receipts(
-    conn: psycopg.Connection[dict[str, Any]],
+def _receipt_filters(
     *,
-    vendor: str | None = None,
-    amount: Decimal | None = None,
-    amount_min: Decimal | None = None,
-    amount_max: Decimal | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
-    source_name: str | None = None,
-) -> list[Receipt]:
-    """Search receipts with optional filters, combined with AND."""
+    vendor: str | None,
+    amount: Decimal | None,
+    amount_min: Decimal | None,
+    amount_max: Decimal | None,
+    date_from: date | None,
+    date_to: date | None,
+    source_name: str | None,
+) -> tuple[str, dict[str, object]]:
+    """Build the WHERE clause and parameters shared by search and count."""
     clauses: list[str] = []
     params: dict[str, object] = {}
 
@@ -129,13 +128,85 @@ def search_receipts(
         params["source_name"] = source_name
 
     where = " AND ".join(clauses) if clauses else "TRUE"
+    return where, params
+
+
+def _page_clause(
+    params: dict[str, object], limit: int | None, offset: int | None
+) -> str:
+    """Return LIMIT/OFFSET SQL for the given values, adding them to params."""
+    sql = ""
+    if limit is not None:
+        sql += " LIMIT %(limit)s"
+        params["limit"] = limit
+    if offset is not None:
+        sql += " OFFSET %(offset)s"
+        params["offset"] = offset
+    return sql
+
+
+def search_receipts(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    vendor: str | None = None,
+    amount: Decimal | None = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    source_name: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+) -> list[Receipt]:
+    """Search receipts with optional filters, combined with AND.
+
+    Results are ordered newest first, then by vendor, then by id, so that
+    ``limit``/``offset`` pages are stable between calls.
+    """
+    where, params = _receipt_filters(
+        vendor=vendor,
+        amount=amount,
+        amount_min=amount_min,
+        amount_max=amount_max,
+        date_from=date_from,
+        date_to=date_to,
+        source_name=source_name,
+    )
     sql = (
         f"SELECT * FROM receipt.receipts WHERE {where} "
-        "ORDER BY receipt_date DESC, vendor ASC"
-    )
+        "ORDER BY receipt_date DESC, vendor ASC, id ASC"
+    ) + _page_clause(params, limit, offset)
 
     cur = conn.execute(sql, params)
     return [Receipt.model_validate(row) for row in cur.fetchall()]
+
+
+def count_receipts(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    vendor: str | None = None,
+    amount: Decimal | None = None,
+    amount_min: Decimal | None = None,
+    amount_max: Decimal | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    source_name: str | None = None,
+) -> int:
+    """Count the receipts that ``search_receipts`` would return unpaged."""
+    where, params = _receipt_filters(
+        vendor=vendor,
+        amount=amount,
+        amount_min=amount_min,
+        amount_max=amount_max,
+        date_from=date_from,
+        date_to=date_to,
+        source_name=source_name,
+    )
+    cur = conn.execute(
+        f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
+    )
+    row = cur.fetchone()
+    return int(row["n"]) if row else 0
 
 
 def insert_ingest_log(
@@ -199,13 +270,27 @@ def insert_ingest_log(
 
 def get_ingest_failures(
     conn: psycopg.Connection[dict[str, Any]],
+    *,
+    limit: int | None = None,
+    offset: int | None = None,
 ) -> list[IngestLogEntry]:
-    """Return all failed ingest log entries, newest first."""
-    cur = conn.execute(
+    """Return failed ingest log entries, newest first (then by id)."""
+    params: dict[str, object] = {}
+    sql = (
         "SELECT * FROM receipt.ingest_log WHERE status = 'failed' "
-        "ORDER BY created_at DESC"
-    )
+        "ORDER BY created_at DESC, id ASC"
+    ) + _page_clause(params, limit, offset)
+    cur = conn.execute(sql, params)
     return [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
+
+
+def count_ingest_failures(conn: psycopg.Connection[dict[str, Any]]) -> int:
+    """Count failed ingest log entries."""
+    cur = conn.execute(
+        "SELECT COUNT(*) AS n FROM receipt.ingest_log WHERE status = 'failed'"
+    )
+    row = cur.fetchone()
+    return int(row["n"]) if row else 0
 
 
 def get_receipt_by_id(
