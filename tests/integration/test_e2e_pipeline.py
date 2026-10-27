@@ -55,7 +55,7 @@ def _make_mock_agent(
 
     mock_result = MagicMock()
     mock_result.output = meta
-    mock_result.usage.return_value = mock_usage
+    mock_result.usage = mock_usage
 
     agent = MagicMock()
     agent.run_sync.return_value = mock_result
@@ -374,7 +374,7 @@ class TestFullPipelineE2E:
             usage.requests = 1
             r = MagicMock()
             r.output = meta
-            r.usage.return_value = usage
+            r.usage = usage
             return r
 
         agent = MagicMock()

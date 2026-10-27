@@ -76,7 +76,7 @@ def _make_mock_agent(
 
     mock_result = MagicMock()
     mock_result.output = meta
-    mock_result.usage.return_value = mock_usage
+    mock_result.usage = mock_usage
 
     agent = MagicMock()
     agent.run_sync.return_value = mock_result
@@ -104,7 +104,7 @@ def _make_alternating_agent(
 
         mock_result = MagicMock()
         mock_result.output = meta
-        mock_result.usage.return_value = mock_usage
+        mock_result.usage = mock_usage
         results.append(mock_result)
     agent = MagicMock()
     agent.run_sync.side_effect = results

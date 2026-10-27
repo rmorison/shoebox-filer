@@ -63,7 +63,7 @@ def _agent() -> MagicMock:
     usage = MagicMock(input_tokens=100, output_tokens=50, cache_read_tokens=0)
     usage.requests = 1
     result = MagicMock(output=meta)
-    result.usage.return_value = usage
+    result.usage = usage
     agent = MagicMock()
     agent.run_sync.return_value = result
     return agent
