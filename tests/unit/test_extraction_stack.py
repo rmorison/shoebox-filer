@@ -199,3 +199,24 @@ def test_image_path_through_locked_stack(stub_api: list[dict[str, Any]]) -> None
     _assert_result(result)
     assert len(stub_api) == 1
     assert "image" in _content_types(stub_api[0])
+
+
+def test_pdf_vision_path_through_locked_stack(stub_api: list[dict[str, Any]]) -> None:
+    # A PDF with no extractable text falls back to sending the PDF itself
+    # as a document block, the path Drive PDFs and renditions take.
+    raw = RawReceipt(
+        source_id="3",
+        source_name="drive",
+        source_type="gdrive",
+        date=datetime(2026, 10, 27, tzinfo=UTC),
+        file_name="receipt.pdf",
+        file_content=b"%PDF-1.4\n%%EOF\n",
+        file_content_type="application/pdf",
+    )
+    agent = create_extraction_agent(api_key="stub-key", model=_MODEL)
+
+    result = extract_metadata(raw, agent=agent)
+
+    _assert_result(result)
+    assert len(stub_api) == 1
+    assert "document" in _content_types(stub_api[0])
