@@ -88,7 +88,7 @@ class Llm:
         usage.requests = 1
         result = MagicMock()
         result.output = answer
-        result.usage.return_value = usage
+        result.usage = usage
         return result
 
     @property

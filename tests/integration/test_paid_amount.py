@@ -91,7 +91,7 @@ def _agent_for_fixtures() -> MagicMock:
         usage.requests = 1
         result = MagicMock()
         result.output = meta
-        result.usage.return_value = usage
+        result.usage = usage
         return result
 
     agent = MagicMock()

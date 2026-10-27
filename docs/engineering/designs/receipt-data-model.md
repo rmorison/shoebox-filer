@@ -686,7 +686,7 @@ Tickets 3 to 8 can run partly in parallel once their dependencies are merged; ti
 - Re-extraction rules: fill-only versus `--overwrite`, `manual_fields` never written, the confidence gate, skipping receipts at the current prompt version, input preference order.
 - Refund linking: one candidate links, none or several leave it unlinked, a currency mismatch is refused.
 - Tags: unknown and inactive tags are refused; each apply and remove writes one event.
-- Mocked LLM results use real integers for `result.usage()`.
+- Mocked LLM results use real integers for `result.usage`.
 
 ### Integration tests
 

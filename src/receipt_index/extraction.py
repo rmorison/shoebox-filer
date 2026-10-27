@@ -122,7 +122,7 @@ _MIN_TEXT_LENGTH = 20
 
 def _to_extraction_result(result: Any) -> ExtractionResult:
     """Convert a pydantic-ai AgentRunResult to an ExtractionResult."""
-    usage = result.usage()
+    usage = result.usage
     return ExtractionResult(
         metadata=result.output,
         input_tokens=usage.input_tokens or 0,
