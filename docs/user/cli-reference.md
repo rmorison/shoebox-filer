@@ -331,7 +331,7 @@ uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD 
 
 ### What it does
 
-Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown. A card number typed into `--vendor` or `--reason` is cut to its last four digits, as at extraction.
+Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown. A card number typed into `--vendor`, `--reason` or `--as` is cut to its last four digits, as at extraction.
 
 `--clear-manual` takes a field off `manual_fields` and records that in the history. The field keeps its value, but the next `reextract --overwrite` may replace it (fill-only runs leave it, since it isn't empty). It is refused, and nothing is written, when a field isn't hand-edited.
 
