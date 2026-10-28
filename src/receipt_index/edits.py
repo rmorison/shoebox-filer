@@ -10,6 +10,9 @@ event.
 
 The receipt is read ``FOR UPDATE``, as re-extraction reads it before it
 applies a result, so an edit and a run never interleave on one receipt.
+Each function commits on success. On an error it leaves the transaction
+open: the caller rolls it back (the CLI's connection context does), so no
+event is left without its change.
 """
 
 from __future__ import annotations
@@ -127,6 +130,7 @@ def edit_receipt(
         for name, new in values.items()
     }
     reason = _scrubbed(reason)
+    actor = scrub_card_numbers(actor)
     receipt = _locked(conn, receipt_id)
     manual = list(receipt.manual_fields)
     confidence = dict(receipt.field_confidence)
@@ -178,6 +182,7 @@ def clear_manual(
     Refuses, writing nothing, when any field isn't hand-edited.
     """
     reason = _scrubbed(reason)
+    actor = scrub_card_numbers(actor)
     names = list(dict.fromkeys(field_name(f) for f in fields))
     if not names:
         msg = "no field to clear"

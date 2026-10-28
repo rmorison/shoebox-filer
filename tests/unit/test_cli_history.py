@@ -137,3 +137,14 @@ def test_other_event_types_show_their_payload(
     assert "refund_linked" in line
     assert "ingest (rule)" in line
     assert f'{{"amount": "5.00", "refund_id": "{_RECEIPT.id}"}}' in line
+
+
+@patch("receipt_index.repository.get_receipt_events", return_value=[])
+@patch("receipt_index.repository.get_receipt_by_id", return_value=_RECEIPT)
+@patch("receipt_index.db.get_connection")
+def test_history_reads_on_a_read_only_connection(
+    conn: MagicMock, get: MagicMock, events: MagicMock, config_file: Path
+) -> None:
+    result = _invoke(config_file, "history", str(_RECEIPT.id))
+    assert result.exit_code == 0, result.output
+    assert conn.call_args.kwargs == {"read_only": True}

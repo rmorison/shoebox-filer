@@ -968,7 +968,7 @@ def history(ctx: click.Context, receipt_id: str, output_format: str) -> None:
     _configure_logging(config)
     uid = _parse_receipt_id(receipt_id)
 
-    with get_connection(config.database.url) as conn:
+    with get_connection(config.database.url, read_only=True) as conn:
         receipt = get_receipt_by_id(conn, uid)
         events = [] if receipt is None else get_receipt_events(conn, uid)
 

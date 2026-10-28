@@ -32,7 +32,10 @@ CREATE TABLE IF NOT EXISTS receipt.receipt_events (
     actor       TEXT NOT NULL,
     actor_kind  TEXT NOT NULL,
     reason      TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- The time the event is written, not the transaction's start (NOW()):
+    -- a writer that waited on the receipt's lock still records its event
+    -- after the one it waited for.
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 
     CONSTRAINT pk_receipt_events PRIMARY KEY (id),
     CONSTRAINT fk_receipt_events_receipt FOREIGN KEY (receipt_id)

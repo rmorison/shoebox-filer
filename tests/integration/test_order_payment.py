@@ -19,6 +19,7 @@ from receipt_index.repository import (
     count_receipts,
     get_receipt_by_id,
     get_receipt_events,
+    insert_event,
     insert_extraction,
     search_receipts,
 )
@@ -282,3 +283,28 @@ class TestNeedsReview:
             pg_conn, receipt.id, ["paid_amount"], actor="operator", reason=None
         )
         assert listed()
+
+
+class TestHistoryOrder:
+    def test_events_take_the_time_they_are_written(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        # NOW() is the transaction's start: two events in one transaction (or
+        # a writer that waited on the receipt's lock) would share or invert
+        # their times. Each event's time is when it was written.
+        receipt = _seed(pg_conn, LocalEvidenceStore(tmp_path), "Ordered")
+        for field in ("vendor", "order_number"):
+            insert_event(
+                pg_conn,
+                receipt_id=receipt.id,
+                event_type="field_edited",
+                payload={"field": field},
+                actor="operator",
+                actor_kind="person",
+            )
+            pg_conn.execute("SELECT pg_sleep(0.01)")
+        pg_conn.commit()
+        first, second = get_receipt_events(pg_conn, receipt.id)
+        pg_conn.commit()
+        assert first.payload["field"] == "vendor"
+        assert first.created_at < second.created_at

@@ -259,3 +259,11 @@ class TestHandEnteredText:
         )
         clear_manual(db.conn, _ID, ["vendor"], actor="op", reason=None)
         assert db.events[1]["payload"]["value"] == "Acme ending 1111"
+
+    def test_actor_is_scrubbed(self, db: FakeDb) -> None:
+        edit_receipt(
+            db.conn, _ID, {"vendor": "Acme"}, actor="op 4111111111111111", reason=None
+        )
+        db.receipt = _receipt(manual_fields=["vendor"])
+        clear_manual(db.conn, _ID, ["vendor"], actor="op 4111111111111111", reason=None)
+        assert [e["actor"] for e in db.events] == ["op ending 1111", "op ending 1111"]
