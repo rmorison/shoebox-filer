@@ -213,9 +213,7 @@ class TestDescriptionScrub:
             ("Visa 4111 1111 1111 1111 12/27", "Visa ending 1111 12/27"),
             ("card 4111111111111111 2 items", "card ending 1111 2 items"),
             ("x 7 4111111111111111 99", "x 7 ending 1111 99"),
-            # A span reaching into the date also passes the check: the whole
-            # overlap goes, the safe way to err.
-            ("4111-1111-1111-1111 10 28 2026", "[card number removed]"),
+            ("4111-1111-1111-1111 10 28 2026", "ending 1111 10 28 2026"),
         ],
     )
     def test_a_card_number_beside_other_digits_is_cut(
@@ -231,7 +229,7 @@ class TestDescriptionScrub:
             # A group before the card also forms a valid 16-digit span; neither
             # may leave part of the card behind.
             ("8377 4439 1500 0806 3600", "[card number removed]"),
-            ("exp 12-28 5442 6942 0809 3976", "exp [card number removed]"),
+            ("exp 12-28 5442 6942 0809 3976", "exp 12-28 ending 3976"),
         ],
     )
     def test_overlapping_candidates_leave_no_digits_behind(
@@ -272,6 +270,46 @@ class TestDescriptionScrub:
     def test_ordinary_numbers_are_kept(self, raw: str) -> None:
         # Dates, prices, times, addresses and phone numbers are no card,
         # whatever their digits happen to add up to.
+        assert _metadata(description=raw).description == raw
+
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            # A number beside the card with the same separator.
+            (
+                "Exp 12/2028\u00a04526\u00a00181\u00a05908\u00a03012",
+                "Exp 12/2028\u00a0ending 3012",
+            ),
+            (
+                "Card\u00a04111\u00a01111\u00a01111\u00a01111\u00a0123\u00a0ok",
+                "Card\u00a0ending 1111\u00a0123\u00a0ok",
+            ),
+            # Here the year and the card's first groups also pass the check,
+            # with the same last four: the year goes too, the safe way to err.
+            (
+                "exp 12/2028  4111  1111  1111  1111  814",
+                "exp 12/ending 1111  814",
+            ),
+            # Plain and no-break spaces mixed.
+            ("Card 4111 1111 1111\u00a01111", "Card ending 1111"),
+        ],
+    )
+    def test_a_card_beside_a_number_with_the_same_separator(
+        self, raw: str, kept: str
+    ) -> None:
+        assert _metadata(description=raw).description == kept
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Order # 787-7893287-9217421",
+            "Orders 112-3456789-1234567 113-7654321-7654321",
+            "800-852-8959 577-961-7934",
+            "Ref 8607553451 8 4192055",
+        ],
+    )
+    def test_order_and_phone_numbers_are_kept(self, raw: str) -> None:
+        # Several groups count as a card only in a card's shape.
         assert _metadata(description=raw).description == raw
 
     def test_a_run_of_one_repeated_digit_is_kept(self) -> None:

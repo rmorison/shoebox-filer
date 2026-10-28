@@ -7,6 +7,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
+from itertools import pairwise
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -163,29 +164,19 @@ def last_four_digits(value: object) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-# A run of digit groups joined by single spaces or dashes: where a card
-# number, printed with or without separators, can sit among other numbers.
-_DIGIT_RUN = re.compile(r"(?<![0-9])[0-9]+(?:[ -][0-9]+)*(?![0-9])")
-# Other separators a printed card number may carry (no-break and thin spaces
-# from HTML email, double spaces, en and em dashes, dots, slashes, a spaced
-# dash). These also join dates, prices, times and phone numbers, so they count
-# only between groups shaped like a card, one separator throughout: 4-4-4-4,
-# 4-4-4-4-3, or 4-6-5 and 4-6-4. A single plain space or hyphen is left to
-# _DIGIT_RUN, which also catches a card with other numbers beside it.
-_WIDE = (
-    r"(?:[\t\u00a0\u2009\u202f]"  # one no-break, thin or tab space
-    r"|[ \t\u00a0\u2009\u202f]{2}"  # two spaces of any kind
-    r"|[ \u00a0]?[\u2010-\u2015./][ \u00a0]?"  # en or em dash, dot, slash
-    r"|[ \u00a0]-[ \u00a0]?|-[ \u00a0])"  # a spaced hyphen
-)
-_CARD_SHAPED = re.compile(
-    rf"(?<![0-9])(?:"
-    rf"[0-9]{{4}}(?P<a>{_WIDE})[0-9]{{4}}(?P=a)[0-9]{{4}}(?P=a)[0-9]{{4}}"
-    rf"(?:(?P=a)[0-9]{{3}})?"
-    rf"|[0-9]{{4}}(?P<b>{_WIDE})[0-9]{{6}}(?P=b)[0-9]{{4,5}}"
-    rf")(?![0-9])"
-)
+# What can sit between the digit groups of a printed card number: one or two
+# spaces (plain, no-break, thin, tab), or a hyphen, en or em dash, dot or slash
+# with an optional space either side.
+_SPACES = "[ \t\u00a0\u2009\u202f]"
+_SEPARATOR = rf"(?:{_SPACES}{{1,2}}|{_SPACES}?[-\u2010-\u2015./]{_SPACES}?)"
+# A run of digit groups joined by separators: where a card number can sit
+# among dates, prices, codes and other numbers.
+_DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
 _DIGIT_GROUP = re.compile(r"[0-9]+")
+_ONE_SPACE = re.compile(rf"{_SPACES}")
+# How a printed card number is grouped, by digits per group.
+_CARD_SHAPES = frozenset({(4, 4, 4, 4), (4, 4, 4, 4, 3), (4, 6, 5), (4, 6, 4)})
+_REMOVED = "[card number removed]"
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -198,27 +189,42 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _is_card(digits: str) -> bool:
+    return 13 <= len(digits) <= 19 and len(set(digits)) > 1 and _luhn_valid(digits)
+
+
+def _separator_kind(sep: str) -> str:
+    """A single space of any kind is one kind of separator."""
+    return " " if len(sep) == 1 and _ONE_SPACE.fullmatch(sep) else sep
+
+
 def _card_spans(run: str) -> list[tuple[int, int, str]]:
     """The card numbers in ``run``, as ``(start, end, replacement)``.
 
-    A candidate is any whole sequence of the run's digit groups holding 13 to
-    19 digits, not all one digit, that passes the Luhn check; so a
-    neighbouring group (a security code, an expiry, a quantity) is never
-    needed to make a card pass. A stray group joined to a card passes by
-    chance about one time in ten, so candidates that overlap are removed
-    together, leaving no part of a card behind: as "ending NNNN" when they
-    agree on the last four digits, else as "[card number removed]".
+    A candidate is one unbroken group of 13 to 19 digits, or consecutive
+    groups in a card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with one kind
+    of separator between them (any single space counts as one kind), that is
+    not all one digit and passes the Luhn check. Shapes keep dates, prices,
+    phone and order numbers out; trying every starting group finds a card
+    with another number beside it. Candidates that overlap are removed
+    together, so no part of a card is left: as "ending NNNN" when they agree
+    on the last four digits, else as "[card number removed]".
     """
     groups = list(_DIGIT_GROUP.finditer(run))
+    seps = [_separator_kind(run[a.end() : b.start()]) for a, b in pairwise(groups)]
     candidates: list[tuple[int, int, str]] = []
-    for i in range(len(groups)):
-        digits = ""
-        for j in range(i, len(groups)):
-            digits += groups[j].group(0)
-            if len(digits) > 19:
-                break
-            if len(digits) >= 13 and len(set(digits)) > 1 and _luhn_valid(digits):
-                candidates.append((groups[i].start(), groups[j].end(), digits[-4:]))
+    for i, group in enumerate(groups):
+        if _is_card(group.group(0)):
+            candidates.append((group.start(), group.end(), group.group(0)[-4:]))
+        for shape in _CARD_SHAPES:
+            j = i + len(shape)
+            if j > len(groups) or len(set(seps[i : j - 1])) != 1:
+                continue
+            if tuple(len(g.group(0)) for g in groups[i:j]) != shape:
+                continue
+            digits = "".join(g.group(0) for g in groups[i:j])
+            if _is_card(digits):
+                candidates.append((group.start(), groups[j - 1].end(), digits[-4:]))
     candidates.sort()
     spans: list[tuple[int, int, set[str]]] = []
     for begin, end, last4 in candidates:
@@ -233,15 +239,10 @@ def _card_spans(run: str) -> list[tuple[int, int, str]]:
     ]
 
 
-_REMOVED = "[card number removed]"
-
-
 def scrub_card_numbers(text: str) -> str:
-    """``text`` with each card number (13 to 19 digits, single spaces or
-    dashes allowed between groups, or other separators between card-shaped
-    groups, that pass the Luhn check) replaced by
-    "ending NNNN", its last four digits, or "[card number removed]" when
-    overlapping candidates disagree on them."""
+    """``text`` with each card number replaced by "ending NNNN", its last four
+    digits, or "[card number removed]" when overlapping candidates disagree
+    on them. See ``_card_spans`` for what counts as a card number."""
 
     def cut(match: re.Match[str]) -> str:
         run = match.group(0)
@@ -253,13 +254,7 @@ def scrub_card_numbers(text: str) -> str:
         out.append(run[pos:])
         return "".join(out)
 
-    def cut_shaped(match: re.Match[str]) -> str:
-        digits = _NOT_DIGIT.sub("", match.group(0))
-        if len(set(digits)) > 1 and _luhn_valid(digits):
-            return f"ending {digits[-4:]}"
-        return match.group(0)
-
-    return _DIGIT_RUN.sub(cut, _CARD_SHAPED.sub(cut_shaped, text))
+    return _DIGIT_RUN.sub(cut, text)
 
 
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
