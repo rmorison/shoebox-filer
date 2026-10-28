@@ -180,46 +180,55 @@ def _luhn_valid(digits: str) -> bool:
 
 
 def _card_spans(run: str) -> list[tuple[int, int, str]]:
-    """The card numbers in ``run``, as ``(start, end, last four)``.
+    """The card numbers in ``run``, as ``(start, end, replacement)``.
 
-    A card number is any whole sequence of the run's digit groups holding 13
-    to 19 digits that passes the Luhn check. A neighbouring group (a security
-    code, an expiry, a quantity) is therefore never needed to make it pass.
-    Where candidates overlap, the one nearest 16 digits wins, then the
-    earliest, since a stray group joined to a card passes by chance about one
-    time in ten.
+    A candidate is any whole sequence of the run's digit groups holding 13 to
+    19 digits, not all one digit, that passes the Luhn check; so a
+    neighbouring group (a security code, an expiry, a quantity) is never
+    needed to make a card pass. A stray group joined to a card passes by
+    chance about one time in ten, so candidates that overlap are removed
+    together, leaving no part of a card behind: as "ending NNNN" when they
+    agree on the last four digits, else as "[card number removed]".
     """
     groups = list(_DIGIT_GROUP.finditer(run))
-    candidates: list[tuple[int, int, int, str]] = []
+    candidates: list[tuple[int, int, str]] = []
     for i in range(len(groups)):
         digits = ""
         for j in range(i, len(groups)):
             digits += groups[j].group(0)
             if len(digits) > 19:
                 break
-            if len(digits) >= 13 and _luhn_valid(digits):
-                candidates.append(
-                    (groups[i].start(), groups[j].end(), len(digits), digits[-4:])
-                )
-    candidates.sort(key=lambda c: (abs(c[2] - 16), c[0]))
-    chosen: list[tuple[int, int, str]] = []
-    for begin, end, _, last4 in candidates:
-        if all(end <= b or begin >= e for b, e, _ in chosen):
-            chosen.append((begin, end, last4))
-    return sorted(chosen)
+            if len(digits) >= 13 and len(set(digits)) > 1 and _luhn_valid(digits):
+                candidates.append((groups[i].start(), groups[j].end(), digits[-4:]))
+    candidates.sort()
+    spans: list[tuple[int, int, set[str]]] = []
+    for begin, end, last4 in candidates:
+        if spans and begin < spans[-1][1]:
+            b, e, fours = spans[-1]
+            spans[-1] = (b, max(e, end), fours | {last4})
+        else:
+            spans.append((begin, end, {last4}))
+    return [
+        (b, e, f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
+        for b, e, fours in spans
+    ]
+
+
+_REMOVED = "[card number removed]"
 
 
 def scrub_card_numbers(text: str) -> str:
     """``text`` with each card number (13 to 19 digits, spaces or dashes
     allowed between groups, that pass the Luhn check) replaced by
-    "ending NNNN", its last four digits."""
+    "ending NNNN", its last four digits, or "[card number removed]" when
+    overlapping candidates disagree on them."""
 
     def cut(match: re.Match[str]) -> str:
         run = match.group(0)
         out, pos = [], 0
-        for begin, end, last4 in _card_spans(run):
+        for begin, end, replacement in _card_spans(run):
             out.append(run[pos:begin])
-            out.append(f"ending {last4}")
+            out.append(replacement)
             pos = end
         out.append(run[pos:])
         return "".join(out)

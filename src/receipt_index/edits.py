@@ -19,6 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from receipt_index.models import scrub_card_numbers
 from receipt_index.repository import insert_event, lock_receipt, update_edited_fields
 
 if TYPE_CHECKING:
@@ -78,6 +79,10 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _scrubbed(text: str | None) -> str | None:
+    return None if text is None else scrub_card_numbers(text)
+
+
 def _locked(conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID) -> Receipt:
     receipt = lock_receipt(conn, receipt_id)
     if receipt is None:
@@ -108,6 +113,13 @@ def edit_receipt(
         msg = f"not an editable field: {', '.join(unknown)}"
         raise ValueError(msg)
 
+    # Hand-entered text lands in the append-only history too: no card numbers
+    # (order_number is left as given, as it is at extraction).
+    values = {
+        name: scrub_card_numbers(new) if name == "vendor" else new
+        for name, new in values.items()
+    }
+    reason = _scrubbed(reason)
     receipt = _locked(conn, receipt_id)
     manual = list(receipt.manual_fields)
     confidence = dict(receipt.field_confidence)
@@ -158,6 +170,7 @@ def clear_manual(
 
     Refuses, writing nothing, when any field isn't hand-edited.
     """
+    reason = _scrubbed(reason)
     names = list(dict.fromkeys(field_name(f) for f in fields))
     if not names:
         msg = "no field to clear"

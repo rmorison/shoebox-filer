@@ -234,3 +234,17 @@ class TestClearManual:
             )
         db.conn.rollback.assert_called_once()
         assert db.events == [] and db.updates == []
+
+
+class TestHandEnteredText:
+    def test_vendor_and_reason_are_scrubbed(self, db: FakeDb) -> None:
+        edit_receipt(
+            db.conn,
+            _ID,
+            {"vendor": "Acme 4111 1111 1111 1111"},
+            actor="op",
+            reason="card 4111111111111111 on the statement",
+        )
+        assert db.updates[0]["columns"] == {"vendor": "Acme ending 1111"}
+        assert db.events[0]["payload"]["new"] == "Acme ending 1111"
+        assert db.events[0]["reason"] == "card ending 1111 on the statement"

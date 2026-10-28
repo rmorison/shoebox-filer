@@ -42,7 +42,7 @@ Receipts ingested before the paid amount was added have `paid_amount: null`, so 
 |---|---|
 | `order_number` | The order, confirmation or invoice number as printed. Not unique: a confirmation, a shipment, a refund and an invoice can share one |
 | `payment_method` | `card`, `bank`, `wallet`, `cash`, `transfer` or `other` |
-| `payment_last4` | The last four digits of the card or account. No more is ever stored: a longer number, in this field or in the description, vendor or payer, is cut to its last four digits |
+| `payment_last4` | The last four digits of the card or account. No more is ever stored: a longer number, in this field or in the description, vendor or payer, is cut to its last four digits (or replaced by `[card number removed]` when the digits around it make the last four uncertain) |
 | `payer` | The cardholder or bill-to name as printed on the receipt, not who forwarded the email |
 
 Each is `null` when the receipt doesn't show it, and on receipts extracted before these fields were added, until they are [re-extracted](#reextract).
@@ -331,7 +331,7 @@ uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD 
 
 ### What it does
 
-Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown.
+Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown. A card number typed into `--vendor` or `--reason` is cut to its last four digits, as at extraction.
 
 `--clear-manual` takes a field off `manual_fields` and records that in the history. The field keeps its value, but the next `reextract --overwrite` may replace it (fill-only runs leave it, since it isn't empty). It is refused, and nothing is written, when a field isn't hand-edited.
 
