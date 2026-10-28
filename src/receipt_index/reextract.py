@@ -30,9 +30,11 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
+from receipt_index.refunds import RULE_FIELDS, link_by_rule
 from receipt_index.repository import (
     get_cleared_fields,
     get_extraction_history,
+    has_linked_refunds,
     insert_extraction,
     is_current,
     lock_receipt,
@@ -76,7 +78,12 @@ _CONFIDENCE_OF: dict[str, tuple[str, ...]] = {
     "field_confidence.date": ("receipt_date",),
     "field_confidence.order_number": ("order_number",),
     "field_confidence.payment": ("payment_method", "payment_last4", "payer"),
+    "field_confidence.kind": ("kind",),
 }
+
+# Fields that are NOT NULL with a default: empty while they hold the default
+# and no earlier run applied them.
+_DEFAULTS: dict[str, Any] = {"kind": "purchase"}
 
 Status = Literal[
     "applied", "unchanged", "current", "gated", "failed", "locked", "unavailable"
@@ -117,8 +124,9 @@ def plan_changes(
 ) -> dict[str, tuple[Any, Any]]:
     """The fields a run writes, as ``name -> (old, new)``.
 
-    - Fill-only (the default) writes a field only when it is empty: NULL, or
-      a missing ``field_confidence`` entry. ``amount`` is empty too on a
+    - Fill-only (the default) writes a field only when it is empty: NULL, a
+      missing ``field_confidence`` entry, or ``kind`` while it holds its
+      default and no earlier run applied it. ``amount`` is empty too on a
       receipt extracted under the old prompt (ingested before the history
       existed, with an empty ``field_confidence`` and no run that applied
       ``amount``), whose amount may be the payment, not the total. A gated or
@@ -148,6 +156,12 @@ def plan_changes(
 
     def allowed(name: str, current: Any) -> bool:
         if current is None and name not in _NEVER_EMPTY:
+            return True
+        if (
+            name in _DEFAULTS
+            and current == _DEFAULTS[name]
+            and name not in history.applied
+        ):
             return True
         if name == "amount" and old_prompt:
             return True
@@ -223,6 +237,9 @@ class ReceiptOutcome:
     paid_amount_confidence: float | None = None
     extracted_confidence: float | None = None
     error: str | None = None
+    # The extracted kind, when the run left the stored one because the
+    # receipt is in a refund link (unlink it to change its kind).
+    kind_kept: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -240,6 +257,7 @@ class ReceiptOutcome:
             "paid_amount_confidence": self.paid_amount_confidence,
             "extracted_confidence": self.extracted_confidence,
             "error": self.error,
+            "kind_kept": self.kind_kept,
         }
 
 
@@ -369,6 +387,14 @@ def _apply(
             overwrite=overwrite,
         )
     )
+    kind_kept = None
+    if "kind" in changes and (
+        current.refund_of is not None or has_linked_refunds(conn, current.id)
+    ):
+        # A linked refund, or a purchase with linked refunds, keeps its kind
+        # (ck_receipts_refund_of_kind refuses the first): a person unlinks it.
+        kind_kept = changes.pop("kind")[1]
+        changes.pop("field_confidence.kind", None)
     columns = {k: new for k, (_, new) in changes.items() if "." not in k}
     entries = {k.split(".", 1)[1]: new for k, (_, new) in changes.items() if "." in k}
     if columns or entries:
@@ -395,12 +421,16 @@ def _apply(
         llm_cache_read_tokens=extraction.cache_read_tokens,
         llm_requests=extraction.requests,
     )
+    if RULE_FIELDS.intersection(changes):
+        updated = lock_receipt(conn, receipt.id)
+        if updated is not None:
+            link_by_rule(conn, updated)
     conn.commit()
     if gated:
         status: Status = "gated"
     else:
         status = "applied" if changes else "unchanged"
-    return _outcome(current, status, changes=changes, **extracted)
+    return _outcome(current, status, changes=changes, kind_kept=kind_kept, **extracted)
 
 
 def reextract_receipt(

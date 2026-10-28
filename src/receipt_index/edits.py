@@ -22,8 +22,14 @@ from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from receipt_index.models import scrub_card_numbers
-from receipt_index.repository import insert_event, lock_receipt, update_edited_fields
+from receipt_index.models import KINDS, scrub_card_numbers
+from receipt_index.refunds import RULE_FIELDS, link_by_rule
+from receipt_index.repository import (
+    has_linked_refunds,
+    insert_event,
+    lock_receipt,
+    update_edited_fields,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -40,6 +46,7 @@ EDITABLE_FIELDS: dict[str, str] = {
     "vendor": "vendor",
     "receipt_date": "date",
     "order_number": "order_number",
+    "kind": "kind",
 }
 
 # Other names a person may use for a field.
@@ -122,6 +129,9 @@ def edit_receipt(
     if unknown:
         msg = f"not an editable field: {', '.join(unknown)}"
         raise ValueError(msg)
+    if "kind" in values and values["kind"] not in KINDS:
+        msg = f"kind must be one of {', '.join(KINDS)}, not {values['kind']!r}"
+        raise ValueError(msg)
 
     # Hand-entered text lands in the append-only history too: no card numbers
     # (order_number is left as given, as it is at extraction).
@@ -132,6 +142,17 @@ def edit_receipt(
     reason = _scrubbed(reason)
     actor = scrub_card_numbers(actor)
     receipt = _locked(conn, receipt_id)
+    if (
+        "kind" in values
+        and values["kind"] != receipt.kind
+        and (receipt.refund_of is not None or has_linked_refunds(conn, receipt_id))
+    ):
+        conn.rollback()
+        msg = (
+            f"{receipt_id} is in a refund link: unlink it with "
+            "`refund unlink` before changing its kind"
+        )
+        raise EditError(msg)
     manual = list(receipt.manual_fields)
     confidence = dict(receipt.field_confidence)
     changes: list[FieldChange] = []
@@ -165,6 +186,13 @@ def edit_receipt(
         manual_fields=manual,
         field_confidence=confidence,
     )
+    if RULE_FIELDS.intersection(values):
+        # A refund may now have its purchase, or a purchase its refunds. The
+        # rule's events (on the refunds it links) are returned with the edit's.
+        linked = link_by_rule(conn, updated)
+        if linked:
+            events.extend(linked)
+            updated = lock_receipt(conn, receipt_id) or updated
     conn.commit()
     return EditResult(updated, changes, events)
 

@@ -442,6 +442,41 @@ def test_write_paths_run_as_the_write_login(
     }
     pg_conn.commit()
 
+    # 4c. edit --kind and the refund commands: kind and refund_of (UPDATE),
+    #     the v_receipt_net view and the rule's and a person's events.
+    purchase = pg_conn.execute(
+        "INSERT INTO receipt.receipts (source_id, source_name, vendor, amount, "
+        "paid_amount, currency, receipt_date, confidence, pdf_path, order_number) "
+        "VALUES (%s, %s, 'Acme Parking (U.S.), LLC, Garage 2', 20.00, 20.00, "
+        "'EUR', '2026-10-01', 0.9, 'p.pdf', 'A-101') RETURNING id",
+        (f"<purchase-{source}@example.com>", source),
+    ).fetchone()
+    assert purchase is not None
+    pg_conn.commit()
+    result = _invoke(config, "edit", rid, "--kind", "refund")
+    assert result.exit_code == 0, result.output
+    assert "linked to purchase" in result.output
+    result = _invoke(config, "refund", "unlink", rid, "--reason", "check")
+    assert result.exit_code == 0, result.output
+    result = _invoke(config, "refund", "link", rid, str(purchase["id"]))
+    assert result.exit_code == 0, result.output
+    result = _invoke(config, "search", "--kind", "purchase", "--output", "json")
+    assert result.exit_code == 0, result.output
+    (shown,) = [r for r in json.loads(result.output) if r["id"] == str(purchase["id"])]
+    assert shown["net_paid"] == "2.50"
+    events = pg_conn.execute(
+        "SELECT event_type, actor_kind FROM receipt.receipt_events "
+        "WHERE receipt_id = %s AND event_type LIKE 'refund%%' "
+        "ORDER BY created_at, id",
+        (receipt["id"],),
+    ).fetchall()
+    assert [(e["event_type"], e["actor_kind"]) for e in events] == [
+        ("refund_linked", "rule"),
+        ("refund_unlinked", "person"),
+        ("refund_linked", "person"),
+    ]
+    pg_conn.commit()
+
     # 5. The Drive cursor (CI has no Drive to ingest from).
     for reset in (False, True):
         save_drive_cursor(
@@ -562,6 +597,8 @@ def test_forensic_commands_run_as_the_read_login(
             "--output",
             "json",
         ),
+        ("search", "--kind", "refund", "--kind", "statement", "--output", "json"),
+        ("refund", "list", "--output", "json"),
         ("failures", "--output", "json"),
         ("show", str(receipt_id["id"])),
         ("history", str(receipt_id["id"])),

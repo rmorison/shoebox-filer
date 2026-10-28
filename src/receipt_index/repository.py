@@ -20,6 +20,7 @@ from receipt_index.models import (
 from receipt_index.store import LOCAL_SCHEME
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import date, datetime
     from decimal import Decimal
 
@@ -33,6 +34,15 @@ _MANUAL_NAME = {"date": "receipt_date"}
 # The effective amount: paid when known, the total otherwise. The expression
 # matches idx_receipts_effective_amount, so keep the two in step.
 _EFFECTIVE_AMOUNT = "COALESCE(paid_amount, amount)"
+
+# A receipt with its refunded and net paid figures (null unless a purchase).
+# receipts keeps its own name, unaliased: the filters and _NEEDS_REVIEW refer
+# to its columns bare or as receipts.<column>, and no view column shares a
+# name with one of them.
+_WITH_NET = (
+    "SELECT receipts.*, n.refunded, n.net_paid FROM receipt.receipts"
+    " LEFT JOIN receipt.v_receipt_net n ON n.receipt_id = receipts.id"
+)
 
 
 def get_processed_source_ids(
@@ -224,6 +234,7 @@ def insert_receipt(
     payment_method: str | None = None,
     payment_last4: str | None = None,
     payer: str | None = None,
+    kind: str = "purchase",
     commit: bool = True,
 ) -> Receipt:
     """Insert a receipt row and return the validated Receipt model.
@@ -238,14 +249,15 @@ def insert_receipt(
             receipt_date, description, confidence, pdf_path,
             email_subject, email_sender, email_date, file_name,
             paid_amount, field_confidence,
-            order_number, payment_method, payment_last4, payer
+            order_number, payment_method, payment_last4, payer, kind
         ) VALUES (
             %(source_id)s, %(source_type)s, %(source_name)s,
             %(vendor)s, %(amount)s, %(currency)s,
             %(receipt_date)s, %(description)s, %(confidence)s, %(pdf_path)s,
             %(email_subject)s, %(email_sender)s, %(email_date)s, %(file_name)s,
             %(paid_amount)s, %(field_confidence)s,
-            %(order_number)s, %(payment_method)s, %(payment_last4)s, %(payer)s
+            %(order_number)s, %(payment_method)s, %(payment_last4)s, %(payer)s,
+            %(kind)s
         )
         RETURNING *
         """,
@@ -270,6 +282,7 @@ def insert_receipt(
             "payment_method": payment_method,
             "payment_last4": payment_last4,
             "payer": payer,
+            "kind": kind,
         },
     )
     row = cur.fetchone()
@@ -344,6 +357,7 @@ def _receipt_filters(
     order_number: str | None = None,
     last4: str | None = None,
     payer: str | None = None,
+    kinds: Sequence[str] | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Build the WHERE clause and parameters shared by search and count."""
     clauses: list[str] = []
@@ -389,6 +403,10 @@ def _receipt_filters(
         clauses.append("payer ILIKE %(payer)s")
         params["payer"] = f"%{_escape_like(payer)}%"
 
+    if kinds:
+        clauses.append("kind = ANY(%(kinds)s)")
+        params["kinds"] = list(kinds)
+
     if needs_review:
         clauses.append(_NEEDS_REVIEW)
 
@@ -426,13 +444,15 @@ def search_receipts(
     order_number: str | None = None,
     last4: str | None = None,
     payer: str | None = None,
+    kinds: Sequence[str] | None = None,
 ) -> list[Receipt]:
     """Search receipts with optional filters, combined with AND.
 
     Results are ordered newest first, then by vendor, then by id, so that
     ``limit``/``offset`` pages are stable between calls. ``order_number``
     and ``last4`` match exactly; ``payer`` is a case-insensitive substring.
-    ``needs_review``
+    ``kinds`` keeps only those kinds (every kind when None or empty).
+    A purchase comes with its ``refunded`` and ``net_paid``. ``needs_review``
     keeps receipts still missing a paid amount or whose latest extraction
     failed or was gated, lowest paid-amount confidence first.
     """
@@ -448,13 +468,14 @@ def search_receipts(
         order_number=order_number,
         last4=last4,
         payer=payer,
+        kinds=kinds,
     )
     order = (
         _NEEDS_REVIEW_ORDER if needs_review else "receipt_date DESC, vendor ASC, id ASC"
     )
-    sql = (
-        f"SELECT * FROM receipt.receipts WHERE {where} ORDER BY {order}"
-    ) + _page_clause(params, limit, offset)
+    sql = (f"{_WITH_NET} WHERE {where} ORDER BY {order}") + _page_clause(
+        params, limit, offset
+    )
 
     cur = conn.execute(sql, params)
     return [Receipt.model_validate(row) for row in cur.fetchall()]
@@ -474,6 +495,7 @@ def count_receipts(
     order_number: str | None = None,
     last4: str | None = None,
     payer: str | None = None,
+    kinds: Sequence[str] | None = None,
 ) -> int:
     """Count the receipts that ``search_receipts`` would return unpaged."""
     where, params = _receipt_filters(
@@ -488,6 +510,7 @@ def count_receipts(
         order_number=order_number,
         last4=last4,
         payer=payer,
+        kinds=kinds,
     )
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
@@ -892,9 +915,9 @@ def get_receipt_by_id(
     conn: psycopg.Connection[dict[str, Any]],
     receipt_id: UUID,
 ) -> Receipt | None:
-    """Look up a single receipt by its UUID."""
+    """Look up a single receipt by its UUID; a purchase with its net paid."""
     cur = conn.execute(
-        "SELECT * FROM receipt.receipts WHERE id = %(id)s",
+        f"{_WITH_NET} WHERE receipts.id = %(id)s",
         {"id": receipt_id},
     )
     row = cur.fetchone()
@@ -906,6 +929,36 @@ def get_receipt_by_id(
 # ---------------------------------------------------------------------------
 # Re-extraction (receipt data-model design, §3)
 # ---------------------------------------------------------------------------
+
+
+# The words reextract --refund-candidates looks for: whole words, any case
+# (a Postgres regex; \m and \M are its word boundaries). "credit card" is
+# not a credit, and "returns policy" is not a return.
+REFUND_CANDIDATE_WORDS = (
+    "refund",
+    "refunds",
+    "refunded",
+    "credit",
+    "credits",
+    "credited",
+    "return",
+    "returned",
+    "reversal",
+    "reversals",
+    "reversed",
+    "chargeback",
+    "chargebacks",
+    "statement",
+    "statements",
+    "estatement",
+    "estatements",
+    "cancel",
+    "cancelled",
+    "canceled",
+    "cancellation",
+    "cancellations",
+)
+REFUND_CANDIDATE_PATTERN = r"\m(" + "|".join(REFUND_CANDIDATE_WORDS) + r")\M(?!\s+card)"
 
 
 def _failed(output: str = "output") -> str:
@@ -958,6 +1011,7 @@ def select_for_reextract(
     force: bool = False,
     model_not: str | None = None,
     confidence_below: tuple[str | None, float] | None = None,
+    refund_candidates: bool = False,
     limit: int | None = None,
 ) -> list[Receipt]:
     """The receipts a re-extraction run selects, oldest first.
@@ -969,7 +1023,9 @@ def select_for_reextract(
     that have none). ``confidence_below`` is ``(field, x)``: the overall
     confidence when ``field`` is None, else that field's entry, missing
     entries counting as below; a receipt where that field is hand-edited
-    is left out.
+    is left out. ``refund_candidates`` keeps receipts still marked purchase,
+    their kind not hand-edited, whose subject, description, vendor or file
+    name has a word that a refund, credit or statement often uses.
     """
     clauses: list[str] = []
     params: dict[str, object] = {"version": prompt_version, "model": llm_model}
@@ -1007,6 +1063,13 @@ def select_for_reextract(
             # A hand-edited field has no entry, but a run can't change it.
             clauses.append("NOT (%(below_manual)s = ANY(r.manual_fields))")
             params["below_manual"] = _MANUAL_NAME.get(field, field)
+    if refund_candidates:
+        clauses.append(
+            "r.kind = 'purchase' AND NOT ('kind' = ANY(r.manual_fields))"
+            " AND concat_ws(' ', r.email_subject, r.description, r.vendor,"
+            " r.file_name) ~* %(candidate_words)s"
+        )
+        params["candidate_words"] = REFUND_CANDIDATE_PATTERN
     where = " AND ".join(clauses) if clauses else "TRUE"
     sql = (
         f"WITH l AS ({_LATEST_GOOD}) "
@@ -1086,6 +1149,7 @@ _REEXTRACT_COLUMNS = frozenset(
         "payment_method",
         "payment_last4",
         "payer",
+        "kind",
         "confidence",
     }
 )
@@ -1123,7 +1187,9 @@ def update_receipt_fields(
 
 
 # The receipt columns a person may edit by hand (receipt data-model design, §4).
-_EDITABLE_COLUMNS = frozenset({"paid_amount", "vendor", "receipt_date", "order_number"})
+_EDITABLE_COLUMNS = frozenset(
+    {"paid_amount", "vendor", "receipt_date", "order_number", "kind"}
+)
 
 
 def update_edited_fields(
@@ -1275,3 +1341,159 @@ def get_cleared_fields(
         {"id": receipt_id},
     )
     return {row["field"] for row in cur.fetchall() if row["field"]}
+
+
+# ---------------------------------------------------------------------------
+# Refunds (receipt data-model design, \u00a76)
+# ---------------------------------------------------------------------------
+
+
+def find_refund_purchases(
+    conn: psycopg.Connection[dict[str, Any]], refund: Receipt
+) -> list[UUID]:
+    """The purchases the linking rule would link ``refund`` to.
+
+    Same order number, same vendor (any case), same currency, and a paid
+    amount above zero, which leaves out confirmation and shipping emails and
+    unpaid invoices that share the order number. The rule links only when
+    there is exactly one. The matches are read without a lock, so that
+    candidates the rule won't link are never locked: the one it links is
+    locked by ``lock_matching_purchase``.
+    """
+    if refund.order_number is None:
+        return []
+    cur = conn.execute(
+        """\
+        SELECT id FROM receipt.receipts
+        WHERE kind = 'purchase' AND id <> %(id)s
+          AND order_number = %(order_number)s
+          AND lower(vendor) = lower(%(vendor)s)
+          AND currency = %(currency)s
+          AND paid_amount > 0
+        ORDER BY id
+        """,
+        {
+            "id": refund.id,
+            "order_number": refund.order_number,
+            "vendor": refund.vendor,
+            "currency": refund.currency,
+        },
+    )
+    return [row["id"] for row in cur.fetchall()]
+
+
+def find_unlinked_refunds(
+    conn: psycopg.Connection[dict[str, Any]], purchase: Receipt
+) -> list[Receipt]:
+    """Unlinked refunds sharing ``purchase``'s order number, vendor and currency,
+    locked ``FOR UPDATE`` in the caller's transaction.
+
+    A refund a person unlinked is left out: only ``refund link`` links it again.
+    """
+    if purchase.order_number is None:
+        return []
+    cur = conn.execute(
+        """\
+        SELECT * FROM receipt.receipts
+        WHERE kind = 'refund' AND refund_of IS NULL AND id <> %(id)s
+          AND order_number = %(order_number)s
+          AND lower(vendor) = lower(%(vendor)s)
+          AND currency = %(currency)s
+          AND NOT EXISTS (
+              SELECT 1 FROM receipt.receipt_events e
+              WHERE e.receipt_id = receipts.id
+                AND e.event_type = 'refund_unlinked'
+          )
+        ORDER BY id
+        FOR UPDATE
+        """,
+        {
+            "id": purchase.id,
+            "order_number": purchase.order_number,
+            "vendor": purchase.vendor,
+            "currency": purchase.currency,
+        },
+    )
+    return [Receipt.model_validate(row) for row in cur.fetchall()]
+
+
+def lock_matching_purchase(
+    conn: psycopg.Connection[dict[str, Any]], refund: Receipt, purchase_id: UUID
+) -> bool:
+    """Lock a purchase ``FOR SHARE`` and say whether it still matches ``refund``.
+
+    The whole match is re-checked under the lock (a purchase, the same order
+    number, vendor in any case and currency, a paid amount above zero), so a
+    concurrent change to any of those either waits for the link or is seen
+    by it. Only the one purchase the rule is about to link is locked.
+    """
+    cur = conn.execute(
+        """\
+        SELECT 1 FROM receipt.receipts
+        WHERE id = %(id)s AND kind = 'purchase'
+          AND order_number = %(order_number)s
+          AND lower(vendor) = lower(%(vendor)s)
+          AND currency = %(currency)s
+          AND paid_amount > 0
+        FOR SHARE
+        """,
+        {
+            "id": purchase_id,
+            "order_number": refund.order_number,
+            "vendor": refund.vendor,
+            "currency": refund.currency,
+        },
+    )
+    return cur.fetchone() is not None
+
+
+def was_unlinked(conn: psycopg.Connection[dict[str, Any]], refund_id: UUID) -> bool:
+    """Whether a person has unlinked this refund (a ``refund_unlinked`` event)."""
+    cur = conn.execute(
+        "SELECT 1 FROM receipt.receipt_events WHERE receipt_id = %(id)s"
+        " AND event_type = 'refund_unlinked' LIMIT 1",
+        {"id": refund_id},
+    )
+    return cur.fetchone() is not None
+
+
+def set_refund_of(
+    conn: psycopg.Connection[dict[str, Any]],
+    refund_id: UUID,
+    purchase_id: UUID | None,
+    *,
+    only_if_unlinked: bool = False,
+) -> bool:
+    """Link a refund to a purchase, or unlink it (None). The caller commits.
+
+    With ``only_if_unlinked`` (the rule's write), a refund that is already
+    linked, by a person meanwhile, is left as it is. Returns whether the row
+    was written.
+    """
+    sql = "UPDATE receipt.receipts SET refund_of = %(purchase)s WHERE id = %(id)s"
+    if only_if_unlinked:
+        sql += " AND refund_of IS NULL"
+    cur = conn.execute(sql, {"purchase": purchase_id, "id": refund_id})
+    return cur.rowcount == 1
+
+
+def has_linked_refunds(
+    conn: psycopg.Connection[dict[str, Any]], purchase_id: UUID
+) -> bool:
+    """Whether any refund is linked to this purchase."""
+    cur = conn.execute(
+        "SELECT 1 FROM receipt.receipts WHERE refund_of = %(id)s LIMIT 1",
+        {"id": purchase_id},
+    )
+    return cur.fetchone() is not None
+
+
+def list_refunds(
+    conn: psycopg.Connection[dict[str, Any]], *, unlinked: bool = False
+) -> list[Receipt]:
+    """Every refund, newest first; only those with no purchase if ``unlinked``."""
+    where = "kind = 'refund'" + (" AND refund_of IS NULL" if unlinked else "")
+    cur = conn.execute(
+        f"{_WITH_NET} WHERE {where} ORDER BY receipt_date DESC, vendor ASC, id ASC"
+    )
+    return [Receipt.model_validate(row) for row in cur.fetchall()]

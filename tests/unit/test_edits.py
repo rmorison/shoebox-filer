@@ -63,6 +63,17 @@ class FakeDb:
     events: list[dict[str, Any]] = field(default_factory=list)
     updates: list[dict[str, Any]] = field(default_factory=list)
     conn: MagicMock = field(default_factory=MagicMock)
+    # Whether the receipt is a purchase with linked refunds; the receipts the
+    # refund linking rule ran on.
+    with_refunds: bool = False
+    linked: list[Receipt] = field(default_factory=list)
+
+    def has_linked_refunds(self, conn: Any, purchase_id: UUID) -> bool:
+        return self.with_refunds
+
+    def link_by_rule(self, conn: Any, receipt: Receipt) -> list[Any]:
+        self.linked.append(receipt)
+        return []
 
     def lock_receipt(self, conn: Any, receipt_id: UUID) -> Receipt | None:
         return self.receipt
@@ -102,7 +113,13 @@ class FakeDb:
 @pytest.fixture
 def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
     fake = FakeDb(receipt=_receipt())
-    for name in ("lock_receipt", "insert_event", "update_edited_fields"):
+    for name in (
+        "lock_receipt",
+        "insert_event",
+        "update_edited_fields",
+        "has_linked_refunds",
+        "link_by_rule",
+    ):
         monkeypatch.setattr(edits, name, getattr(fake, name))
     return fake
 
@@ -193,11 +210,87 @@ class TestEditReceipt:
         db.conn.rollback.assert_called_once()
         assert db.events == [] and db.updates == []
 
-    @pytest.mark.parametrize("name", ["amount", "currency", "payer", "kind"])
-    def test_only_the_four_fields(self, db: FakeDb, name: str) -> None:
+    @pytest.mark.parametrize("name", ["amount", "currency", "payer", "refund_of"])
+    def test_only_the_editable_fields(self, db: FakeDb, name: str) -> None:
         with pytest.raises(ValueError, match="not an editable field"):
             edit_receipt(db.conn, _ID, {name: "x"}, actor="op", reason=None)
         assert db.events == []
+
+    @pytest.mark.parametrize("kind", ["other", "charge", "Refund"])
+    def test_kind_takes_only_the_four_kinds(self, db: FakeDb, kind: str) -> None:
+        with pytest.raises(ValueError, match="kind must be one of"):
+            edit_receipt(db.conn, _ID, {"kind": kind}, actor="op", reason=None)
+        assert db.events == [] and db.updates == []
+
+    def test_kind_is_editable_and_runs_the_rule(self, db: FakeDb) -> None:
+        result = edit_receipt(db.conn, _ID, {"kind": "refund"}, actor="op", reason=None)
+        assert result.receipt.kind == "refund"
+        assert "kind" in result.receipt.manual_fields
+        assert [r.kind for r in db.linked] == ["refund"]
+
+    def test_the_rules_links_come_back_with_the_edit(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        purchase = uuid4()
+        rule_event = ReceiptEvent(
+            id=uuid4(),
+            receipt_id=_ID,
+            event_type="refund_linked",
+            payload={"purchase_id": str(purchase)},
+            actor="rule",
+            actor_kind="rule",
+            created_at=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+        def link_by_rule(conn: Any, receipt: Receipt) -> list[ReceiptEvent]:
+            # The rule linked it: the stored receipt now has its purchase.
+            assert db.receipt is not None
+            db.receipt = db.receipt.model_copy(
+                update={"kind": "refund", "refund_of": purchase}
+            )
+            return [rule_event]
+
+        monkeypatch.setattr(edits, "link_by_rule", link_by_rule)
+        result = edit_receipt(db.conn, _ID, {"kind": "refund"}, actor="op", reason=None)
+        assert [e.event_type for e in result.events] == [
+            "field_edited",
+            "refund_linked",
+        ]
+        assert result.receipt.refund_of == purchase
+
+    def test_an_order_number_edit_runs_the_rule(self, db: FakeDb) -> None:
+        edit_receipt(db.conn, _ID, {"order_number": "A-1"}, actor="op", reason=None)
+        assert len(db.linked) == 1
+
+    @pytest.mark.parametrize(
+        "values", [{"vendor": "Acme"}, {"paid_amount": Decimal("25.00")}]
+    )
+    def test_a_matched_field_edit_runs_the_rule(
+        self, db: FakeDb, values: dict[str, Any]
+    ) -> None:
+        edit_receipt(db.conn, _ID, values, actor="op", reason=None)
+        assert len(db.linked) == 1
+
+    def test_a_date_edit_runs_no_rule(self, db: FakeDb) -> None:
+        edit_receipt(
+            db.conn, _ID, {"receipt_date": date(2026, 2, 2)}, actor="op", reason=None
+        )
+        assert db.linked == []
+
+    @pytest.mark.parametrize("linked", ["refund", "purchase"])
+    def test_a_receipt_in_a_link_keeps_its_kind(self, db: FakeDb, linked: str) -> None:
+        if linked == "refund":
+            db.receipt = _receipt(kind="refund", refund_of=uuid4())
+        else:
+            db.with_refunds = True
+        with pytest.raises(EditError, match="refund unlink"):
+            edit_receipt(db.conn, _ID, {"kind": "credit"}, actor="op", reason=None)
+        assert db.events == [] and db.updates == []
+
+    def test_confirming_a_linked_kind_is_allowed(self, db: FakeDb) -> None:
+        db.receipt = _receipt(kind="refund", refund_of=uuid4())
+        edit_receipt(db.conn, _ID, {"kind": "refund"}, actor="op", reason=None)
+        assert len(db.events) == 1
 
     def test_nothing_to_edit(self, db: FakeDb) -> None:
         with pytest.raises(ValueError, match="nothing to edit"):

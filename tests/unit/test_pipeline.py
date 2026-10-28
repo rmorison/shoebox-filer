@@ -113,6 +113,8 @@ class FakeRepo:
     extractions: list[dict[str, Any]] = field(default_factory=list)
     # Every write in order, to check what commits with what.
     writes: list[str] = field(default_factory=list)
+    # Receipts the refund linking rule ran on.
+    linked: list[Receipt] = field(default_factory=list)
 
     def known(self) -> set[str]:
         return {sid for sid, _ in self.rows} | self.receipts
@@ -145,6 +147,11 @@ class FakeRepo:
         self.writes.append("receipt")
         self.receipt_kwargs.append({"source_id": source_id, **kwargs})
         return Receipt.model_validate({**_RECEIPT_ROW, "source_id": source_id})
+
+    def link_by_rule(self, conn: Any, receipt: Receipt) -> list[Any]:
+        self.writes.append("link_rule")
+        self.linked.append(receipt)
+        return []
 
     def insert_extraction(self, conn: Any, **kwargs: Any) -> None:
         self.writes.append("extraction")
@@ -319,6 +326,7 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
         "insert_ingest_log",
         "insert_receipt",
         "insert_extraction",
+        "link_by_rule",
         "save_imap_cursor",
         "save_drive_cursor",
         "item_lock",
@@ -811,6 +819,7 @@ class TestIngestRecordsItsExtraction:
             "field_confidence.amount",
             "field_confidence.paid_amount",
             "field_confidence.date",
+            "kind",
         }  # paid_amount is None in this extraction, so it wasn't written
 
     def test_order_number_and_payment_are_stored(
@@ -844,6 +853,25 @@ class TestIngestRecordsItsExtraction:
             "field_confidence.payment",
         } <= applied
 
+    def test_kind_is_stored(self, repo: FakeRepo, extract: MagicMock) -> None:
+        result = _extraction()
+        result.metadata = result.metadata.model_copy(update={"kind": "refund"})
+        extract.return_value = result
+        _run(FakeAdapter(_imap_read([1])))
+        assert repo.receipt_kwargs[0]["kind"] == "refund"
+
+    def test_linking_rule_runs_before_the_commit(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        # The refund link and its event commit with the receipt, its
+        # extraction row and the success row, or not at all.
+        _run(FakeAdapter(_imap_read([1])))
+        linked = [r.source_id for r in repo.linked]
+        assert linked == [repo.receipt_kwargs[0]["source_id"]]
+        receipt_at = repo.writes.index("receipt")
+        assert repo.writes[receipt_at + 1] == "link_rule"
+        assert repo.writes.index("ingest_log:success") > receipt_at + 1
+
     def test_receipt_and_extraction_commit_with_the_success_row(
         self, repo: FakeRepo, extract: MagicMock
     ) -> None:
@@ -851,6 +879,7 @@ class TestIngestRecordsItsExtraction:
         assert repo.writes == [
             "ingest_log:started",
             "receipt",
+            "link_rule",
             "extraction",
             "ingest_log:success",
         ]

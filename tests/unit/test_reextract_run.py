@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -99,6 +99,9 @@ class FakeDb:
         self.edit_before_apply: dict[UUID, dict[str, Any]] = {}
         # Fields with a manual_cleared event, per receipt.
         self.cleared: dict[UUID, set[str]] = {}
+        # Purchases with a linked refund; receipts the linking rule ran on.
+        self.with_refunds: set[UUID] = set()
+        self.linked: list[Receipt] = []
 
     @contextmanager
     def item_lock(self, conn: Any, source_id: str) -> Iterator[bool]:
@@ -138,6 +141,13 @@ class FakeDb:
 
     def insert_extraction(self, conn: Any, **kwargs: Any) -> None:
         self.extractions.append(kwargs)
+
+    def has_linked_refunds(self, conn: Any, purchase_id: UUID) -> bool:
+        return purchase_id in self.with_refunds
+
+    def link_by_rule(self, conn: Any, receipt: Receipt) -> list[Any]:
+        self.linked.append(receipt)
+        return []
 
 
 class FakeAdapter:
@@ -194,6 +204,8 @@ def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
         "get_cleared_fields",
         "update_receipt_fields",
         "insert_extraction",
+        "has_linked_refunds",
+        "link_by_rule",
     ):
         monkeypatch.setattr(reextract, name, getattr(fake, name))
     return fake
@@ -574,3 +586,71 @@ class TestOrderAndPaymentApply:
         db.cleared[receipt.id] = {"paid_amount"}
         outcome = _run(db, [receipt], adapter=None, overwrite=True)[0].outcomes[0]
         assert outcome.changes["paid_amount"] == (Decimal("12.00"), Decimal("30.00"))
+
+
+def _kind_result(kind: str, order_number: str | None = None) -> ExtractionResult:
+    result = _result()
+    result.metadata = result.metadata.model_copy(
+        update={"kind": kind, "order_number": order_number}
+    )
+    return result
+
+
+class TestKindApply:
+    def test_a_refund_gets_its_kind_and_the_rule_runs(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        llm["rendition"].return_value = _kind_result("refund", "12345")
+        receipt = _receipt()
+        result, _ = _run(db, [receipt], adapter=None)
+        ((_, columns, _),) = db.updates
+        assert columns["kind"] == "refund"
+        assert [r.id for r in db.linked] == [receipt.id]
+        assert result.outcomes[0].kind_kept is None
+
+    def test_a_filled_paid_amount_runs_the_rule(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        # A waiting refund needs its purchase to have a paid amount: filling
+        # one may make this purchase its only match (design §6).
+        receipt = _receipt()
+        _run(db, [receipt], adapter=None)
+        ((_, columns, _),) = db.updates
+        assert columns == {"paid_amount": Decimal("30.00")}
+        assert [r.id for r in db.linked] == [receipt.id]
+
+    def test_a_change_to_no_matched_field_runs_no_rule(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        # Only the description is empty, so only it is filled.
+        _run(
+            db,
+            [_receipt(paid_amount=Decimal("30.00"), description=None)],
+            adapter=None,
+        )
+        ((_, columns, _),) = db.updates
+        assert set(columns) == {"description"}
+        assert db.linked == []
+
+    def test_a_linked_refund_keeps_its_kind(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        llm["rendition"].return_value = _kind_result("purchase")
+        receipt = _receipt(kind="refund", refund_of=uuid4())
+        result, _ = _run(db, [receipt], adapter=None, overwrite=True)
+        assert all("kind" not in columns for _, columns, _ in db.updates)
+        assert result.outcomes[0].kind_kept == "purchase"
+        assert "kind" not in result.outcomes[0].changes
+
+    def test_a_purchase_with_linked_refunds_keeps_its_kind(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        llm["rendition"].return_value = _kind_result("credit")
+        receipt = _receipt()
+        db.with_refunds.add(receipt.id)
+        result, _ = _run(db, [receipt], adapter=None)
+        assert all("kind" not in columns for _, columns, _ in db.updates)
+        assert result.outcomes[0].kind_kept == "credit"
+        applied = db.extractions[-1]["applied_fields"]
+        assert "kind" not in applied
+        assert "field_confidence.kind" not in applied

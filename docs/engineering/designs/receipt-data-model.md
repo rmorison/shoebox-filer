@@ -60,7 +60,7 @@ The two designs divide the `receipt` schema as follows.
 | This design owns | The [evidence-store design](evidence-store.md) owns |
 |---|---|
 | The receipt's own fields: vendor, amounts, date, currency, description, confidence, order number, payment, kind and refund link | Stored files: originals, attachments and renditions, with their hashes and storage references |
-| `line_items`, `tags`, `receipt_tags`, `external_links`, `receipt_events`, `extractions`, the `receipt_net` view | Provenance records (one per source item), which take over `source_id`, `source_type`, `source_name`, `file_name` and the `email_*` columns |
+| `line_items`, `tags`, `receipt_tags`, `external_links`, `receipt_events`, `extractions`, the `v_receipt_net` view | Provenance records (one per source item), which take over `source_id`, `source_type`, `source_name`, `file_name` and the `email_*` columns |
 | The search document | Today's `pdf_path`, and the rendition reference that replaces it |
 | | Duplicate detection (its `duplicate_candidates` table references provenance records, not receipts), and linking and unlinking duplicates |
 
@@ -186,7 +186,7 @@ class ReceiptMetadata(BaseModel):
     description: str | None = None
     order_number: str | None = None
     payment: Payment | None = None
-    kind: Literal["purchase", "refund"] = "purchase"
+    kind: Literal["purchase", "refund", "credit", "statement"] = "purchase"
     receipt_document: str | None = None             # attachment file name, or "body"
     line_items: list[LineItem] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)        # is this a receipt at all
@@ -215,7 +215,7 @@ These values are the model's own estimate, not a measured probability. They are 
 
 The configured model is Claude Haiku 4.5, at list prices (October 2026) of $1 per million input tokens and $5 per million output tokens. The devtest database holds no real receipts, so these figures are estimates; ticket 1 measures them.
 
-The table predates the move to Claude Haiku 5.5 at medium effort, whose thinking tokens are billed as output, so its figures no longer describe the configured model. Ticket 3's fields add roughly 40 to 60 output tokens a receipt and about 250 input tokens of prompt; the measured averages come from the query below, by `llm_model`, after each ticket is deployed.
+The table predates the move to Claude Haiku 5.5 at medium effort, whose thinking tokens are billed as output, so its figures no longer describe the configured model. Ticket 3's fields add roughly 40 to 60 output tokens a receipt and about 250 input tokens of prompt; ticket 5's kind adds about 200 input tokens of prompt and 10 to 15 output tokens; the measured averages come from the query below, by `llm_model`, after each ticket is deployed.
 
 | | Input tokens | Output tokens | Cost |
 |---|---|---|---|
@@ -458,11 +458,23 @@ CREATE INDEX IF NOT EXISTS idx_line_items_description
 
 ### 6. Refunds and returns
 
+The operator widened this section when the refunds request was planned: `kind` also takes `credit` and `statement`, and a generated `signed_amount` makes a plain sum the net spend. Where this section and the code differ, the code and `docs/user/cli-reference.md` ("Kinds and totals", "refund") are current.
+
+| `kind` | What it is | `signed_amount` |
+|---|---|---|
+| `purchase` | A charge or payment: a receipt, order confirmation, invoice or bill, payment confirmation. A statement that bills a new charge for its own period is a purchase | `COALESCE(paid_amount, amount)` |
+| `refund` | Money returned for an earlier purchase | its negative |
+| `credit` | A credit that isn't money returned for one purchase (credit memo, account credit, rebate) | its negative |
+| `statement` | A card or bank statement, or a vendor statement summarising orders already receipted | `0` |
+
+`signed_amount` is a stored generated column (`0 - x` for the negatives, so a refund of `0.00` never reads `-0.00`), and `Receipt.signed_amount` computes the same in Python. `effective_amount` keeps its meaning and stays unsigned. Search returns every kind unless `--kind` narrows it. The view is named `v_receipt_net`, with the `v_` prefix the database standards give views.
+
 ```sql
 ALTER TABLE receipt.receipts
     ADD COLUMN kind      TEXT NOT NULL DEFAULT 'purchase',
     ADD COLUMN refund_of UUID,
-    ADD CONSTRAINT ck_receipts_kind CHECK (kind IN ('purchase', 'refund')),
+    ADD CONSTRAINT ck_receipts_kind
+        CHECK (kind IN ('purchase', 'refund', 'credit', 'statement')),
     ADD CONSTRAINT fk_receipts_refund_of FOREIGN KEY (refund_of)
         REFERENCES receipt.receipts (id) ON DELETE SET NULL,
     ADD CONSTRAINT ck_receipts_refund_of_kind
@@ -472,7 +484,7 @@ ALTER TABLE receipt.receipts
 
 CREATE INDEX IF NOT EXISTS idx_receipts_refund_of ON receipt.receipts (refund_of);
 
-CREATE OR REPLACE VIEW receipt.receipt_net AS
+CREATE OR REPLACE VIEW receipt.v_receipt_net AS
 WITH live_refunds AS (
     -- A refund counts against the purchase that remains after any merge,
     -- and not at all if the refund was itself merged away.
@@ -497,11 +509,14 @@ GROUP BY p.id;
 
 - **A refund is its own receipt**, with `kind = 'refund'`, its own date and its own evidence. Its amounts are stored as positive numbers; `kind` gives the direction. A bank feed shows a refund as a credit, and the consumer maps the sign. Its `paid_amount` is what went back to the payer's card or account, so a refund given as store credit doesn't lower the net paid.
 - **Net paid is computed, not stored**, so it can't fall out of step with the refunds. A purchase with several partial refunds gets the sum.
-- **The linking rule.** An unlinked refund is linked to a purchase when exactly one purchase has the same order number, the same vendor (compared case-insensitively), the same currency and a paid amount above zero (`paid_amount > 0`). The paid-amount condition leaves out confirmation and shipping emails, and unpaid invoices, that charged nothing, which share an order number with the purchase that did. If several purchases still match (an order charged on each shipment), or none does, the refund stays unlinked.
+- **The linking rule.** An unlinked refund is linked to a purchase when exactly one purchase has the same order number, the same vendor (compared case-insensitively), the same currency and a paid amount above zero (`paid_amount > 0`). The rule never links a refund a person has unlinked (one with a `refund_unlinked` event): only `refund link` links it again, as the operator decided. Credits and statements are never linked. The paid-amount condition leaves out confirmation and shipping emails, and unpaid invoices, that charged nothing, which share an order number with the purchase that did. If several purchases still match (an order charged on each shipment), or none does, the refund stays unlinked.
 - **When the rule runs.** Whenever an unlinked refund gains its kind or order number (at ingest, re-extraction or a hand edit), and whenever a purchase is ingested or re-extracted with an order number that matches an unlinked refund. Each link it makes is recorded as a `refund_linked` event with `actor_kind = 'rule'`.
 - **The rule trusts the email.** An email in the watched folder that claims to be a refund for a known order is linked, and lowers that purchase's net paid. The event, `refund list` and `history` make every automatic link visible, and `refund unlink` undoes it.
 - **Linking by hand.** `receipt-index refund link <refund-id> <purchase-id>` and `refund unlink <refund-id>`, both recorded. `refund list --unlinked` shows refunds with no purchase. Linking checks that the currencies match.
-- Search gains `--kind purchase|refund` (default both), and JSON output adds `kind`, `refund_of` and, for purchases, `refunded` and `net_paid`.
+- Search gains `--kind` (repeatable; default every kind), and JSON output adds `kind`, `signed_amount`, `refund_of` and, for purchases, `refunded` and `net_paid`. A refund's `order_number` is the original order it refers to, when the document shows one.
+- **Merges.** The view above has the merge conditions of the evidence-store design. Migration 000016 creates it without them, since `merged_into_id` doesn't exist yet; the merge ticket adds them, as [Merged receipts](#merged-receipts) says.
+- **Back-fill.** `reextract --refund-candidates` selects receipts still marked `purchase` whose subject, description, vendor or file name has, as a whole word, one a refund, credit, cancellation or statement often uses. Fill-only runs set `kind` while it holds its default.
+- **When the rule runs, as built.** At ingest, and on re-extraction or a hand edit that changes any field it matches on: kind, order number, vendor, currency or paid amount. It locks only the purchase it links (`FOR SHARE`, re-checking the whole match), and writes the link only while the refund is still unlinked. A link already made isn't moved by a later edit of either receipt. Nothing in the database stops a link target from later becoming a non-purchase; the application's checks prevent it. The view doesn't compare currencies, which the rule and `refund link` check when linking.
 - Duplicate detection in the evidence store excludes pairs whose `kind` differs.
 
 ### 7. Text search
@@ -622,7 +637,7 @@ CREATE INDEX IF NOT EXISTS idx_external_links_system_id
 The evidence-store design marks a merged receipt with `merged_into_id` instead of deleting it. In this design:
 
 - Search, `--needs-review`, `--untagged`, `--not-linked`, text search, totals and the JSON output leave out merged receipts (`merged_into_id IS NULL`). `show` on a merged receipt still works, and says which receipt it was merged into.
-- `receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
+- `v_receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
 - The refund linking rule and `reextract` skip merged receipts.
 - A merge always points at a receipt that isn't itself merged; the evidence-store design keeps it so (it flattens merges and checks this with a trigger), which is why one `COALESCE` is enough.
 - These conditions need the evidence-store design's columns. Whichever ticket lands second, this design's or that design's merge, adds them.
@@ -642,11 +657,12 @@ For reference, the columns this design adds to `receipt.receipts`:
 | `payer` | `TEXT` | 3 |
 | `kind` | `TEXT`, default `purchase` | 5 |
 | `refund_of` | `UUID`, references `receipts` | 5 |
+| `signed_amount` | `NUMERIC(12,2)`, generated from `kind` and the amounts | 5 |
 | `search_document` | `TSVECTOR` | 6 |
 
-New tables: `extractions` (2), `receipt_events` (3), `line_items` (4), `tags` and `receipt_tags` (7), `external_links` (8). New view: `receipt_net` (5). New grant-target role: `receipt_index_dev_annotate` (7).
+New tables: `extractions` (2), `receipt_events` (3), `line_items` (4), `tags` and `receipt_tags` (7), `external_links` (8). New view: `v_receipt_net` (5). New grant-target role: `receipt_index_dev_annotate` (7).
 
-Every column added to `receipts` gets column-level `INSERT` and `UPDATE` grants for `_write` and `SELECT` for `_read`, as the existing migrations do, apart from `search_document`, which only the trigger writes.
+Every column added to `receipts` gets column-level `INSERT` and `UPDATE` grants for `_write` and `SELECT` for `_read`, as the existing migrations do, apart from `search_document`, which only the trigger writes, and `signed_amount`, which is generated (`SELECT` only).
 
 ---
 
@@ -698,7 +714,7 @@ Against the devtest database, with every migration mirrored in the integration c
 - Ingest of a fixture receipt fills `paid_amount`, `field_confidence` and an `extractions` row.
 - `reextract --input rendition` over fixtures: the first run fills fields, a second run with the same prompt version does nothing, an edited field survives `--overwrite`.
 - The search document follows changes to line items, and `--text` finds a receipt by an item description.
-- `receipt_net` gives the right net figure for a purchase with two partial refunds.
+- `v_receipt_net` gives the right net figure for a purchase with two partial refunds.
 - The annotate role can apply a tag and add a link, each with a trigger-written event recorded as `agent`, and is refused when it tries to define a tag, update a receipt or write an event directly.
 - An update or delete of a history row is refused even for the table's owner, and deleting a receipt still cascades.
 - A fill-only re-extraction sets `kind = 'refund'` on a receipt with no extraction history, and links it to its purchase.

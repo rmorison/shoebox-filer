@@ -32,6 +32,7 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
+from receipt_index.refunds import link_by_rule
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
     get_item_history,
@@ -289,6 +290,7 @@ def process_item(
             payment_method=metadata.payment.method if metadata.payment else None,
             payment_last4=metadata.payment.last4 if metadata.payment else None,
             payer=metadata.payment.payer if metadata.payment else None,
+            kind=metadata.kind,
             pdf_path=pdf_path_for(stored.ref),
             email_subject=raw.subject,
             email_sender=raw.sender,
@@ -296,6 +298,9 @@ def process_item(
             file_name=raw.file_name,
             commit=False,
         )
+        # A refund is linked to its purchase, or a purchase to its waiting
+        # refunds, in the same transaction (receipt data-model design, §6).
+        link_by_rule(conn, receipt)
         # The receipt, its extraction row and the success row commit together.
         insert_extraction(
             conn,
