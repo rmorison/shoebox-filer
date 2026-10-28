@@ -183,3 +183,42 @@ class TestReceipt:
         data = receipt.model_dump(mode="json")
         for name in ("order_number", "payment_method", "payment_last4", "payer"):
             assert data[name] is None
+
+
+class TestDescriptionScrub:
+    """A card number the model writes into the description is cut to its last
+    four digits, so the append-only extraction history never holds it."""
+
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            (f"Paid with {_TEST_CARD}", "Paid with ending 1111"),
+            ("card 5555-5555-5555-4444 charged", "card ending 4444 charged"),
+            ("Amex 378282246310005.", "Amex ending 0005."),
+            (
+                "two: 4111111111111111 and 5555555555554444",
+                "two: ending 1111 and ending 4444",
+            ),
+        ],
+    )
+    def test_card_numbers_are_cut(self, raw: str, kept: str) -> None:
+        assert _metadata(description=raw).description == kept
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Order 4111 1111 1111 1112",  # fails the Luhn check
+            "Order 123456789012",  # 12 digits: too short for a card
+            "Call 555-0100 or 555-0199",
+            "Tracking 1Z999AA10123456784",
+            None,
+        ],
+    )
+    def test_other_numbers_are_kept(self, raw: str | None) -> None:
+        assert _metadata(description=raw).description == raw
+
+    def test_order_number_is_left_alone(self) -> None:
+        # Real order numbers can be long digit runs that pass the check.
+        assert _metadata(order_number="4111111111111111").order_number == (
+            "4111111111111111"
+        )

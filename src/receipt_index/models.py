@@ -163,6 +163,32 @@ def last_four_digits(value: object) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
+# A run of 13 to 19 digits, with single spaces or dashes allowed between them:
+# the shape of a card number as printed.
+_CARD_NUMBER = re.compile(r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,18}(?![0-9])")
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch)
+        if i % 2:
+            n = n * 2 - 9 if n > 4 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def scrub_card_numbers(text: str) -> str:
+    """``text`` with each card number (13 to 19 digits that pass the Luhn
+    check) replaced by "ending NNNN", its last four digits."""
+
+    def cut(match: re.Match[str]) -> str:
+        digits = _NOT_DIGIT.sub("", match.group(0))
+        return f"ending {digits[-4:]}" if _luhn_valid(digits) else match.group(0)
+
+    return _CARD_NUMBER.sub(cut, text)
+
+
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
 
 
@@ -222,6 +248,15 @@ class ReceiptMetadata(BaseModel):
     @classmethod
     def _order_number(cls, value: object) -> object:
         return _blank_to_none(value)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _no_card_numbers(cls, value: object) -> object:
+        # The prompt asks for no more than the last four digits anywhere; this
+        # holds whatever the model does, since the extraction history that
+        # keeps the output is append-only. order_number is left alone: real
+        # order numbers can be long digit runs that pass the check.
+        return scrub_card_numbers(value) if isinstance(value, str) else value
 
     @field_validator("payment", mode="after")
     @classmethod
