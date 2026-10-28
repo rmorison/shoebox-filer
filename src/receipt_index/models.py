@@ -227,10 +227,10 @@ def last_four_digits(value: object) -> str | None:
         return None
     view = _visible(str(value))
     text = view.text.strip()
-    if not view.soft and _GROUPED_DIGITS.fullmatch(text):
+    cards = _cards(view)
+    if _GROUPED_DIGITS.fullmatch(text) and (not view.soft or not cards):
         digits = "".join(_DIGITS.findall(text))
         return digits[-4:] if len(digits) >= 4 else None
-    cards = _cards(view)
     if len(cards) == 1 and len(cards[0][2]) == 1:
         begin, end, fours = cards[0]
         last4 = next(iter(fours))
@@ -310,12 +310,18 @@ def _run_candidates(
         if g_index:
             gap = run[groups[g_index - 1].end() : group.start()]
             joins.append(_separator_kind(gap))
+        cuts = [
+            cut for cut in range(group.start() + 1, group.end()) if offset + cut in soft
+        ]
+        # Dense soft breaks (obfuscated text: more than four, between more
+        # than half of the digits) break nothing: one number.
+        if len(cuts) > 4 and len(cuts) * 2 > group.end() - group.start():
+            cuts = []
         begin = group.start()
-        for cut in range(group.start() + 1, group.end()):
-            if offset + cut in soft:
-                pieces.append((begin, cut))
-                joins.append(None)
-                begin = cut
+        for cut in cuts:
+            pieces.append((begin, cut))
+            joins.append(None)
+            begin = cut
         pieces.append((begin, group.end()))
 
     found: list[tuple[int, int, str]] = []
@@ -362,7 +368,9 @@ def _cards(view: _Visible) -> list[tuple[int, int, set[str]]]:
     for begin, end, last4 in found:
         if merged and begin < merged[-1][1]:
             b, e, fours = merged[-1]
-            merged[-1] = (b, max(e, end), fours | {last4})
+            if len(fours) < 2:  # only "one last four or not" matters
+                fours.add(last4)
+            merged[-1] = (b, max(e, end), fours)
         else:
             merged.append((begin, end, {last4}))
     return merged

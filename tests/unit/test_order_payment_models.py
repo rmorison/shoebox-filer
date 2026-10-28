@@ -523,3 +523,28 @@ class TestSoftBreaks:
     )
     def test_last4_with_soft_breaks(self, raw: str) -> None:
         assert Payment.model_validate({"last4": raw}).last4 in ("1111", None)
+
+
+class TestDenseSoftBreaks:
+    def test_an_invisible_between_every_digit_reads_as_one_number(self) -> None:
+        # Obfuscated mail: a 23-digit tracking number is no card.
+        raw = "Tracking " + "\u200c".join("92612903412345678901234")
+        assert _metadata(description=raw).description == raw
+
+    def test_a_card_written_that_way_is_still_cut(self) -> None:
+        raw = "card " + "\u200c".join("4111111111111111")
+        out = _metadata(description=raw).description
+        assert out == "card ending 1111"
+
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            ("\ufeff1234 5678 9012 3456", "3456"),
+            ("1234 5678\u200b 9012 3456", "3456"),
+            ("\u200c1234-5678", "5678"),
+        ],
+    )
+    def test_last4_digit_groups_with_an_invisible_character(
+        self, raw: str, kept: str
+    ) -> None:
+        assert Payment.model_validate({"last4": raw}).last4 == kept
