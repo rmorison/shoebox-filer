@@ -1149,16 +1149,54 @@ class TestRetryOtherSourceDown:
     def test_another_source_down_skips_only_that_item(
         self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
     ) -> None:
-        ids = ["<msg-1@example.com>", "<msg-2@example.com>"]
-        for sid in ids:
-            history[sid] = [_log(sid, "failed", next_retry_at=_past())]
-        adapter = FetchByIdAdapter(unavailable_from=ids[0])
-        due = [history[s][0] for s in ids]
-        # The pass runs for "mail"; the item is looked for in "personal-email".
-        result = _retry(due, adapter, own_source="mail")
+        """Two IMAP sources: "scans" is down, the pass runs for "personal-email".
+
+        An item that names no source is looked for in "scans" first and left
+        for later; the next item, from the healthy own source, still runs.
+        """
+        from contextlib import ExitStack
+
+        from receipt_index.config import ImapSourceConfig
+        from receipt_index.fetching import SourcePool
+
+        legacy, own = "<msg-1@example.com>", "<msg-2@example.com>"
+        history[legacy] = [_log(legacy, "queued", attempt=0, source_name=None)]
+        history[own] = [_log(own, "failed", next_retry_at=_past())]
+        down = FetchByIdAdapter(unavailable_from=legacy)
+        healthy = FetchByIdAdapter()
+
+        def config(name: str) -> ImapSourceConfig:
+            return ImapSourceConfig(
+                name=name,
+                type="imap",
+                host="mail.example.com",
+                username="user@example.com",
+                password="x",  # pragma: allowlist secret
+                folder="INBOX",
+            )
+
+        adapters = {"scans": down, "personal-email": healthy}
+        with ExitStack() as stack:
+            pool = SourcePool(
+                [config("scans"), config("personal-email")],
+                lambda c: adapters[c.name],  # type: ignore[arg-type,return-value]
+                stack,
+            )
+            result = pipeline.run_due_retries(
+                MagicMock(),
+                [history[legacy][0], history[own][0]],
+                pool=pool,
+                store=_store(),
+                agents={"email": MagicMock(), "document": MagicMock()},
+                llm_model="test-model",
+                own_source="personal-email",
+            )
+
         assert result.stopped is None
-        assert repo.rows == []  # the second item hits the same down source
-        assert adapter.fetched == [ids[0]]
+        assert result.processed == 1
+        assert repo.statuses(legacy) == []  # left for a later run, no attempt used
+        assert repo.statuses(own) == ["started", "success"]
+        assert down.fetched == [legacy]
 
     def test_own_source_down_stops_the_pass(
         self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
