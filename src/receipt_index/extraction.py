@@ -539,23 +539,24 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
     return pdfs
 
 
-_MAX_LABEL_NAME = 100
+_MAX_LABEL_NAME = 255
 
 
 def _label_name(filename: str) -> str:
     """An attachment's file name, safe to put in a prompt label or a log line.
 
     The name comes from the email, so it can't be allowed to end its label
-    and fake a section: control and line-separator characters become
-    spaces, whitespace collapses to one space, runs of dashes become one,
-    and the name is cut to 100 characters. An ordinary name is unchanged,
-    so the model can still give it back as receipt_document.
+    and fake a section: control and line-separator characters (newlines
+    among them) become spaces, a run of three or more dashes becomes one,
+    and the name is cut to 255 characters. An ordinary name is unchanged,
+    so the model gives it back as receipt_document exactly as the MIME
+    headers have it; a name that had to be cleaned won't match.
     """
     chars = (
         " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
         for ch in filename
     )
-    name = re.sub(r"-{2,}", "-", " ".join("".join(chars).split()))
+    name = re.sub(r"-{3,}", "-", "".join(chars)).strip()
     if len(name) > _MAX_LABEL_NAME:
         name = name[: _MAX_LABEL_NAME - 1].rstrip() + "…"
     return name or "(no name)"
