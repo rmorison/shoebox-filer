@@ -141,6 +141,9 @@ class TestUpAndDown:
         _extraction(conn, receipt_id)
         conn.commit()
 
+        # 000015's receipt_events triggers use 000011's guard function, so
+        # 000015 comes down first and goes back up after.
+        _run(conn, _migration("000015", "down"))
         _run(conn, _migration("000011", "down"))
         row = conn.execute(
             "SELECT to_regclass('receipt.extractions') AS t,"
@@ -153,6 +156,7 @@ class TestUpAndDown:
         assert kept == {"n": 1}
 
         _run(conn, _migration("000011", "up"))
+        _run(conn, _migration("000015", "up"))
         row = conn.execute(
             "SELECT manual_fields FROM receipt.receipts WHERE id = %s", (receipt_id,)
         ).fetchone()
