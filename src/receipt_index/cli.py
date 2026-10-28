@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sys
+from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
     from receipt_index.adapters.base import SourceAdapter
     from receipt_index.config import SourceConfig
-    from receipt_index.models import IngestLogEntry, Receipt
+    from receipt_index.models import IngestLogEntry, Receipt, ReceiptEvent
     from receipt_index.requeue import OrphanReport, RequeueOutcome
 
 logger = logging.getLogger(__name__)
@@ -921,6 +922,76 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             click.echo(f"Email Date:   {receipt.email_date.isoformat()}")
         if receipt.file_name:
             click.echo(f"File:         {receipt.file_name}")
+
+
+def _parse_receipt_id(receipt_id: str) -> UUID:
+    try:
+        return UUID(receipt_id)
+    except ValueError:
+        click.echo(f"Error: invalid UUID: {receipt_id}", err=True)
+        sys.exit(1)
+
+
+def _shown(value: Any) -> str:
+    return "\u2014" if value is None else str(value)
+
+
+def _event_summary(event: ReceiptEvent) -> str:
+    """One line for an event's payload, by its type."""
+    payload = event.payload
+    if event.event_type == "field_edited":
+        return (
+            f"{payload.get('field')} {_shown(payload.get('old'))} \u2192 "
+            f"{_shown(payload.get('new'))}"
+        )
+    if event.event_type == "manual_cleared":
+        return f"{payload.get('field')} handed back to re-extraction"
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+@cli.command()
+@click.argument("receipt_id")
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def history(ctx: click.Context, receipt_id: str, output_format: str) -> None:
+    """Show a receipt's history: every change made after extraction."""
+    from receipt_index.db import get_connection
+    from receipt_index.repository import get_receipt_by_id, get_receipt_events
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _parse_receipt_id(receipt_id)
+
+    with get_connection(config.database.url) as conn:
+        receipt = get_receipt_by_id(conn, uid)
+        events = [] if receipt is None else get_receipt_events(conn, uid)
+
+    if receipt is None:
+        click.echo(f"Receipt not found: {receipt_id}", err=True)
+        sys.exit(1)
+
+    if output_format == "json":
+        data = [e.model_dump(mode="json") for e in events]
+        click.echo(json.dumps(data, indent=2))
+        return
+    if not events:
+        click.echo(f"No history for receipt {uid}.")
+        return
+    for event in events:
+        when = event.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+        line = (
+            f"{when}  {event.event_type:<16} "
+            f"{event.actor} ({event.actor_kind})  {_event_summary(event)}"
+        )
+        if event.reason:
+            line += f"  \u2014 {event.reason}"
+        click.echo(line)
 
 
 # The per-field confidences --confidence-below can name.

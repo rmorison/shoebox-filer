@@ -14,6 +14,7 @@ from receipt_index.models import (
     MIN_RECEIPT_CONFIDENCE,
     IngestLogEntry,
     Receipt,
+    ReceiptEvent,
     SyncState,
 )
 from receipt_index.store import LOCAL_SCHEME
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
     import psycopg
+
+    from receipt_index.models import ActorKind, EventType
 
 # The effective amount: paid when known, the total otherwise. The expression
 # matches idx_receipts_effective_amount, so keep the two in step.
@@ -1155,3 +1158,56 @@ def token_averages(
     if row is not None and int(row["runs"]) > 0:
         return {**row, "basis": "ingest_log"}
     return None
+
+
+# ---------------------------------------------------------------------------
+# The receipt history (receipt data-model design, §4)
+# ---------------------------------------------------------------------------
+
+
+def insert_event(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    event_type: EventType,
+    payload: dict[str, Any],
+    actor: str,
+    actor_kind: ActorKind,
+    reason: str | None = None,
+) -> ReceiptEvent:
+    """Append one row to ``receipt_events``. The caller commits.
+
+    The event belongs in the same transaction as the change it records.
+    """
+    cur = conn.execute(
+        """\
+        INSERT INTO receipt.receipt_events (
+            receipt_id, event_type, payload, actor, actor_kind, reason
+        ) VALUES (
+            %(receipt_id)s, %(event_type)s, %(payload)s, %(actor)s,
+            %(actor_kind)s, %(reason)s
+        )
+        RETURNING *
+        """,
+        {
+            "receipt_id": receipt_id,
+            "event_type": event_type,
+            "payload": Jsonb(payload),
+            "actor": actor,
+            "actor_kind": actor_kind,
+            "reason": reason,
+        },
+    )
+    return ReceiptEvent.model_validate(cur.fetchone())
+
+
+def get_receipt_events(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> list[ReceiptEvent]:
+    """A receipt's events, oldest first (UUID v7 breaks a timestamp tie)."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.receipt_events WHERE receipt_id = %(id)s"
+        " ORDER BY created_at, id",
+        {"id": receipt_id},
+    )
+    return [ReceiptEvent.model_validate(row) for row in cur.fetchall()]
