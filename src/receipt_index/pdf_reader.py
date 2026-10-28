@@ -1,18 +1,16 @@
-"""PDF text extraction with pdfplumber and Claude vision fallback."""
+"""PDF text extraction with pdfplumber.
+
+A PDF with too little text, such as a scan, gives an empty string. The
+caller then sends the PDF itself to the extraction agent as a document
+block (see ADR-0004), so this module makes no model calls.
+"""
 
 from __future__ import annotations
 
 import io
 import logging
-from typing import Any
 
 import pdfplumber
-from pydantic_ai import Agent, BinaryContent
-from pydantic_ai.capabilities import RaiseContentFilterError
-from pydantic_ai.exceptions import AgentRunError, ContentFilterError
-
-from receipt_index.llm import DEFAULT_MODEL, anthropic_model
-from receipt_index.models import redacted_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -21,37 +19,17 @@ logger = logging.getLogger(__name__)
 # provides a buffer while catching truly empty extractions from image-only PDFs.
 _MIN_TEXT_LENGTH = 20
 
-_VISION_SYSTEM_PROMPT = """\
-You are a document text extractor. Given a PDF document, extract ALL visible \
-text content exactly as it appears. Include:
-- All amounts, prices, and totals (preserve exact formatting)
-- All dates
-- Vendor/merchant names
-- Line items and descriptions
-- Any other readable text
 
-Return the raw text content only. Do not add commentary or formatting.\
-"""
-
-
-def extract_text(
-    pdf_bytes: bytes,
-    *,
-    vision_agent: Agent[None, str] | None = None,
-) -> str:
-    """Extract text from PDF bytes.
-
-    Strategy:
-    1. Try pdfplumber for text-based PDFs (fast, no API call)
-    2. Fall back to Claude vision for scanned/image PDFs
+def extract_text(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes with pdfplumber.
 
     Args:
         pdf_bytes: Raw PDF file content.
-        vision_agent: Optional pydantic-ai Agent for vision fallback
-                      (injected in tests).
 
     Returns:
-        Extracted text content, or empty string if extraction fails.
+        The extracted text, or an empty string when there is too little
+        text to use (fewer than 20 non-whitespace characters), as in a
+        scanned or image-only PDF, or when pdfplumber can't read the file.
     """
     text = _extract_with_pdfplumber(pdf_bytes)
     if _is_sufficient_text(text):
@@ -59,40 +37,10 @@ def extract_text(
         return text
 
     logger.info(
-        "pdfplumber extracted insufficient text (%d chars), "
-        "falling back to Claude vision",
-        len(text.strip()),
+        "pdfplumber extracted insufficient text (%d non-whitespace chars)",
+        len("".join(text.split())),
     )
-    return _extract_with_vision(pdf_bytes, agent=vision_agent)
-
-
-def create_vision_agent(
-    *,
-    api_key: str,
-    model: str = DEFAULT_MODEL,
-) -> Agent[None, str]:
-    """Create a pydantic-ai Agent configured for PDF text extraction.
-
-    Parameters
-    ----------
-    api_key:
-        Anthropic API key.
-    model:
-        Model identifier.
-    """
-    if not api_key:
-        msg = "Anthropic API key is required"
-        raise ValueError(msg)
-
-    llm, settings = anthropic_model(api_key=api_key, model=model)
-    return Agent(
-        llm,
-        output_type=str,
-        system_prompt=_VISION_SYSTEM_PROMPT,
-        model_settings=settings,
-        # A refusal ends the run, even after partial text.
-        capabilities=[RaiseContentFilterError()],
-    )
+    return ""
 
 
 def _extract_with_pdfplumber(pdf_bytes: bytes) -> str:
@@ -110,39 +58,3 @@ def _is_sufficient_text(text: str) -> bool:
     """Check if extracted text meets the minimum quality threshold."""
     stripped = "".join(text.split())
     return len(stripped) >= _MIN_TEXT_LENGTH
-
-
-def _extract_with_vision(
-    pdf_bytes: bytes,
-    *,
-    agent: Agent[None, str] | None = None,
-) -> str:
-    """Extract text from PDF using Claude vision API.
-
-    A model or API failure (pydantic-ai's ``AgentRunError``) means no usable
-    text: it is logged and gives ``""``. A refusal is raised, as it is for
-    the extraction agent, and so is anything else, such as a library or
-    programming error, rather than passing as an empty PDF.
-    """
-    if agent is None:
-        logger.warning("No vision agent provided; skipping vision extraction")
-        return ""
-
-    try:
-        result: Any = agent.run_sync(
-            [
-                "Extract all text content from this PDF document.",
-                BinaryContent(data=pdf_bytes, media_type="application/pdf"),
-            ]
-        )
-        return result.output  # type: ignore[no-any-return]
-    except ContentFilterError:
-        raise
-    except AgentRunError as exc:
-        # Not exc_info: the chain can hold the model's output and its link.
-        logger.warning(
-            "Vision extraction failed for PDF: %s\n%s",
-            type(exc).__name__,
-            redacted_traceback(exc),
-        )
-        return ""

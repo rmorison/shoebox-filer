@@ -644,7 +644,7 @@ Application runs directly on the host (not containerized) for Phase 1 — this i
 | `weasyprint` struggles with complex email HTML | Medium | Medium | Email HTML is often poorly structured. Test with real receipts early. Fall back to simpler HTML stripping + re-rendering if needed. |
 | IMAP connection reliability | Low | Low | Standard retry logic. Ingestion is one-shot, can be re-run. Idempotency ensures safety. |
 | Anthropic API rate limits or outages | Low | Low | Process receipts sequentially with modest delay. Idempotency allows resuming after partial failure. |
-| PDF attachments that are scanned images (not text) | Medium | Medium | A PDF attachment that opens but has too little text goes to the extraction model as a document, in the same request as the email text: at most three per email, of ten pages or fewer, and 20 MB in all with the email's images. A PDF that can't be read, or an encrypted scan, is left out, since the API would reject the whole request; an encrypted PDF with text still gives its text. |
+| PDF attachments that are scanned images (not text) | Medium | Medium | A PDF attachment that opens but has too little text goes to the extraction model as a document, in the same request as the email text: at most three per email, of ten pages or fewer, and 20 MB in all with the email's images. A PDF that can't be read, or an encrypted scan, is left out, since the API would reject the whole request; an encrypted PDF with text still gives its text. A Drive PDF or stored rendition with too little text also goes as a `document` block ([ADR-0004](../adr/0004-pdf-extraction-pdfplumber-plus-vision.md), amended). |
 
 ---
 

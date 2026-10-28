@@ -5,12 +5,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic_ai import BinaryContent
-from pydantic_ai.exceptions import ContentFilterError, ModelHTTPError
 
+from receipt_index import pdf_reader
 from receipt_index.pdf_reader import (
     _extract_with_pdfplumber,
-    _extract_with_vision,
     _is_sufficient_text,
     extract_text,
 )
@@ -66,48 +64,6 @@ class TestIsSufficientText:
         assert _is_sufficient_text("a " * 10) is False
 
 
-class TestExtractWithVision:
-    """Tests for Claude vision fallback."""
-
-    def test_calls_agent_with_binary_content(self) -> None:
-        mock_result = MagicMock()
-        mock_result.output = "Amazon Order $42.99"
-        mock_agent = MagicMock()
-        mock_agent.run_sync.return_value = mock_result
-
-        result = _extract_with_vision(b"%PDF-fake", agent=mock_agent)
-
-        assert result == "Amazon Order $42.99"
-        call_args = mock_agent.run_sync.call_args[0][0]
-        assert isinstance(call_args[1], BinaryContent)
-        assert call_args[1].media_type == "application/pdf"
-
-    def test_returns_empty_on_model_failure(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        mock_agent = MagicMock()
-        mock_agent.run_sync.side_effect = ModelHTTPError(400, "claude-haiku-5-5")
-
-        result = _extract_with_vision(b"%PDF-fake", agent=mock_agent)
-
-        assert result == ""
-        assert "Vision extraction failed for PDF: ModelHTTPError" in caplog.text
-
-    def test_library_error_is_not_swallowed(self) -> None:
-        mock_agent = MagicMock()
-        mock_agent.run_sync.side_effect = TypeError("unexpected keyword argument")
-
-        with pytest.raises(TypeError):
-            _extract_with_vision(b"%PDF-fake", agent=mock_agent)
-
-    def test_refusal_is_not_swallowed(self) -> None:
-        mock_agent = MagicMock()
-        mock_agent.run_sync.side_effect = ContentFilterError("refused")
-
-        with pytest.raises(ContentFilterError):
-            _extract_with_vision(b"%PDF-fake", agent=mock_agent)
-
-
 class TestExtractText:
     """Tests for the top-level extract_text function."""
 
@@ -119,50 +75,26 @@ class TestExtractText:
 
         assert "Amazon" in result
 
-    @patch("receipt_index.pdf_reader._extract_with_vision")
     @patch("receipt_index.pdf_reader._extract_with_pdfplumber")
-    def test_falls_back_to_vision_when_insufficient(
-        self, mock_plumber: MagicMock, mock_vision: MagicMock
+    def test_returns_empty_when_text_insufficient(
+        self, mock_plumber: MagicMock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        mock_plumber.return_value = ""
-        mock_vision.return_value = "Scanned receipt content"
+        # A scanned PDF yields too little text. The caller then sends the
+        # PDF itself to the extraction agent; there is no text-only model call.
+        mock_plumber.return_value = "Total"
 
-        result = extract_text(b"%PDF-fake")
-
-        assert result == "Scanned receipt content"
-        mock_vision.assert_called_once()
-
-    @patch("receipt_index.pdf_reader._extract_with_vision")
-    @patch("receipt_index.pdf_reader._extract_with_pdfplumber")
-    def test_returns_empty_when_both_fail(
-        self, mock_plumber: MagicMock, mock_vision: MagicMock
-    ) -> None:
-        mock_plumber.return_value = ""
-        mock_vision.return_value = ""
-
-        result = extract_text(b"%PDF-fake")
+        with caplog.at_level("DEBUG", logger="receipt_index.pdf_reader"):
+            result = extract_text(b"%PDF-fake")
 
         assert result == ""
+        assert "vision" not in caplog.text.lower()
 
-    @patch("receipt_index.pdf_reader._extract_with_pdfplumber")
-    def test_does_not_call_vision_when_pdfplumber_succeeds(
-        self, mock_plumber: MagicMock
-    ) -> None:
-        mock_plumber.return_value = "Sufficient text content here for extraction"
+    def test_takes_no_vision_agent(self) -> None:
+        with pytest.raises(TypeError):
+            extract_text(b"%PDF-fake", vision_agent=MagicMock())  # type: ignore[call-arg]
 
-        with patch("receipt_index.pdf_reader._extract_with_vision") as mock_vision:
-            extract_text(b"%PDF-fake")
-            mock_vision.assert_not_called()
-
-    @patch("receipt_index.pdf_reader._extract_with_vision")
-    @patch("receipt_index.pdf_reader._extract_with_pdfplumber")
-    def test_passes_vision_agent_through(
-        self, mock_plumber: MagicMock, mock_vision: MagicMock
-    ) -> None:
-        mock_plumber.return_value = ""
-        mock_vision.return_value = "vision result"
-        mock_agent = MagicMock()
-
-        extract_text(b"%PDF-fake", vision_agent=mock_agent)
-
-        mock_vision.assert_called_once_with(b"%PDF-fake", agent=mock_agent)
+    def test_has_no_vision_agent_factory(self) -> None:
+        assert not hasattr(pdf_reader, "create_vision_agent")
+        assert not hasattr(pdf_reader, "_extract_with_vision")
+        # No model client in this module, so extract_text can't call one.
+        assert not hasattr(pdf_reader, "Agent")

@@ -2,9 +2,9 @@
 
 Every other extraction test mocks the agent, so a lock that breaks the
 pydantic-ai/anthropic pairing leaves them green. These tests run the
-extraction agent and the PDF vision-text agent unmocked, against the stub
-Messages API in ``conftest.py``, so they need no API key and make no
-network call beyond 127.0.0.1.
+extraction agent unmocked, against the stub Messages API in
+``conftest.py``, so they need no API key and make no network call beyond
+127.0.0.1.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from receipt_index.extraction import (
     extract_metadata,
 )
 from receipt_index.models import Attachment, RawReceipt
-from receipt_index.pdf_reader import create_vision_agent, extract_text
 from tests.pdfs import make_pdf
 from tests.unit.conftest import STUB_INPUT_TOKENS, STUB_OUTPUT_TOKENS
 
@@ -52,7 +51,6 @@ _OUTPUT = {
     "confidence": 0.9,
     "field_confidence": {"vendor": 0.9, "amount": 0.9, "paid_amount": 0.5, "date": 0.9},
 }
-_VISION_TEXT = "Acme Parking (U.S.), LLC 2026-10-27 Total $12.34"
 
 _SAMPLING = ("temperature", "top_p", "top_k")
 
@@ -60,7 +58,6 @@ _SAMPLING = ("temperature", "top_p", "top_k")
 @pytest.fixture
 def stub(stub_api: StubAnthropic) -> StubAnthropic:
     stub_api.tool_input = _OUTPUT
-    stub_api.text = _VISION_TEXT
     return stub_api
 
 
@@ -253,24 +250,3 @@ def test_refusal_without_details(stub: StubAnthropic) -> None:
     assert info.value.category is None
     assert info.value.explanation is None
     assert str(info.value) == "The model declined to extract this receipt."
-
-
-def test_vision_text_path_through_locked_stack(stub: StubAnthropic) -> None:
-    agent = create_vision_agent(api_key=_KEY, model=_MODEL)
-
-    text = extract_text(_EMPTY_PDF, vision_agent=agent)
-
-    assert text == _VISION_TEXT
-    _assert_request(stub)
-    assert "document" in _content_types(stub.requests[0])
-
-
-@pytest.mark.parametrize("reply", ["refusal", "partial_refusal"])
-def test_vision_text_refusal_is_not_swallowed(
-    stub: StubAnthropic, reply: Reply
-) -> None:
-    stub.reply = reply
-    agent = create_vision_agent(api_key=_KEY, model=_MODEL)
-
-    with pytest.raises(ContentFilterError):
-        extract_text(_EMPTY_PDF, vision_agent=agent)
