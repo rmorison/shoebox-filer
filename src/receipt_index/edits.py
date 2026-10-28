@@ -83,6 +83,13 @@ def _scrubbed(text: str | None) -> str | None:
     return None if text is None else scrub_card_numbers(text)
 
 
+def _history_value(receipt: Receipt, name: str) -> Any:
+    """A field's current value for an event; a vendor without card numbers
+    (a receipt extracted before vendor was scrubbed may hold one)."""
+    value = getattr(receipt, name, None)
+    return _scrubbed(value) if name == "vendor" else value
+
+
 def _locked(conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID) -> Receipt:
     receipt = lock_receipt(conn, receipt_id)
     if receipt is None:
@@ -138,7 +145,7 @@ def edit_receipt(
                 event_type="field_edited",
                 payload={
                     "field": name,
-                    "old": _jsonable(old),
+                    "old": _jsonable(_scrubbed(old) if name == "vendor" else old),
                     "new": _jsonable(new),
                     "old_confidence": old_confidence,
                 },
@@ -187,7 +194,7 @@ def clear_manual(
             conn,
             receipt_id=receipt_id,
             event_type="manual_cleared",
-            payload={"field": name, "value": _jsonable(getattr(receipt, name, None))},
+            payload={"field": name, "value": _jsonable(_history_value(receipt, name))},
             actor=actor,
             actor_kind="person",
             reason=reason,

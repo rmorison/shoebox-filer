@@ -248,3 +248,14 @@ class TestHandEnteredText:
         assert db.updates[0]["columns"] == {"vendor": "Acme ending 1111"}
         assert db.events[0]["payload"]["new"] == "Acme ending 1111"
         assert db.events[0]["reason"] == "card ending 1111 on the statement"
+
+    def test_an_old_vendor_is_scrubbed_in_the_event(self, db: FakeDb) -> None:
+        # A receipt extracted before vendor scrubbing may hold a card number.
+        db.receipt = _receipt(vendor="Acme 4111 1111 1111 1111")
+        edit_receipt(db.conn, _ID, {"vendor": "Acme"}, actor="op", reason=None)
+        assert db.events[0]["payload"]["old"] == "Acme ending 1111"
+        db.receipt = _receipt(
+            vendor="Acme 4111 1111 1111 1111", manual_fields=["vendor"]
+        )
+        clear_manual(db.conn, _ID, ["vendor"], actor="op", reason=None)
+        assert db.events[1]["payload"]["value"] == "Acme ending 1111"

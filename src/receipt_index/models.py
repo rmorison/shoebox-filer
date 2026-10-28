@@ -163,9 +163,14 @@ def last_four_digits(value: object) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-# A run of digit groups joined by single spaces or dashes: where a card
-# number, printed with or without separators, can sit among other numbers.
-_DIGIT_RUN = re.compile(r"(?<![0-9])[0-9]+(?:[ -][0-9]+)*(?![0-9])")
+# What can sit between the digit groups of a printed card number: one or two
+# spaces (including no-break and thin spaces from HTML email), or a dash, en
+# or em dash, dot or slash with an optional space either side.
+_SPACE = "[ \t\u00a0\u2009\u202f]"
+_SEPARATOR = rf"(?:{_SPACE}{{1,2}}|{_SPACE}?[-\u2010-\u2015./]{_SPACE}?)"
+# A run of digit groups joined by separators: where a card number, printed
+# with or without them, can sit among other numbers.
+_DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
 _DIGIT_GROUP = re.compile(r"[0-9]+")
 
 
@@ -218,8 +223,8 @@ _REMOVED = "[card number removed]"
 
 
 def scrub_card_numbers(text: str) -> str:
-    """``text`` with each card number (13 to 19 digits, spaces or dashes
-    allowed between groups, that pass the Luhn check) replaced by
+    """``text`` with each card number (13 to 19 digits, spaces, dashes,
+    dots or slashes allowed between groups, that pass the Luhn check) replaced by
     "ending NNNN", its last four digits, or "[card number removed]" when
     overlapping candidates disagree on them."""
 

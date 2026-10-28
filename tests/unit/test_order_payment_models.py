@@ -239,6 +239,21 @@ class TestDescriptionScrub:
     ) -> None:
         assert _metadata(description=raw).description == kept
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "card 4111\u00a01111\u00a01111\u00a01111",  # no-break space
+            "card 4111\u20131111\u20131111\u20131111",  # en dash
+            "card 4111  1111 1111 1111",
+            "card 4111 - 1111 - 1111 - 1111",
+            "card 4111.1111.1111.1111",
+            "card 4111/1111/1111/1111",
+        ],
+    )
+    def test_other_separators(self, raw: str) -> None:
+        # HTML email often carries no-break spaces and en dashes.
+        assert _metadata(description=raw).description == "card ending 1111"
+
     def test_a_run_of_one_repeated_digit_is_kept(self) -> None:
         # All-zero spans always pass the Luhn check; they are no card.
         raw = "USPS 9400 1000 0000 0000 0000 00"
