@@ -58,7 +58,7 @@ Optional variables (defaults are usually fine):
 | Variable | Description | Default |
 |---|---|---|
 | `MIGRATION_DATABASE_URL` | Superuser URL for running migrations | (see `example.env`) |
-| `LLM_MODEL` | Anthropic model for metadata extraction | `claude-haiku-4-5-20251001` |
+| `LLM_MODEL` | Anthropic model for metadata extraction | `claude-haiku-5-5` |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
 
 The `PLAYWRIGHT_BROWSERS_PATH` and Docker port variables can generally be left at their defaults.

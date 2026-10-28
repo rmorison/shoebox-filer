@@ -308,9 +308,9 @@ Exit codes: 0 when every receipt was applied, unchanged or current; 1 when any f
 
 ```yaml
 llm:
-  model: claude-haiku-4-5-20251001
-  price_per_mtok_input: 1.00    # optional, per million input tokens
-  price_per_mtok_output: 5.00   # optional, per million output tokens
+  model: claude-haiku-5-5
+  price_per_mtok_input: 0.10    # optional, per million input tokens
+  price_per_mtok_output: 0.50   # optional, per million output tokens
 ```
 
 Prices change, so they are configuration, not code.
@@ -325,7 +325,7 @@ uv run receipt-index reextract --date-from 2025-01-01 --date-to 2025-12-31 --dry
 uv run receipt-index reextract --source personal-email --date-from 2026-01-01 --date-to 2026-03-31
 
 # After changing llm.model: receipts last extracted by another model
-uv run receipt-index reextract --model-not claude-haiku-4-5-20251001 --all --dry-run
+uv run receipt-index reextract --model-not claude-haiku-5-5 --all --dry-run
 
 # Look again at receipts whose paid amount was uncertain
 uv run receipt-index reextract --confidence-below paid_amount=0.5 --force --all

@@ -8,6 +8,9 @@ from typing import Any
 
 import pdfplumber
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai.exceptions import AgentRunError, ContentFilterError
+
+from receipt_index.llm import DEFAULT_MODEL, anthropic_model
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +67,7 @@ def extract_text(
 def create_vision_agent(
     *,
     api_key: str,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = DEFAULT_MODEL,
 ) -> Agent[None, str]:
     """Create a pydantic-ai Agent configured for PDF text extraction.
 
@@ -79,10 +82,12 @@ def create_vision_agent(
         msg = "Anthropic API key is required"
         raise ValueError(msg)
 
+    llm, settings = anthropic_model(api_key=api_key, model=model)
     return Agent(
-        f"anthropic:{model}",
+        llm,
         output_type=str,
         system_prompt=_VISION_SYSTEM_PROMPT,
+        model_settings=settings,
     )
 
 
@@ -108,7 +113,13 @@ def _extract_with_vision(
     *,
     agent: Agent[None, str] | None = None,
 ) -> str:
-    """Extract text from PDF using Claude vision API."""
+    """Extract text from PDF using Claude vision API.
+
+    A model or API failure (pydantic-ai's ``AgentRunError``) means no usable
+    text: it is logged and gives ``""``. A refusal is raised, as it is for
+    the extraction agent, and so is anything else, such as a library or
+    programming error, rather than passing as an empty PDF.
+    """
     if agent is None:
         logger.warning("No vision agent provided; skipping vision extraction")
         return ""
@@ -121,6 +132,10 @@ def _extract_with_vision(
             ]
         )
         return result.output  # type: ignore[no-any-return]
-    except Exception:
-        logger.warning("Vision extraction failed for PDF", exc_info=True)
+    except ContentFilterError:
+        raise
+    except AgentRunError as exc:
+        logger.warning(
+            "Vision extraction failed for PDF: %s", type(exc).__name__, exc_info=True
+        )
         return ""

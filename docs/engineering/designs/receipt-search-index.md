@@ -463,7 +463,7 @@ RECEIPT_STORE_PATH=./data/receipts
 
 # Optional
 LOG_LEVEL=INFO
-LLM_MODEL=claude-haiku-4-5-20251001
+LLM_MODEL=claude-haiku-5-5
 ```
 
 ### Dependencies
