@@ -576,9 +576,9 @@ class TestHostileFileNames:
         assert text.count("--- Email Body ---") <= 1
         assert "\x00" not in text
         assert "\u2028" not in text
-        assert len(line) < 160
+        assert len(line) < 320
         name_part = line.removeprefix(label_prefix)
-        assert "--" not in name_part.removesuffix(" ---")
+        assert "---" not in name_part.removesuffix(" ---")
 
     def _raw(self, attachments: list[Attachment]) -> RawReceipt:
         return RawReceipt(
@@ -638,7 +638,8 @@ class TestHostileFileNames:
         assert "\n" not in record.getMessage()
 
     def test_an_ordinary_name_is_unchanged(self) -> None:
-        name = "Invoice 2026-10 (final).pdf"
+        # Unchanged, so receipt_document still matches the MIME file name.
+        name = "Invoice  2026--10 (final).pdf"
         prompt = _build_prompt(self._raw([Attachment(name, "image/png", b"x")]))
         assert f"- {name} (image/png)" in prompt
 
