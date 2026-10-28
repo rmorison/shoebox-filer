@@ -25,6 +25,7 @@ from receipt_index.repository import (
     find_refund_purchases,
     find_unlinked_refunds,
     insert_event,
+    lock_if_purchase,
     lock_receipt,
     set_refund_of,
     was_unlinked,
@@ -83,7 +84,7 @@ def link_by_rule(
         if receipt.refund_of is not None or was_unlinked(conn, receipt.id):
             return []
         matches = find_refund_purchases(conn, receipt)
-        if len(matches) != 1:
+        if len(matches) != 1 or not lock_if_purchase(conn, matches[0]):
             return []
         return [
             _link_event(

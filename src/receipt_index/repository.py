@@ -1339,9 +1339,9 @@ def find_refund_purchases(
     Same order number, same vendor (any case), same currency, and a paid
     amount above zero, which leaves out confirmation and shipping emails and
     unpaid invoices that share the order number. The rule links only when
-    there is exactly one. The matches are read ``FOR SHARE``: a concurrent
-    change to a match's kind waits for the link, or the link waits for it
-    and sees the new kind, so a refund never links to a non-purchase.
+    there is exactly one. The matches are read without a lock, so that
+    candidates the rule won't link are never locked: the one it links is
+    locked by ``lock_if_purchase``.
     """
     if refund.order_number is None:
         return []
@@ -1354,7 +1354,6 @@ def find_refund_purchases(
           AND currency = %(currency)s
           AND paid_amount > 0
         ORDER BY id
-        FOR SHARE
         """,
         {
             "id": refund.id,
@@ -1399,6 +1398,23 @@ def find_unlinked_refunds(
         },
     )
     return [Receipt.model_validate(row) for row in cur.fetchall()]
+
+
+def lock_if_purchase(
+    conn: psycopg.Connection[dict[str, Any]], purchase_id: UUID
+) -> bool:
+    """Lock a purchase ``FOR SHARE`` and say whether it still is one.
+
+    A concurrent change to its kind either waits for the link, or the link
+    waits for it and sees the new kind, so a refund never links to a
+    non-purchase. Only the one purchase the rule is about to link is locked.
+    """
+    cur = conn.execute(
+        "SELECT kind FROM receipt.receipts WHERE id = %(id)s FOR SHARE",
+        {"id": purchase_id},
+    )
+    row = cur.fetchone()
+    return row is not None and row["kind"] == "purchase"
 
 
 def was_unlinked(conn: psycopg.Connection[dict[str, Any]], refund_id: UUID) -> bool:
