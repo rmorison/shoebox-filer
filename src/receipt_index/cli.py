@@ -386,8 +386,8 @@ def search(
         _print_receipts(results)
         if link_only:
             click.echo(
-                f"\n{link_only} link-only item(s) in all (not filtered by this "
-                "search): receipts that are only a link aren't indexed. See "
+                f"\n{link_only} link-only item(s) (not filtered by vendor, "
+                "amount or date): receipts that are only a link aren't indexed. See "
                 "`receipt-index failures --status link-only`."
             )
 

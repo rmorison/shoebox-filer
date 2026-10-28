@@ -629,8 +629,9 @@ class TestSearchCommand:
         args = ["--config", str(config_file), "search", "--needs-review"]
         result = runner.invoke(cli, args)
         assert result.exit_code == 0, result.output
-        assert "2 link-only item(s) in all" in result.output
-        assert "not filtered" in result.output
+        assert "2 link-only item(s) (not filtered by vendor, amount or date)" in (
+            result.output
+        )
         assert "failures --status link-only" in result.output
         assert mock_count.call_args.kwargs["status"] == "link-only"
 
@@ -655,7 +656,7 @@ class TestSearchCommand:
             cli, ["--config", str(config_file), "search", "--needs-review"]
         )
         assert "No receipts found." in result.output
-        assert "1 link-only item(s) in all" in result.output
+        assert "1 link-only item(s)" in result.output
 
     @patch("receipt_index.repository.count_ingest_failures", return_value=0)
     @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
