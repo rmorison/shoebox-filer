@@ -831,12 +831,13 @@ docker compose -f deploy/docker-compose.yml build
 # committing its row leaves an orphan file behind. Check for an in-flight cycle
 # first — ticks land on :00/:15/:30/:45 and normally finish in well under a
 # minute, so there is a wide idle window.
-# Idle only when the output is exactly `pgrep-exit=1`. `pgrep-exit=0` lists a
-# running ingest: wait and check again. Anything else, or no `pgrep-exit` line
-# at all (the container is down, or the exec failed), means the check didn't
-# run: find out why before going on. The `[r]` keeps pgrep from matching the
-# shell that runs it.
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
+# The image has no pgrep, so the check reads each process's command line
+# from /proc. Idle only when the output is exactly `check-exit=1`.
+# `check-exit=0` lists a running ingest: wait and check again. Anything else,
+# or no `check-exit` line at all (the container is down, or the exec failed),
+# means the check didn't run: find out why before going on. The `[r]` keeps
+# grep from matching the shell that runs it.
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
@@ -1031,10 +1032,10 @@ Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. Leave `
 docker compose -f deploy/docker-compose.yml config --quiet
 ```
 
-**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints exactly `pgrep-exit=1`, as in [8.1](#81-upgrade):
+**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints exactly `check-exit=1`, as in [8.1](#81-upgrade):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1084,7 +1085,7 @@ DROP OWNED BY receipt_index_mcp;
 DROP ROLE receipt_index_mcp;
 ```
 
-**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove a login, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8.
+**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
 
 ---
 
@@ -1151,10 +1152,10 @@ On [rootless Docker](#rootless-docker), chown it from inside a container instead
 RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 ```
 
-**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints exactly `pgrep-exit=1`:
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints exactly `check-exit=1`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
