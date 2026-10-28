@@ -1,7 +1,8 @@
 -- A link-only receipt: an email whose receipt is only a link to a hosted
 -- receipt. The item is recorded as 'skipped' with the link here, so
--- `failures --status link-only` lists it for review and `retry` can requeue
--- it once link-following exists. The link may carry a personal token: it is
+-- `failures --status link-only` lists it for the operator, who opens the
+-- link and saves the receipt by hand. Ingest never follows the link. It
+-- may carry a personal token: it is
 -- stored on this row only, never in the extraction history or the logs.
 
 ALTER TABLE receipt.ingest_log

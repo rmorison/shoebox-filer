@@ -111,7 +111,7 @@ def test_a_link_only_email_is_listed_and_can_be_requeued(
     outcome = apply_requeue(pg_conn, spec, candidates)
     assert outcome.requeued == [link_only]
 
-    # Until link-following exists, the requeued item is a link-only skip again.
+    # Ingest never follows the link: the requeued item is a link-only skip again.
     agent = MagicMock()
     agent.run_sync.return_value = _low_confidence(_LINK)
     _, retried = _ingest(pg_conn, config, store, agent, policy)

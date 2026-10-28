@@ -459,8 +459,8 @@ def _aware(value: datetime | None) -> datetime | None:
         "Items whose latest row is: failed (retrying or terminal); retrying "
         "(due again later); terminal (not retried automatically); skipped "
         "(judged not a receipt); queued (requeued by `retry`); link-only "
-        "(skipped because the receipt is only a link, which isn't followed "
-        "yet; --output json gives the link)."
+        "(skipped because the receipt is only a link, which ingest doesn't "
+        "follow; --output json gives the link)."
     ),
 )
 @click.option(

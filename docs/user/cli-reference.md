@@ -74,7 +74,7 @@ uv run receipt-index ingest
 3. For each new item:
    - Records that work on it has started, so the run's position can move past it safely
    - Sends the email or file content to Claude Haiku to extract vendor, total, paid amount, date, description and per-field confidence (see [Amounts](#amounts))
-   - If the LLM confidence is too low, the item is skipped (not a receipt). When the email's receipt is only a link to a hosted receipt ("View your receipt"), the skip is recorded as a link-only receipt, with the link, so that [`failures --status link-only`](#failures) lists it for review. The link isn't followed yet
+   - If the LLM confidence is too low, the item is skipped (not a receipt). When the email's receipt is only a link to a hosted receipt ("View your receipt"), the skip is recorded as a link-only receipt, with the link, so that [`failures --status link-only`](#failures) lists it for the operator to save by hand. Ingest never follows the link
    - Renders the email as a PDF (using Playwright headless Chromium, with weasyprint fallback)
    - Stores the metadata in PostgreSQL and the PDF in the file store
 4. Saves each source's new read position.
@@ -284,7 +284,7 @@ uv run receipt-index failures [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt), `queued` (requeued with `retry`, waiting for the next ingest) or `link-only` (skipped because the receipt is only a link to a hosted receipt, which isn't followed yet; `skipped` lists these too) |
+| `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt), `queued` (requeued with `retry`, waiting for the next ingest) or `link-only` (skipped because the receipt is only a link to a hosted receipt, which ingest doesn't follow; `skipped` lists these too) |
 | `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
 | `--source NAME` | Only items from this source |
 | `--orphans` | Instead, list stored PDFs that a failed attempt left behind and no receipt references, whatever the item's state now (for example after a retry succeeded and stored a new one). Nothing is deleted |
@@ -345,7 +345,7 @@ uv run receipt-index retry --error-like "renderer" --yes
 # Take a second look at skipped items from one source
 uv run receipt-index retry --status skipped --source personal-email --all --yes
 
-# Requeue the link-only receipts (once link-following exists)
+# Requeue the link-only receipts, for example after a prompt change
 uv run receipt-index retry --status link-only --all --yes
 
 # Who requeued what

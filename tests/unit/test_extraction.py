@@ -177,6 +177,44 @@ class TestStripHtmlTags:
             "Receipt <https://receipts.example.com/r?a=1&b=2>"
         )
 
+    def test_a_newsletter_keeps_none_of_its_links(self) -> None:
+        # Tracking, shop and unsubscribe links: no receipt or order word in
+        # their text or URL, so none reaches the prompt.
+        links = [
+            ("https://click.example.com/t/a1b2?u=xyz", "Shop the sale"),
+            ("https://click.example.com/t/c3d4?u=xyz", "New arrivals"),
+            ("https://www.example.com/stores", "Find a store"),
+            ("https://social.example.com/acme", "Follow us"),
+            ("https://click.example.com/unsub?u=xyz", "Unsubscribe"),
+        ]
+        html = "".join(f'<a href="{url}">{text}</a> ' for url, text in links)
+        assert "http" not in _strip_html_tags(html)
+
+    @pytest.mark.parametrize(
+        ("text", "url"),
+        [
+            ("View your receipt", "https://pos.example.com/r/abc123"),
+            ("Click here", "https://shop.example.com/orders/123"),
+            ("Your INVOICE", "https://billing.example.com/d/9"),
+            ("Transaction details", "https://pay.example.com/t/7"),
+            ("Your purchase", "https://shop.example.com/p/7"),
+        ],
+    )
+    def test_a_receipt_or_order_link_is_kept(self, text: str, url: str) -> None:
+        assert _strip_html_tags(f'<a href="{url}">{text}</a>') == f"{text} <{url}>"
+
+    def test_at_most_ten_links_are_kept(self) -> None:
+        html = "".join(
+            f'<a href="https://shop.example.com/orders/{n}">Order {n}</a> '
+            for n in range(12)
+        )
+        text = _strip_html_tags(html)
+        assert text.count("<https://") == 10
+        assert "orders/9>" in text
+        assert "orders/10>" not in text
+        # The text of every link stays, kept URL or not.
+        assert "Order 11" in text
+
     def test_html_only_email_prompt_carries_the_link(self) -> None:
         raw = RawReceipt(
             source_id="<link@example.com>",

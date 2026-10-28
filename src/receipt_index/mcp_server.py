@@ -734,7 +734,7 @@ def build_server(
                 description=(
                     "'failed' (default): items whose latest attempt failed. "
                     "'link-only': items skipped because the receipt is only a "
-                    "link to a hosted receipt, which isn't followed yet."
+                    "link to a hosted receipt, which ingest doesn't follow."
                 )
             ),
         ] = "failed",

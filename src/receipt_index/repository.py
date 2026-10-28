@@ -548,7 +548,7 @@ FailureStatus = Literal[
     "failed", "retrying", "terminal", "skipped", "queued", "link-only"
 ]
 
-# A skip whose receipt is only a link to a hosted receipt, not followed yet.
+# A skip whose receipt is only a link to a hosted receipt (never followed).
 _LINK_ONLY = "l.status = 'skipped' AND l.receipt_link IS NOT NULL"
 
 # Each --status value, over the latest row.

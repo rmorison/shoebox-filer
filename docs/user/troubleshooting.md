@@ -70,14 +70,14 @@ Skipped messages are those the LLM determined are not receipts (low confidence).
 
 ### A receipt that is only a link
 
-Some merchants, point-of-sale systems especially, send an email that holds only a link to a hosted receipt. Ingest doesn't follow the link yet. It records the item as a link-only receipt, with the link, instead of skipping it silently:
+Some merchants, point-of-sale systems especially, send an email that holds only a link to a hosted receipt. Ingest doesn't follow the link, since most receipt and order pages need a login. It records the item as a link-only receipt, with the link, instead of skipping it silently:
 
 ```bash
 uv run receipt-index failures --status link-only                # host and subject
 uv run receipt-index failures --status link-only --output json  # with receipt_link
 ```
 
-Open the link to get the receipt by hand. Once ingest can follow links, `retry --status link-only --all --yes` requeues them all. Items skipped before link-only receipts were recorded can be re-checked with `retry --status skipped --since YYYY-MM-DD --yes`: their links then show up in this list.
+Open each link and save the receipt by hand. The item stays on this list, since a receipt saved by hand is a new item, so use `--since YYYY-MM-DD` to see only the new ones. Items skipped before link-only receipts were recorded can be re-checked with `retry --status skipped --since YYYY-MM-DD --yes`: their links then show up in this list.
 
 ### `amount > 0` validation errors
 
