@@ -463,9 +463,11 @@ def _strip_html_tags(html: str) -> str:
     return stripper.get_text()
 
 
-# A link worth showing the extractor: its text or URL names a receipt or an
-# order. A best guess, so that newsletters' tracking links stay out of the
-# prompt and receipt_link stays a likely receipt.
+# A link worth showing the extractor: its text (an image button's alt text
+# included) or URL names a receipt or an order. A best guess: most of a
+# newsletter's tracking links stay out of the prompt, though a "View this
+# email in your browser" link matches, and receipt_link stays a likely
+# receipt.
 _RECEIPT_LINK_WORDS = re.compile(
     r"receipt|order|invoice|transaction|purchase|view", re.IGNORECASE
 )
@@ -488,23 +490,30 @@ class _HTMLTagStripper(HTMLParser):
         # The open anchor's URL and where its text starts in _parts.
         self._href: str | None = None
         self._href_start = 0
+        self._alt: list[str] = []
         self._kept = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "img" and self._href is not None:
+            # An image button's alt text is its text, for matching only.
+            self._alt.append(dict(attrs).get("alt") or "")
+            return
         if tag != "a":
             return
         href = (dict(attrs).get("href") or "").strip()
         if href.lower().startswith(("http://", "https://")):
             self._href = href
             self._href_start = len(self._parts)
+            self._alt = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag != "a" or self._href is None:
             return
         href, self._href = self._href, None
         text = "".join(self._parts[self._href_start :]).strip()
+        alt = " ".join(self._alt)
         if self._kept >= _MAX_LINKS_KEPT or not _RECEIPT_LINK_WORDS.search(
-            f"{text} {href}"
+            f"{text} {alt} {href}"
         ):
             return
         self._kept += 1

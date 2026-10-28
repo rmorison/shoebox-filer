@@ -203,6 +203,16 @@ class TestStripHtmlTags:
     def test_a_receipt_or_order_link_is_kept(self, text: str, url: str) -> None:
         assert _strip_html_tags(f'<a href="{url}">{text}</a>') == f"{text} <{url}>"
 
+    def test_an_image_button_matches_on_its_alt_text(self) -> None:
+        html = (
+            '<a href="https://t.example.com/c/9">'
+            '<img src="https://t.example.com/b.png" alt="View receipt"></a>'
+        )
+        assert _strip_html_tags(html) == " <https://t.example.com/c/9>"
+
+    def test_alt_text_of_an_image_outside_a_link_is_ignored(self) -> None:
+        assert _strip_html_tags('<img alt="View receipt">') == ""
+
     def test_at_most_ten_links_are_kept(self) -> None:
         html = "".join(
             f'<a href="https://shop.example.com/orders/{n}">Order {n}</a> '
