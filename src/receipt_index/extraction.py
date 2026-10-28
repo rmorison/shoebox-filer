@@ -156,8 +156,9 @@ _MIN_TEXT_LENGTH = 20
 # Scanned PDF attachments sent to the model as documents, per email. Every
 # page costs input tokens for its text and its image, so these bound one
 # email's cost: a scanned receipt or invoice runs to a page or three, and a
-# longer scan is unlikely to be a receipt. The byte cap keeps the request,
-# after base64, under the Messages API's 32 MB limit.
+# longer scan is unlikely to be a receipt. The byte cap, which image
+# attachments count toward too, keeps the request, after base64, under the
+# Messages API's 32 MB limit.
 _MAX_EMAIL_PDF_DOCUMENTS = 3
 _MAX_EMAIL_PDF_PAGES = 10
 _MAX_EMAIL_PDF_BYTES = 20_000_000
@@ -459,22 +460,33 @@ class _PdfAttachments:
     documents: list[Attachment] = field(default_factory=list)
 
 
-def _read_pdf(data: bytes) -> tuple[int, str] | None:
-    """A PDF's page count and text, or None when it can't be read.
+@dataclass
+class _PdfRead:
+    """What pdfplumber found in one PDF. ``text`` is None when not read."""
 
-    An encrypted PDF counts as unreadable even when pdfplumber opens it (an
-    owner password only): the API rejects it as a document.
+    pages: int
+    text: str | None
+    encrypted: bool
+
+
+def _read_pdf(data: bytes, *, text_up_to_pages: int | None = None) -> _PdfRead | None:
+    """A PDF's page count, text and encryption, or None when it can't be read.
+
+    With ``text_up_to_pages``, a longer PDF's text isn't read. Any failure,
+    on opening or on a page, means unreadable, never a scan.
     """
     import pdfplumber
 
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            if pdf.doc.encryption is not None:
-                return None
-            pages = [page.extract_text() or "" for page in pdf.pages]
+            pages = len(pdf.pages)
+            encrypted = pdf.doc.encryption is not None
+            if text_up_to_pages is not None and pages > text_up_to_pages:
+                return _PdfRead(pages, None, encrypted)
+            texts = [page.extract_text() or "" for page in pdf.pages]
     except Exception:  # any failure means unreadable, never a scan
         return None
-    return len(pages), "\n\n".join(pages).strip()
+    return _PdfRead(pages, "\n\n".join(texts).strip(), encrypted)
 
 
 def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
@@ -482,34 +494,41 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
 
     The first PDF with text gives the text section; later ones are left
     out, as before. A PDF that opens but has too little text is a scan and
-    goes as a document, within the caps above. A PDF that can't be read, or
-    is encrypted, is left out: sent, it would fail the whole request.
+    goes as a document, within the caps above; image attachments, which
+    are all sent, count toward the byte cap. A PDF that can't be read, or
+    an encrypted scan, is left out: sent, it would fail the whole request.
     """
     pdfs = _PdfAttachments()
-    sent_bytes = 0
+    sent_bytes = sum(len(att.data) for att in _image_attachments(attachments))
     for att in attachments:
         if _base_content_type(att.content_type) != "application/pdf":
             continue
-        read = _read_pdf(att.data)
+        # Once the text is found, a PDF too long to be a document isn't
+        # read through: it can be neither.
+        limit = _MAX_EMAIL_PDF_PAGES if pdfs.text is not None else None
+        read = _read_pdf(att.data, text_up_to_pages=limit)
         if read is None:
             logger.info("PDF attachment %s can't be read; left out", att.filename)
             continue
-        pages, text = read
-        if _has_sufficient_text(text):
+        if read.text is None:
+            reason = f"{read.pages} pages, over {_MAX_EMAIL_PDF_PAGES}"
+        elif _has_sufficient_text(read.text):
             if pdfs.text is None:
-                pdfs.text_name, pdfs.text = att.filename, text
+                pdfs.text_name, pdfs.text = att.filename, read.text
             continue
-        if len(pdfs.documents) >= _MAX_EMAIL_PDF_DOCUMENTS:
+        elif read.encrypted:
+            reason = "encrypted"
+        elif len(pdfs.documents) >= _MAX_EMAIL_PDF_DOCUMENTS:
             reason = f"already {_MAX_EMAIL_PDF_DOCUMENTS} scanned PDFs"
-        elif pages > _MAX_EMAIL_PDF_PAGES:
-            reason = f"{pages} pages, over {_MAX_EMAIL_PDF_PAGES}"
+        elif read.pages > _MAX_EMAIL_PDF_PAGES:
+            reason = f"{read.pages} pages, over {_MAX_EMAIL_PDF_PAGES}"
         elif sent_bytes + len(att.data) > _MAX_EMAIL_PDF_BYTES:
             reason = f"{len(att.data)} bytes, over the email's limit"
         else:
             pdfs.documents.append(att)
             sent_bytes += len(att.data)
             continue
-        logger.info("Scanned PDF attachment %s left out: %s", att.filename, reason)
+        logger.info("PDF attachment %s left out: %s", att.filename, reason)
     return pdfs
 
 
