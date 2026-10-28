@@ -42,7 +42,7 @@ Receipts ingested before the paid amount was added have `paid_amount: null`, so 
 |---|---|
 | `order_number` | The order, confirmation or invoice number as printed. Not unique: a confirmation, a shipment, a refund and an invoice can share one |
 | `payment_method` | `card`, `bank`, `wallet`, `cash`, `transfer` or `other` |
-| `payment_last4` | The last four digits of the card or account. No more is ever stored: a longer number, in this field or in the description, is cut to its last four digits |
+| `payment_last4` | The last four digits of the card or account. No more is ever stored: a longer number, in this field or in the description, vendor or payer, is cut to its last four digits |
 | `payer` | The cardholder or bill-to name as printed on the receipt, not who forwarded the email |
 
 Each is `null` when the receipt doesn't show it, and on receipts extracted before these fields were added, until they are [re-extracted](#reextract).

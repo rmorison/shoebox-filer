@@ -205,6 +205,34 @@ class TestDescriptionScrub:
         assert _metadata(description=raw).description == kept
 
     @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            ("Card 4111 1111 1111 1111 123", "Card ending 1111 123"),
+            ("Qty 2 4111 1111 1111 1111", "Qty 2 ending 1111"),
+            ("Visa 4111 1111 1111 1111 12 27", "Visa ending 1111 12 27"),
+            ("Visa 4111 1111 1111 1111 12/27", "Visa ending 1111 12/27"),
+            ("card 4111111111111111 2 items", "card ending 1111 2 items"),
+            ("x 7 4111111111111111 99", "x 7 ending 1111 99"),
+            ("4111-1111-1111-1111 10 28 2026", "ending 1111 10 28 2026"),
+        ],
+    )
+    def test_a_card_number_beside_other_digits_is_cut(
+        self, raw: str, kept: str
+    ) -> None:
+        # The neighbouring group (a security code, an expiry, a quantity)
+        # must not hide the card number from the check.
+        assert _metadata(description=raw).description == kept
+
+    def test_payer_and_vendor_are_scrubbed_too(self) -> None:
+        meta = _metadata(
+            vendor="Acme 4111 1111 1111 1111",
+            payment={"method": "card", "payer": "VISA 4111111111111111 JANE DOE"},
+        )
+        assert meta.vendor == "Acme ending 1111"
+        assert meta.payment is not None
+        assert meta.payment.payer == "VISA ending 1111 JANE DOE"
+
+    @pytest.mark.parametrize(
         "raw",
         [
             "Order 4111 1111 1111 1112",  # fails the Luhn check

@@ -163,9 +163,10 @@ def last_four_digits(value: object) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-# A run of 13 to 19 digits, with single spaces or dashes allowed between them:
-# the shape of a card number as printed.
-_CARD_NUMBER = re.compile(r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,18}(?![0-9])")
+# A run of digit groups joined by single spaces or dashes: where a card
+# number, printed with or without separators, can sit among other numbers.
+_DIGIT_RUN = re.compile(r"(?<![0-9])[0-9]+(?:[ -][0-9]+)*(?![0-9])")
+_DIGIT_GROUP = re.compile(r"[0-9]+")
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -178,15 +179,52 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _card_spans(run: str) -> list[tuple[int, int, str]]:
+    """The card numbers in ``run``, as ``(start, end, last four)``.
+
+    A card number is any whole sequence of the run's digit groups holding 13
+    to 19 digits that passes the Luhn check. A neighbouring group (a security
+    code, an expiry, a quantity) is therefore never needed to make it pass.
+    Where candidates overlap, the one nearest 16 digits wins, then the
+    earliest, since a stray group joined to a card passes by chance about one
+    time in ten.
+    """
+    groups = list(_DIGIT_GROUP.finditer(run))
+    candidates: list[tuple[int, int, int, str]] = []
+    for i in range(len(groups)):
+        digits = ""
+        for j in range(i, len(groups)):
+            digits += groups[j].group(0)
+            if len(digits) > 19:
+                break
+            if len(digits) >= 13 and _luhn_valid(digits):
+                candidates.append(
+                    (groups[i].start(), groups[j].end(), len(digits), digits[-4:])
+                )
+    candidates.sort(key=lambda c: (abs(c[2] - 16), c[0]))
+    chosen: list[tuple[int, int, str]] = []
+    for begin, end, _, last4 in candidates:
+        if all(end <= b or begin >= e for b, e, _ in chosen):
+            chosen.append((begin, end, last4))
+    return sorted(chosen)
+
+
 def scrub_card_numbers(text: str) -> str:
-    """``text`` with each card number (13 to 19 digits that pass the Luhn
-    check) replaced by "ending NNNN", its last four digits."""
+    """``text`` with each card number (13 to 19 digits, spaces or dashes
+    allowed between groups, that pass the Luhn check) replaced by
+    "ending NNNN", its last four digits."""
 
     def cut(match: re.Match[str]) -> str:
-        digits = _NOT_DIGIT.sub("", match.group(0))
-        return f"ending {digits[-4:]}" if _luhn_valid(digits) else match.group(0)
+        run = match.group(0)
+        out, pos = [], 0
+        for begin, end, last4 in _card_spans(run):
+            out.append(run[pos:begin])
+            out.append(f"ending {last4}")
+            pos = end
+        out.append(run[pos:])
+        return "".join(out)
 
-    return _CARD_NUMBER.sub(cut, text)
+    return _DIGIT_RUN.sub(cut, text)
 
 
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
@@ -209,7 +247,9 @@ class Payment(BaseModel):
     @field_validator("payer", mode="before")
     @classmethod
     def _payer(cls, value: object) -> object:
-        return _blank_to_none(value)
+        # Free text, stored in the append-only history: no card numbers.
+        value = _blank_to_none(value)
+        return scrub_card_numbers(value) if isinstance(value, str) else value
 
     def is_empty(self) -> bool:
         return self.method is None and self.last4 is None and self.payer is None
@@ -249,13 +289,14 @@ class ReceiptMetadata(BaseModel):
     def _order_number(cls, value: object) -> object:
         return _blank_to_none(value)
 
-    @field_validator("description", mode="before")
+    @field_validator("description", "vendor", mode="before")
     @classmethod
     def _no_card_numbers(cls, value: object) -> object:
         # The prompt asks for no more than the last four digits anywhere; this
-        # holds whatever the model does, since the extraction history that
-        # keeps the output is append-only. order_number is left alone: real
-        # order numbers can be long digit runs that pass the check.
+        # holds whatever the model does in the free-text fields (payer too, in
+        # Payment), since the extraction history that keeps the output is
+        # append-only. order_number is left alone: real order numbers can be
+        # long digit runs that pass the check.
         return scrub_card_numbers(value) if isinstance(value, str) else value
 
     @field_validator("payment", mode="after")
