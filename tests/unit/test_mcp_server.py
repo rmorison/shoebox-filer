@@ -590,13 +590,58 @@ class TestListFailures:
             "<fail-2@example.com>",
         ]
         assert data["failures"][0]["amount"] == "1.50"
-        assert get.call_args.kwargs == {"limit": 2, "offset": 0}
+        assert get.call_args.kwargs == {"status": "failed", "limit": 2, "offset": 0}
 
     def test_rejects_bad_limit(
         self, conn: MagicMock, store_root: Path, log_path: Path
     ) -> None:
         result = _call(_server(store_root, log_path), "list_failures", {"limit": 0})
         assert result.is_error is True
+
+    def test_lists_link_only_items(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        link = "https://receipts.example.com/r/abc123"
+        skipped = _failure(1).model_copy(
+            update={
+                "status": "skipped",
+                "error_message": "Skipped: link-only receipt (receipts.example.com)",
+                "receipt_link": link,
+            }
+        )
+        with (
+            patch(
+                "receipt_index.repository.get_ingest_failures", return_value=[skipped]
+            ) as get,
+            patch(
+                "receipt_index.repository.count_ingest_failures", return_value=1
+            ) as count,
+        ):
+            result = _call(
+                _server(store_root, log_path),
+                "list_failures",
+                {"status": "link-only"},
+            )
+
+        data = result.structured_content
+        assert data is not None
+        assert data["failures"][0]["status"] == "skipped"
+        assert data["failures"][0]["receipt_link"] == link
+        assert get.call_args.kwargs["status"] == "link-only"
+        assert count.call_args.kwargs == {"status": "link-only"}
+
+    def test_rejects_other_statuses(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        # Read-only and narrow: only the two lists the consumer agent needs.
+        result = _call(
+            _server(store_root, log_path), "list_failures", {"status": "skipped"}
+        )
+        assert result.is_error is True
+
+    def test_receipt_link_is_marked_untrusted(self) -> None:
+        description = FailureOut.model_fields["receipt_link"].description or ""
+        assert "must not be fetched" in description
 
 
 # ---------------------------------------------------------------------------

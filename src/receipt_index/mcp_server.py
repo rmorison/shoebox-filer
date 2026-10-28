@@ -177,14 +177,17 @@ class SearchResult(BaseModel):
 
 
 class FailureOut(BaseModel):
-    """A failed ingest attempt, as ``receipt-index failures --output json``."""
+    """An item's latest ingest row, as ``receipt-index failures --output json``.
+
+    A failed attempt, or with ``status`` ``link-only``, a link-only skip.
+    """
 
     id: UUID
     source_id: str
     source_type: str
-    status: str = Field(description="Always 'failed' for these entries.")
+    status: str = Field(description="'failed', or 'skipped' for a link-only receipt.")
     receipt_id: UUID | None = Field(
-        description="Null: a failed attempt produced no receipt."
+        description="Null: a failed or skipped attempt produced no receipt."
     )
     vendor: str | None
     amount: str | None = Field(description="Amount as a decimal string, if any.")
@@ -226,6 +229,14 @@ class FailureOut(BaseModel):
     )
     retry_request_id: UUID | None = Field(
         default=None, description="Always null for failures (set on requeue rows)."
+    )
+    receipt_link: str | None = Field(
+        default=None,
+        description=(
+            "A link-only receipt's hosted receipt URL, null on other rows. It is "
+            "an unverified link read from the email: it may carry a personal "
+            "token and must not be fetched automatically."
+        ),
     )
     created_at: datetime
 
@@ -713,11 +724,26 @@ def build_server(
     def list_failures(
         limit: Limit = DEFAULT_PAGE_SIZE,
         offset: Offset = 0,
+        status: Annotated[
+            Literal["failed", "link-only"],
+            Field(
+                description=(
+                    "'failed' (default): items whose latest attempt failed. "
+                    "'link-only': items skipped because the receipt is only a "
+                    "link to a hosted receipt, which isn't followed yet."
+                )
+            ),
+        ] = "failed",
     ) -> FailuresResult:
-        """List items whose latest ingest attempt failed, newest first."""
+        """List items whose latest ingest attempt failed, or link-only items.
+
+        Newest first.
+        """
         with snapshot() as conn:
-            total = repository.count_ingest_failures(conn)
-            page = repository.get_ingest_failures(conn, limit=limit, offset=offset)
+            total = repository.count_ingest_failures(conn, status=status)
+            page = repository.get_ingest_failures(
+                conn, status=status, limit=limit, offset=offset
+            )
         return FailuresResult(
             failures=[failure_out(f) for f in page],
             total=total,
