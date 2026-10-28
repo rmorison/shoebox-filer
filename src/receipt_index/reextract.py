@@ -30,7 +30,7 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
-from receipt_index.refunds import link_by_rule
+from receipt_index.refunds import RULE_FIELDS, link_by_rule
 from receipt_index.repository import (
     get_cleared_fields,
     get_extraction_history,
@@ -421,7 +421,7 @@ def _apply(
         llm_cache_read_tokens=extraction.cache_read_tokens,
         llm_requests=extraction.requests,
     )
-    if "kind" in changes or "order_number" in changes:
+    if RULE_FIELDS.intersection(changes):
         updated = lock_receipt(conn, receipt.id)
         if updated is not None:
             link_by_rule(conn, updated)

@@ -8,11 +8,12 @@ import re
 import sys
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import UUID
 
 import click
 from dotenv import load_dotenv
+from psycopg.errors import DeadlockDetected
 
 from receipt_index.config import AppConfig, ConfigError, load_config
 from receipt_index.models import KINDS
@@ -954,6 +955,16 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             click.echo(f"File:         {receipt.file_name}")
 
 
+def _concurrent_change() -> NoReturn:
+    """A deadlock with another writer: Postgres rolled this change back."""
+    click.echo(
+        "Error: a concurrent change to the same receipts; nothing was saved. "
+        "Run it again.",
+        err=True,
+    )
+    sys.exit(1)
+
+
 def _parse_receipt_id(receipt_id: str) -> UUID:
     try:
         return UUID(receipt_id)
@@ -1160,6 +1171,8 @@ def edit(
     except edits.EditError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
 
     if output_format == "json":
         data = {
@@ -1276,8 +1289,9 @@ def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
     is_flag=True,
     help=(
         "Only receipts still marked purchase whose subject, description, "
-        "vendor or file name says refund, credit, return, reversal, reversed, "
-        "chargeback or statement: the back-fill for kind."
+        "vendor or file name has a whole word such as refund, credit, return, "
+        "reversal, chargeback, statement or cancelled (not 'credit card'): "
+        "the back-fill for kind."
     ),
 )
 @click.option(
@@ -1627,6 +1641,8 @@ def refund_link(
     except refunds.RefundError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
     click.echo(f"Linked refund {refund_uid} to purchase {purchase_uid} as {who}.")
 
 
@@ -1658,6 +1674,8 @@ def refund_unlink(
     except refunds.RefundError as exc:
         click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
     click.echo(f"Unlinked refund {uid} as {who}.")
 
 

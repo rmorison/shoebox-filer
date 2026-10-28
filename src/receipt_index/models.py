@@ -657,7 +657,8 @@ class Receipt(BaseModel):
         if self.kind == "purchase":
             return self.effective_amount
         if self.kind == "statement":
-            return Decimal(0)
+            # 0.00, as the NUMERIC(12,2) column reads.
+            return Decimal("0.00")
         # 0 - x, not -x: a refund of 0.00 (all store credit) stays 0.00,
         # where -Decimal("0.00") would print as -0.00.
         return Decimal(0) - self.effective_amount

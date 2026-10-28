@@ -26,7 +26,9 @@ from receipt_index.repository import (
     get_receipt_events,
     insert_receipt,
     list_refunds,
+    lock_matching_purchase,
     search_receipts,
+    set_refund_of,
 )
 from receipt_index.store import LocalEvidenceStore
 
@@ -260,6 +262,55 @@ class TestLinkingRule:
             receipt = _insert(pg_conn, kind=kind)
             assert _refund_of(pg_conn, receipt) is None
 
+    def test_a_purchase_whose_paid_amount_is_filled_links_its_refund(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        # The Done gate's case: the refund waits on a purchase whose paid
+        # amount isn't known; re-extraction fills it, and the rule runs.
+        store = LocalEvidenceStore(tmp_path)
+        purchase = _seed(pg_conn, store, "Your order")
+        pg_conn.execute(
+            "UPDATE receipt.receipts SET order_number = '12345' WHERE id = %s",
+            (purchase.id,),
+        )
+        pg_conn.commit()
+        refund = _insert(pg_conn, kind="refund")
+        assert _refund_of(pg_conn, refund) is None
+        llm = Llm({"Your order": _meta("Your order", order_number="12345")})
+        _run(pg_conn, store, llm, _select(pg_conn, ids=[purchase.id]))
+        assert _refund_of(pg_conn, refund) == purchase.id
+
+    def test_the_lock_rechecks_the_whole_match(self, pg_conn: Conn) -> None:
+        # Between the rule's read and its lock, a match can stop matching.
+        purchase = _insert(pg_conn)
+        refund = _insert(pg_conn, kind="refund", order_number="other")
+        for change in (
+            "vendor = 'Example Services'",
+            "currency = 'CAD'",
+            "paid_amount = 0",
+            "order_number = 'changed'",
+            "kind = 'credit'",
+        ):
+            pg_conn.execute(
+                f"UPDATE receipt.receipts SET {change} WHERE id = %s",
+                (purchase.id,),
+            )
+            stale = refund.model_copy(update={"order_number": "12345"})
+            assert not lock_matching_purchase(pg_conn, stale, purchase.id), change
+            pg_conn.rollback()
+        stale = refund.model_copy(update={"order_number": "12345"})
+        assert lock_matching_purchase(pg_conn, stale, purchase.id)
+        pg_conn.rollback()
+
+    def test_the_rules_write_never_overwrites_a_link(self, pg_conn: Conn) -> None:
+        first = _insert(pg_conn, order_number="A")
+        second = _insert(pg_conn, order_number="B")
+        refund = _insert(pg_conn, kind="refund", order_number="C")
+        link(pg_conn, refund.id, first.id, actor="operator", reason=None)
+        assert not set_refund_of(pg_conn, refund.id, second.id, only_if_unlinked=True)
+        pg_conn.commit()
+        assert _refund_of(pg_conn, refund) == first.id
+
     def test_a_refund_a_person_unlinked_stays_unlinked(self, pg_conn: Conn) -> None:
         # The operator's ruling: after a person unlinks a refund, only
         # `refund link` links it again; the rule never does.
@@ -406,9 +457,24 @@ class TestReextract:
         store = LocalEvidenceStore(tmp_path)
         hits = [
             _seed(pg_conn, store, subject)
-            for subject in ("Your REFUND", "Statement for June", "Credit memo")
+            for subject in (
+                "Your REFUND",
+                "Refunded: order 12345",
+                "Statement for June",
+                "Credit memo",
+                "Order cancelled",
+                "Cancellation confirmed",
+                "Item returned",
+            )
         ]
-        _seed(pg_conn, store, "Parking receipt")
+        # Whole words only, and a credit card is not a credit.
+        for subject in (
+            "Parking receipt",
+            "Paid by credit card",
+            "See our returns policy",
+            "Precancelled stamps",
+        ):
+            _seed(pg_conn, store, subject)
         already = _seed(pg_conn, store, "Refund two")
         pg_conn.execute(
             "UPDATE receipt.receipts SET kind = 'refund' WHERE id = %s", (already.id,)

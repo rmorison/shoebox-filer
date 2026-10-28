@@ -54,19 +54,35 @@ class _Repo:
         self.still_purchase = still_purchase
         self.locked: list[UUID] = []
         self.linked: list[tuple[UUID, UUID | None]] = []
+        self.unlinked_only: list[bool] = []
+        # A person linked the refund between the rule's read and its write.
+        self.hand_linked_meanwhile = False
 
     def find_refund_purchases(self, conn: Any, refund: Receipt) -> list[UUID]:
         return list(self.matches)
 
-    def lock_if_purchase(self, conn: Any, purchase_id: UUID) -> bool:
+    def lock_matching_purchase(
+        self, conn: Any, refund: Receipt, purchase_id: UUID
+    ) -> bool:
         self.locked.append(purchase_id)
         return self.still_purchase
 
     def was_unlinked(self, conn: Any, refund_id: UUID) -> bool:
         return False
 
-    def set_refund_of(self, conn: Any, refund_id: UUID, purchase: UUID | None) -> None:
+    def set_refund_of(
+        self,
+        conn: Any,
+        refund_id: UUID,
+        purchase: UUID | None,
+        *,
+        only_if_unlinked: bool = False,
+    ) -> bool:
+        self.unlinked_only.append(only_if_unlinked)
+        if self.hand_linked_meanwhile:
+            return False
         self.linked.append((refund_id, purchase))
+        return True
 
     def insert_event(self, conn: Any, **kwargs: Any) -> ReceiptEvent:
         return ReceiptEvent(id=uuid4(), created_at=_NOW, **kwargs)
@@ -75,7 +91,7 @@ class _Repo:
 def _run(monkeypatch: pytest.MonkeyPatch, repo: _Repo) -> list[ReceiptEvent]:
     for name in (
         "find_refund_purchases",
-        "lock_if_purchase",
+        "lock_matching_purchase",
         "was_unlinked",
         "set_refund_of",
         "insert_event",
@@ -113,3 +129,14 @@ class TestLocking:
         assert _run(monkeypatch, repo) == []
         assert repo.locked == []
         assert repo.linked == []
+
+
+class TestConcurrentHandLink:
+    def test_the_rule_never_overwrites_a_link(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = _Repo([uuid4()], still_purchase=True)
+        repo.hand_linked_meanwhile = True
+        # No link was written, so no event either.
+        assert _run(monkeypatch, repo) == []
+        assert repo.unlinked_only == [True]

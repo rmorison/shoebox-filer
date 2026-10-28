@@ -608,10 +608,28 @@ class TestKindApply:
         assert [r.id for r in db.linked] == [receipt.id]
         assert result.outcomes[0].kind_kept is None
 
-    def test_no_kind_or_order_change_runs_no_rule(
+    def test_a_filled_paid_amount_runs_the_rule(
         self, db: FakeDb, llm: dict[str, MagicMock]
     ) -> None:
-        _run(db, [_receipt()], adapter=None)
+        # A waiting refund needs its purchase to have a paid amount: filling
+        # one may make this purchase its only match (design §6).
+        receipt = _receipt()
+        _run(db, [receipt], adapter=None)
+        ((_, columns, _),) = db.updates
+        assert columns == {"paid_amount": Decimal("30.00")}
+        assert [r.id for r in db.linked] == [receipt.id]
+
+    def test_a_change_to_no_matched_field_runs_no_rule(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        # Only the description is empty, so only it is filled.
+        _run(
+            db,
+            [_receipt(paid_amount=Decimal("30.00"), description=None)],
+            adapter=None,
+        )
+        ((_, columns, _),) = db.updates
+        assert set(columns) == {"description"}
         assert db.linked == []
 
     def test_a_linked_refund_keeps_its_kind(

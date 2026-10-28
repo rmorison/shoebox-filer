@@ -109,6 +109,10 @@ class TestSignedAmount:
     def test_by_kind(self, kind: str, signed: Decimal) -> None:
         assert _receipt(kind=kind).signed_amount == signed
 
+    def test_a_statement_reads_like_the_column(self) -> None:
+        # The generated column is NUMERIC(12,2): 0.00, as every other kind.
+        assert str(_receipt(kind="statement").signed_amount) == "0.00"
+
     def test_falls_back_to_the_total(self) -> None:
         r = _receipt(kind="refund", paid_amount=None, amount=Decimal("12.50"))
         assert r.signed_amount == Decimal("-12.50")

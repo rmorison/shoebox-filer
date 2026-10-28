@@ -515,7 +515,8 @@ GROUP BY p.id;
 - **Linking by hand.** `receipt-index refund link <refund-id> <purchase-id>` and `refund unlink <refund-id>`, both recorded. `refund list --unlinked` shows refunds with no purchase. Linking checks that the currencies match.
 - Search gains `--kind` (repeatable; default every kind), and JSON output adds `kind`, `signed_amount`, `refund_of` and, for purchases, `refunded` and `net_paid`. A refund's `order_number` is the original order it refers to, when the document shows one.
 - **Merges.** The view above has the merge conditions of the evidence-store design. Migration 000016 creates it without them, since `merged_into_id` doesn't exist yet; the merge ticket adds them, as [Merged receipts](#merged-receipts) says.
-- **Back-fill.** `reextract --refund-candidates` selects receipts still marked `purchase` whose subject, description, vendor or file name uses a word a refund, credit or statement often uses. Fill-only runs set `kind` while it holds its default.
+- **Back-fill.** `reextract --refund-candidates` selects receipts still marked `purchase` whose subject, description, vendor or file name has, as a whole word, one a refund, credit, cancellation or statement often uses. Fill-only runs set `kind` while it holds its default.
+- **When the rule runs, as built.** At ingest, and on re-extraction or a hand edit that changes any field it matches on: kind, order number, vendor, currency or paid amount. It locks only the purchase it links (`FOR SHARE`, re-checking the whole match), and writes the link only while the refund is still unlinked. A link already made isn't moved by a later edit of either receipt. Nothing in the database stops a link target from later becoming a non-purchase; the application's checks prevent it. The view doesn't compare currencies, which the rule and `refund link` check when linking.
 - Duplicate detection in the evidence store excludes pairs whose `kind` differs.
 
 ### 7. Text search

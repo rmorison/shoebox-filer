@@ -931,17 +931,27 @@ def get_receipt_by_id(
 # ---------------------------------------------------------------------------
 
 
-# The words reextract --refund-candidates looks for (a POSIX regex, any case).
+# The words reextract --refund-candidates looks for: whole words, any case
+# (a Postgres regex; \m and \M are its word boundaries). "credit card" is
+# not a credit, and "returns policy" is not a return.
 REFUND_CANDIDATE_WORDS = (
     "refund",
+    "refunds",
+    "refunded",
     "credit",
+    "credited",
     "return",
+    "returned",
     "reversal",
     "reversed",
     "chargeback",
     "statement",
+    "cancel",
+    "cancelled",
+    "canceled",
+    "cancellation",
 )
-REFUND_CANDIDATE_PATTERN = "(" + "|".join(REFUND_CANDIDATE_WORDS) + ")"
+REFUND_CANDIDATE_PATTERN = r"\m(" + "|".join(REFUND_CANDIDATE_WORDS) + r")\M(?!\s+card)"
 
 
 def _failed(output: str = "output") -> str:
@@ -1341,7 +1351,7 @@ def find_refund_purchases(
     unpaid invoices that share the order number. The rule links only when
     there is exactly one. The matches are read without a lock, so that
     candidates the rule won't link are never locked: the one it links is
-    locked by ``lock_if_purchase``.
+    locked by ``lock_matching_purchase``.
     """
     if refund.order_number is None:
         return []
@@ -1400,21 +1410,34 @@ def find_unlinked_refunds(
     return [Receipt.model_validate(row) for row in cur.fetchall()]
 
 
-def lock_if_purchase(
-    conn: psycopg.Connection[dict[str, Any]], purchase_id: UUID
+def lock_matching_purchase(
+    conn: psycopg.Connection[dict[str, Any]], refund: Receipt, purchase_id: UUID
 ) -> bool:
-    """Lock a purchase ``FOR SHARE`` and say whether it still is one.
+    """Lock a purchase ``FOR SHARE`` and say whether it still matches ``refund``.
 
-    A concurrent change to its kind either waits for the link, or the link
-    waits for it and sees the new kind, so a refund never links to a
-    non-purchase. Only the one purchase the rule is about to link is locked.
+    The whole match is re-checked under the lock (a purchase, the same order
+    number, vendor in any case and currency, a paid amount above zero), so a
+    concurrent change to any of those either waits for the link or is seen
+    by it. Only the one purchase the rule is about to link is locked.
     """
     cur = conn.execute(
-        "SELECT kind FROM receipt.receipts WHERE id = %(id)s FOR SHARE",
-        {"id": purchase_id},
+        """\
+        SELECT 1 FROM receipt.receipts
+        WHERE id = %(id)s AND kind = 'purchase'
+          AND order_number = %(order_number)s
+          AND lower(vendor) = lower(%(vendor)s)
+          AND currency = %(currency)s
+          AND paid_amount > 0
+        FOR SHARE
+        """,
+        {
+            "id": purchase_id,
+            "order_number": refund.order_number,
+            "vendor": refund.vendor,
+            "currency": refund.currency,
+        },
     )
-    row = cur.fetchone()
-    return row is not None and row["kind"] == "purchase"
+    return cur.fetchone() is not None
 
 
 def was_unlinked(conn: psycopg.Connection[dict[str, Any]], refund_id: UUID) -> bool:
@@ -1431,12 +1454,20 @@ def set_refund_of(
     conn: psycopg.Connection[dict[str, Any]],
     refund_id: UUID,
     purchase_id: UUID | None,
-) -> None:
-    """Link a refund to a purchase, or unlink it (None). The caller commits."""
-    conn.execute(
-        "UPDATE receipt.receipts SET refund_of = %(purchase)s WHERE id = %(id)s",
-        {"purchase": purchase_id, "id": refund_id},
-    )
+    *,
+    only_if_unlinked: bool = False,
+) -> bool:
+    """Link a refund to a purchase, or unlink it (None). The caller commits.
+
+    With ``only_if_unlinked`` (the rule's write), a refund that is already
+    linked, by a person meanwhile, is left as it is. Returns whether the row
+    was written.
+    """
+    sql = "UPDATE receipt.receipts SET refund_of = %(purchase)s WHERE id = %(id)s"
+    if only_if_unlinked:
+        sql += " AND refund_of IS NULL"
+    cur = conn.execute(sql, {"purchase": purchase_id, "id": refund_id})
+    return cur.rowcount == 1
 
 
 def has_linked_refunds(

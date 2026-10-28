@@ -364,7 +364,7 @@ uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD 
 
 Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown. A card number typed into `--vendor`, `--reason` or `--as` is cut to its last four digits, as at extraction.
 
-Editing `--kind` or `--order-number` runs the refund linking rule (see [`refund`](#refund)): a receipt that becomes a refund may be linked to its purchase, and a purchase may get its waiting refunds. Each link is printed and recorded in the refund's history.
+Editing `--kind`, `--order-number`, `--vendor` or `--paid-amount` runs the refund linking rule (see [`refund`](#refund)): a receipt that becomes a refund may be linked to its purchase, and a purchase may get its waiting refunds, for example once its paid amount is known. Each link is printed and recorded in the refund's history. Editing a receipt that is already linked doesn't move its link: use `refund unlink` and `refund link`.
 
 `--clear-manual` takes a field off `manual_fields` and records that in the history. The field keeps its value, but the next `reextract --overwrite` may replace it (fill-only runs leave it, since it isn't empty). It is refused, and nothing is written, when a field isn't hand-edited.
 
@@ -524,7 +524,7 @@ At least one of these, `--limit` or `--all` is required, so that a bare command 
 | `--id UUID` | This receipt (repeatable) |
 | `--model-not MODEL` | Receipts whose latest extraction used a different model, or that have none |
 | `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing. A receipt where that field is hand-edited is left out, since a run can't change it |
-| `--refund-candidates` | Receipts still marked `purchase`, their kind not hand-edited, whose email subject, description, vendor or file name contains `refund`, `credit`, `return`, `reversal`, `reversed`, `chargeback` or `statement` (any case). The back-fill for [kind](#kinds-and-totals): run it with `--dry-run` first |
+| `--refund-candidates` | Receipts still marked `purchase`, their kind not hand-edited, whose email subject, description, vendor or file name has one of these whole words, in any case: `refund`, `refunds`, `refunded`, `credit`, `credited`, `return`, `returned`, `reversal`, `reversed`, `chargeback`, `statement`, `cancel`, `cancelled`, `canceled` or `cancellation`. A word followed by `card` (`credit card`) doesn't count. The back-fill for [kind](#kinds-and-totals): run it with `--dry-run` first |
 | `--all` | Every receipt |
 | `--limit N` | At most `N` receipts, oldest first |
 
@@ -555,7 +555,7 @@ In both modes:
 
 If the new overall confidence is below 0.5, the run is recorded and nothing is applied (`gated`). The rendition's file name is never changed.
 
-When a run changes a receipt's `kind` or order number, it runs the refund linking rule (see [`refund`](#refund)). A run never changes the kind of a receipt in a refund link (a linked refund, or a purchase with linked refunds): it keeps the stored kind and prints `kind: kept` with the extracted one (`kind_kept` in JSON). Unlink it with `refund unlink`, then edit or re-extract it.
+When a run changes a receipt's `kind`, order number, vendor, currency or paid amount, it runs the refund linking rule (see [`refund`](#refund)). A run never changes the kind of a receipt in a refund link (a linked refund, or a purchase with linked refunds): it keeps the stored kind and prints `kind: kept` with the extracted one (`kind_kept` in JSON). Unlink it with `refund unlink`, then edit or re-extract it.
 
 ### Inputs
 
@@ -628,13 +628,13 @@ uv run receipt-index refund list [--unlinked] [--output text|json]
 
 Ingest, re-extraction and [`edit`](#edit) link a refund by rule. An unlinked refund is linked when **exactly one** purchase has the same order number, the same vendor (ignoring case), the same currency and a paid amount above zero. The paid-amount condition leaves out confirmation and shipping emails, and unpaid invoices, that share the order number but charged nothing. When several purchases match (an order charged on each shipment), or none does, the refund stays unlinked: `refund list --unlinked` shows it, and `refund link` links it by hand.
 
-The rule runs whenever a refund gets its kind or order number, and whenever a purchase is ingested or gets an order number, so a purchase that arrives after its refund still links it. Each link is a `refund_linked` event in the refund's [history](#history), with the actor `rule`. The rule trusts the email: a message that claims to be a refund for a known order is linked, and lowers that purchase's net paid. `refund list` and `history` show every link it made.
+The rule runs at ingest, and whenever re-extraction or `edit` changes a field it matches on (kind, order number, vendor, currency or paid amount), so a purchase that arrives after its refund, or gets its paid amount later, still links it. A link already made isn't moved by a later change to either receipt: `refund unlink` and `refund link` do that. Each link is a `refund_linked` event in the refund's [history](#history), with the actor `rule`. The rule trusts the email: a message that claims to be a refund for a known order is linked, and lowers that purchase's net paid. `refund list` and `history` show every link it made.
 
 Credits and statements are never linked.
 
 ### Linking by hand
 
-`refund link` links an unlinked refund to a purchase in the same currency. It refuses, writing nothing, when the first receipt isn't a refund, the second isn't a purchase, the currencies differ, or the refund is already linked (unlink it first). `refund unlink` removes a refund's link. Both write one event with your reason, as the `--as` actor (default: `annotations.actor` in the config, else `operator`).
+`refund link` links an unlinked refund to a purchase in the same currency. It refuses, writing nothing, when the first receipt isn't a refund, the second isn't a purchase, the currencies differ, or the refund is already linked (unlink it first). `refund unlink` removes a refund's link. Both write one event with your reason, as the `--as` actor (default: `annotations.actor` in the config, else `operator`). If another change to the same receipts runs at the same moment, Postgres may stop one of them: the command then says nothing was saved, and you run it again.
 
 **A refund you unlink stays unlinked.** The rule never links a refund that has been unlinked by hand; only `refund link` links it again.
 

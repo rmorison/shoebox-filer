@@ -290,3 +290,39 @@ class TestRefundCommands:
         result = _invoke(config_file, "refund", "list")
         assert result.exit_code == 0, result.output
         assert str(_PURCHASE.id) in result.output
+
+
+class TestDeadlock:
+    """Two writers locking a refund and a purchase in opposite orders: Postgres
+    aborts one. The CLI says so in one line, not a traceback."""
+
+    @pytest.mark.parametrize(
+        ("target", "args"),
+        [
+            (
+                "receipt_index.refunds.link",
+                ["refund", "link", str(_REFUND.id), str(_PURCHASE.id)],
+            ),
+            ("receipt_index.refunds.unlink", ["refund", "unlink", str(_REFUND.id)]),
+            (
+                "receipt_index.edits.edit_receipt",
+                ["edit", str(_REFUND.id), "--kind", "refund"],
+            ),
+        ],
+    )
+    @patch("receipt_index.db.get_connection")
+    def test_a_deadlock_is_one_line(
+        self,
+        mock_conn: MagicMock,
+        config_file: Path,  # noqa: F811
+        target: str,
+        args: list[str],
+    ) -> None:
+        from psycopg import errors
+
+        with patch(target, side_effect=errors.DeadlockDetected("deadlock detected")):
+            result = _invoke(config_file, *args)
+        assert result.exit_code == 1
+        assert "concurrent change" in result.output
+        assert "nothing was saved" in result.output
+        assert "Traceback" not in result.output

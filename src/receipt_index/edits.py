@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from receipt_index.models import KINDS, scrub_card_numbers
-from receipt_index.refunds import link_by_rule
+from receipt_index.refunds import RULE_FIELDS, link_by_rule
 from receipt_index.repository import (
     has_linked_refunds,
     insert_event,
@@ -186,7 +186,7 @@ def edit_receipt(
         manual_fields=manual,
         field_confidence=confidence,
     )
-    if "kind" in values or "order_number" in values:
+    if RULE_FIELDS.intersection(values):
         # A refund may now have its purchase, or a purchase its refunds. The
         # rule's events (on the refunds it links) are returned with the edit's.
         linked = link_by_rule(conn, updated)

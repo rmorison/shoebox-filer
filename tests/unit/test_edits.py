@@ -262,8 +262,19 @@ class TestEditReceipt:
         edit_receipt(db.conn, _ID, {"order_number": "A-1"}, actor="op", reason=None)
         assert len(db.linked) == 1
 
-    def test_a_vendor_edit_runs_no_rule(self, db: FakeDb) -> None:
-        edit_receipt(db.conn, _ID, {"vendor": "Acme"}, actor="op", reason=None)
+    @pytest.mark.parametrize(
+        "values", [{"vendor": "Acme"}, {"paid_amount": Decimal("25.00")}]
+    )
+    def test_a_matched_field_edit_runs_the_rule(
+        self, db: FakeDb, values: dict[str, Any]
+    ) -> None:
+        edit_receipt(db.conn, _ID, values, actor="op", reason=None)
+        assert len(db.linked) == 1
+
+    def test_a_date_edit_runs_no_rule(self, db: FakeDb) -> None:
+        edit_receipt(
+            db.conn, _ID, {"receipt_date": date(2026, 2, 2)}, actor="op", reason=None
+        )
         assert db.linked == []
 
     @pytest.mark.parametrize("linked", ["refund", "purchase"])

@@ -25,7 +25,7 @@ from receipt_index.repository import (
     find_refund_purchases,
     find_unlinked_refunds,
     insert_event,
-    lock_if_purchase,
+    lock_matching_purchase,
     lock_receipt,
     set_refund_of,
     was_unlinked,
@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 
 # The actor recorded for a link the rule makes.
 RULE_ACTOR = "rule"
+
+# The fields the rule matches on. A change to any of them, by re-extraction
+# or a hand edit, runs the rule again (design \u00a76): a purchase that gains a
+# paid amount may now be a waiting refund's only match.
+RULE_FIELDS = frozenset({"kind", "order_number", "vendor", "currency", "paid_amount"})
 
 
 class RefundError(Exception):
@@ -70,6 +75,27 @@ def _link_event(
     )
 
 
+def _rule_link(
+    conn: psycopg.Connection[dict[str, Any]], refund: Receipt, purchase_id: UUID
+) -> ReceiptEvent | None:
+    """The rule's link: written only while the refund is still unlinked (a
+    person may have linked it meanwhile), with its event only if written."""
+    if not set_refund_of(conn, refund.id, purchase_id, only_if_unlinked=True):
+        return None
+    return insert_event(
+        conn,
+        receipt_id=refund.id,
+        event_type="refund_linked",
+        payload={
+            "purchase_id": str(purchase_id),
+            "order_number": refund.order_number,
+        },
+        actor=RULE_ACTOR,
+        actor_kind="rule",
+        reason=None,
+    )
+
+
 def link_by_rule(
     conn: psycopg.Connection[dict[str, Any]], receipt: Receipt
 ) -> list[ReceiptEvent]:
@@ -84,33 +110,18 @@ def link_by_rule(
         if receipt.refund_of is not None or was_unlinked(conn, receipt.id):
             return []
         matches = find_refund_purchases(conn, receipt)
-        if len(matches) != 1 or not lock_if_purchase(conn, matches[0]):
+        if len(matches) != 1 or not lock_matching_purchase(conn, receipt, matches[0]):
             return []
-        return [
-            _link_event(
-                conn,
-                receipt,
-                matches[0],
-                actor=RULE_ACTOR,
-                actor_kind="rule",
-                reason=None,
-            )
-        ]
+        event = _rule_link(conn, receipt, matches[0])
+        return [] if event is None else [event]
     if receipt.kind != "purchase":
         return []
     events: list[ReceiptEvent] = []
     for refund in find_unlinked_refunds(conn, receipt):
         if find_refund_purchases(conn, refund) == [receipt.id]:
-            events.append(
-                _link_event(
-                    conn,
-                    refund,
-                    receipt.id,
-                    actor=RULE_ACTOR,
-                    actor_kind="rule",
-                    reason=None,
-                )
-            )
+            event = _rule_link(conn, refund, receipt.id)
+            if event is not None:
+                events.append(event)
     return events
 
 
