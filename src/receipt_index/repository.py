@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 
     from receipt_index.models import ActorKind, EventType
 
+# The manual_fields name of a field_confidence entry, where they differ.
+_MANUAL_NAME = {"date": "receipt_date"}
+
 # The effective amount: paid when known, the total otherwise. The expression
 # matches idx_receipts_effective_amount, so keep the two in step.
 _EFFECTIVE_AMOUNT = "COALESCE(paid_amount, amount)"
@@ -963,7 +966,8 @@ def select_for_reextract(
     ``model_not`` keeps receipts whose latest such run used another model (or
     that have none). ``confidence_below`` is ``(field, x)``: the overall
     confidence when ``field`` is None, else that field's entry, missing
-    entries counting as below.
+    entries counting as below; a receipt where that field is hand-edited
+    is left out.
     """
     clauses: list[str] = []
     params: dict[str, object] = {"version": prompt_version, "model": llm_model}
@@ -998,6 +1002,9 @@ def select_for_reextract(
                 " < %(below)s"
             )
             params["below_field"] = field
+            # A hand-edited field has no entry, but a run can't change it.
+            clauses.append("NOT (%(below_manual)s = ANY(r.manual_fields))")
+            params["below_manual"] = _MANUAL_NAME.get(field, field)
     where = " AND ".join(clauses) if clauses else "TRUE"
     sql = (
         f"WITH l AS ({_LATEST_GOOD}) "
@@ -1250,3 +1257,19 @@ def get_receipt_events(
         {"id": receipt_id},
     )
     return [ReceiptEvent.model_validate(row) for row in cur.fetchall()]
+
+
+def get_cleared_fields(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> set[str]:
+    """Fields whose hand edit was handed back (a ``manual_cleared`` event).
+
+    Re-extraction counts them as machine-extracted, so ``--overwrite`` may
+    replace them even when no run ever applied them.
+    """
+    cur = conn.execute(
+        "SELECT DISTINCT payload->>'field' AS field FROM receipt.receipt_events"
+        " WHERE receipt_id = %(id)s AND event_type = 'manual_cleared'",
+        {"id": receipt_id},
+    )
+    return {row["field"] for row in cur.fetchall() if row["field"]}
