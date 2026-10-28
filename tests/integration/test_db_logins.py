@@ -20,6 +20,7 @@ run resets their memberships and checks them before trusting a pass.
 
 from __future__ import annotations
 
+import json
 import textwrap
 import uuid
 from datetime import date
@@ -35,7 +36,7 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 
 from receipt_index.cli import cli
 from receipt_index.mcp_server import startup_check
-from receipt_index.models import FieldConfidence, ReceiptMetadata
+from receipt_index.models import FieldConfidence, Payment, ReceiptMetadata
 from receipt_index.repository import save_drive_cursor
 
 from .conftest import (
@@ -347,9 +348,11 @@ def test_write_paths_run_as_the_write_login(
         currency="EUR",
         date=date(2026, 10, 2),
         description="re-extracted",
+        order_number="A-100",
+        payment=Payment(method="card", last4="1234", payer="Jane Doe"),
         confidence=0.99,
         field_confidence=FieldConfidence(
-            vendor=0.8, amount=0.8, paid_amount=0.8, date=0.8
+            vendor=0.8, amount=0.8, paid_amount=0.8, date=0.8, payment=0.8
         ),
     )
     before = pg_conn.execute(
@@ -376,6 +379,7 @@ def test_write_paths_run_as_the_write_login(
     assert after["n"] == before["n"] + 1
     row = pg_conn.execute(
         "SELECT vendor, amount, paid_amount, currency, receipt_date, description, "
+        "order_number, payment_method, payment_last4, payer, "
         "field_confidence FROM receipt.receipts WHERE id = %s",
         (receipt["id"],),
     ).fetchone()
@@ -386,13 +390,56 @@ def test_write_paths_run_as_the_write_login(
         "currency": "EUR",
         "receipt_date": date(2026, 10, 2),
         "description": "re-extracted",
+        "order_number": "A-100",
+        "payment_method": "card",
+        "payment_last4": "1234",
+        "payer": "Jane Doe",
         "field_confidence": {
             "vendor": 0.8,
             "amount": 0.8,
             "paid_amount": 0.8,
             "date": 0.8,
+            "payment": 0.8,
         },
     }, result.output
+    pg_conn.commit()
+
+    # 4b. edit, edit --clear-manual and history: the hand-edit columns,
+    #     manual_fields, field_confidence, and receipt_events (INSERT, SELECT).
+    rid = str(receipt["id"])
+    result = _invoke(
+        config,
+        "edit",
+        rid,
+        "--paid-amount",
+        "17.50",
+        "--order-number",
+        "A-101",
+        "--reason",
+        "statement",
+    )
+    assert result.exit_code == 0, result.output
+    result = _invoke(config, "edit", rid, "--clear-manual", "paid_amount")
+    assert result.exit_code == 0, result.output
+    result = _invoke(config, "history", rid, "--output", "json")
+    assert result.exit_code == 0, result.output
+    events = json.loads(result.output)
+    assert [(e["event_type"], e["payload"]["field"]) for e in events] == [
+        ("field_edited", "paid_amount"),
+        ("field_edited", "order_number"),
+        ("manual_cleared", "paid_amount"),
+    ]
+    assert {e["actor"] for e in events} == {"operator"}
+    row = pg_conn.execute(
+        "SELECT paid_amount, order_number, manual_fields FROM receipt.receipts "
+        "WHERE id = %s",
+        (receipt["id"],),
+    ).fetchone()
+    assert row == {
+        "paid_amount": Decimal("17.50"),
+        "order_number": "A-101",
+        "manual_fields": ["order_number"],
+    }
     pg_conn.commit()
 
     # 5. The Drive cursor (CI has no Drive to ingest from).
@@ -418,6 +465,12 @@ def test_write_paths_run_as_the_write_login(
     [
         # The append-only guard: only the owner can switch it off.
         "ALTER TABLE receipt.extractions DISABLE TRIGGER trg_extractions_append_only",
+        "ALTER TABLE receipt.receipt_events "
+        "DISABLE TRIGGER trg_receipt_events_append_only",
+        # receipt_events: INSERT and SELECT only.
+        "UPDATE receipt.receipt_events SET actor = 'someone else'",
+        "DELETE FROM receipt.receipt_events",
+        "TRUNCATE receipt.receipt_events",
         "DELETE FROM receipt.ingest_log",
         "TRUNCATE receipt.ingest_log",
         # ingest_log is append-only; 000014 takes back 000007's UPDATE grant.
@@ -498,8 +551,20 @@ def test_forensic_commands_run_as_the_read_login(
     assert receipt_id is not None
     for args in (
         ("search", "--vendor", "Acme", "--output", "json"),
+        (
+            "search",
+            "--order-number",
+            "A-100",
+            "--last4",
+            "1234",
+            "--payer",
+            "jane",
+            "--output",
+            "json",
+        ),
         ("failures", "--output", "json"),
         ("show", str(receipt_id["id"])),
+        ("history", str(receipt_id["id"])),
     ):
         result = _invoke(config, *args)
         assert result.exit_code == 0, (args, result.output)
