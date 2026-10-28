@@ -437,9 +437,9 @@ class TestInvisibleInsideGroups:
     @pytest.mark.parametrize(
         "raw",
         [
-            "card 41​11 1111 1111 1111",
-            "card 4111 1111 1111 11­11",
-            "card 4̲1̲1̲1̲ 1111 1111 1111",
+            "card 41\u200b11 1111 1111 1111",
+            "card 4111 1111 1111 11\u00ad11",
+            "card 4\u03321\u03321\u03321\u0332 1111 1111 1111",
         ],
     )
     def test_invisible_characters_inside_a_group(self, raw: str) -> None:
@@ -448,4 +448,39 @@ class TestInvisibleInsideGroups:
     def test_last4_does_not_trust_a_number_beside_another_group(self) -> None:
         # The order number passes Luhn; the card's own last four is 4242.
         raw = "Order 1234567812345670, Visa ending 4242"
+        assert Payment.model_validate({"last4": raw}).last4 is None
+
+
+class TestInvisibleBetweenNumbers:
+    """An invisible character can be the only break between numbers."""
+
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            # Read without the break, the two cards also form candidates
+            # spanning both: the whole stretch goes.
+            (
+                "4111 1111 1111 1111\u200b5555 5555 5555 4444",
+                "[card number removed]",
+            ),
+            ("5\u200b4111 1111 1111 1111", "5\u200bending 1111"),
+            ("Card:4111 1111 1111 1111\u200b2025", "Card:ending 1111\u200b2025"),
+            ("4111111111111111\u200b4", "ending 1111\u200b4"),
+            # The mark stays on what replaces the card; no digit is left.
+            (
+                "4111 1111 1111 1111\u0332 5555555555554444",
+                "ending 1111\u0332 ending 4444",
+            ),
+            # Control characters and blank filler letters separate too.
+            ("4111\x001111\x001111\x001111", "ending 1111"),
+            ("4111\u31641111\u31641111\u31641111", "ending 1111"),
+        ],
+    )
+    def test_both_readings_are_tried(self, raw: str, kept: str) -> None:
+        assert _metadata(description=raw).description == kept
+
+    def test_last4_declines_with_a_year_beside_the_card(self) -> None:
+        # Another number of four or more digits: no guess, rather than a
+        # wrong last four.
+        raw = "Visa 4111 1111 1111 1111 exp 12/2025"
         assert Payment.model_validate({"last4": raw}).last4 is None

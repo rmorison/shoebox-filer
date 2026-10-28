@@ -148,10 +148,17 @@ def _blank_to_none(value: object) -> object:
     return value
 
 
-# Unicode categories that print nothing: format characters (zero-width space
-# and joiner, soft hyphen) and combining marks. A card is read as if they
-# weren't there, wherever they sit, even inside a digit group.
-_INVISIBLE = frozenset({"Cf", "Mn", "Me"})
+# Characters that print nothing: format characters (zero-width space and
+# joiner, soft hyphen), combining marks, control characters other than
+# whitespace, and the blank filler letters.
+_INVISIBLE = frozenset({"Cf", "Mn", "Me", "Cc"})
+_BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def _is_invisible(ch: str) -> bool:
+    if ch in _BLANK_LETTERS:
+        return True
+    return not ch.isspace() and unicodedata.category(ch) in _INVISIBLE
 
 
 def _fold(ch: str) -> str:
@@ -166,13 +173,19 @@ def _fold(ch: str) -> str:
     return folded if len(folded) == 1 and not folded.isdigit() else ch
 
 
+def _spaced(text: str) -> str:
+    """``text`` folded (``_fold``), each invisible character as a space: the
+    same length, so a span found here is the same span in ``text``."""
+    return "".join(" " if _is_invisible(ch) else _fold(ch) for ch in text)
+
+
 def _visible(text: str) -> tuple[str, list[int]]:
     """``text`` folded (``_fold``) without its invisible characters, and for
     each character kept, its index in ``text``: a span found in the first is
     mapped back to ``text`` through the second."""
     chars, index = [], []
     for i, ch in enumerate(text):
-        if not ch.isascii() and unicodedata.category(ch) in _INVISIBLE:
+        if _is_invisible(ch):
             continue
         chars.append(_fold(ch))
         index.append(i)
@@ -312,15 +325,31 @@ def scrub_card_numbers(text: str) -> str:
     digits, or "[card number removed]" when overlapping candidates disagree
     on them. See ``_card_candidates`` for what counts as a card number;
     digits in any script count, and invisible characters are ignored."""
+    # An invisible character may sit inside a digit group or be the only
+    # break between two numbers; each reading misses what the other finds,
+    # so both are tried and every card either finds is removed.
+    found: list[tuple[int, int, set[str]]] = []
     visible, index = _visible(text)
-    out, pos = [], 0
     for match in _DIGIT_RUN.finditer(visible):
-        for begin, end, replacement in _card_spans(match.group(0)):
+        for begin, end, fours in _card_candidates(match.group(0)):
             first = index[match.start() + begin]
-            last = index[match.start() + end - 1] + 1
-            out.append(text[pos:first])
-            out.append(replacement)
-            pos = last
+            found.append((first, index[match.start() + end - 1] + 1, fours))
+    for match in _DIGIT_RUN.finditer(_spaced(text)):
+        for begin, end, fours in _card_candidates(match.group(0)):
+            found.append((match.start() + begin, match.start() + end, fours))
+    found.sort(key=lambda span: (span[0], span[1]))
+    merged: list[tuple[int, int, set[str]]] = []
+    for begin, end, fours in found:
+        if merged and begin < merged[-1][1]:
+            b, e, f = merged[-1]
+            merged[-1] = (b, max(e, end), f | fours)
+        else:
+            merged.append((begin, end, set(fours)))
+    out, pos = [], 0
+    for begin, end, fours in merged:
+        out.append(text[pos:begin])
+        out.append(f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
+        pos = end
     out.append(text[pos:])
     return "".join(out)
 
