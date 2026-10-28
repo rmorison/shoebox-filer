@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import functools
+import io
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
@@ -32,8 +34,9 @@ _R = TypeVar("_R")
 # Raised whenever the prompts or the output model change; every extraction
 # run records it. 0 means a receipt has no extraction history; 1 was the
 # paid-amount prompt, which was never recorded. 3 added receipt_link, and
-# likely receipt link URLs in the text of an HTML-only email.
-EXTRACTION_PROMPT_VERSION = 3
+# likely receipt link URLs in the text of an HTML-only email. 4 sends a
+# scanned PDF attachment (no text layer) to the model as a document.
+EXTRACTION_PROMPT_VERSION = 4
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
@@ -110,6 +113,10 @@ If PDF attachment content is provided below the email body, use it as additional
 context for extraction. The PDF content often contains the detailed receipt with \
 amounts and line items that may not appear in the email body.
 
+A PDF attachment with no text layer (a scan) is sent as a document after a line \
+"--- PDF Attachment (scanned): <file name> ---". Read the receipt from it, and \
+when it holds the receipt, give that file name as receipt_document.
+
 If image attachments are provided, they are likely a screenshot or photo of the \
 receipt itself (the email body may be empty) — extract the receipt details from \
 the image.
@@ -145,6 +152,15 @@ If the currency is not stated, assume USD.\
 # Minimum non-whitespace characters for PDF text to be considered sufficient.
 # Matches the threshold used in pdf_reader.py.
 _MIN_TEXT_LENGTH = 20
+
+# Scanned PDF attachments sent to the model as documents, per email. Every
+# page costs input tokens for its text and its image, so these bound one
+# email's cost: a scanned receipt or invoice runs to a page or three, and a
+# longer scan is unlikely to be a receipt. The byte cap keeps the request,
+# after base64, under the Messages API's 32 MB limit.
+_MAX_EMAIL_PDF_DOCUMENTS = 3
+_MAX_EMAIL_PDF_PAGES = 10
+_MAX_EMAIL_PDF_BYTES = 20_000_000
 
 
 def _to_extraction_result(result: Any) -> ExtractionResult:
@@ -249,24 +265,28 @@ def _extract_from_email(
         msg = "No extraction agent provided."
         raise ValueError(msg)
 
-    pdf_name, pdf_text = _first_pdf_text(raw.attachments)
-    prompt = _build_prompt(raw, pdf_text=pdf_text, pdf_name=pdf_name)
+    pdfs = _read_pdf_attachments(raw.attachments)
+    prompt = _build_prompt(raw, pdf_text=pdfs.text, pdf_name=pdfs.text_name)
 
     images = _image_attachments(raw.attachments)
-    if images:
-        # Send image attachments (e.g. screenshot receipts) to vision alongside
-        # the email text context. The IMAP body is often empty for these.
-        message: list[Any] = [prompt]
-        for att in images:
-            message.append(
-                BinaryContent(
-                    data=att.data,
-                    media_type=_base_content_type(att.content_type),
-                )
+    if not pdfs.documents and not images:
+        return _to_extraction_result(agent.run_sync(prompt))
+
+    # Scanned PDFs go as documents, each after a line naming its file, and
+    # image attachments (e.g. screenshot receipts) as images, in the same
+    # request as the email text. The IMAP body is often empty for these.
+    message: list[Any] = [prompt]
+    for att in pdfs.documents:
+        message.append(f"--- PDF Attachment (scanned): {att.filename} ---")
+        message.append(BinaryContent(data=att.data, media_type="application/pdf"))
+    for att in images:
+        message.append(
+            BinaryContent(
+                data=att.data,
+                media_type=_base_content_type(att.content_type),
             )
-        result: Any = agent.run_sync(message)
-    else:
-        result = agent.run_sync(prompt)
+        )
+    result: Any = agent.run_sync(message)
     return _to_extraction_result(result)
 
 
@@ -426,20 +446,71 @@ def _build_prompt(
     return "\n".join(parts)
 
 
-def _extract_pdf_text(attachments: list[Attachment]) -> str | None:
-    """Extract text from the first PDF attachment, if any."""
-    return _first_pdf_text(attachments)[1]
+@dataclass
+class _PdfAttachments:
+    """An email's PDF attachments, as the extractor gets them.
+
+    ``text`` is the first PDF with text, by name; ``documents`` are the
+    scanned PDFs (no text layer) sent to the model as they are.
+    """
+
+    text_name: str | None = None
+    text: str | None = None
+    documents: list[Attachment] = field(default_factory=list)
 
 
-def _first_pdf_text(attachments: list[Attachment]) -> tuple[str | None, str | None]:
-    """The first PDF attachment's file name and text, or (None, None)."""
-    from receipt_index.pdf_reader import extract_text
+def _read_pdf(data: bytes) -> tuple[int, str] | None:
+    """A PDF's page count and text, or None when it can't be read.
 
+    An encrypted PDF counts as unreadable even when pdfplumber opens it (an
+    owner password only): the API rejects it as a document.
+    """
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            if pdf.doc.encryption is not None:
+                return None
+            pages = [page.extract_text() or "" for page in pdf.pages]
+    except Exception:  # any failure means unreadable, never a scan
+        return None
+    return len(pages), "\n\n".join(pages).strip()
+
+
+def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
+    """Sort the PDF attachments into text, documents and left out.
+
+    The first PDF with text gives the text section; later ones are left
+    out, as before. A PDF that opens but has too little text is a scan and
+    goes as a document, within the caps above. A PDF that can't be read, or
+    is encrypted, is left out: sent, it would fail the whole request.
+    """
+    pdfs = _PdfAttachments()
+    sent_bytes = 0
     for att in attachments:
-        if _base_content_type(att.content_type) == "application/pdf":
-            text = extract_text(att.data)
-            return att.filename, (text if text else None)
-    return None, None
+        if _base_content_type(att.content_type) != "application/pdf":
+            continue
+        read = _read_pdf(att.data)
+        if read is None:
+            logger.info("PDF attachment %s can't be read; left out", att.filename)
+            continue
+        pages, text = read
+        if _has_sufficient_text(text):
+            if pdfs.text is None:
+                pdfs.text_name, pdfs.text = att.filename, text
+            continue
+        if len(pdfs.documents) >= _MAX_EMAIL_PDF_DOCUMENTS:
+            reason = f"already {_MAX_EMAIL_PDF_DOCUMENTS} scanned PDFs"
+        elif pages > _MAX_EMAIL_PDF_PAGES:
+            reason = f"{pages} pages, over {_MAX_EMAIL_PDF_PAGES}"
+        elif sent_bytes + len(att.data) > _MAX_EMAIL_PDF_BYTES:
+            reason = f"{len(att.data)} bytes, over the email's limit"
+        else:
+            pdfs.documents.append(att)
+            sent_bytes += len(att.data)
+            continue
+        logger.info("Scanned PDF attachment %s left out: %s", att.filename, reason)
+    return pdfs
 
 
 def _base_content_type(content_type: str) -> str:
