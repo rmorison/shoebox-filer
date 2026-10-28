@@ -75,6 +75,7 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: uv sync --all-extras
       - run: uv run pytest tests/integration/ -m integration --cov-fail-under=60
+        # Required: without all three ports every integration test skips.
         env:
           POSTGRES_HOST_PORT: "15432"
           GREENMAIL_SMTP_PORT: "3025"

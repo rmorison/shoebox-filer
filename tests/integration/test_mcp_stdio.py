@@ -39,18 +39,19 @@ from receipt_index.mcp_server import (
 )
 from receipt_index.repository import insert_ingest_log, insert_receipt
 
+from .ports import dsn
+
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
     from mcp_types import CallToolResult
 
 pytestmark = pytest.mark.integration
 
-_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
 _PASSWORD = "localpass"  # pragma: allowlist secret
 
 
 def _dsn(role: str) -> str:
-    return f"postgresql://{role}:{_PASSWORD}@localhost:{_PORT}/receipt_index_dev"
+    return dsn(role, _PASSWORD)
 
 
 _READ_ROLE = "receipt_index_dev_read"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import smtplib
 from email.mime.application import MIMEApplication
@@ -13,6 +12,17 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import pytest
+
+from .ports import (
+    GREENMAIL_IMAP_PORT as GREENMAIL_IMAP_PORT,  # re-exported for the tests
+)
+from .ports import (
+    GREENMAIL_SMTP_PORT,
+    MISSING,
+    POSTGRES_HOST_PORT,
+    dsn,
+    skip_reason,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,12 +35,29 @@ if TYPE_CHECKING:
 # Tests run as superuser (main). test_db_logins.py applies the migrations'
 # grants (apply_migration_grants) and runs the write and read paths as logins
 # that hold only those grants, to catch a missing GRANT.
-_MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
-_POSTGRES_HOST_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
-_DB_DSN = (
-    "postgresql://main:localpass@localhost:"  # pragma: allowlist secret
-    f"{_POSTGRES_HOST_PORT}/receipt_index_dev"
-)
+_HERE = Path(__file__).resolve().parent
+_MIGRATIONS = _HERE.parents[1] / "db" / "migrations"
+_POSTGRES_HOST_PORT = POSTGRES_HOST_PORT
+_DB_DSN = dsn("main", "localpass")  # pragma: allowlist secret
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Fail closed: skip every integration test unless all ports are set.
+
+    There is no default port to fall back to, so a run without the devtest
+    variables skips here, before any fixture runs or connection opens.
+    """
+    if not MISSING:
+        return
+    # A skipif placed first: pytest reads skipif marks before skip marks, so
+    # this reason wins over a test's own skip condition.
+    skip = pytest.mark.skipif(True, reason=skip_reason(MISSING))
+    for item in items:
+        if _HERE in item.path.parents:
+            item.add_marker(skip, append=False)
 
 
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
@@ -337,8 +364,7 @@ def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
 # GreenMail / IMAP fixtures
 # ---------------------------------------------------------------------------
 
-_GREENMAIL_SMTP_PORT = int(os.environ.get("GREENMAIL_SMTP_PORT", "3025"))
-GREENMAIL_IMAP_PORT = int(os.environ.get("GREENMAIL_IMAP_PORT", "3143"))
+_GREENMAIL_SMTP_PORT = GREENMAIL_SMTP_PORT
 
 
 def _smtp_available() -> bool:
