@@ -41,7 +41,7 @@ Postgres and GreenMail (mock IMAP for integration tests):
 ```bash
 docker compose up -d
 ```
-Port mappings are configurable via env vars (see `example.env`). The defaults below are Docker Compose's only; the integration tests have none and need all three set:
+Port mappings are configurable via env vars. `example.env` leaves all three commented out, so a `.env` that `make setup` copies from it sets none. The defaults below are Docker Compose's only; the integration tests have none and need all three set:
 - `POSTGRES_HOST_PORT` (Compose default 15432)
 - `GREENMAIL_SMTP_PORT` (Compose default 3025)
 - `GREENMAIL_IMAP_PORT` (Compose default 3143)
@@ -59,7 +59,7 @@ On a host that also runs the production stack, the default host ports can collid
   ```
   Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env`, so plain `docker compose` commands and `make docker-up` / `make docker-down` all use the same project, and its containers and volumes stay separate from production's. Passing `docker compose -p shoebox-dev` on every command does the same; the `make docker-*` targets don't pass `-p`. Keep this `.env` to the devtest checkout: an exported `COMPOSE_PROJECT_NAME` overrides the production compose file's own project name.
 - Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env`, and in the migration URL below, from 15432 to your `POSTGRES_HOST_PORT`.
-- The integration tests read the three port variables from the environment and have no fallback. If any is unset, empty or not a port number, every integration test skips before a fixture runs or a connection opens. A value that is set is trusted, though: a `.env` copied from `example.env` sets the Compose defaults, so on a shared host change them before running the tests. The Makefile loads `.env`, so `make test-integration` gets them; export them yourself when running `pytest` directly, or if the Makefile can't parse your `.env`. A `.env` alone isn't enough for a direct `pytest` run: the tests decide before anything loads it.
+- The integration tests read the three port variables from the environment and have no fallback. If any is unset, empty or not a port number, every integration test skips before a fixture runs or a connection opens. A value that is set is trusted, though, so on a shared host never set them to the Compose defaults. The Makefile loads `.env`, so `make test-integration` gets them; export them yourself when running `pytest` directly, or if the Makefile can't parse your `.env`. A `.env` alone isn't enough for a direct `pytest` run: the tests decide before anything loads it.
 
 ### Database
 Migrations (requires [golang-migrate](https://github.com/golang-migrate/migrate)):
@@ -72,9 +72,10 @@ Note: Postgres 18 requires volume mount at `/var/lib/postgresql` (not `/data` su
 
 ### Integration Tests
 
-Requires Docker services running, and `POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT` and `GREENMAIL_IMAP_PORT` set to their host ports (from `.env` through the Makefile, or exported). Without them every integration test skips with a message naming the variables:
+Requires Docker services running, and `POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT` and `GREENMAIL_IMAP_PORT` set to their host ports (from `.env` through the Makefile, or exported). After `make setup`, uncomment and set the three in `.env` (choose ports nothing else on the host uses), match the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL`, then run Compose and the tests with them. Without them every integration test skips, without connecting, with a message naming the missing variables and pointing at "Integration tests" in `docs/user/getting-started.md`:
 ```bash
 docker compose up -d
+make migrate-up
 make test-integration
 ```
 

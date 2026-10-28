@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 PORT_VARS = ("POSTGRES_HOST_PORT", "GREENMAIL_SMTP_PORT", "GREENMAIL_IMAP_PORT")
 
+# Where setting the ports is described; the skip message points here.
+SETUP_DOC = '"Integration tests" in docs/user/getting-started.md'
+
 # Stands in for a missing port so the module-level names keep their types.
 # The conftest skips before anything uses it. If the conftest is turned off
 # (--noconftest), test bodies can run, so the value must not be a port any
@@ -42,9 +45,9 @@ def missing_ports(env: Mapping[str, str] | None = None) -> list[str]:
 
 def skip_reason(missing: list[str]) -> str:
     return (
-        f"{', '.join(missing)} not set: set POSTGRES_HOST_PORT, "
+        f"{', '.join(missing)} not set to a port: set POSTGRES_HOST_PORT, "
         "GREENMAIL_SMTP_PORT and GREENMAIL_IMAP_PORT to your devtest "
-        "stack's ports (there is no default)"
+        f"stack's ports (there is no default); see {SETUP_DOC}"
     )
 
 

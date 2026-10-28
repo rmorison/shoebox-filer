@@ -22,7 +22,13 @@ from typing import Any
 import psycopg
 import pytest
 
-from tests.integration.ports import UNSET_PORT, missing_ports, parse_port
+from tests.integration.ports import (
+    SETUP_DOC,
+    UNSET_PORT,
+    missing_ports,
+    parse_port,
+    skip_reason,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PORT_VARS = ("POSTGRES_HOST_PORT", "GREENMAIL_SMTP_PORT", "GREENMAIL_IMAP_PORT")
@@ -171,3 +177,24 @@ class TestUnsetPlaceholder:
         dsn = f"postgresql://nobody@localhost:{UNSET_PORT}/none"
         with pytest.raises(psycopg.OperationalError):
             psycopg.connect(dsn, connect_timeout=1)
+
+
+class TestSetupDefaults:
+    """A ``.env`` copied from ``example.env`` must leave the gate shut."""
+
+    def test_example_env_sets_no_port(self) -> None:
+        # Read it the way the Makefile does: skip comment and blank lines.
+        env: dict[str, str] = {}
+        for line in (_ROOT / "example.env").read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                key, value = line.split("=", 1)
+                env[key.strip()] = value.strip()
+        assert missing_ports(env) == list(_PORT_VARS)
+
+    def test_skip_message_points_at_a_section_that_exists(self) -> None:
+        assert SETUP_DOC in skip_reason(["POSTGRES_HOST_PORT"])
+        doc = (_ROOT / "docs" / "user" / "getting-started.md").read_text()
+        assert "\n## Integration tests\n" in doc
+        assert "docs/user/getting-started.md" in SETUP_DOC
+        assert '"Integration tests"' in SETUP_DOC
