@@ -8,7 +8,6 @@ table: in production the application connects as the owner.
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,17 +17,16 @@ import pytest
 from psycopg import sql
 from psycopg.rows import dict_row
 
+from .ports import POSTGRES_HOST_PORT, dsn
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 pytestmark = pytest.mark.integration
 
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
-_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
-_ADMIN_DSN = (
-    "postgresql://main:localpass@localhost:"  # pragma: allowlist secret
-    f"{_PORT}/receipt_index_dev"
-)
+_PORT = POSTGRES_HOST_PORT
+_ADMIN_DSN = dsn("main", "localpass")  # pragma: allowlist secret
 _ROLES = ("receipt_index_dev_all", "receipt_index_dev_write", "receipt_index_dev_read")
 
 

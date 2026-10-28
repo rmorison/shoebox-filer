@@ -61,7 +61,7 @@ Optional variables (defaults are usually fine):
 | `LLM_MODEL` | Anthropic model for metadata extraction | `claude-haiku-5-5` |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
 
-The `PLAYWRIGHT_BROWSERS_PATH` and Docker port variables can generally be left at their defaults.
+`PLAYWRIGHT_BROWSERS_PATH` can generally be left at its default. The Docker port variables (`POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT`, `GREENMAIL_IMAP_PORT`) are commented out in `example.env`: Docker Compose uses its own defaults without them, but the integration tests need them set (see [Integration tests](#integration-tests)).
 
 ### Email App-Specific Passwords
 
@@ -135,6 +135,29 @@ uv run receipt-index search --vendor amazon
 ```
 
 See the [CLI Reference](cli-reference.md) for all search options and more examples.
+
+## Integration tests
+
+The integration tests (for contributors) run against the Docker Compose stack: PostgreSQL and GreenMail, a mock mail server. They rebuild and empty tables, so they never guess where that stack listens. `POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT` and `GREENMAIL_IMAP_PORT` must all be set, and `example.env` leaves them commented out. Until all three are set, every integration test skips without connecting, and the skip message names the variables that are missing.
+
+After `make setup`, set the three ports in `.env`. Choose ports nothing else on the host uses; on a host that also runs another copy of the stack, such as production, don't use Compose's defaults (15432, 3025, 3143). For example:
+
+```bash
+POSTGRES_HOST_PORT=25432
+GREENMAIL_SMTP_PORT=23025
+GREENMAIL_IMAP_PORT=23143
+```
+
+A `.env` created from an older `example.env` still sets the three ports to Compose's defaults, so check it on a shared host.
+
+Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env` to the same `POSTGRES_HOST_PORT`. Then start the stack and run the tests. The tests apply the schema themselves, so they need no `make migrate-up`. Docker Compose and the Makefile both read `.env`, so each command uses the same ports:
+
+```bash
+docker compose up -d
+make test-integration
+```
+
+To run `pytest` directly instead of through `make`, export the three variables in your shell first. Don't rely on `.env` for that: the tests read the variables from the environment before anything loads it.
 
 ## Next Steps
 

@@ -2,7 +2,7 @@
 
 Requires Docker services: Postgres and GreenMail, on the host ports set by
 POSTGRES_HOST_PORT, GREENMAIL_SMTP_PORT and GREENMAIL_IMAP_PORT
-(defaults 15432, 3025 and 3143).
+(required; without them every integration test skips).
 Start with: docker compose up -d
 
 These tests exercise:

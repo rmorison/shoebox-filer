@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import smtplib
 from email.mime.application import MIMEApplication
@@ -13,6 +12,17 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import pytest
+
+from .ports import (
+    GREENMAIL_IMAP_PORT as GREENMAIL_IMAP_PORT,  # re-exported for the tests
+)
+from .ports import (
+    GREENMAIL_SMTP_PORT,
+    MISSING,
+    POSTGRES_HOST_PORT,
+    dsn,
+    skip_reason,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -26,11 +36,23 @@ if TYPE_CHECKING:
 # grants (apply_migration_grants) and runs the write and read paths as logins
 # that hold only those grants, to catch a missing GRANT.
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
-_POSTGRES_HOST_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
-_DB_DSN = (
-    "postgresql://main:localpass@localhost:"  # pragma: allowlist secret
-    f"{_POSTGRES_HOST_PORT}/receipt_index_dev"
-)
+_POSTGRES_HOST_PORT = POSTGRES_HOST_PORT
+_DB_DSN = dsn("main", "localpass")  # pragma: allowlist secret
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Fail closed: skip every integration test unless all ports are set.
+
+    There is no default port to fall back to, so a run without the devtest
+    variables skips here, before any fixture runs or connection opens.
+    pytest calls a conftest's setup hook only for the items under its own
+    directory, however that directory was named on the command line, and
+    the skip is raised here rather than through a skip mark, so it holds
+    with the skipping plugin turned off too.
+    """
+    if MISSING:
+        pytest.skip(skip_reason(MISSING))
 
 
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
@@ -337,8 +359,7 @@ def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
 # GreenMail / IMAP fixtures
 # ---------------------------------------------------------------------------
 
-_GREENMAIL_SMTP_PORT = int(os.environ.get("GREENMAIL_SMTP_PORT", "3025"))
-GREENMAIL_IMAP_PORT = int(os.environ.get("GREENMAIL_IMAP_PORT", "3143"))
+_GREENMAIL_SMTP_PORT = GREENMAIL_SMTP_PORT
 
 
 def _smtp_available() -> bool:
