@@ -101,6 +101,7 @@ class TestLocking:
         purchase = uuid4()
         repo = _Repo([purchase], still_purchase=False)
         assert _run(monkeypatch, repo) == []
+        assert repo.locked == [purchase]
         assert repo.linked == []
 
     def test_several_matches_lock_nothing(
