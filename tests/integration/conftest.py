@@ -34,7 +34,7 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000011 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000012 (tables, indexes and
     constraints; not the grants, since CI's Postgres has no application roles).
     Keep in sync with db/migrations/ when schema changes.
     """
@@ -203,6 +203,13 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # Run from the migration file itself, up to its grants, so the guard
     # under test is the one that ships.
     conn.execute(_schema_part("receipt", "000011"))
+
+    # receipt/000012 — retries: attempt columns, error class, the 'queued'
+    # status and retry_requests. Run from the migration file, up to its grants.
+    # ingest_log was dropped above; retry_requests goes now, so the file's
+    # CREATE TABLE IF NOT EXISTS builds a fresh one.
+    conn.execute("DROP TABLE IF EXISTS receipt.retry_requests CASCADE")
+    conn.execute(_schema_part("receipt", "000012"))
     conn.commit()
 
 
@@ -230,13 +237,14 @@ def pg_conn() -> Iterator[psycopg.Connection[dict[str, Any]]]:
 
 @pytest.fixture(autouse=True)
 def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
-    """Clear the receipts, ingest_log and sync_state tables before each test."""
+    """Clear the receipts, ingest_log, sync_state and retry_requests tables."""
     pg_conn.rollback()  # clear any dangling transaction from a prior test failure
     # The cascade reaches receipt.extractions, whose guard refuses TRUNCATE.
     # Replica mode skips ordinary triggers for this test-only statement.
     pg_conn.execute("SET LOCAL session_replication_role = replica")
     pg_conn.execute(
-        "TRUNCATE receipt.ingest_log, receipt.receipts, receipt.sync_state CASCADE"
+        "TRUNCATE receipt.ingest_log, receipt.receipts, receipt.sync_state, "
+        "receipt.retry_requests CASCADE"
     )
     pg_conn.commit()
 

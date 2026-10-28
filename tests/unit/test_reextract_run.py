@@ -21,6 +21,7 @@ from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.adapters.imap import MessageRefusedError
 from receipt_index.config import ImapSourceConfig
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+from receipt_index.fetching import SourcePool
 from receipt_index.models import (
     ExtractionResult,
     FieldConfidence,
@@ -28,7 +29,7 @@ from receipt_index.models import (
     Receipt,
     ReceiptMetadata,
 )
-from receipt_index.reextract import SourcePool, run_reextract
+from receipt_index.reextract import run_reextract
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

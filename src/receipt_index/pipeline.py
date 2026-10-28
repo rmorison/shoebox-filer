@@ -2,44 +2,67 @@
 
 ``process_item`` runs one fetched item through extract, render, store and
 index. ``handle_item`` wraps it in the per-item protocol: item lock, re-check,
-``started`` row, fetch. ``run_ingest`` is the one-shot loop over one source:
+fetch, ``started`` row. ``run_ingest`` is the one-shot loop over one source:
 it reads what is new since the stored sync state and advances the cursor
 under the cursor rule (see the always-on ingest design, sections 1 and 5).
+``run_due_retries`` is the retry scheduler (section 6): it runs the items of
+one source that are due again, through the shared re-fetch path.
+
+Every failed row is classified (``receipt_index.errors``) and carries its
+attempt and next retry time (``receipt_index.retries``). A transient or
+config failure stops the source for the rest of the run: the next item would
+most likely fail the same way.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from receipt_index.adapters.base import SourceUnavailableError
+from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
+from receipt_index.fetching import SourceDownError, fetch_item
 from receipt_index.locks import SourceLockLostError, item_lock
 from receipt_index.models import MIN_RECEIPT_CONFIDENCE, receipt_values
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
+    get_item_history,
     get_processed_source_ids,
-    get_stale_started,
     get_sync_state,
+    has_receipt,
     insert_extraction,
     insert_ingest_log,
     insert_receipt,
+    is_due,
     is_source_id_known,
     record_poll,
     save_drive_cursor,
     save_imap_cursor,
 )
+from receipt_index.retries import (
+    AttemptState,
+    RetryPolicy,
+    attempt_state,
+    failure_fields,
+)
 from receipt_index.store import pdf_path_for, store_rendition
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import psycopg
     from pydantic_ai import Agent
 
     from receipt_index.adapters.base import SourceAdapter
+    from receipt_index.errors import ErrorClass
+    from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
     from receipt_index.models import (
         ExtractionResult,
+        IngestLogEntry,
         ItemRef,
         RawReceipt,
         Receipt,
@@ -53,9 +76,8 @@ logger = logging.getLogger(__name__)
 
 _MIN_CONFIDENCE = MIN_RECEIPT_CONFIDENCE
 
-# A started row older than this, with no later row, belongs to a process that
-# died mid-item.
-_STALE_STARTED_SECONDS = 3600
+# The error a dead started row is closed with.
+_DIED_MID_ITEM = "the process stopped mid-item (found by the retry scheduler)"
 
 ItemStatus = Literal["success", "skipped", "failed", "known", "locked"]
 
@@ -68,8 +90,9 @@ class IngestResult:
     skipped: int = 0
     failed: int = 0
     receipts: list[Receipt] = field(default_factory=list)
-    # Set when the source itself failed: it couldn't be read, or its lock
-    # was lost. The CLI exits non-zero.
+    # Set when the source itself failed: it couldn't be read, its lock was
+    # lost, or an item failed in a way that stops the source (transient or
+    # config). The CLI exits non-zero.
     source_error: str | None = None
 
 
@@ -79,6 +102,23 @@ class ItemOutcome:
 
     status: ItemStatus
     receipt: Receipt | None = None
+    error_class: ErrorClass | None = None
+
+    @property
+    def stops_source(self) -> bool:
+        """A transient or config failure: the next item would fail too."""
+        return self.status == "failed" and self.error_class in ("transient", "config")
+
+
+def _now() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+def _stop_message(outcome: ItemOutcome) -> str:
+    return (
+        f"stopped after a {outcome.error_class} failure; the item is retried "
+        "on a later run"
+    )
 
 
 def _email_date(source_type: str, ref_or_raw: ItemRef | RawReceipt) -> Any:
@@ -97,8 +137,18 @@ def _record_failure(
     exc: Exception,
     extraction: ExtractionResult | None,
     llm_model: str | None,
-) -> None:
-    """Write an item's ``failed`` row. A failure to write it is only logged."""
+    policy: RetryPolicy,
+    state: AttemptState,
+    stored_ref: str | None = None,
+    error_class: ErrorClass | None = None,
+) -> ErrorClass:
+    """Write an item's ``failed`` row and return its class.
+
+    The class comes from the exception unless ``error_class`` is given. A
+    failure to write the row is only logged.
+    """
+    cls = error_class or classify(exc)
+    fields = failure_fields(policy, state, cls, _now())
     try:
         insert_ingest_log(
             conn,
@@ -117,9 +167,15 @@ def _record_failure(
             ),
             llm_requests=(extraction.requests if extraction else None),
             llm_model=llm_model,
+            attempt=fields.attempt,
+            counts_attempt=fields.counts_attempt,
+            next_retry_at=fields.next_retry_at,
+            error_class=fields.error_class,
+            stored_ref=stored_ref,
         )
     except Exception:
         logger.warning("Failed to write ingest log for %s", source_id, exc_info=True)
+    return cls
 
 
 def process_item(
@@ -131,13 +187,19 @@ def process_item(
     source_type: str,
     llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
+    policy: RetryPolicy | None = None,
+    state: AttemptState | None = None,
 ) -> ItemOutcome:
     """Extract, render, store and index one fetched item.
 
     Writes the item's outcome row: ``success``, ``skipped`` (confidence below
-    the threshold) or ``failed``. An error never propagates.
+    the threshold) or ``failed``, numbered as attempt ``state.number``. An
+    error never propagates.
     """
+    policy = policy or RetryPolicy()
+    state = state or AttemptState()
     extraction = None
+    stored_ref: str | None = None
     try:
         extraction = extract_metadata(raw, agent=agent)
         metadata = extraction.metadata
@@ -170,6 +232,7 @@ def process_item(
                 llm_cache_read_tokens=extraction.cache_read_tokens,
                 llm_requests=extraction.requests,
                 llm_model=llm_model,
+                attempt=state.number,
             )
             return ItemOutcome("skipped")
 
@@ -181,6 +244,9 @@ def process_item(
             vendor=metadata.vendor,
             amount=metadata.amount,
         )
+        # Recorded on a failed row, so `retry` can report the file as
+        # orphaned if the database writes below fail.
+        stored_ref = stored.ref
         receipt = insert_receipt(
             conn,
             source_id=raw.source_id,
@@ -239,6 +305,7 @@ def process_item(
             llm_cache_read_tokens=extraction.cache_read_tokens,
             llm_requests=extraction.requests,
             llm_model=llm_model,
+            attempt=state.number,
         )
         logger.info(
             "Processed receipt: %s (%s) confidence=%.2f",
@@ -250,7 +317,7 @@ def process_item(
     except Exception as exc:
         # Rollback failed transaction so the ingest_log write succeeds
         conn.rollback()
-        _record_failure(
+        cls = _record_failure(
             conn,
             source_id=raw.source_id,
             source_type=source_type,
@@ -261,15 +328,19 @@ def process_item(
             exc=exc,
             extraction=extraction,
             llm_model=llm_model,
+            policy=policy,
+            state=state,
+            stored_ref=stored_ref,
         )
         logger.warning(
-            "Failed to process message %s (subject=%s, sender=%s)",
+            "Failed to process message %s (subject=%s, sender=%s; %s failure)",
             raw.source_id,
             raw.subject,
             raw.sender,
+            cls,
             exc_info=True,
         )
-        return ItemOutcome("failed")
+        return ItemOutcome("failed", error_class=cls)
 
 
 def handle_item(
@@ -282,8 +353,9 @@ def handle_item(
     source_type: str,
     llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
+    policy: RetryPolicy | None = None,
 ) -> ItemOutcome:
-    """Take the item lock, re-check, write ``started``, fetch and process.
+    """Take the item lock, re-check, fetch, write ``started`` and process.
 
     Returns ``locked`` when another process holds the item, and ``known``
     when the item gained a record between listing and locking. Once the
@@ -346,6 +418,7 @@ def handle_item(
             email_date=email_date,
         )
 
+        policy = policy or RetryPolicy()
         if fetch_error is not None or raw is None:
             _record_failure(
                 conn,
@@ -358,9 +431,12 @@ def handle_item(
                 exc=fetch_error or LookupError("item is no longer in the source"),
                 extraction=None,
                 llm_model=llm_model,
+                policy=policy,
+                state=AttemptState(),
+                error_class="content",
             )
             logger.warning("Failed to fetch %s", ref.source_id, exc_info=fetch_error)
-            return ItemOutcome("failed")
+            return ItemOutcome("failed", error_class="content")
 
         return process_item(
             conn,
@@ -370,6 +446,7 @@ def handle_item(
             source_type=source_type,
             agent=agent,
             llm_model=llm_model,
+            policy=policy,
         )
 
 
@@ -488,6 +565,7 @@ def run_ingest(
     dry_run: bool = False,
     limit: int | None = None,
     source_lock: SourceLock | None = None,
+    policy: RetryPolicy | None = None,
 ) -> IngestResult:
     """Read what is new in one source and process it, one item at a time.
 
@@ -565,6 +643,7 @@ def run_ingest(
                     source_type=source_type,
                     agent=agent,
                     llm_model=llm_model,
+                    policy=policy,
                 )
                 if outcome.status == "locked":
                     logger.info(
@@ -581,6 +660,10 @@ def run_ingest(
                 elif outcome.status == "failed":
                     result.failed += 1
                 cursor.mark_done(ref)
+                if outcome.stops_source:
+                    result.source_error = _stop_message(outcome)
+                    logger.error("Source %s: %s", source_name, result.source_error)
+                    break
 
             if not dry_run:
                 cursor.finish()
@@ -598,19 +681,157 @@ def run_ingest(
     return result
 
 
-def warn_stale_started(conn: psycopg.Connection[dict[str, Any]]) -> list[str]:
-    """Log items left with only an old ``started`` row, and return their IDs.
+@dataclass
+class RetryResult:
+    """Summary of one retry pass over one source."""
 
-    Their process died mid-item. They count as processed, so nothing retries
-    them until the retry scheduler exists; this makes them visible.
+    processed: int = 0
+    skipped: int = 0
+    failed: int = 0
+    receipts: list[Receipt] = field(default_factory=list)
+    # Why the pass stopped early, if it did.
+    stopped: str | None = None
+
+
+def run_due_retries(
+    conn: psycopg.Connection[dict[str, Any]],
+    due: list[IngestLogEntry],
+    *,
+    pool: SourcePool,
+    store: EvidenceStore,
+    agents: Mapping[str, Agent[None, ReceiptMetadata]],
+    llm_model: str,
+    policy: RetryPolicy | None = None,
+) -> RetryResult:
+    """Run the items that are due again, one at a time.
+
+    ``due`` comes from ``select_due``. For each item: take its lock (skip it
+    if someone holds it), re-check that its latest row is still due, and
+
+    - close a ``started`` row whose process died with a counted failure (it
+      is retried after the normal backoff);
+    - otherwise re-fetch it through the shared fetch path *before* writing
+      ``started``, so an unreachable source leaves no row and uses up no
+      attempt, then process it as attempt ``n``.
+
+    ``agents`` maps ``"email"`` and ``"document"`` to their agents. A source
+    that can't be reached, or a transient or config failure, ends the pass.
     """
-    rows = get_stale_started(conn, older_than_seconds=_STALE_STARTED_SECONDS)
-    ids = [str(row["source_id"]) for row in rows]
-    if ids:
-        logger.warning(
-            "%d item(s) have a 'started' row older than an hour and no outcome "
-            "(their run stopped mid-item; they aren't retried automatically): %s",
-            len(ids),
-            ", ".join(ids),
-        )
-    return ids
+    policy = policy or RetryPolicy()
+    result = RetryResult()
+    for entry in due:
+        with item_lock(conn, entry.source_id) as locked:
+            if not locked:
+                logger.info("Item %s is locked; leaving it", entry.source_id)
+                continue
+            history = get_item_history(conn, entry.source_id)
+            latest = history[0] if history else None
+            if (
+                latest is None
+                or not is_due(latest, _now())
+                or has_receipt(conn, entry.source_id)
+            ):
+                conn.commit()
+                continue
+            conn.commit()
+            state = attempt_state(history)
+            source_name = latest.source_name
+            source_type = latest.source_type
+            email_date = latest.email_date
+
+            if latest.status == "started":
+                logger.warning(
+                    "Item %s has a started row and no outcome; its process "
+                    "died. Recording a failure.",
+                    entry.source_id,
+                )
+                _record_failure(
+                    conn,
+                    source_id=entry.source_id,
+                    source_type=source_type,
+                    source_name=source_name or "",
+                    subject=latest.email_subject or "",
+                    sender=latest.email_sender or "",
+                    email_date=email_date,
+                    exc=RuntimeError(_DIED_MID_ITEM),
+                    extraction=None,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=AttemptState(latest.attempt),
+                    error_class="content",
+                )
+                result.failed += 1
+                continue
+
+            try:
+                fetched = fetch_item(
+                    pool,
+                    source_id=entry.source_id,
+                    source_name=source_name,
+                    source_type=source_type,
+                )
+            except SourceDownError as exc:
+                result.stopped = str(exc)
+                logger.error("Retries stopped: %s", exc)
+                break
+
+            name = fetched.source_name or source_name or ""
+            insert_ingest_log(
+                conn,
+                source_id=entry.source_id,
+                source_type=source_type,
+                source_name=name or None,
+                status="started",
+                email_subject=latest.email_subject,
+                email_sender=latest.email_sender,
+                email_date=email_date,
+                attempt=state.number,
+            )
+            if fetched.raw is None:
+                exc_: Exception = fetched.item_error or LookupError(
+                    "item is no longer in the source"
+                )
+                _record_failure(
+                    conn,
+                    source_id=entry.source_id,
+                    source_type=source_type,
+                    source_name=name,
+                    subject=latest.email_subject or "",
+                    sender=latest.email_sender or "",
+                    email_date=email_date,
+                    exc=exc_,
+                    extraction=None,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=state,
+                    error_class="content",
+                )
+                logger.warning("Retry of %s: %s", entry.source_id, exc_)
+                result.failed += 1
+                continue
+
+            raw = fetched.raw
+            agent = agents["document" if raw.source_type == "gdrive" else "email"]
+            outcome = process_item(
+                conn,
+                raw,
+                store=store,
+                source_name=name,
+                source_type=source_type,
+                agent=agent,
+                llm_model=llm_model,
+                policy=policy,
+                state=state,
+            )
+        if outcome.status == "success" and outcome.receipt is not None:
+            result.processed += 1
+            result.receipts.append(outcome.receipt)
+        elif outcome.status == "skipped":
+            result.skipped += 1
+        elif outcome.status == "failed":
+            result.failed += 1
+        if outcome.stops_source:
+            result.stopped = _stop_message(outcome)
+            logger.error("Retries %s", result.stopped)
+            break
+    return result

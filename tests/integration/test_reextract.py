@@ -20,9 +20,10 @@ import pytest
 from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.config import ImapSourceConfig
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+from receipt_index.fetching import SourcePool
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
-from receipt_index.reextract import SourcePool, run_reextract
+from receipt_index.reextract import run_reextract
 from receipt_index.repository import (
     get_receipt_by_id,
     insert_extraction,
