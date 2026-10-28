@@ -849,12 +849,13 @@ docker compose -f deploy/docker-compose.yml build
 # first — ticks land on :00/:15/:30/:45 and normally finish in well under a
 # minute, so there is a wide idle window.
 # The image has no pgrep, so the check reads each process's command line
-# from /proc. Idle only when the output is exactly `check-exit=1`.
-# `check-exit=0` lists a running ingest: wait and check again. Anything else,
-# or no `check-exit` line at all (the container is down, or the exec failed),
-# means the check didn't run: find out why before going on. The `[r]` keeps
+# from /proc, and prints `idle` only when the exec ran and found no ingest
+# (`check-exit=1` inside the container). `NOT idle` means an ingest is running
+# (wait a minute and check again) or the check didn't run at all: a stopped
+# container or a failed exec never reads as idle. If `docker compose ps` shows
+# the scheduler isn't running, there is no cycle to wait for. The `[r]` keeps
 # grep from matching the shell that runs it.
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
@@ -1033,26 +1034,40 @@ SELECT r.rolname, r.rolsuper, array_agg(g.rolname) AS member_of
 
 **Pass:** two rows, `receipt_index_read | f | {receipt_index_dev_read}` and `receipt_index_write | f | {receipt_index_dev_write}`. Each login is a member of its one role and nothing else.
 
-**5. Edit `.env`** in an editor. Keep the current `DATABASE_URL` line as a comment, for rollback, and set:
+**5. Set the two passwords and the three URLs** in an editor. Which file each goes in depends on whether this server has already split its env files ([8.5](#85-split-the-owner-credentials-out-of-env)):
+
+```bash
+test -e .env.db && echo split || echo "one file"
+```
+
+The two password lines:
 
 ```bash
 RECEIPT_INDEX_WRITE_PASSWORD=<write password>
 RECEIPT_INDEX_READ_PASSWORD=<read password>
+```
+
+The three URL lines:
+
+```bash
 DATABASE_URL=postgresql://receipt_index_write:<write password>@db:5432/receipt_index  # pragma: allowlist secret
 RECEIPT_INDEX_READ_DATABASE_URL=postgresql://receipt_index_read:<read password>@db:5432/receipt_index  # pragma: allowlist secret
 RECEIPT_INDEX_MCP_DATABASE_URL=postgresql://receipt_index_read:<read password>@db:5432/receipt_index  # pragma: allowlist secret
 ```
 
-Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. Leave `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` as they are: migrations still run as the owner. The service doesn't read the two password variables; `db-init` does, on a disaster-recovery rebuild ([8.3](#83-disaster-recovery-from-dropbox)). Then check for expansion warnings, as in [3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password):
+- **`one file`**, the usual case, since 8.5 runs after this section: all five lines go in `.env`. Keep the current `DATABASE_URL` line there as a comment, for rollback. Leave `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` in `.env` as they are: migrations still run as the owner. 8.5 later moves the owner's lines and the two passwords into `.env.db`, and has you delete the comment.
+- **`split`**: the two password lines go in `.env.db`, and the three URL lines in `.env`. Keep the current `DATABASE_URL` line as a comment in `.env.db`, for rollback, not in `.env`: `.env` holds no owner credential, not even in a comment. `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` stay in `.env.db`.
+
+Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. The service doesn't read the two password variables; `db-init` does, on a disaster-recovery rebuild ([8.3](#83-disaster-recovery-from-dropbox)). Then check for expansion warnings, as in [3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password):
 
 ```bash
 docker compose -f deploy/docker-compose.yml config --quiet
 ```
 
-**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints exactly `check-exit=1`, as in [8.1](#81-upgrade):
+**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints `idle`, as in [8.1](#81-upgrade):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1121,21 +1136,21 @@ test ! -e .env.pre-split && cp -pn .env .env.pre-split && echo copied
 
 **Pass:** `copied`.
 
-**2. Move the owner's lines** into `.env.db`. The subshell's `umask` creates both new files mode 600, `set -C` refuses to overwrite an existing `.env.db`, and `grep` writes the lines to files without printing them:
+**2. Move the owner's lines** into `.env.db`. The subshell's `umask` creates both new files mode 600, `set -C` refuses to overwrite an existing `.env.db`, and `grep` writes the lines to files without printing them. The patterns also match a line written as `export NAME=` or indented:
 
 ```bash
 (set -C; umask 077
- grep -E '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.db &&
- grep -vE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.new &&
+ grep -E '^[[:space:]]*(export[[:space:]]+)?(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.db &&
+ grep -vE '^[[:space:]]*(export[[:space:]]+)?(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.new &&
  mv .env.new .env)
 ```
 
 **3. Check by count and by mode,** still printing no values:
 
 ```bash
-grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env.db   # must print 7
-grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env      # must print 0
-grep -c '^DATABASE_URL=' .env                                     # must print 1
+grep -cE '^[[:space:]]*(export[[:space:]]+)?(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env.db   # must print 7
+grep -cE '^[[:space:]]*(export[[:space:]]+)?(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env      # must print 0
+grep -cE '^[[:space:]]*(export[[:space:]]+)?DATABASE_URL=' .env   # must print 1
 grep -cE '://(receipt_index|postgres)[:@]' .env                   # must print 0
 stat -c '%a %n' .env .env.db                                      # both 600
 ```
@@ -1152,10 +1167,10 @@ docker compose -f deploy/docker-compose.yml build
 docker compose -f deploy/docker-compose.yml config --quiet   # must print nothing
 ```
 
-**5. Recreate both containers between ingest cycles.** `db`'s environment changed, so `up -d` recreates it as well as the scheduler: Postgres restarts on the same volume, which takes seconds. Stop the scheduler first, as in [8.1](#81-upgrade), so no cycle runs while the database restarts. Go on past the check only when it prints exactly `check-exit=1`:
+**5. Recreate both containers between ingest cycles.** `db`'s environment changed, so `up -d` recreates it as well as the scheduler: Postgres restarts on the same volume, which takes seconds. Stop the scheduler first, as in [8.1](#81-upgrade), so no cycle runs while the database restarts. Go on past the check only when it prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 make migrate-up      # "no change", or this release's migrations; it reads .env.db
 docker compose -f deploy/docker-compose.yml up -d
@@ -1182,7 +1197,7 @@ b. [8.4](#84-separate-database-logins) step 7: each URL connects as its login, G
 
 ```bash
 cp -p .env.pre-split .env
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1254,10 +1269,10 @@ On [rootless Docker](#rootless-docker), chown it from inside a container instead
 RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 ```
 
-**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints exactly `check-exit=1`:
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
