@@ -19,6 +19,8 @@ BEGIN
         IF to_regclass(version_table) IS NOT NULL THEN
             EXECUTE format('GRANT SELECT ON %s TO receipt_index_dev_read',
                            version_table);
+        ELSE
+            RAISE NOTICE '% not found: no grant change on it', version_table;
         END IF;
     END LOOP;
 END $$;
