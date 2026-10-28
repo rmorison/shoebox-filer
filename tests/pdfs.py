@@ -29,18 +29,32 @@ def _rc4(key: bytes, data: bytes) -> bytes:
     return bytes(out)
 
 
-def _owner_password_only(file_id: bytes) -> bytes:
-    """An RC4 40-bit encryption dictionary with an empty user password."""
-    permissions = -4
+_FILE_ID = b"0123456789abcdef"
+_PERMISSIONS = -4
+
+
+def _owner_password_only() -> tuple[bytes, bytes]:
+    """An RC4 40-bit encryption dictionary with an empty user password.
+
+    Returns the dictionary and the file key that encrypts the streams.
+    """
+    permissions, file_id = _PERMISSIONS, _FILE_ID
     owner = _rc4(hashlib.md5(b"owner" + _PDF_PAD[:27]).digest()[:5], _PDF_PAD)
     key = hashlib.md5(
         _PDF_PAD + owner + permissions.to_bytes(4, "little", signed=True) + file_id
     ).digest()[:5]
     user = _rc4(key, _PDF_PAD)
-    return (
+    encrypt = (
         f"<< /Filter /Standard /V 1 /R 2 /O <{owner.hex()}> /U <{user.hex()}> "
         f"/P {permissions} >>"
     ).encode()
+    return encrypt, key
+
+
+def _object_key(file_key: bytes, number: int) -> bytes:
+    """The RC4 key for one object's strings and streams (generation 0)."""
+    digest = hashlib.md5(file_key + number.to_bytes(3, "little") + b"\0\0").digest()
+    return digest[: len(file_key) + 5]
 
 
 def make_pdf(
@@ -50,8 +64,10 @@ def make_pdf(
 
     A blank page stands in for a scan: pdfplumber opens it and finds no
     text, as it does for a page that is only an image. ``encrypted`` gives
-    a blank PDF with only an owner password, which pdfplumber still opens.
+    a PDF with only an owner password, which pdfplumber still opens and
+    reads.
     """
+    encrypt, file_key = _owner_password_only() if encrypted else (b"", b"")
     content = b""
     if text is not None:
         content = b"BT /F1 12 Tf 72 720 Td (" + text.encode("latin-1") + b") Tj ET"
@@ -69,10 +85,11 @@ def make_pdf(
                 f"/Contents {5 + 2 * i} 0 R >>"
             ).encode()
         )
+        stream = content
+        if encrypted:
+            stream = _rc4(_object_key(file_key, 5 + 2 * i), content)
         objects.append(
-            f"<< /Length {len(content)} >>\nstream\n".encode()
-            + content
-            + b"\nendstream"
+            f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream"
         )
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
@@ -85,12 +102,8 @@ def make_pdf(
         out += f"{offset:010d} 00000 n \n".encode()
     trailer = f"/Size {len(objects) + 1} /Root 1 0 R".encode()
     if encrypted:
-        file_id = b"0123456789abcdef"
-        trailer += (
-            b" /Encrypt "
-            + _owner_password_only(file_id)
-            + f" /ID [<{file_id.hex()}> <{file_id.hex()}>]".encode()
-        )
+        file_id = _FILE_ID.hex()
+        trailer += b" /Encrypt " + encrypt + f" /ID [<{file_id}> <{file_id}>]".encode()
     out += b"trailer\n<< " + trailer + b" >>\n"
     out += f"startxref\n{xref}\n%EOF\n".encode()
     return bytes(out)

@@ -423,7 +423,9 @@ class TestReadPdfAttachments:
         assert "second.pdf" in caplog.text
 
     @pytest.mark.parametrize(
-        "data", [b"%PDF-1.4 broken", b"not a pdf at all", make_pdf(encrypted=True)]
+        "data",
+        [b"%PDF-1.4 broken", b"not a pdf at all", make_pdf(encrypted=True)],
+        ids=["broken", "not-a-pdf", "encrypted-scan"],
     )
     def test_unreadable_or_encrypted_pdfs_are_left_out(
         self, data: bytes, caplog: pytest.LogCaptureFixture
@@ -433,6 +435,49 @@ class TestReadPdfAttachments:
         assert pdfs.documents == []
         assert pdfs.text is None
         assert "odd.pdf" in caplog.text
+
+    def test_an_encrypted_pdf_still_gives_its_text(self) -> None:
+        # An owner password only: readable, as before, though never a document.
+        pdf = make_pdf(_RECEIPT_TEXT, encrypted=True)
+        pdfs = _read_pdf_attachments([_pdf("statement.pdf", pdf)])
+        assert pdfs.text_name == "statement.pdf"
+        assert pdfs.text == _RECEIPT_TEXT
+
+    def test_image_bytes_count_toward_the_byte_cap(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        scan = _pdf("scan.pdf", make_pdf())
+        monkeypatch.setattr(
+            "receipt_index.extraction._MAX_EMAIL_PDF_BYTES", len(scan.data) + 1
+        )
+        image = Attachment("shot.png", "image/png", b"\x89PNG")
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments([image, scan])
+        assert pdfs.documents == []
+        assert "scan.pdf" in caplog.text
+
+    def test_a_long_pdf_after_the_text_is_not_read_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # It can be neither the text (that's found) nor a document (too long).
+        import pdfplumber.page
+
+        calls: list[int] = []
+        real = pdfplumber.page.Page.extract_text
+
+        def counting(page: pdfplumber.page.Page, *args: object, **kw: object) -> str:
+            calls.append(page.page_number)
+            return real(page, *args, **kw)
+
+        monkeypatch.setattr(pdfplumber.page.Page, "extract_text", counting)
+        pdfs = _read_pdf_attachments(
+            [
+                _pdf("receipt.pdf", make_pdf(_RECEIPT_TEXT)),
+                _pdf("statement.pdf", make_pdf(_RECEIPT_TEXT, pages=11)),
+            ]
+        )
+        assert pdfs.text_name == "receipt.pdf"
+        assert len(calls) == 1
 
     def test_a_page_read_error_is_unreadable_not_scanned(
         self, monkeypatch: pytest.MonkeyPatch
