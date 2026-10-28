@@ -72,12 +72,14 @@ def _ensure_login_role(conn: psycopg.Connection[dict[str, Any]], role: str) -> N
     exists = conn.execute(
         "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)
     ).fetchone()
-    if exists is None:
-        conn.execute(
-            psycopg.sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
-                psycopg.sql.Identifier(role), psycopg.sql.Literal(_PASSWORD)
-            )
+    # A role that already exists may be a NOLOGIN one, which the migration
+    # tests' scratch databases create when they run first: make it a login.
+    verb = "CREATE" if exists is None else "ALTER"
+    conn.execute(
+        psycopg.sql.SQL(verb + " ROLE {} LOGIN PASSWORD {}").format(
+            psycopg.sql.Identifier(role), psycopg.sql.Literal(_PASSWORD)
         )
+    )
     conn.execute(
         psycopg.sql.SQL("GRANT CONNECT ON DATABASE receipt_index_dev TO {}").format(
             psycopg.sql.Identifier(role)
