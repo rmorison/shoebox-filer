@@ -158,7 +158,7 @@ uv run receipt-index search [OPTIONS]
 | `--amount-max DECIMAL` | Filter by maximum effective amount (inclusive) |
 | `--date-from YYYY-MM-DD` | Filter by start date (inclusive) |
 | `--date-to YYYY-MM-DD` | Filter by end date (inclusive) |
-| `--needs-review` | Only receipts still needing a look: `paid_amount` is `null`, or the latest extraction failed or fell below the confidence gate (see [reextract](#reextract)) |
+| `--needs-review` | Only receipts still needing a look: `paid_amount` is `null`, or the latest extraction failed or fell below the confidence gate (see [reextract](#reextract)). A receipt whose paid amount was set by hand ([`edit`](#edit)) is left out |
 | `--order-number TEXT` | Filter by order number (exact match) |
 | `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
 | `--payer TEXT` | Filter by payer name (case-insensitive substring match) |

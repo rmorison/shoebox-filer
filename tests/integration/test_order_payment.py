@@ -19,6 +19,7 @@ from receipt_index.repository import (
     count_receipts,
     get_receipt_by_id,
     get_receipt_events,
+    insert_extraction,
     search_receipts,
 )
 from receipt_index.store import LocalEvidenceStore
@@ -236,3 +237,48 @@ class TestEditAndReextract:
             r.id for r in _select(pg_conn, ids=ids, confidence_below=("date", 0.5))
         }
         assert below == {edited.id}
+
+
+class TestNeedsReview:
+    def test_a_hand_edited_paid_amount_leaves_the_list(
+        self, pg_conn: Conn, tmp_path: Path
+    ) -> None:
+        store = LocalEvidenceStore(tmp_path)
+        receipt = _seed(pg_conn, store, "Gated", paid="12.00")
+        # Its latest extraction fell below the confidence gate.
+        insert_extraction(
+            pg_conn,
+            receipt_id=receipt.id,
+            origin="reextract",
+            input_kind="rendition",
+            prompt_version=EXTRACTION_PROMPT_VERSION,
+            llm_model=_MODEL,
+            output={"confidence": 0.2},
+            applied_fields=[],
+            replaced={},
+            llm_input_tokens=1000,
+            llm_output_tokens=100,
+            llm_cache_read_tokens=0,
+            llm_requests=1,
+        )
+        pg_conn.commit()
+
+        def listed() -> bool:
+            found = {r.id for r in search_receipts(pg_conn, needs_review=True)}
+            assert count_receipts(pg_conn, needs_review=True) == len(found)
+            pg_conn.commit()
+            return receipt.id in found
+
+        assert listed()
+        edit_receipt(
+            pg_conn,
+            receipt.id,
+            {"paid_amount": Decimal("12.50")},
+            actor="operator",
+            reason=None,
+        )
+        assert not listed()
+        clear_manual(
+            pg_conn, receipt.id, ["paid_amount"], actor="operator", reason=None
+        )
+        assert listed()

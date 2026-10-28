@@ -925,8 +925,10 @@ ORDER BY receipt_id, created_at DESC, id DESC
 # A receipt still needs review when its paid amount isn't known, or when its
 # latest run (failed ones included) applied nothing because it failed or was
 # gated. A run that applied nothing because nothing was empty doesn't count.
+# A paid amount a person set by hand has been reviewed: no run can change it
+# (``edit --clear-manual`` puts the receipt back on the list).
 _NEEDS_REVIEW = f"""\
-(paid_amount IS NULL OR EXISTS (
+NOT ('paid_amount' = ANY(manual_fields)) AND (paid_amount IS NULL OR EXISTS (
     SELECT 1 FROM (
         SELECT e.output FROM receipt.extractions e
         WHERE e.receipt_id = receipts.id
