@@ -84,15 +84,19 @@ def _chain(exc: BaseException) -> list[BaseException]:
 def classify(exc: BaseException) -> ErrorClass:
     """Return the failure class of ``exc``.
 
-    A model refusal (pydantic-ai's ``ContentFilterError`` anywhere in the
-    chain) is always ``content``. Otherwise a config error outranks a
-    transient one found in the same chain, because waiting won't fix it.
+    A model refusal (``ExtractionRefusedError``, or pydantic-ai's
+    ``ContentFilterError``, anywhere in the chain) is always ``content``.
+    Otherwise a config error outranks a transient one found in the same
+    chain, because waiting won't fix it.
     """
     from pydantic_ai.exceptions import ContentFilterError
 
+    from receipt_index.extraction import ExtractionRefusedError
+
     chain = _chain(exc)
     # A model refusal is the item's: asking again gets the same answer.
-    if any(isinstance(e, ContentFilterError) for e in chain):
+    refusal = (ExtractionRefusedError, ContentFilterError)
+    if any(isinstance(e, refusal) for e in chain):
         return "content"
     config = _config_types()
     if any(isinstance(e, config) or _http_status(e) in (401, 403) for e in chain):

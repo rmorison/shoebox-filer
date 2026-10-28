@@ -21,6 +21,7 @@ from pydantic_ai.exceptions import (
 
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.errors import TransientError, classify
+from receipt_index.extraction import ExtractionRefusedError
 
 _M = "claude-test"
 
@@ -90,7 +91,25 @@ def _raised_from(outer: Exception, inner: Exception) -> Exception:
 
 
 class RefusedError(Exception):
-    """Stands in for the extraction module's refusal error."""
+    """A wrapper the refusal might be raised from."""
+
+
+class TestRefusals:
+    def test_extraction_refusal_is_content(self) -> None:
+        assert classify(ExtractionRefusedError("cyber", "declined")) == "content"
+
+    def test_extraction_refusal_from_the_filter_error(self) -> None:
+        exc = _raised_from(
+            ExtractionRefusedError(None, None), ContentFilterError("refusal")
+        )
+        assert classify(exc) == "content"
+
+    def test_refusal_wrapping_a_connection_error_is_still_content(self) -> None:
+        # Refusals outrank transient causes anywhere in the chain.
+        exc = _raised_from(
+            ExtractionRefusedError("cyber", "declined"), ConnectionResetError()
+        )
+        assert classify(exc) == "content"
 
 
 class TestChains:
