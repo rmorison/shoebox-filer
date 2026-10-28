@@ -831,6 +831,8 @@ After an upgrade that touched the renderer, the Dockerfile, or the config, re-ru
 
 A failed item is retried automatically: a transient failure (the LLM overloaded or rate-limited, a network error) after 30 seconds to 15 minutes without using up an attempt, a content failure after 5 and then 30 minutes. The third content failure is **terminal**, and a skipped item (judged not a receipt) is never retried automatically. See [Retries](cli-reference.md#retries) in the CLI reference. Terminal and skipped items stay where they are until they are requeued by hand with `receipt-index retry`. Nothing in `ingest_log` is ever deleted: a requeue adds a `queued` record, and the next `ingest` runs the item again.
 
+Two things happen on their own after the upgrade that adds retries. Items whose processing started but never finished (the run stopped mid-item; the old `ingest` logged a warning about them) are picked up by the next `ingest`: each is recorded as a failure that uses up an attempt, then retried, up to three paid attempts. Failures recorded before the upgrade are not retried until you requeue them. When a retry succeeds over a failure that had already stored a PDF, the old file is left behind and logged; `receipt-index failures --orphans` lists such files.
+
 Only requeue for **environmental** causes: a rendering gap, a permissions problem, a corrupted credential, a bug since fixed. Content failures (the LLM genuinely cannot read the document) will simply fail again, and re-running them costs Anthropic spend for nothing.
 
 1. **Fix the cause first.** Re-run the relevant gate to prove it.

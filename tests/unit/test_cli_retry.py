@@ -292,3 +292,84 @@ def test_requeue_count_is_written_after_a_failed_write() -> None:
     ):
         requeue.apply_requeue(conn, RetryFilter(error_class="transient"), entries)
     assert calls[-2:] == ["rollback", "count=1"]
+
+
+def test_a_failed_count_update_keeps_the_loop_error() -> None:
+    from unittest.mock import MagicMock
+
+    from receipt_index import requeue
+    from receipt_index.repository import RetryFilter
+
+    entries = [_entry("<a@example.com>")]
+    with (
+        patch.object(requeue, "insert_retry_request", return_value=_REQUEST),
+        patch.object(requeue, "get_item_history", return_value=entries),
+        patch.object(requeue, "has_receipt", return_value=False),
+        patch.object(
+            requeue, "insert_ingest_log", side_effect=RuntimeError("connection reset")
+        ),
+        patch.object(
+            requeue, "set_retry_request_count", side_effect=OSError("db gone")
+        ),
+        pytest.raises(RuntimeError, match="connection reset"),
+    ):
+        requeue.apply_requeue(
+            MagicMock(), RetryFilter(error_class="transient"), entries
+        )
+
+
+def test_a_failed_count_update_alone_still_raises() -> None:
+    from unittest.mock import MagicMock
+
+    from receipt_index import requeue
+    from receipt_index.repository import RetryFilter
+
+    with (
+        patch.object(requeue, "insert_retry_request", return_value=_REQUEST),
+        patch.object(
+            requeue, "set_retry_request_count", side_effect=OSError("db gone")
+        ),
+        pytest.raises(OSError, match="db gone"),
+    ):
+        requeue.apply_requeue(MagicMock(), RetryFilter(error_class="transient"), [])
+
+
+class TestOrphans:
+    def _invoke(self, tmp_path: Path, *args: str, exists: set[str]) -> Any:
+        from unittest.mock import MagicMock
+
+        path = tmp_path / "receipt-index.yaml"
+        path.write_text(_MINIMAL_CONFIG_YAML)
+        store = MagicMock()
+        store.exists.side_effect = lambda ref: ref in exists
+        with (
+            patch("receipt_index.cli.load_config", return_value=_make_config()),
+            patch("receipt_index.db.get_connection"),
+            patch("receipt_index.store.open_store", return_value=store),
+            patch(
+                "receipt_index.repository.orphaned_refs",
+                return_value={"<a@x>": ["local:a.pdf"], "<b@x>": ["local:b.pdf"]},
+            ) as found,
+        ):
+            result = CliRunner().invoke(
+                cli, ["--config", str(path), "failures", "--orphans", *args]
+            )
+        assert found.call_args.args[1] is None  # every item, whatever its state
+        return result
+
+    def test_lists_files_that_still_exist(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, exists={"local:a.pdf"})
+        assert result.exit_code == 0
+        assert "<a@x>  local:a.pdf" in result.output
+        assert "local:b.pdf" not in result.output
+        assert "1 orphaned file(s)" in result.output
+
+    def test_json_reports_existence(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--output", "json", exists={"local:a.pdf"})
+        assert json.loads(result.output) == [
+            {"source_id": "<a@x>", "stored_ref": "local:a.pdf", "exists": True},
+            {"source_id": "<b@x>", "stored_ref": "local:b.pdf", "exists": False},
+        ]
+
+    def test_none(self, tmp_path: Path) -> None:
+        assert "No orphaned files." in self._invoke(tmp_path, exists=set()).output

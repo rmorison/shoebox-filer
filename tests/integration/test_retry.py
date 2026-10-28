@@ -394,3 +394,47 @@ def test_type_skips_are_not_requeued(
     found = select_retry_candidates(pg_conn, RetryFilter(status="skipped"))
     pg_conn.commit()
     assert sorted(e.source_id for e in found) == ["<legacy@x>", "file-pdf"]
+
+
+def test_orphans_of_items_that_later_succeeded(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+) -> None:
+    """A retry that succeeded stored a new PDF; the failed attempt's stays listed."""
+    from receipt_index.repository import insert_receipt, orphaned_refs
+
+    insert_ingest_log(
+        pg_conn,
+        source_id="<done@x>",
+        source_type="imap",
+        status="failed",
+        stored_ref="local:renditions/2026/10/2026-10-01__acme__12.50.pdf",
+    )
+    insert_receipt(
+        pg_conn,
+        source_id="<done@x>",
+        source_type="imap",
+        source_name=_SOURCE,
+        vendor="Acme Parking (U.S.), LLC",
+        amount=Decimal("12.50"),
+        currency="USD",
+        receipt_date=date(2026, 10, 1),
+        description=None,
+        confidence=0.95,
+        pdf_path="renditions/2026/10/2026-10-01__acme__12.50-2.pdf",
+        email_subject=None,
+        email_sender=None,
+        email_date=None,
+    )
+    # A failure whose stored file the receipt now uses isn't an orphan.
+    insert_ingest_log(
+        pg_conn,
+        source_id="<reused@x>",
+        source_type="imap",
+        status="failed",
+        stored_ref="local:renditions/2026/10/2026-10-01__acme__12.50-2.pdf",
+    )
+    assert orphaned_refs(pg_conn, None) == {
+        "<done@x>": ["local:renditions/2026/10/2026-10-01__acme__12.50.pdf"]
+    }
+    assert orphaned_refs(pg_conn, ["<reused@x>"]) == {}
+    assert orphaned_refs(pg_conn, []) == {}

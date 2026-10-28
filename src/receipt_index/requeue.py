@@ -115,6 +115,7 @@ def apply_requeue(
         matched=len(candidates),
     )
     outcome = RequeueOutcome(request_id)
+    loop_error: BaseException | None = None
     try:
         for entry in candidates:
             with item_lock(conn, entry.source_id) as locked:
@@ -149,9 +150,20 @@ def apply_requeue(
                     retry_request_id=request_id,
                 )
                 outcome.requeued.append(entry.source_id)
+    except BaseException as exc:
+        loop_error = exc
+        raise
     finally:
         # Every queued row so far is committed; a write that failed mid-loop
         # left an aborted transaction, which the count update can't use.
-        conn.rollback()
-        set_retry_request_count(conn, request_id, len(outcome.requeued))
+        try:
+            conn.rollback()
+            set_retry_request_count(conn, request_id, len(outcome.requeued))
+        except Exception:
+            if loop_error is None:
+                raise
+            # Keep the error that stopped the loop; the count is secondary.
+            logger.warning(
+                "Can't record the count for retry request %s", request_id, exc_info=True
+            )
     return outcome

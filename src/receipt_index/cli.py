@@ -397,6 +397,42 @@ def search(
         click.echo(f"\n{len(results)} receipt(s) found.")
 
 
+def _print_orphans(config: AppConfig, output_format: str) -> None:
+    """`failures --orphans`: renditions left by failed attempts."""
+    from receipt_index.db import get_connection
+    from receipt_index.repository import orphaned_refs
+    from receipt_index.store import open_store
+
+    store = open_store(config.store)
+    with get_connection(config.database.url) as conn:
+        found = orphaned_refs(conn, None)
+    rows = [
+        {"source_id": sid, "stored_ref": ref, "exists": _exists(store, ref)}
+        for sid, refs in found.items()
+        for ref in refs
+    ]
+    if output_format == "json":
+        click.echo(json.dumps(rows, indent=2))
+        return
+    present = [r for r in rows if r["exists"]]
+    if not present:
+        click.echo("No orphaned files.")
+        return
+    for row in present:
+        click.echo(f"{row['source_id']}  {row['stored_ref']}")
+    click.echo(
+        f"\n{len(present)} orphaned file(s): stored by a failed attempt, "
+        "referenced by no receipt. Nothing was deleted."
+    )
+
+
+def _exists(store: Any, ref: str) -> bool:
+    try:
+        return bool(store.exists(ref))
+    except Exception:
+        return False
+
+
 def _aware(value: datetime | None) -> datetime | None:
     """A ``--since`` date, read as local midnight."""
     return value.astimezone() if value is not None else None
@@ -422,6 +458,14 @@ def _aware(value: datetime | None) -> datetime | None:
 )
 @click.option("--source", "source_name", default=None, help="Filter by source name.")
 @click.option(
+    "--orphans",
+    is_flag=True,
+    help=(
+        "Instead, list stored PDFs that a failed attempt left behind and no "
+        "receipt references (whatever the item's state now)."
+    ),
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -434,11 +478,13 @@ def failures(
     status: str,
     since: datetime | None,
     source_name: str | None,
+    orphans: bool,
     output_format: str,
 ) -> None:
     """List items whose latest ingest attempt failed (or was skipped).
 
-    One line per item, newest first.
+    One line per item, newest first. With --orphans, list the PDFs that
+    failed attempts left behind instead; nothing is deleted.
     """
     from receipt_index.db import get_connection
     from receipt_index.repository import get_ingest_failures
@@ -446,6 +492,10 @@ def failures(
     config = _load_config_or_exit(ctx)
 
     _configure_logging(config)
+
+    if orphans:
+        _print_orphans(config, output_format)
+        return
 
     with get_connection(config.database.url) as conn:
         results = get_ingest_failures(
@@ -609,7 +659,13 @@ def _print_retry(
     help="Allow a filter that matches every item of the status.",
 )
 @click.option(
-    "--yes", is_flag=True, help="Requeue the items. Without it, only preview."
+    "--yes",
+    is_flag=True,
+    help=(
+        "Requeue the items. Without it, only preview. --yes selects again, so "
+        "failures that arrived since the preview are included; pin "
+        "--source-id to requeue exactly what you reviewed."
+    ),
 )
 @click.option(
     "--output",
@@ -636,8 +692,10 @@ def retry(
     """Requeue failed or skipped items, so the next ingest runs them again.
 
     Without --yes this is a dry run: it lists what would be requeued and
-    writes nothing. With --yes it writes a 'queued' row for each item (the
-    log is never edited), records the request in receipt.retry_requests, and
+    writes nothing. --yes runs the selection again and requeues what it
+    lists, which can include failures written since an earlier preview.
+    With --yes it writes a 'queued' row for each item (the log is never
+    edited), records the request in receipt.retry_requests, and
     resets each item's attempt count. A filter that would match every item
     of the status is refused unless --all is given.
 

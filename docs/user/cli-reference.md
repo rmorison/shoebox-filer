@@ -92,7 +92,7 @@ A failed item is retried by a later run. Each failure is recorded with a class:
 | `config` | The LLM API key is rejected, the account's credits ran out, or the configured model doesn't exist (a retired or mistyped `llm.model`) | No | The same as `transient` |
 | `content` | The message can't be parsed or rendered, the extraction fails validation, the model declines the request | Yes | `ingest.retry_backoff_seconds` for that attempt (5 minutes, then 30 minutes) |
 
-The failure of attempt `ingest.retry_max_attempts` (default 3) is **terminal**: the item isn't retried automatically again, and only [`retry`](#retry) puts it back. Once `ingest.transient_item_max_seconds` (default six hours) have passed since an item's first transient failure, each further transient failure counts as an attempt, so the item can't hold up retries for ever. A `config` failure never counts, since it isn't the item's fault.
+The failure of attempt `ingest.retry_max_attempts` (default 3) is **terminal**: the item isn't retried automatically again, and only [`retry`](#retry) puts it back. Once `ingest.transient_item_max_seconds` (default six hours) have passed since an item's first transient failure (since it was last requeued), each further transient failure counts as an attempt, so the item can't hold up retries for ever. The clock is wall time since that first failure, not time spent failing: in an outage longer than six hours, the oldest items start using up attempts. Nothing is lost; `retry --transient` puts them back. A `config` failure never counts, since it isn't the item's fault.
 
 A `transient` or `config` failure also stops the source for the rest of the run, since the next item would most likely fail the same way. An LLM outage during a large backfill therefore costs one failed item per run, not one per item.
 
@@ -100,7 +100,7 @@ Each run's retry pass picks up, for the sources it holds:
 
 - failed items whose retry time has come;
 - items requeued with [`retry`](#retry);
-- items whose processing started but has no outcome, because the run handling them stopped mid-item. Each is recorded as a failure that uses up an attempt, then retried after the normal backoff.
+- items whose processing started but has no outcome, because the run handling them stopped mid-item. Each is recorded as a failure that uses up an attempt, then retried after the normal backoff. This includes such items left by runs before retries existed: the first `ingest` after the upgrade picks them up.
 
 A retry finds the item again by its source ID: an IMAP message by its `Message-ID` in the watched folder, a Drive file by its file ID. An item recorded before records named their source, or under a source since renamed or removed from the configuration, is looked for in every configured source of its type. An item that can't be found fails as `content`. Messages without a `Message-ID` can't be found yet. Skipped items (not receipts) are never retried automatically.
 
@@ -285,6 +285,7 @@ uv run receipt-index failures [OPTIONS]
 | `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt) or `queued` (requeued with `retry`, waiting for the next ingest) |
 | `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
 | `--source NAME` | Only items from this source |
+| `--orphans` | Instead, list stored PDFs that a failed attempt left behind and no receipt references, whatever the item's state now (for example after a retry succeeded and stored a new one). Nothing is deleted |
 | `--output text\|json` | Output format (default: `text`) |
 
 The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class` and `stored_ref`.
@@ -319,7 +320,7 @@ Filters combine with AND. A selection with nothing narrower than `--status` (and
 ### What it does
 
 - **Without `--yes`** it lists the matching items (when, status, class, attempt, subject or source ID, error), and the count. Nothing is written.
-- **With `--yes`** it requeues the same list. For each item it takes the item's lock and checks that its latest record hasn't changed since it was listed. An item another process holds, or that changed, is reported and left alone. Each requeued item gets a new `queued` record; the log is never edited or deleted. The item's attempt count starts again at 1.
+- **With `--yes`** it selects again and requeues what it lists: failures recorded since an earlier preview are included. To requeue exactly the items you reviewed, pass them as source IDs. For each item it takes the item's lock and checks that its latest record hasn't changed since it was listed. An item another process holds, or that changed, is reported and left alone. Each requeued item gets a new `queued` record; the log is never edited or deleted. The item's attempt count starts again at 1.
 - **Each requeue is recorded** in `receipt.retry_requests`: who ran it (the operating-system user and the database user), when, the filters, how many items matched and how many were requeued. The `queued` records point to it by `retry_request_id`.
 - **Orphaned files.** A failure after the PDF was stored but before the database write leaves a file no receipt points to. The failure records the file (`stored_ref`), and `retry` lists each matched item's file that still exists and no receipt references. Failures recorded before this existed can't be checked; `retry` says how many there are, so they can be checked by hand. Nothing is deleted.
 

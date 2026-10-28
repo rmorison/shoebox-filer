@@ -808,17 +808,19 @@ def set_retry_request_count(
 
 
 def orphaned_refs(
-    conn: psycopg.Connection[dict[str, Any]], source_ids: list[str]
+    conn: psycopg.Connection[dict[str, Any]], source_ids: list[str] | None
 ) -> dict[str, list[str]]:
-    """Stored renditions that failed rows of these items recorded, and that no
-    receipt references, by source ID. The caller checks they still exist."""
-    if not source_ids:
+    """Stored renditions that failed rows recorded, and that no receipt
+    references, by source ID: for these items, or for every item when
+    ``source_ids`` is None. The caller checks they still exist."""
+    if source_ids is not None and not source_ids:
         return {}
     cur = conn.execute(
         """\
         SELECT DISTINCT l.source_id, l.stored_ref
         FROM receipt.ingest_log l
-        WHERE l.source_id = ANY(%(ids)s) AND l.stored_ref IS NOT NULL
+        WHERE (%(ids)s::text[] IS NULL OR l.source_id = ANY(%(ids)s::text[]))
+          AND l.stored_ref IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM receipt.receipts r
               WHERE %(scheme)s || r.pdf_path = l.stored_ref)

@@ -7,6 +7,7 @@ how far the cursor moved.
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -967,6 +968,7 @@ def history(monkeypatch: pytest.MonkeyPatch, repo: FakeRepo) -> dict[str, list[A
     monkeypatch.setattr(
         pipeline, "has_receipt", lambda conn, source_id: source_id in repo.receipts
     )
+    monkeypatch.setattr(pipeline, "orphaned_refs", lambda conn, ids: {})
     return rows
 
 
@@ -1206,6 +1208,39 @@ class TestRetryOtherSourceDown:
         adapter = FetchByIdAdapter(unavailable_from=sid)
         result = _retry(history[sid], adapter, own_source="personal-email")
         assert result.stopped is not None
+
+
+class TestRetryOrphans:
+    def test_success_over_an_orphan_is_logged(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        history: dict[str, list[Any]],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        old = "local:renditions/2025/06/2025-06-15__amazon__42.99.pdf"
+        monkeypatch.setattr(pipeline, "orphaned_refs", lambda conn, ids: {sid: [old]})
+        with caplog.at_level(logging.WARNING):
+            result = _retry(history[sid], FetchByIdAdapter())
+        assert result.processed == 1
+        assert old in caplog.text
+        assert "failures --orphans" in caplog.text
+
+    def test_no_warning_without_an_orphan(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        history: dict[str, list[Any]],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        with caplog.at_level(logging.WARNING):
+            _retry(history[sid], FetchByIdAdapter())
+        assert "orphans" not in caplog.text
 
 
 def _past() -> datetime:

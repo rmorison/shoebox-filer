@@ -66,4 +66,4 @@ ingest:
   drive_settle_seconds: 60             # leave a Drive change this young for the next run
   retry_max_attempts: 3                # a content failure's last attempt is terminal; 1 = no automatic retries
   retry_backoff_seconds: [300, 1800, 7200, 43200]  # wait after attempt 1, 2, ...
-  transient_item_max_seconds: 21600    # after this long failing transiently, a failure counts
+  transient_item_max_seconds: 21600    # wall time since an item's first transient failure; after it, each one counts

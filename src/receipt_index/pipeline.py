@@ -38,6 +38,7 @@ from receipt_index.repository import (
     insert_receipt,
     is_due,
     is_source_id_known,
+    orphaned_refs,
     record_poll,
     save_drive_cursor,
     save_imap_cursor,
@@ -681,6 +682,27 @@ def run_ingest(
     return result
 
 
+def _warn_orphans(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> None:
+    """Log renditions an earlier failure of this item left behind.
+
+    The retry that just succeeded stored a new one, so these are duplicates.
+    Nothing is deleted; `failures --orphans` lists them.
+    """
+    try:
+        refs = orphaned_refs(conn, [source_id]).get(source_id, [])
+    except Exception:
+        conn.rollback()
+        logger.warning("Can't check orphaned files for %s", source_id, exc_info=True)
+        return
+    for ref in refs:
+        logger.warning(
+            "Retry of %s succeeded; an earlier failure left %s, which no receipt "
+            "references (see `receipt-index failures --orphans`)",
+            source_id,
+            ref,
+        )
+
+
 @dataclass
 class RetryResult:
     """Summary of one retry pass over one source."""
@@ -838,6 +860,7 @@ def run_due_retries(
         if outcome.status == "success" and outcome.receipt is not None:
             result.processed += 1
             result.receipts.append(outcome.receipt)
+            _warn_orphans(conn, entry.source_id)
         elif outcome.status == "skipped":
             result.skipped += 1
         elif outcome.status == "failed":
