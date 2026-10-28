@@ -108,3 +108,81 @@ class TestLinkStaysOutOfTheHistory:
 
     def test_the_output_schema_still_asks_for_it(self) -> None:
         assert "receipt_link" in ReceiptMetadata.model_json_schema()["properties"]
+
+
+class TestRedactedTraceback:
+    """A failed extraction's traceback can echo the model's output, link included."""
+
+    def test_links_become_their_host(self) -> None:
+        from receipt_index.models import redact_links
+
+        text = "input_value={'receipt_link': 'https://receipts.example.com/r/1?t=x'}"
+        assert (
+            redact_links(text)
+            == "input_value={'receipt_link': '<link: receipts.example.com>'}"
+        )
+
+    def test_the_whole_chain_is_redacted(self) -> None:
+        from receipt_index.models import redacted_traceback
+
+        try:
+            try:
+                raise ValueError(
+                    "bad output: https://receipts.example.com/r/abc?token=s3cr3t"
+                )
+            except ValueError as inner:
+                raise RuntimeError("Exceeded maximum output retries (1)") from inner
+        except RuntimeError as exc:
+            text = redacted_traceback(exc)
+
+        assert "RuntimeError: Exceeded maximum output retries (1)" in text
+        assert "ValueError: bad output: <link: receipts.example.com>" in text
+        assert "s3cr3t" not in text
+        assert "/r/abc" not in text
+
+
+class TestValidationErrorsKeepTheLinkOut:
+    """Through the real pydantic-ai stack: output that fails validation."""
+
+    _URL = "https://receipts.example.com/r/abc123?token=s3cr3t"
+
+    def _failure(self) -> BaseException:
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        def reply(_: object, info: AgentInfo) -> ModelResponse:
+            args = {  # no vendor: a required field is missing
+                "amount": 0,
+                "date": "2025-06-15",
+                "confidence": 0.2,
+                "field_confidence": {
+                    "vendor": 0.1,
+                    "amount": 0.1,
+                    "paid_amount": 0.1,
+                    "date": 0.1,
+                },
+                "receipt_link": self._URL,
+            }
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args)])
+
+        agent = Agent(FunctionModel(reply), output_type=ReceiptMetadata)
+        with pytest.raises(Exception) as caught:
+            agent.run_sync("Extract")
+        return caught.value
+
+    def test_the_traceback_holds_no_part_of_the_link(self) -> None:
+        import traceback
+
+        text = "".join(traceback.format_exception(self._failure()))
+        assert "Exceeded maximum output retries" in text
+        assert "s3cr3t" not in text
+        assert "/r/abc123" not in text
+
+    def test_a_valid_output_still_keeps_its_link(self) -> None:
+        metadata = ReceiptMetadata.model_validate_json(
+            '{"vendor": "Acme Parking (U.S.), LLC", "amount": 0, "date": "2025-06-15",'
+            ' "confidence": 0.2, "field_confidence": {"vendor": 0.5, "amount": 0.1,'
+            ' "paid_amount": 0.1, "date": 0.5}, "receipt_link": "' + self._URL + '"}'
+        )
+        assert metadata.receipt_link == self._URL

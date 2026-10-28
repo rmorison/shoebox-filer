@@ -26,7 +26,12 @@ from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
 from receipt_index.fetching import SourceDownError, fetch_item
 from receipt_index.locks import SourceLockLostError, item_lock
-from receipt_index.models import MIN_RECEIPT_CONFIDENCE, link_host, receipt_values
+from receipt_index.models import (
+    MIN_RECEIPT_CONFIDENCE,
+    link_host,
+    receipt_values,
+    redacted_traceback,
+)
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
     get_item_history,
@@ -352,13 +357,14 @@ def process_item(
             state=state,
             stored_ref=stored_ref,
         )
+        # Not exc_info: the chain can hold the model's output and its link.
         logger.warning(
-            "Failed to process message %s (subject=%s, sender=%s; %s failure)",
+            "Failed to process message %s (subject=%s, sender=%s; %s failure)\n%s",
             raw.source_id,
             raw.subject,
             raw.sender,
             cls,
-            exc_info=True,
+            redacted_traceback(exc),
         )
         return ItemOutcome("failed", error_class=cls)
 

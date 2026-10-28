@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -9,7 +11,14 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ModelWrapValidatorHandler,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 @dataclass
@@ -168,6 +177,21 @@ class ReceiptMetadata(BaseModel):
             return None
         return link
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def _link_kept_out_of_errors(
+        cls, data: Any, handler: ModelWrapValidatorHandler[ReceiptMetadata]
+    ) -> ReceiptMetadata:
+        # A validation error echoes its input, truncated in the middle, into
+        # the traceback the pipeline logs; a token in the link's path would
+        # survive that. So the other fields are validated without the link.
+        if not isinstance(data, dict) or "receipt_link" not in data:
+            return handler(data)
+        rest = {k: v for k, v in data.items() if k != "receipt_link"}
+        metadata = handler(rest)
+        metadata.receipt_link = cls._http_link_or_none(data["receipt_link"])
+        return metadata
+
 
 # The longest receipt link kept; the ingest_log column has the same limit.
 MAX_RECEIPT_LINK_LENGTH = 2048
@@ -180,6 +204,27 @@ def link_host(url: str) -> str:
     except ValueError:
         host = None
     return host or "unknown host"
+
+
+_URL = re.compile(r"https?://[^\s'\"<>\\]+", re.IGNORECASE)
+
+
+def redact_links(text: str) -> str:
+    """Every http(s) URL in ``text`` as its host alone."""
+    return _URL.sub(lambda m: f"<link: {link_host(m.group(0))}>", text)
+
+
+def redacted_traceback(exc: BaseException) -> str:
+    """``exc``'s traceback, its cause chain included, with links redacted.
+
+    A failed extraction's chain can hold the model's output, or the email
+    text sent to it, and so a link whose path or query may carry a personal
+    token. Log this instead of ``exc_info=True`` wherever that can be in the
+    chain. It catches whole URLs only: pydantic truncates a long input in
+    the middle, dropping the scheme, so ReceiptMetadata keeps receipt_link
+    out of its validation errors itself.
+    """
+    return redact_links("".join(traceback.format_exception(exc)))
 
 
 # Below this overall confidence an extraction isn't treated as a receipt:

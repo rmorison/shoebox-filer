@@ -1308,6 +1308,31 @@ class TestLinkOnly:
         assert "receipt_link" not in extraction["output"]
         assert "receipt_link" not in extraction["applied_fields"]
 
+    def test_a_failed_extraction_logs_no_link(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # pydantic-ai's output-validation error chains the model's output,
+        # which can hold the link, into the traceback the warning logs.
+        try:
+            raise ValueError(
+                f"Field required [input_value={{'receipt_link': '{_LINK}'}}]"
+            )
+        except ValueError as cause:
+            failure = UnexpectedModelBehavior("Exceeded maximum output retries (1)")
+            failure.__cause__ = cause
+        extract.side_effect = failure
+        with caplog.at_level(logging.DEBUG):
+            _run(FakeAdapter(_imap_read([1])))
+
+        assert "Exceeded maximum output retries" in caplog.text
+        assert "receipts.example.com" in caplog.text
+        assert "s3cr3t-t0ken" not in caplog.text
+        row = next(k for k in repo.row_kwargs if k["status"] == "failed")
+        assert "s3cr3t-t0ken" not in row["error_message"]
+
     def test_the_link_is_never_logged(
         self,
         repo: FakeRepo,

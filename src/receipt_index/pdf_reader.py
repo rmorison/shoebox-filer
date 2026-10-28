@@ -12,6 +12,7 @@ from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import AgentRunError, ContentFilterError
 
 from receipt_index.llm import DEFAULT_MODEL, anthropic_model
+from receipt_index.models import redacted_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,10 @@ def _extract_with_vision(
     except ContentFilterError:
         raise
     except AgentRunError as exc:
+        # Not exc_info: the chain can hold the model's output and its link.
         logger.warning(
-            "Vision extraction failed for PDF: %s", type(exc).__name__, exc_info=True
+            "Vision extraction failed for PDF: %s\n%s",
+            type(exc).__name__,
+            redacted_traceback(exc),
         )
         return ""
