@@ -992,3 +992,69 @@ class TestBothStoreLayouts:
                     access_log=AccessLog(log_path),
                     **kwargs,  # type: ignore[arg-type]
                 )
+
+
+class TestOrderAndPayment:
+    """search_receipts filters on order number, last four and payer, and the
+    receipt output carries the four fields (receipt data-model design, §4)."""
+
+    def test_filters_reach_the_repository(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with (
+            patch("receipt_index.repository.search_receipts", return_value=[]) as s,
+            patch("receipt_index.repository.count_receipts", return_value=0) as c,
+        ):
+            result = _call(
+                _server(store_root, log_path),
+                "search_receipts",
+                {"order_number": " A-100 ", "last4": "1234", "payer": "jane"},
+            )
+        assert result.is_error is False
+        for mock in (s, c):
+            kwargs = mock.call_args.kwargs
+            assert kwargs["order_number"] == "A-100"
+            assert kwargs["last4"] == "1234"
+            assert kwargs["payer"] == "jane"
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"last4": "123"},
+            {"last4": "4111111111111111"},
+            {"last4": "12a4"},
+            {"order_number": "  "},
+            {"payer": ""},
+        ],
+    )
+    def test_bad_filters_are_refused(
+        self,
+        conn: MagicMock,
+        store_root: Path,
+        log_path: Path,
+        args: dict[str, Any],
+    ) -> None:
+        with patch("receipt_index.repository.search_receipts") as search:
+            result = _call(_server(store_root, log_path), "search_receipts", args)
+        assert result.is_error is True
+        search.assert_not_called()
+
+    def test_output_has_the_fields(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        receipt = _receipt(
+            order_number="A-100",
+            payment_method="card",
+            payment_last4="1234",
+            payer="Jane Doe",
+        )
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+            result = _call(
+                _server(store_root, log_path), "get_receipt", {"receipt_id": str(_ID)}
+            )
+        data = result.structured_content
+        assert data is not None
+        assert data["order_number"] == "A-100"
+        assert data["payment_method"] == "card"
+        assert data["payment_last4"] == "1234"
+        assert data["payer"] == "Jane Doe"

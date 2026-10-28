@@ -126,13 +126,67 @@ class FieldConfidence(BaseModel):
     """The model's own confidence in each extracted field, from 0 to 1.
 
     An estimate, not a measured probability: good for ordering a review,
-    not for a hard threshold.
+    not for a hard threshold. ``order_number`` and ``payment`` are null when
+    their field is.
     """
 
     vendor: float = Field(ge=0.0, le=1.0)
     amount: float = Field(ge=0.0, le=1.0)
     paid_amount: float = Field(ge=0.0, le=1.0)
     date: float = Field(ge=0.0, le=1.0)
+    order_number: float | None = Field(default=None, ge=0.0, le=1.0)
+    payment: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+def _blank_to_none(value: object) -> object:
+    """A string stripped, and None when nothing is left."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+_NOT_DIGIT = re.compile(r"[^0-9]")
+
+
+def last_four_digits(value: object) -> str | None:
+    """The last four digits of ``value``, or None when it has fewer.
+
+    Only the last four digits of a card or account number are ever kept, so
+    a longer number is cut here, whatever its type. The result always
+    matches ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
+    validation error would echo it into a logged traceback.
+    """
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    digits = _NOT_DIGIT.sub("", str(value))
+    return digits[-4:] if len(digits) >= 4 else None
+
+
+PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
+
+
+class Payment(BaseModel):
+    """How the receipt says it was paid, as printed on it."""
+
+    method: PaymentMethod | None = None
+    # Only ever the last four digits of the card or account.
+    last4: str | None = Field(default=None, pattern=r"^[0-9]{4}$")
+    # The cardholder or bill-to name as printed; not who forwarded the email.
+    payer: str | None = None
+
+    @field_validator("last4", mode="before")
+    @classmethod
+    def _last_four(cls, value: object) -> str | None:
+        return last_four_digits(value)
+
+    @field_validator("payer", mode="before")
+    @classmethod
+    def _payer(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+    def is_empty(self) -> bool:
+        return self.method is None and self.last4 is None and self.payer is None
 
 
 class ReceiptMetadata(BaseModel):
@@ -147,6 +201,9 @@ class ReceiptMetadata(BaseModel):
     currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     date: date
     description: str | None = None
+    # The order, confirmation or invoice number as printed. Not unique.
+    order_number: str | None = None
+    payment: Payment | None = None
     # Which part of an email held the receipt: an attachment's file name as
     # listed, or "body". None when the extractor can't tell, and always None
     # for a Drive document or a rendition.
@@ -160,6 +217,16 @@ class ReceiptMetadata(BaseModel):
     # bad link can't fail the extraction. Left out of model_dump, so the
     # append-only extraction history never holds a token it can't drop.
     receipt_link: str | None = Field(default=None, exclude=True)
+
+    @field_validator("order_number", mode="before")
+    @classmethod
+    def _order_number(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+    @field_validator("payment", mode="after")
+    @classmethod
+    def _empty_payment_is_none(cls, value: Payment | None) -> Payment | None:
+        return None if value is None or value.is_empty() else value
 
     @field_validator("receipt_link", mode="before")
     @classmethod
@@ -244,6 +311,7 @@ def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
     field confidence as ``field_confidence.<field>``: the names that
     ``extractions.applied_fields`` and ``receipts.manual_fields`` use.
     """
+    payment = metadata.payment
     values: dict[str, Any] = {
         "vendor": metadata.vendor,
         "amount": metadata.amount,
@@ -251,6 +319,10 @@ def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
         "currency": metadata.currency,
         "receipt_date": metadata.date,
         "description": metadata.description,
+        "order_number": metadata.order_number,
+        "payment_method": payment.method if payment else None,
+        "payment_last4": payment.last4 if payment else None,
+        "payer": payment.payer if payment else None,
         "confidence": metadata.confidence,
     }
     for name, value in metadata.field_confidence.model_dump().items():
@@ -286,6 +358,10 @@ class Receipt(BaseModel):
     field_confidence: dict[str, float] = Field(default_factory=dict)
     # Fields a person has edited; re-extraction never writes them.
     manual_fields: list[str] = Field(default_factory=list)
+    order_number: str | None = None
+    payment_method: str | None = None
+    payment_last4: str | None = None
+    payer: str | None = None
     pdf_path: str
     email_subject: str | None
     email_sender: str | None
@@ -302,6 +378,36 @@ class Receipt(BaseModel):
         Search filters on the same expression: COALESCE(paid_amount, amount).
         """
         return self.amount if self.paid_amount is None else self.paid_amount
+
+
+EventType = Literal[
+    "field_edited",
+    "manual_cleared",
+    "tag_added",
+    "tag_removed",
+    "link_added",
+    "link_removed",
+    "refund_linked",
+    "refund_unlinked",
+]
+ActorKind = Literal["person", "agent", "rule"]
+
+
+class ReceiptEvent(BaseModel):
+    """One change made to a receipt after extraction (``receipt_events``).
+
+    Append-only: who made the change (``actor``, and whether a person, an
+    agent or a rule), what it was (``payload``) and why (``reason``).
+    """
+
+    id: UUID
+    receipt_id: UUID
+    event_type: EventType
+    payload: dict[str, Any]
+    actor: str
+    actor_kind: ActorKind
+    reason: str | None = None
+    created_at: datetime
 
 
 class IngestLogEntry(BaseModel):

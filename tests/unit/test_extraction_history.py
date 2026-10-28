@@ -73,13 +73,40 @@ def _raw(attachments: list[Attachment]) -> RawReceipt:
 class TestPromptVersion:
     def test_current_version(self) -> None:
         # 0 is "no history"; 1 was the paid-amount prompt, never recorded;
-        # 3 added receipt_link; 4 sends scanned PDF attachments as documents.
-        assert EXTRACTION_PROMPT_VERSION == 4
+        # 3 added receipt_link; 4 sends scanned PDF attachments as documents;
+        # 5 added order_number and payment.
+        assert EXTRACTION_PROMPT_VERSION == 5
 
     def test_email_prompt_explains_scanned_pdfs(self) -> None:
         flat = " ".join(_SYSTEM_PROMPT.split())
         assert "--- PDF Attachment (scanned): <file name> ---" in flat
         assert "give that file name as receipt_document" in flat
+
+
+class TestOrderPaymentPrompt:
+    """Both prompts ask for order_number and payment, with the last-four rule.
+
+    A guard against an edit dropping one: the rules live in one shared block.
+    """
+
+    _RULES = (
+        "- order_number: The order, confirmation or invoice number",
+        "- payment: How this document says it was paid",
+        "method: one of card, bank, wallet, cash, transfer or other",
+        "last4: only the last four digits of the card or account number",
+        "even when the document shows more",
+        "payer: the cardholder or bill-to name as printed",
+        "Never write more than the last four digits of a card or account "
+        "number anywhere in your output, the description included.",
+        "order_number and payment: your confidence in each, or null when the "
+        "field is null.",
+    )
+
+    def test_both_prompts_carry_every_rule(self) -> None:
+        for prompt in (_SYSTEM_PROMPT, DOCUMENT_SYSTEM_PROMPT):
+            flat = " ".join(prompt.split())
+            for rule in self._RULES:
+                assert rule in flat, rule
 
 
 class TestReceiptDocument:

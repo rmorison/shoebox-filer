@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -279,6 +280,33 @@ def ingest(
         sys.exit(1)
 
 
+def _text_filter(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """A text filter, trimmed; blank is refused rather than matching all."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise click.BadParameter("must not be blank")
+    return value
+
+
+_FOUR_DIGITS = re.compile(r"[0-9]{4}")
+
+
+def _last4_filter(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Exactly four digits: the only part of a card number that is stored."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not _FOUR_DIGITS.fullmatch(value):
+        raise click.BadParameter("must be exactly four digits")
+    return value
+
+
 @cli.command()
 @click.option("--source", "source_name", default=None, help="Filter by source name.")
 @click.option("--vendor", default=None, help="Filter by vendor name (substring).")
@@ -312,6 +340,24 @@ def ingest(
     ),
 )
 @click.option(
+    "--order-number",
+    callback=_text_filter,
+    default=None,
+    help="Filter by order number (exact).",
+)
+@click.option(
+    "--last4",
+    callback=_last4_filter,
+    default=None,
+    help="Filter by the payment card's or account's last four digits.",
+)
+@click.option(
+    "--payer",
+    callback=_text_filter,
+    default=None,
+    help="Filter by payer name (substring, any case).",
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -329,6 +375,9 @@ def search(
     date_from: datetime | None,
     date_to: datetime | None,
     needs_review: bool,
+    order_number: str | None,
+    last4: str | None,
+    payer: str | None,
     output_format: str,
 ) -> None:
     """Search indexed receipts."""
@@ -370,6 +419,9 @@ def search(
             date_to=date_to.date() if date_to else None,
             source_name=source_name,
             needs_review=needs_review,
+            order_number=order_number,
+            last4=last4,
+            payer=payer,
         )
         # Items with no receipt to search: counted for the text output only,
         # so the JSON stays a list of receipts.
@@ -392,20 +444,41 @@ def search(
             )
 
 
+def _clip(text: str, width: int) -> str:
+    """``text`` cut to ``width`` characters, with an ellipsis when cut."""
+    return text[: width - 1] + "\u2026" if len(text) > width else text
+
+
+def _payment_line(receipt: Receipt) -> str | None:
+    """``card ending 1234 (payer)``, from whichever parts are known."""
+    parts = []
+    if receipt.payment_method:
+        parts.append(receipt.payment_method)
+    if receipt.payment_last4:
+        parts.append(f"ending {receipt.payment_last4}")
+    if receipt.payer:
+        parts.append(f"({receipt.payer})" if parts else receipt.payer)
+    return " ".join(parts) or None
+
+
 def _print_receipts(results: list[Receipt]) -> None:
     """The `search` text table."""
     if not results:
         click.echo("No receipts found.")
         return
     # Amount is the effective amount (paid when known, else the total).
-    click.echo(f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Amount':>10} {'Total':>10}")
-    click.echo("-" * 93)
+    click.echo(
+        f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Order':<16} {'Last4':<5} "
+        f"{'Amount':>10} {'Total':>10}"
+    )
+    click.echo("-" * 116)
     for r in results:
-        vendor_display = r.vendor[:19] + "\u2026" if len(r.vendor) > 20 else r.vendor
         click.echo(
             f"{r.id!s:<38} "
             f"{r.receipt_date.isoformat():<12} "
-            f"{vendor_display:<20} "
+            f"{_clip(r.vendor, 20):<20} "
+            f"{_clip(r.order_number or '', 16):<16} "
+            f"{r.payment_last4 or '':<5} "
             f"{r.effective_amount!s:>10} "
             f"{r.amount!s:>10}"
         )
@@ -821,6 +894,11 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
         click.echo(f"Date:         {receipt.receipt_date}")
         desc = receipt.description or "\u2014"
         click.echo(f"Description:  {desc}")
+        if receipt.order_number:
+            click.echo(f"Order:        {receipt.order_number}")
+        payment = _payment_line(receipt)
+        if payment:
+            click.echo(f"Payment:      {payment}")
         click.echo(f"Confidence:   {receipt.confidence}")
         if receipt.field_confidence:
             fields = ", ".join(

@@ -214,6 +214,10 @@ def insert_receipt(
     file_name: str | None = None,
     paid_amount: Decimal | None = None,
     field_confidence: dict[str, float] | None = None,
+    order_number: str | None = None,
+    payment_method: str | None = None,
+    payment_last4: str | None = None,
+    payer: str | None = None,
     commit: bool = True,
 ) -> Receipt:
     """Insert a receipt row and return the validated Receipt model.
@@ -227,13 +231,15 @@ def insert_receipt(
             source_id, source_type, source_name, vendor, amount, currency,
             receipt_date, description, confidence, pdf_path,
             email_subject, email_sender, email_date, file_name,
-            paid_amount, field_confidence
+            paid_amount, field_confidence,
+            order_number, payment_method, payment_last4, payer
         ) VALUES (
             %(source_id)s, %(source_type)s, %(source_name)s,
             %(vendor)s, %(amount)s, %(currency)s,
             %(receipt_date)s, %(description)s, %(confidence)s, %(pdf_path)s,
             %(email_subject)s, %(email_sender)s, %(email_date)s, %(file_name)s,
-            %(paid_amount)s, %(field_confidence)s
+            %(paid_amount)s, %(field_confidence)s,
+            %(order_number)s, %(payment_method)s, %(payment_last4)s, %(payer)s
         )
         RETURNING *
         """,
@@ -254,6 +260,10 @@ def insert_receipt(
             "file_name": file_name,
             "paid_amount": paid_amount,
             "field_confidence": Jsonb(field_confidence or {}),
+            "order_number": order_number,
+            "payment_method": payment_method,
+            "payment_last4": payment_last4,
+            "payer": payer,
         },
     )
     row = cur.fetchone()
@@ -325,6 +335,9 @@ def _receipt_filters(
     date_to: date | None,
     source_name: str | None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Build the WHERE clause and parameters shared by search and count."""
     clauses: list[str] = []
@@ -357,6 +370,18 @@ def _receipt_filters(
     if source_name is not None:
         clauses.append("source_name = %(source_name)s")
         params["source_name"] = source_name
+
+    if order_number is not None:
+        clauses.append("order_number = %(order_number)s")
+        params["order_number"] = order_number
+
+    if last4 is not None:
+        clauses.append("payment_last4 = %(last4)s")
+        params["last4"] = last4
+
+    if payer is not None:
+        clauses.append("payer ILIKE %(payer)s")
+        params["payer"] = f"%{_escape_like(payer)}%"
 
     if needs_review:
         clauses.append(_NEEDS_REVIEW)
@@ -392,11 +417,16 @@ def search_receipts(
     limit: int | None = None,
     offset: int | None = None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> list[Receipt]:
     """Search receipts with optional filters, combined with AND.
 
     Results are ordered newest first, then by vendor, then by id, so that
-    ``limit``/``offset`` pages are stable between calls. ``needs_review``
+    ``limit``/``offset`` pages are stable between calls. ``order_number``
+    and ``last4`` match exactly; ``payer`` is a case-insensitive substring.
+    ``needs_review``
     keeps receipts still missing a paid amount or whose latest extraction
     failed or was gated, lowest paid-amount confidence first.
     """
@@ -409,6 +439,9 @@ def search_receipts(
         date_to=date_to,
         source_name=source_name,
         needs_review=needs_review,
+        order_number=order_number,
+        last4=last4,
+        payer=payer,
     )
     order = (
         _NEEDS_REVIEW_ORDER if needs_review else "receipt_date DESC, vendor ASC, id ASC"
@@ -432,6 +465,9 @@ def count_receipts(
     date_to: date | None = None,
     source_name: str | None = None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> int:
     """Count the receipts that ``search_receipts`` would return unpaged."""
     where, params = _receipt_filters(
@@ -443,6 +479,9 @@ def count_receipts(
         date_to=date_to,
         source_name=source_name,
         needs_review=needs_review,
+        order_number=order_number,
+        last4=last4,
+        payer=payer,
     )
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
@@ -1031,6 +1070,10 @@ _REEXTRACT_COLUMNS = frozenset(
         "currency",
         "receipt_date",
         "description",
+        "order_number",
+        "payment_method",
+        "payment_last4",
+        "payer",
         "confidence",
     }
 )

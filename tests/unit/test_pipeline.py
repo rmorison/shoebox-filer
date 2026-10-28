@@ -31,6 +31,7 @@ from receipt_index.models import (
     ExtractionResult,
     FieldConfidence,
     ItemRef,
+    Payment,
     RawReceipt,
     Receipt,
     ReceiptMetadata,
@@ -811,6 +812,37 @@ class TestIngestRecordsItsExtraction:
             "field_confidence.paid_amount",
             "field_confidence.date",
         }  # paid_amount is None in this extraction, so it wasn't written
+
+    def test_order_number_and_payment_are_stored(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        result = _extraction()
+        result.metadata = result.metadata.model_copy(
+            update={
+                "order_number": "A-100",
+                "payment": Payment(method="card", last4="1234", payer="Jane Doe"),
+                "field_confidence": _FIELD_CONFIDENCE.model_copy(
+                    update={"order_number": 0.9, "payment": 0.8}
+                ),
+            }
+        )
+        extract.return_value = result
+        _run(FakeAdapter(_imap_read([1])))
+        kwargs = repo.receipt_kwargs[0]
+        assert kwargs["order_number"] == "A-100"
+        assert kwargs["payment_method"] == "card"
+        assert kwargs["payment_last4"] == "1234"
+        assert kwargs["payer"] == "Jane Doe"
+        assert kwargs["field_confidence"]["payment"] == 0.8
+        applied = set(repo.extractions[0]["applied_fields"])
+        assert {
+            "order_number",
+            "payment_method",
+            "payment_last4",
+            "payer",
+            "field_confidence.order_number",
+            "field_confidence.payment",
+        } <= applied
 
     def test_receipt_and_extraction_commit_with_the_success_row(
         self, repo: FakeRepo, extract: MagicMock

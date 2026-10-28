@@ -22,6 +22,7 @@ import base64
 import json
 import logging
 import os
+import re
 import threading
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -69,7 +70,9 @@ refund, what was returned to them (null when not known, 0 when nothing was
 charged). A refund's paid_amount is not negative and refunds are not yet
 marked, so a sum of effective_amount values counts them as charges.
 effective_amount is paid_amount when known, otherwise amount, and the amount
-filters match on it.
+filters match on it. order_number and the payment fields (payment_method,
+payment_last4, payer) are as printed on the receipt, and null when it doesn't
+show them; payment_last4 is only ever the last four digits.
 Use search_receipts to find receipts (paged: keep calling with next_offset
 until it is null, and compare the count with total), get_receipt for one
 receipt's metadata, get_receipt_file for its PDF, and list_failures for
@@ -157,6 +160,25 @@ class ReceiptOut(BaseModel):
         description=(
             "Fields a person has edited by hand; re-extraction never overwrites them."
         ),
+    )
+    order_number: str | None = Field(
+        default=None,
+        description=(
+            "The order, confirmation or invoice number as printed. Not unique: "
+            "a confirmation, a shipment, a refund and an invoice can share one."
+        ),
+    )
+    payment_method: str | None = Field(
+        default=None,
+        description="card, bank, wallet, cash, transfer or other, as printed.",
+    )
+    payment_last4: str | None = Field(
+        default=None,
+        description="The last four digits of the card or account; never more.",
+    )
+    payer: str | None = Field(
+        default=None,
+        description="The cardholder or bill-to name as printed on the receipt.",
     )
     pdf_path: str = Field(description="PDF path relative to the file store.")
     email_subject: str | None
@@ -446,6 +468,29 @@ def _parse_amount(value: str | None, name: str) -> Decimal | None:
     return amount
 
 
+def _parse_text(value: str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        msg = f"{name} must not be blank"
+        raise ToolError(msg)
+    return text
+
+
+def _parse_last4(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if not _FOUR_DIGITS.fullmatch(text):
+        msg = "last4 must be exactly four digits"
+        raise ToolError(msg)
+    return text
+
+
+_FOUR_DIGITS = re.compile(r"[0-9]{4}")
+
+
 def _decimal_str(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
@@ -544,6 +589,16 @@ def build_server(
                 )
             ),
         ] = None,
+        order_number: Annotated[
+            str | None, Field(description="Exact order number.")
+        ] = None,
+        last4: Annotated[
+            str | None,
+            Field(description="Last four digits of the card or account."),
+        ] = None,
+        payer: Annotated[
+            str | None, Field(description="Payer name substring (any case).")
+        ] = None,
         limit: Limit = DEFAULT_PAGE_SIZE,
         offset: Offset = 0,
     ) -> SearchResult:
@@ -551,7 +606,8 @@ def build_server(
 
         The amount filters match the effective amount (paid when known,
         otherwise the total). `amount` matches exactly and can't be combined
-        with `amount_min` or `amount_max`.
+        with `amount_min` or `amount_max`. `order_number` and `last4` match
+        exactly (`last4` is four digits); `payer` is a substring.
         """
         if amount is not None and (amount_min is not None or amount_max is not None):
             msg = "amount cannot be combined with amount_min/amount_max"
@@ -564,6 +620,9 @@ def build_server(
             "date_from": date_from,
             "date_to": date_to,
             "source_name": source,
+            "order_number": _parse_text(order_number, "order_number"),
+            "last4": _parse_last4(last4),
+            "payer": _parse_text(payer, "payer"),
         }
         with snapshot() as conn:
             total = repository.count_receipts(conn, **filters)
