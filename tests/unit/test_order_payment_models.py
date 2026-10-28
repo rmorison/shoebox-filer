@@ -484,3 +484,42 @@ class TestInvisibleBetweenNumbers:
         # wrong last four.
         raw = "Visa 4111 1111 1111 1111 exp 12/2025"
         assert Payment.model_validate({"last4": raw}).last4 is None
+
+
+class TestSoftBreaks:
+    """Invisible characters doing different jobs in one card: each may count
+    as nothing or as a group boundary."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "123\u200b4111 1111 11\u200b11 1111",
+            "4111 1111 11\u200b11 1111\u200b2028",
+            "4111\u200b1111 11\u200b11 1111",
+            "Card 4111-1111-11\u00ad11-1111\u200b12/28",
+            "7\u200b41111111\u200b11111111",
+            "3782 8224\u200b63 10005\u200b2028",
+            "4111 11\U000e008011 1111 1111",  # unassigned
+            "4111 11\ue00011 1111 1111",  # private use
+        ],
+    )
+    def test_no_card_digits_are_left(self, raw: str) -> None:
+        out = _metadata(description=raw).description
+        assert out is not None
+        assert "ending" in out or "removed" in out
+        for card in ("4111111111111111", "378282246310005"):
+            digits = "".join(ch for ch in out if ch.isdigit())
+            assert not any(card[i : i + 8] in digits for i in range(len(card) - 7))
+
+    def test_two_cards_one_with_a_soft_break(self) -> None:
+        raw = "4111 11\u200b11 1111 1111\u200b5555 5555 5555 4444"
+        out = _metadata(description=raw).description
+        assert out is not None
+        assert "4111" not in out and "5555" not in out
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["4111 1111 1111 1111\u200b2028", "4111 1111 11\u200b11 1111\u200b2028"],
+    )
+    def test_last4_with_soft_breaks(self, raw: str) -> None:
+        assert Payment.model_validate({"last4": raw}).last4 in ("1111", None)

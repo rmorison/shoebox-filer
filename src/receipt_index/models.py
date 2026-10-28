@@ -8,7 +8,6 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from itertools import pairwise
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -150,8 +149,9 @@ def _blank_to_none(value: object) -> object:
 
 # Characters that print nothing: format characters (zero-width space and
 # joiner, soft hyphen), combining marks, control characters other than
-# whitespace, and the blank filler letters.
-_INVISIBLE = frozenset({"Cf", "Mn", "Me", "Cc"})
+# whitespace, unassigned, private-use and surrogate code points, and the
+# blank filler letters.
+_INVISIBLE = frozenset({"Cf", "Mn", "Me", "Cc", "Cn", "Co", "Cs"})
 _BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
 
 
@@ -173,23 +173,37 @@ def _fold(ch: str) -> str:
     return folded if len(folded) == 1 and not folded.isdigit() else ch
 
 
-def _spaced(text: str) -> str:
-    """``text`` folded (``_fold``), each invisible character as a space: the
-    same length, so a span found here is the same span in ``text``."""
-    return "".join(" " if _is_invisible(ch) else _fold(ch) for ch in text)
+@dataclass(frozen=True)
+class _Visible:
+    """Text as a card is read from it.
+
+    ``text`` is the original folded (``_fold``) with its invisible characters
+    removed; ``index`` gives each kept character's position in the original;
+    ``soft`` holds each position in ``text`` where invisible characters were
+    removed just before it. A soft break may be nothing (a zero-width space
+    inside a group) or a group boundary (the only break between numbers).
+    """
+
+    text: str
+    index: list[int]
+    soft: frozenset[int]
 
 
-def _visible(text: str) -> tuple[str, list[int]]:
-    """``text`` folded (``_fold``) without its invisible characters, and for
-    each character kept, its index in ``text``: a span found in the first is
-    mapped back to ``text`` through the second."""
-    chars, index = [], []
+def _visible(text: str) -> _Visible:
+    chars: list[str] = []
+    index: list[int] = []
+    soft: set[int] = set()
+    pending = False
     for i, ch in enumerate(text):
         if _is_invisible(ch):
+            pending = True
             continue
+        if pending:
+            soft.add(len(chars))
+            pending = False
         chars.append(_fold(ch))
         index.append(i)
-    return "".join(chars), index
+    return _Visible("".join(chars), index, frozenset(soft))
 
 
 _GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015\u2212]+")
@@ -202,37 +216,31 @@ def last_four_digits(value: object) -> str | None:
     Only the last four digits are ever kept, so a longer number is cut here,
     whatever its type. A value that is only digit groups (``4111 1111 1111
     1111``) is read as one number; a value holding one card number among
-    other text gives that card's. Otherwise the one group of four or more
-    digits is the card's (``Visa ending 4242, exp 12/25`` gives ``4242``); with
-    none, or more than one, it is None rather than a guess. The result always
-    matches ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
+    other text gives that card's, when no other number of four or more
+    digits disagrees. Otherwise the one group of four or more digits is the
+    card's (``Visa ending 4242, exp 12/25`` gives ``4242``); with none, or
+    more than one, it is None rather than a guess. The result always matches
+    ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
     validation error would echo it into a logged traceback.
     """
     if isinstance(value, bool) or not isinstance(value, str | int):
         return None
-    text = _visible(str(value))[0].strip()
-    if _GROUPED_DIGITS.fullmatch(text):
+    view = _visible(str(value))
+    text = view.text.strip()
+    if not view.soft and _GROUPED_DIGITS.fullmatch(text):
         digits = "".join(_DIGITS.findall(text))
         return digits[-4:] if len(digits) >= 4 else None
-    # A full card number among other text ("Visa 4111 1111 1111 1111"), when
-    # no other number of four or more digits says otherwise.
-    cards = [
-        (run.start() + b, run.start() + e, fours)
-        for run in _DIGIT_RUN.finditer(text)
-        for b, e, fours in _card_candidates(run.group(0))
-    ]
+    cards = _cards(view)
     if len(cards) == 1 and len(cards[0][2]) == 1:
         begin, end, fours = cards[0]
         last4 = next(iter(fours))
         others = [
             g.group(0)
-            for g in _DIGITS.finditer(text)
+            for g in _DIGITS.finditer(view.text)
             if len(g.group(0)) >= 4 and (g.end() <= begin or g.start() >= end)
         ]
-        if all(other[-4:] == last4 for other in others):
-            return last4
-        return None
-    long_groups = [g for g in _DIGITS.findall(text) if len(g) >= 4]
+        return last4 if all(o[-4:] == last4 for o in others) else None
+    long_groups = [g for g in _DIGITS.findall(view.text) if len(g) >= 4]
     return long_groups[0][-4:] if len(long_groups) == 1 else None
 
 
@@ -244,10 +252,16 @@ _SEPARATOR = rf"(?:\s+|\s*[{_PUNCT}]\s*)"
 # A run of digit groups joined by separators: where a card number can sit
 # among dates, prices, codes and other numbers.
 _DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
-_DIGIT_GROUP = _DIGITS
 _DOT_OR_SLASH = re.compile(r"[./]")
 # How a printed card number is grouped, by digits per group.
 _CARD_SHAPES = frozenset({(4, 4, 4, 4), (4, 4, 4, 4, 3), (4, 6, 5), (4, 6, 4)})
+# For each card length, the digit positions where its shapes have group
+# boundaries.
+_BOUNDARIES: dict[int, set[frozenset[int]]] = {}
+for _shape in _CARD_SHAPES:
+    _BOUNDARIES.setdefault(sum(_shape), set()).add(
+        frozenset(sum(_shape[: k + 1]) for k in range(len(_shape) - 1))
+    )
 _REMOVED = "[card number removed]"
 
 
@@ -274,82 +288,99 @@ def _separator_kind(sep: str) -> str:
     return found.group(0) if found else " "
 
 
-def _card_candidates(run: str) -> list[tuple[int, int, set[str]]]:
-    """The card numbers in ``run``, as ``(start, end, last fours)``.
+def _run_candidates(
+    run: str, offset: int, soft: frozenset[int]
+) -> list[tuple[int, int, str]]:
+    """The card numbers in one digit run, as ``(start, end, last four)``.
 
-    A candidate is one unbroken group of 13 to 19 digits, or consecutive
-    groups in a card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with one kind
-    of separator between them (see ``_separator_kind``), that is not all one
-    digit and passes the Luhn check. Shapes keep dates, prices, phone and
-    order numbers out; trying every starting group finds a card with another
-    number beside it. Candidates that overlap are removed together, so no
-    part of a card is left: as "ending NNNN" when they agree on the last four
-    digits, else as "[card number removed]".
+    The run is cut into digit pieces at its separators and at soft breaks.
+    A candidate is consecutive pieces holding 13 to 19 digits, not all one
+    digit, that pass the Luhn check, and either have no separator between
+    them (one unbroken number, soft breaks read as nothing), or fall into a
+    card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with every separator on
+    a group boundary, all of one kind (see ``_separator_kind``), and every
+    other boundary on a soft break. Shapes keep dates, prices, phone and
+    order numbers out; trying every starting piece finds a card with another
+    number beside it.
     """
-    groups = list(_DIGIT_GROUP.finditer(run))
-    seps = [_separator_kind(run[a.end() : b.start()]) for a, b in pairwise(groups)]
-    candidates: list[tuple[int, int, str]] = []
-    for i, group in enumerate(groups):
-        if _is_card(group.group(0)):
-            candidates.append((group.start(), group.end(), group.group(0)[-4:]))
-        for shape in _CARD_SHAPES:
-            j = i + len(shape)
-            if j > len(groups) or len(set(seps[i : j - 1])) != 1:
+    pieces: list[tuple[int, int]] = []
+    joins: list[str | None] = []  # between piece k and k+1; None is soft
+    groups = list(_DIGITS.finditer(run))
+    for g_index, group in enumerate(groups):
+        if g_index:
+            gap = run[groups[g_index - 1].end() : group.start()]
+            joins.append(_separator_kind(gap))
+        begin = group.start()
+        for cut in range(group.start() + 1, group.end()):
+            if offset + cut in soft:
+                pieces.append((begin, cut))
+                joins.append(None)
+                begin = cut
+        pieces.append((begin, group.end()))
+
+    found: list[tuple[int, int, str]] = []
+    for i in range(len(pieces)):
+        digits = ""
+        real: dict[int, str] = {}
+        softs: set[int] = set()
+        for j in range(i, len(pieces)):
+            if j > i:
+                join = joins[j - 1]
+                if join is None:
+                    softs.add(len(digits))
+                else:
+                    real[len(digits)] = join
+            digits += run[pieces[j][0] : pieces[j][1]]
+            if len(digits) > 19:
+                break
+            if not _is_card(digits):
                 continue
-            if tuple(len(g.group(0)) for g in groups[i:j]) != shape:
-                continue
-            digits = "".join(g.group(0) for g in groups[i:j])
-            if _is_card(digits):
-                candidates.append((group.start(), groups[j - 1].end(), digits[-4:]))
-    candidates.sort()
-    spans: list[tuple[int, int, set[str]]] = []
-    for begin, end, last4 in candidates:
-        if spans and begin < spans[-1][1]:
-            b, e, fours = spans[-1]
-            spans[-1] = (b, max(e, end), fours | {last4})
+            fits = not real or any(
+                set(real) <= bounds
+                and bounds <= set(real) | softs
+                and len(set(real.values())) == 1
+                for bounds in _BOUNDARIES.get(len(digits), ())
+            )
+            if fits:
+                found.append(
+                    (offset + pieces[i][0], offset + pieces[j][1], digits[-4:])
+                )
+    return found
+
+
+def _cards(view: _Visible) -> list[tuple[int, int, set[str]]]:
+    """The card numbers in ``view.text``, as ``(start, end, last fours)``.
+
+    Candidates that overlap are merged, so no part of a card is left: one
+    replacement covers them all.
+    """
+    found: list[tuple[int, int, str]] = []
+    for run in _DIGIT_RUN.finditer(view.text):
+        found += _run_candidates(run.group(0), run.start(), view.soft)
+    found.sort()
+    merged: list[tuple[int, int, set[str]]] = []
+    for begin, end, last4 in found:
+        if merged and begin < merged[-1][1]:
+            b, e, fours = merged[-1]
+            merged[-1] = (b, max(e, end), fours | {last4})
         else:
-            spans.append((begin, end, {last4}))
-    return spans
-
-
-def _card_spans(run: str) -> list[tuple[int, int, str]]:
-    """The card numbers in ``run``, as ``(start, end, replacement)``."""
-    return [
-        (b, e, f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
-        for b, e, fours in _card_candidates(run)
-    ]
+            merged.append((begin, end, {last4}))
+    return merged
 
 
 def scrub_card_numbers(text: str) -> str:
     """``text`` with each card number replaced by "ending NNNN", its last four
     digits, or "[card number removed]" when overlapping candidates disagree
-    on them. See ``_card_candidates`` for what counts as a card number;
-    digits in any script count, and invisible characters are ignored."""
-    # An invisible character may sit inside a digit group or be the only
-    # break between two numbers; each reading misses what the other finds,
-    # so both are tried and every card either finds is removed.
-    found: list[tuple[int, int, set[str]]] = []
-    visible, index = _visible(text)
-    for match in _DIGIT_RUN.finditer(visible):
-        for begin, end, fours in _card_candidates(match.group(0)):
-            first = index[match.start() + begin]
-            found.append((first, index[match.start() + end - 1] + 1, fours))
-    for match in _DIGIT_RUN.finditer(_spaced(text)):
-        for begin, end, fours in _card_candidates(match.group(0)):
-            found.append((match.start() + begin, match.start() + end, fours))
-    found.sort(key=lambda span: (span[0], span[1]))
-    merged: list[tuple[int, int, set[str]]] = []
-    for begin, end, fours in found:
-        if merged and begin < merged[-1][1]:
-            b, e, f = merged[-1]
-            merged[-1] = (b, max(e, end), f | fours)
-        else:
-            merged.append((begin, end, set(fours)))
+    on them. See ``_run_candidates`` for what counts as a card number; digits
+    in any script count, and invisible characters may be nothing or a
+    break."""
+    view = _visible(text)
     out, pos = [], 0
-    for begin, end, fours in merged:
-        out.append(text[pos:begin])
+    for begin, end, fours in _cards(view):
+        first, last = view.index[begin], view.index[end - 1] + 1
+        out.append(text[pos:first])
         out.append(f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
-        pos = end
+        pos = last
     out.append(text[pos:])
     return "".join(out)
 
