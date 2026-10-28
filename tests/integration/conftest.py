@@ -58,7 +58,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000014 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000015 (tables, indexes and
     constraints). receipt/000014 holds grants only. The grants are not applied
     here, since CI's Postgres has no application roles; apply_migration_grants
     applies them for the tests that need them.
@@ -80,8 +80,10 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # receipt/000001 — receipts table, indexes, trigger
     conn.execute("CREATE SCHEMA IF NOT EXISTS receipt")
     conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    # extractions references receipts: drop it first (receipt/000011).
+    # extractions and receipt_events reference receipts: drop them first
+    # (receipt/000011, receipt/000015).
     conn.execute("DROP TABLE IF EXISTS receipt.extractions")
+    conn.execute("DROP TABLE IF EXISTS receipt.receipt_events")
     conn.execute("DROP TABLE IF EXISTS receipt.receipts CASCADE")
     conn.execute(
         """\
@@ -240,6 +242,10 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # receipt/000013 — ingest_log.receipt_link for link-only receipts. Run
     # from the migration file, up to its grants.
     conn.execute(_schema_part("receipt", "000013"))
+
+    # receipt/000015 — order number and payment columns, receipt_events and
+    # its append-only guard. Run from the migration file, up to its grants.
+    conn.execute(_schema_part("receipt", "000015"))
     conn.commit()
 
 

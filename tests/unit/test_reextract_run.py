@@ -25,6 +25,7 @@ from receipt_index.fetching import SourcePool
 from receipt_index.models import (
     ExtractionResult,
     FieldConfidence,
+    Payment,
     RawReceipt,
     Receipt,
     ReceiptMetadata,
@@ -96,6 +97,8 @@ class FakeDb:
         self.current: set[UUID] = set()
         # Applied between the extraction and the apply (a hand edit).
         self.edit_before_apply: dict[UUID, dict[str, Any]] = {}
+        # Fields with a manual_cleared event, per receipt.
+        self.cleared: dict[UUID, set[str]] = {}
 
     @contextmanager
     def item_lock(self, conn: Any, source_id: str) -> Iterator[bool]:
@@ -120,6 +123,9 @@ class FakeDb:
         rows = [e for e in self.extractions if e["receipt_id"] == receipt_id]
         ingested = any(e["origin"] == "ingest" for e in rows)
         return ingested, {f for e in rows for f in e["applied_fields"]}
+
+    def get_cleared_fields(self, conn: Any, receipt_id: UUID) -> set[str]:
+        return set(self.cleared.get(receipt_id, set()))
 
     def update_receipt_fields(
         self,
@@ -185,6 +191,7 @@ def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
         "is_current",
         "lock_receipt",
         "get_extraction_history",
+        "get_cleared_fields",
         "update_receipt_fields",
         "insert_extraction",
     ):
@@ -515,3 +522,55 @@ class TestRecheckUnderTheLock:
         db.current.add(receipt.id)
         result, _ = _run(db, [receipt], adapter=None, force=True)
         assert result.outcomes[0].status == "applied"
+
+
+class TestOrderAndPaymentApply:
+    """_apply removes a stale payment confidence, and counts a cleared field
+    as applied (receipt data-model design, §3 and §4)."""
+
+    def test_stale_payment_confidence_is_removed(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        receipt = _receipt(
+            payment_method="bank",
+            payment_last4="9999",
+            payer="Jane Doe",
+            field_confidence={**_FC, "payment": 0.6},
+        )
+        result = _result()
+        result.metadata = result.metadata.model_copy(
+            update={
+                "payment": Payment(method="card", last4="1234"),
+                "field_confidence": result.metadata.field_confidence.model_copy(
+                    update={"payment": 0.9}
+                ),
+            }
+        )
+        llm["rendition"].return_value = result
+        outcome = _run(db, [receipt], adapter=None, overwrite=True)[0].outcomes[0]
+
+        assert outcome.status == "applied"
+        _, columns, confidence = db.updates[0]
+        assert columns["payment_method"] == "card"
+        assert columns["payment_last4"] == "1234"
+        assert confidence is not None
+        assert "payment" not in confidence
+        row = db.extractions[0]
+        assert row["replaced"]["field_confidence.payment"] == 0.6
+
+    def test_a_cleared_field_counts_as_applied(
+        self, db: FakeDb, llm: dict[str, MagicMock]
+    ) -> None:
+        # Ingest applied no paid amount; a person set one, then cleared it.
+        receipt = _receipt(paid_amount=Decimal("12.00"))
+        db.extractions.append(
+            {"receipt_id": receipt.id, "origin": "ingest", "applied_fields": ["vendor"]}
+        )
+        llm["rendition"].return_value = _result(paid="30.00")
+        outcome = _run(db, [receipt], adapter=None, overwrite=True)[0].outcomes[0]
+        assert "paid_amount" not in outcome.changes
+
+        db.updates.clear()
+        db.cleared[receipt.id] = {"paid_amount"}
+        outcome = _run(db, [receipt], adapter=None, overwrite=True)[0].outcomes[0]
+        assert outcome.changes["paid_amount"] == (Decimal("12.00"), Decimal("30.00"))

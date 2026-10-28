@@ -215,6 +215,8 @@ These values are the model's own estimate, not a measured probability. They are 
 
 The configured model is Claude Haiku 4.5, at list prices (October 2026) of $1 per million input tokens and $5 per million output tokens. The devtest database holds no real receipts, so these figures are estimates; ticket 1 measures them.
 
+The table predates the move to Claude Haiku 5.5 at medium effort, whose thinking tokens are billed as output, so its figures no longer describe the configured model. Ticket 3's fields add roughly 40 to 60 output tokens a receipt and about 250 input tokens of prompt; the measured averages come from the query below, by `llm_model`, after each ticket is deployed.
+
 | | Input tokens | Output tokens | Cost |
 |---|---|---|---|
 | Today (estimate) | about 2,500 | about 150 | about $0.003 |
@@ -281,7 +283,7 @@ ALTER TABLE receipt.receipts
 - `applied_fields` lists the fields this run actually wrote to the receipt, and `replaced` holds the values those fields had before, so any run can be undone by hand.
 - `manual_fields` lists the fields a person has edited. Re-extraction never writes them.
 - Ingest writes an `extractions` row with `origin = 'ingest'` for every receipt it creates. `ingest_log` keeps its token columns, since it also covers runs that produced no receipt.
-- The application roles get `INSERT` and `SELECT` on `extractions` and no `UPDATE` or `DELETE`. Grants alone aren't enough in production, where the application connects as the role that owns the tables, so the table is also guarded by a trigger; see [Keeping history append-only](#keeping-history-append-only).
+- The application roles get `INSERT` and `SELECT` on `extractions` and no `UPDATE` or `DELETE`. Grants alone don't bind the role that owns the tables, which migrations log in as (and which the application used before it had its own login), so the table is also guarded by a trigger; see [Keeping history append-only](#keeping-history-append-only).
 
 Existing receipts have no `extractions` row, and count as prompt version 0. That includes receipts ingested between tickets 1 and 2. They already have a paid amount and a filled `field_confidence`, so they don't count as extracted under the old prompt and their `amount` isn't replaced; re-extracting them costs a little and, in the default fill-only mode, changes nothing they already have.
 
@@ -298,10 +300,10 @@ receipt-index reextract [--date-from YYYY-MM-DD] [--date-to YYYY-MM-DD]
 
 - **Selection.** By receipt date range, source and IDs, combined with AND. `--model-not` keeps receipts whose latest extraction used another model, and `--confidence-below` those whose overall confidence, or one field's, is below a value. A selector, `--limit` or `--all` is required, so that a bare command never re-extracts the whole catalogue. (The sign-off dropped a `--stale` option: the default already selects only stale receipts.)
 - **Repeat runs.** A receipt whose latest extraction already has the current prompt version and the configured model is skipped unless `--force` is given, so a model change makes receipts stale as a prompt change does. An interrupted run can be started again with the same arguments. A failed run is recorded with `output` holding only its `error`, and doesn't count as the latest extraction for this rule, so the next run retries it.
-- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt extracted under the old prompt, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier, and the overall confidence; on a receipt ingested before the history existed (no ingest row), every field counts as machine-extracted, before and after its first re-extraction, since only `manual_fields` marks a hand edit. A field's `field_confidence` entry is written with the field. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
+- **Applying a result.** By default a run writes only fields that are empty. A field is empty when it is `NULL`, when a receipt has no line items, or when it holds only its column default (`kind`, and each entry of `field_confidence`) and no earlier `extractions` row lists it in `applied_fields`. On a receipt extracted under the old prompt, `amount` counts as empty too (see [Existing totals](#existing-totals)). With `--overwrite` a run also replaces fields it extracted earlier, and the overall confidence; on a receipt ingested before the history existed (no ingest row), every field counts as machine-extracted, before and after its first re-extraction, since only `manual_fields` marks a hand edit. A field handed back with `edit --clear-manual` (a `manual_cleared` event) counts as extracted earlier too, even when ingest found it empty and so never applied it. A field's `field_confidence` entry is written with the field. The one `payment` entry covers the three payment columns: it is written when all three hold the extracted values afterwards, and removed (kept in `replaced`) when a run changes some of them but leaves another that doesn't match, since a null result never clears a value. In both modes, fields in `manual_fields` are left alone, and every field whose value changes is printed as old and new and kept in `replaced`.
 - **Refund links.** When a run sets `kind = 'refund'` or an order number, it runs the same linking rule as ingest; see [Refunds and returns](#6-refunds-and-returns). A run never changes the kind of a refund that is linked to a purchase (the constraint `ck_receipts_refund_of_kind` would refuse it); it lists the receipt instead, and a person unlinks it with `refund unlink` before editing it.
 - **Confidence gate.** If the new overall confidence is below 0.5, the run records the extraction and applies nothing, and the summary lists the receipt.
-- **What still needs review.** `search --needs-review` lists receipts whose `paid_amount` is `NULL`, or whose latest extraction applied nothing because of the confidence gate or a failure, lowest paid-amount confidence first. Both are read from the run's `output` (its `confidence`, or an `error`), with no extra column; a run that applied nothing because nothing was empty doesn't count. It is the list success criterion 6 is checked against, and it survives after the run's own output has gone.
+- **What still needs review.** `search --needs-review` lists receipts whose `paid_amount` is `NULL`, or whose latest extraction applied nothing because of the confidence gate or a failure, lowest paid-amount confidence first. Both are read from the run's `output` (its `confidence`, or an `error`), with no extra column; a run that applied nothing because nothing was empty doesn't count. A receipt whose paid amount is hand-edited (`paid_amount` in `manual_fields`) is left out: a person has decided that figure, and `edit --clear-manual` puts it back on the list. It is the list success criterion 6 is checked against, and it survives after the run's own output has gone.
 - **Transactions.** Each receipt is its own transaction: the `extractions` row, the receipt update and any line items commit together. A failure is logged and the run moves on.
 - **Dry run.** `--dry-run` lists the selected receipts, the input each would use and the estimated tokens, from the average of recent extractions. If the configuration gives token prices (`llm.price_per_mtok_input` and `llm.price_per_mtok_output`, both optional, beside the model they price), it prints an estimated cost too. Prices change, so they are configuration rather than code.
 
@@ -343,12 +345,12 @@ CREATE INDEX IF NOT EXISTS idx_receipts_payment_last4
 
 - **Order number** is not unique: a confirmation, a shipment, a refund and an invoice can share one.
 - **Payer** is the name printed on the receipt, as the cardholder or bill-to. Who forwarded the email is provenance and belongs to the evidence store. Matching a card to a household member is a later step: a `payers` map in the YAML configuration, from last four to a name, applied at display time. Configuration, not a table, since it is a handful of entries the operator edits.
-- **Last four only.** No full card or account number is ever stored. If a document shows more, the extractor returns only the last four digits.
+- **Last four only.** No full card or account number is ever stored. If a document shows more, the extractor returns only the last four digits. The output model holds this whatever the model does: `last4` keeps the last four digits of the card in any value it is given (a value of only digit groups is read whole; otherwise the one group of four or more digits; none or several give null), rather than failing validation and losing the receipt; and in `description`, `vendor` and `payer`, any card number that passes the Luhn check (one unbroken group of 13 to 19 digits, or groups in a printed card's shape, 4-4-4-4, 4-4-4-4-3, 4-6-5 or 4-6-4, with one kind of separator between them, however unevenly spaced: whitespace (line breaks included) and dashes are one kind, dots and slashes each another; digits in any script count, and an invisible character, such as a zero-width space or soft hyphen, may be read as nothing or as a group break) becomes "ending NNNN", even with another number printed beside it. Where overlapping candidates disagree on the last four, the whole overlap becomes "[card number removed]". The shapes keep dates, prices, phone and order numbers intact; a tracking number printed in groups of four, or four 4-digit numbers stacked on separate lines, can lose a 16-digit stretch (the price of catching a card wrapped across lines), and digits run onto a card with no separator are not caught. `edit` applies the same to `--vendor`, `--reason` and the actor. `order_number` is left as printed, since real order numbers can be long digit runs.
 - Search gains `--order-number` (exact), `--last4` and `--payer` (substring).
 
 #### Editing a receipt by hand
 
-The same ticket adds `receipt-index edit <id> --paid-amount 12.34 [--vendor ...] [--date ...] [--order-number ...] [--reason TEXT]`. Each edited field is added to `manual_fields` and recorded in `receipt_events` (below) with its old and new value. `edit --clear-manual FIELD` hands a field back to re-extraction. Line items can't be edited by hand in this design; re-extraction replaces them.
+The same ticket adds `receipt-index edit <id> --paid-amount 12.34 [--vendor ...] [--date ...] [--order-number ...] [--reason TEXT] [--as NAME]`. Each edited field is added to `manual_fields` and recorded in `receipt_events` (below) with its old and new value, in one transaction under the receipt's row lock, the lock re-extraction takes before it applies a result. The field's `field_confidence` entry is removed (the event keeps it), since it described the extracted value; setting a field to the value it already has still marks it manual. `edit --clear-manual FIELD` hands a field back to re-extraction. The CLI records the actor as `--as`, else `annotations.actor`, as §8 describes. Line items can't be edited by hand in this design; re-extraction replaces them.
 
 #### The receipt history
 
@@ -363,7 +365,7 @@ CREATE TABLE IF NOT EXISTS receipt.receipt_events (
     actor       TEXT NOT NULL,
     actor_kind  TEXT NOT NULL,
     reason      TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- when written, not the transaction start
 
     CONSTRAINT pk_receipt_events PRIMARY KEY (id),
     CONSTRAINT fk_receipt_events_receipt FOREIGN KEY (receipt_id)
@@ -385,7 +387,7 @@ Application roles get `INSERT` and `SELECT` only. `receipt-index history <id>` p
 
 #### Keeping history append-only
 
-Grants alone don't make `receipt_events` and `extractions` append-only in production. There the application connects as `receipt_index`, which owns the database and every table in it (see `deploy/db-init/01-create-roles.sh`), and a table's owner can update and delete whatever the grants say. In devtest the application connects as `receipt_index_dev_write`, which doesn't own anything, so a test there would pass and hide the gap.
+Grants alone don't make `receipt_events` and `extractions` append-only for every role. `receipt_index` owns the database and every table in it (see `deploy/db-init/01-create-roles.sh`), and a table's owner can update and delete whatever the grants say. Migrations log in as `receipt_index`; the application logs in as `receipt_index_write`, a member of `receipt_index_dev_write` that owns nothing (server deployment guide, "Separate database logins"), on a server provisioned or switched over since those logins were added. Before that, the application logged in as the owner.
 
 So the migration that creates each history table also adds a guard trigger, which applies to the owner too:
 
@@ -416,7 +418,7 @@ CREATE OR REPLACE TRIGGER trg_receipt_events_no_truncate
 
 The same two triggers go on `extractions`. On a truncate `TG_OP` is `TRUNCATE`, so the function raises without reading `OLD`. An integration test shows that deleting a receipt still cascades, and that an update or delete by the owning role is refused.
 
-This stops application code. It doesn't stop the owning role from dropping the trigger, which takes a deliberate schema change. Closing that last gap means connecting the application as a role that owns nothing, with `receipt_index` kept for migrations only. That changes the production deployment, so it is a question for the operator, listed under [Open questions](#open-questions).
+This stops application code, whichever role it runs as. Only the owning role can drop the trigger, which takes a deliberate schema change, and since the separate logins only migrations log in as the owner: the application's login can neither change history nor drop its guard. The trigger stays for the owner, and for a server that hasn't switched to the separate logins yet.
 
 #### Deleting a receipt
 
@@ -701,7 +703,7 @@ Against the devtest database, with every migration mirrored in the integration c
 - An update or delete of a history row is refused even for the table's owner, and deleting a receipt still cascades.
 - A fill-only re-extraction sets `kind = 'refund'` on a receipt with no extraction history, and links it to its purchase.
 
-The integration conftest today replays only the table migrations, not the grant migrations, and connects as the superuser, so no grant would ever be tested. Ticket 3 extends `_run_migrations()` to replay the grant migrations and adds a second connection as a restricted role; ticket 7 adds one as the annotate role.
+The integration conftest replays the table migrations and connects as the superuser. The separate database logins added `apply_migration_grants`, which replays every migration's grants, and `test_db_logins.py`, which runs the CLI as a write login and a read login holding only those grants; ticket 3 extends that module to `edit`, `history`, the new search filters and the refusals on `receipt_events`. Ticket 7 adds a connection as the annotate role.
 
 ### Fixtures
 
@@ -725,7 +727,7 @@ The devtest database holds no real receipts, so this check runs in production af
 | Tags drift or multiply | Tags stop mapping to tracking codes | Controlled vocabulary; only a person can define a tag |
 | An agent applies wrong tags or links | Bad coding of receipts | Every change is in the history with its actor and can be undone; the annotate role limits what an agent can change |
 | An email falsely claims to be a refund for a known order | A purchase's net paid is too low | Every automatic link is an event, `refund list` shows links, `refund unlink` undoes one |
-| The application's role can drop the history guard | History could be altered by a deliberate schema change | The guard stops application code; separating the owner role is an open question for the operator |
+| The owning role can drop the history guard | History could be altered by a deliberate schema change | The guard stops application code; the application logs in as a role that owns nothing, and only migrations log in as the owner |
 | The subject moves to provenance while text search is being built | A broken search document | The function and trigger are adapted by whichever migration lands second, as both designs state |
 
 ---
@@ -746,5 +748,5 @@ The devtest database holds no real receipts, so this check runs in production af
 
 | Question | Who decides | When |
 |---|---|---|
-| Should the application connect as a role that owns nothing, with `receipt_index` kept for migrations? That closes the last way to alter history (dropping the guard trigger), and changes the production deployment | The operator | Before ticket 3 is filed |
+| ~~Should the application connect as a role that owns nothing, with `receipt_index` kept for migrations?~~ Resolved: the separate database logins did this (server deployment guide, "Separate database logins") | The operator | Resolved before ticket 3 was built |
 | Should a tag namespace allow only one tag per receipt (for example one `class:` value)? | The operator | When ticket 7 is planned |

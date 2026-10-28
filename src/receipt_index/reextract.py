@@ -31,6 +31,7 @@ from receipt_index.models import (
     redacted_traceback,
 )
 from receipt_index.repository import (
+    get_cleared_fields,
     get_extraction_history,
     insert_extraction,
     is_current,
@@ -66,12 +67,15 @@ _MAX_CONSECUTIVE_FAILURES = 5
 # Fields re-extraction never treats as empty: they are NOT NULL.
 _NEVER_EMPTY = frozenset({"vendor", "currency", "receipt_date", "confidence"})
 
-# Each field_confidence entry, and the receipt field it describes.
-_CONFIDENCE_OF = {
-    "field_confidence.vendor": "vendor",
-    "field_confidence.amount": "amount",
-    "field_confidence.paid_amount": "paid_amount",
-    "field_confidence.date": "receipt_date",
+# Each field_confidence entry, and the receipt fields it describes. One
+# payment confidence covers the three payment columns.
+_CONFIDENCE_OF: dict[str, tuple[str, ...]] = {
+    "field_confidence.vendor": ("vendor",),
+    "field_confidence.amount": ("amount",),
+    "field_confidence.paid_amount": ("paid_amount",),
+    "field_confidence.date": ("receipt_date",),
+    "field_confidence.order_number": ("order_number",),
+    "field_confidence.payment": ("payment_method", "payment_last4", "payer"),
 }
 
 Status = Literal[
@@ -123,9 +127,14 @@ def plan_changes(
       receipt ingested before the history existed, every field counts as
       machine-extracted (only ``manual_fields`` marks a hand edit).
     - A field in ``manual_fields`` is never written, nor its confidence.
-    - A field's confidence entry moves with the field. An entry is otherwise
-      written only when the stored value equals the extracted one, so that
-      it never describes a value the receipt doesn't hold.
+    - A confidence entry describes a group of fields (one field, or the
+      three payment columns). It is written when, after the run's changes,
+      every field in its group holds the extracted value, and either one of
+      them changed or the entry itself may be written. When a field in the
+      group changes and the group then doesn't match (a null result left a
+      stored value in place), or the run gives no confidence for the group,
+      the entry is removed: listed as ``(old, None)``. So an entry never
+      describes a value the receipt doesn't hold.
     - ``overwrite`` replaces the overall ``confidence`` when anything else
       changes; fill-only never writes it.
     - A null result never clears a value, and an unchanged value isn't listed.
@@ -154,15 +163,28 @@ def plan_changes(
         if allowed(name, current):
             changes[name] = (current, new)
 
-    for name, of in _CONFIDENCE_OF.items():
+    for name, group in _CONFIDENCE_OF.items():
+        if name in manual or any(f in manual for f in group):
+            continue
         new = values[name]
         current = _current(receipt, name)
-        if of in manual or name in manual or new is None or _same(current, new):
-            continue
-        if of in changes or (
-            allowed(name, current) and _same(_current(receipt, of), values[of])
+        after = {
+            f: changes[f][1] if f in changes else _current(receipt, f) for f in group
+        }
+        group_changed = any(f in changes for f in group)
+        if (
+            group_changed
+            and current is not None
+            and (new is None or not all(_same(after[f], values[f]) for f in group))
         ):
-            changes[name] = (current, new)
+            # The stored entry described the group before this run changed
+            # it, and the run gives none that fits: remove it.
+            changes[name] = (current, None)
+        elif all(_same(after[f], values[f]) for f in group):
+            if new is None or _same(current, new):
+                continue
+            if group_changed or allowed(name, current):
+                changes[name] = (current, new)
 
     if overwrite and changes and "confidence" not in manual:
         current = receipt.confidence
@@ -333,6 +355,9 @@ def _apply(
         conn.rollback()
         return _outcome(receipt, "failed", error="receipt was deleted", **extracted)
     ingested, applied = get_extraction_history(conn, receipt.id)
+    # A field whose hand edit was cleared is machine-extracted again, even
+    # when no run ever applied it (ingest found it empty).
+    applied |= get_cleared_fields(conn, receipt.id)
     gated = metadata.confidence < _MIN_CONFIDENCE
     changes = (
         {}
@@ -347,11 +372,13 @@ def _apply(
     columns = {k: new for k, (_, new) in changes.items() if "." not in k}
     entries = {k.split(".", 1)[1]: new for k, (_, new) in changes.items() if "." in k}
     if columns or entries:
+        confidence = {**current.field_confidence, **entries}
         update_receipt_fields(
             conn,
             receipt.id,
             columns,
-            {**current.field_confidence, **entries} if entries else None,
+            # A None entry is a stale one the run removes.
+            {k: v for k, v in confidence.items() if v is not None} if entries else None,
         )
     insert_extraction(
         conn,

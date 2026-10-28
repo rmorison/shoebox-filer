@@ -14,6 +14,7 @@ from receipt_index.models import (
     MIN_RECEIPT_CONFIDENCE,
     IngestLogEntry,
     Receipt,
+    ReceiptEvent,
     SyncState,
 )
 from receipt_index.store import LOCAL_SCHEME
@@ -23,6 +24,11 @@ if TYPE_CHECKING:
     from decimal import Decimal
 
     import psycopg
+
+    from receipt_index.models import ActorKind, EventType
+
+# The manual_fields name of a field_confidence entry, where they differ.
+_MANUAL_NAME = {"date": "receipt_date"}
 
 # The effective amount: paid when known, the total otherwise. The expression
 # matches idx_receipts_effective_amount, so keep the two in step.
@@ -214,6 +220,10 @@ def insert_receipt(
     file_name: str | None = None,
     paid_amount: Decimal | None = None,
     field_confidence: dict[str, float] | None = None,
+    order_number: str | None = None,
+    payment_method: str | None = None,
+    payment_last4: str | None = None,
+    payer: str | None = None,
     commit: bool = True,
 ) -> Receipt:
     """Insert a receipt row and return the validated Receipt model.
@@ -227,13 +237,15 @@ def insert_receipt(
             source_id, source_type, source_name, vendor, amount, currency,
             receipt_date, description, confidence, pdf_path,
             email_subject, email_sender, email_date, file_name,
-            paid_amount, field_confidence
+            paid_amount, field_confidence,
+            order_number, payment_method, payment_last4, payer
         ) VALUES (
             %(source_id)s, %(source_type)s, %(source_name)s,
             %(vendor)s, %(amount)s, %(currency)s,
             %(receipt_date)s, %(description)s, %(confidence)s, %(pdf_path)s,
             %(email_subject)s, %(email_sender)s, %(email_date)s, %(file_name)s,
-            %(paid_amount)s, %(field_confidence)s
+            %(paid_amount)s, %(field_confidence)s,
+            %(order_number)s, %(payment_method)s, %(payment_last4)s, %(payer)s
         )
         RETURNING *
         """,
@@ -254,6 +266,10 @@ def insert_receipt(
             "file_name": file_name,
             "paid_amount": paid_amount,
             "field_confidence": Jsonb(field_confidence or {}),
+            "order_number": order_number,
+            "payment_method": payment_method,
+            "payment_last4": payment_last4,
+            "payer": payer,
         },
     )
     row = cur.fetchone()
@@ -325,6 +341,9 @@ def _receipt_filters(
     date_to: date | None,
     source_name: str | None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Build the WHERE clause and parameters shared by search and count."""
     clauses: list[str] = []
@@ -357,6 +376,18 @@ def _receipt_filters(
     if source_name is not None:
         clauses.append("source_name = %(source_name)s")
         params["source_name"] = source_name
+
+    if order_number is not None:
+        clauses.append("order_number = %(order_number)s")
+        params["order_number"] = order_number
+
+    if last4 is not None:
+        clauses.append("payment_last4 = %(last4)s")
+        params["last4"] = last4
+
+    if payer is not None:
+        clauses.append("payer ILIKE %(payer)s")
+        params["payer"] = f"%{_escape_like(payer)}%"
 
     if needs_review:
         clauses.append(_NEEDS_REVIEW)
@@ -392,11 +423,16 @@ def search_receipts(
     limit: int | None = None,
     offset: int | None = None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> list[Receipt]:
     """Search receipts with optional filters, combined with AND.
 
     Results are ordered newest first, then by vendor, then by id, so that
-    ``limit``/``offset`` pages are stable between calls. ``needs_review``
+    ``limit``/``offset`` pages are stable between calls. ``order_number``
+    and ``last4`` match exactly; ``payer`` is a case-insensitive substring.
+    ``needs_review``
     keeps receipts still missing a paid amount or whose latest extraction
     failed or was gated, lowest paid-amount confidence first.
     """
@@ -409,6 +445,9 @@ def search_receipts(
         date_to=date_to,
         source_name=source_name,
         needs_review=needs_review,
+        order_number=order_number,
+        last4=last4,
+        payer=payer,
     )
     order = (
         _NEEDS_REVIEW_ORDER if needs_review else "receipt_date DESC, vendor ASC, id ASC"
@@ -432,6 +471,9 @@ def count_receipts(
     date_to: date | None = None,
     source_name: str | None = None,
     needs_review: bool = False,
+    order_number: str | None = None,
+    last4: str | None = None,
+    payer: str | None = None,
 ) -> int:
     """Count the receipts that ``search_receipts`` would return unpaged."""
     where, params = _receipt_filters(
@@ -443,6 +485,9 @@ def count_receipts(
         date_to=date_to,
         source_name=source_name,
         needs_review=needs_review,
+        order_number=order_number,
+        last4=last4,
+        payer=payer,
     )
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
@@ -880,8 +925,10 @@ ORDER BY receipt_id, created_at DESC, id DESC
 # A receipt still needs review when its paid amount isn't known, or when its
 # latest run (failed ones included) applied nothing because it failed or was
 # gated. A run that applied nothing because nothing was empty doesn't count.
+# A paid amount a person set by hand has been reviewed: no run can change it
+# (``edit --clear-manual`` puts the receipt back on the list).
 _NEEDS_REVIEW = f"""\
-(paid_amount IS NULL OR EXISTS (
+NOT ('paid_amount' = ANY(manual_fields)) AND (paid_amount IS NULL OR EXISTS (
     SELECT 1 FROM (
         SELECT e.output FROM receipt.extractions e
         WHERE e.receipt_id = receipts.id
@@ -921,7 +968,8 @@ def select_for_reextract(
     ``model_not`` keeps receipts whose latest such run used another model (or
     that have none). ``confidence_below`` is ``(field, x)``: the overall
     confidence when ``field`` is None, else that field's entry, missing
-    entries counting as below.
+    entries counting as below; a receipt where that field is hand-edited
+    is left out.
     """
     clauses: list[str] = []
     params: dict[str, object] = {"version": prompt_version, "model": llm_model}
@@ -956,6 +1004,9 @@ def select_for_reextract(
                 " < %(below)s"
             )
             params["below_field"] = field
+            # A hand-edited field has no entry, but a run can't change it.
+            clauses.append("NOT (%(below_manual)s = ANY(r.manual_fields))")
+            params["below_manual"] = _MANUAL_NAME.get(field, field)
     where = " AND ".join(clauses) if clauses else "TRUE"
     sql = (
         f"WITH l AS ({_LATEST_GOOD}) "
@@ -1031,6 +1082,10 @@ _REEXTRACT_COLUMNS = frozenset(
         "currency",
         "receipt_date",
         "description",
+        "order_number",
+        "payment_method",
+        "payment_last4",
+        "payer",
         "confidence",
     }
 )
@@ -1065,6 +1120,45 @@ def update_receipt_fields(
         ),
         params,
     )
+
+
+# The receipt columns a person may edit by hand (receipt data-model design, §4).
+_EDITABLE_COLUMNS = frozenset({"paid_amount", "vendor", "receipt_date", "order_number"})
+
+
+def update_edited_fields(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    columns: dict[str, Any],
+    *,
+    manual_fields: list[str],
+    field_confidence: dict[str, float],
+) -> Receipt:
+    """Write a hand edit (or a cleared mark) to one receipt. The caller commits."""
+    from psycopg import sql
+
+    unknown = set(columns) - _EDITABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"not an editable column: {sorted(unknown)}")
+    sets = [
+        sql.SQL("{} = {}").format(sql.Identifier(name), sql.Placeholder(name))
+        for name in sorted(columns)
+    ]
+    sets.append(sql.SQL("manual_fields = {}").format(sql.Placeholder("manual")))
+    sets.append(sql.SQL("field_confidence = {}").format(sql.Placeholder("fc")))
+    params: dict[str, Any] = {
+        **columns,
+        "manual": manual_fields,
+        "fc": Jsonb(field_confidence),
+        "id": receipt_id,
+    }
+    cur = conn.execute(
+        sql.SQL("UPDATE receipt.receipts SET {} WHERE id = {} RETURNING *").format(
+            sql.SQL(", ").join(sets), sql.Placeholder("id")
+        ),
+        params,
+    )
+    return Receipt.model_validate(cur.fetchone())
 
 
 # How many runs at the current version and model an average needs before it
@@ -1112,3 +1206,72 @@ def token_averages(
     if row is not None and int(row["runs"]) > 0:
         return {**row, "basis": "ingest_log"}
     return None
+
+
+# ---------------------------------------------------------------------------
+# The receipt history (receipt data-model design, §4)
+# ---------------------------------------------------------------------------
+
+
+def insert_event(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    event_type: EventType,
+    payload: dict[str, Any],
+    actor: str,
+    actor_kind: ActorKind,
+    reason: str | None = None,
+) -> ReceiptEvent:
+    """Append one row to ``receipt_events``. The caller commits.
+
+    The event belongs in the same transaction as the change it records.
+    """
+    cur = conn.execute(
+        """\
+        INSERT INTO receipt.receipt_events (
+            receipt_id, event_type, payload, actor, actor_kind, reason
+        ) VALUES (
+            %(receipt_id)s, %(event_type)s, %(payload)s, %(actor)s,
+            %(actor_kind)s, %(reason)s
+        )
+        RETURNING *
+        """,
+        {
+            "receipt_id": receipt_id,
+            "event_type": event_type,
+            "payload": Jsonb(payload),
+            "actor": actor,
+            "actor_kind": actor_kind,
+            "reason": reason,
+        },
+    )
+    return ReceiptEvent.model_validate(cur.fetchone())
+
+
+def get_receipt_events(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> list[ReceiptEvent]:
+    """A receipt's events, oldest first (UUID v7 breaks a timestamp tie)."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.receipt_events WHERE receipt_id = %(id)s"
+        " ORDER BY created_at, id",
+        {"id": receipt_id},
+    )
+    return [ReceiptEvent.model_validate(row) for row in cur.fetchall()]
+
+
+def get_cleared_fields(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> set[str]:
+    """Fields whose hand edit was handed back (a ``manual_cleared`` event).
+
+    Re-extraction counts them as machine-extracted, so ``--overwrite`` may
+    replace them even when no run ever applied them.
+    """
+    cur = conn.execute(
+        "SELECT DISTINCT payload->>'field' AS field FROM receipt.receipt_events"
+        " WHERE receipt_id = %(id)s AND event_type = 'manual_cleared'",
+        {"id": receipt_id},
+    )
+    return {row["field"] for row in cur.fetchall() if row["field"]}

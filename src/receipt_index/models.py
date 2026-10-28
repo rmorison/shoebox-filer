@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import traceback
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -126,13 +127,306 @@ class FieldConfidence(BaseModel):
     """The model's own confidence in each extracted field, from 0 to 1.
 
     An estimate, not a measured probability: good for ordering a review,
-    not for a hard threshold.
+    not for a hard threshold. ``order_number`` and ``payment`` are null when
+    their field is.
     """
 
     vendor: float = Field(ge=0.0, le=1.0)
     amount: float = Field(ge=0.0, le=1.0)
     paid_amount: float = Field(ge=0.0, le=1.0)
     date: float = Field(ge=0.0, le=1.0)
+    order_number: float | None = Field(default=None, ge=0.0, le=1.0)
+    payment: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+def _blank_to_none(value: object) -> object:
+    """A string stripped, and None when nothing is left."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    return value
+
+
+# Characters that print nothing: format characters (zero-width space and
+# joiner, soft hyphen), combining marks, control characters other than
+# whitespace, unassigned, private-use and surrogate code points, and the
+# blank filler letters.
+_INVISIBLE = frozenset({"Cf", "Mn", "Me", "Cc", "Cn", "Co", "Cs"})
+_BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def _is_invisible(ch: str) -> bool:
+    if ch in _BLANK_LETTERS:
+        return True
+    return not ch.isspace() and unicodedata.category(ch) in _INVISIBLE
+
+
+def _fold(ch: str) -> str:
+    """One character with its digit as ASCII, and full-width punctuation as
+    its ASCII form; a superscript, subscript or circled digit (a footnote
+    mark) is left alone, being no digit of a card."""
+    if ch.isascii():
+        return ch
+    if ch.isdecimal():
+        return str(unicodedata.decimal(ch))
+    folded = unicodedata.normalize("NFKC", ch)
+    return folded if len(folded) == 1 and not folded.isdigit() else ch
+
+
+@dataclass(frozen=True)
+class _Visible:
+    """Text as a card is read from it.
+
+    ``text`` is the original folded (``_fold``) with its invisible characters
+    removed; ``index`` gives each kept character's position in the original;
+    ``soft`` holds each position in ``text`` where invisible characters were
+    removed just before it. A soft break may be nothing (a zero-width space
+    inside a group) or a group boundary (the only break between numbers).
+    """
+
+    text: str
+    index: list[int]
+    soft: frozenset[int]
+
+
+def _visible(text: str) -> _Visible:
+    chars: list[str] = []
+    index: list[int] = []
+    soft: set[int] = set()
+    pending = False
+    for i, ch in enumerate(text):
+        if _is_invisible(ch):
+            pending = True
+            continue
+        if pending:
+            soft.add(len(chars))
+            pending = False
+        chars.append(_fold(ch))
+        index.append(i)
+    return _Visible("".join(chars), index, frozenset(soft))
+
+
+_GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015\u2212]+")
+_DIGITS = re.compile(r"[0-9]+")
+
+
+def last_four_digits(value: object) -> str | None:
+    """The last four digits of the card or account in ``value``, or None.
+
+    Only the last four digits are ever kept, so a longer number is cut here,
+    whatever its type. A value that is only digit groups (``4111 1111 1111
+    1111``) is read as one number; a value holding one card number among
+    other text gives that card's, when no other number of four or more
+    digits disagrees. Otherwise the one group of four or more digits is the
+    card's (``Visa ending 4242, exp 12/25`` gives ``4242``); with none, or
+    more than one, it is None rather than a guess. The result always matches
+    ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
+    validation error would echo it into a logged traceback.
+    """
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return None
+    view = _visible(str(value))
+    text = view.text.strip()
+    cards = _cards(view)
+    if _GROUPED_DIGITS.fullmatch(text) and (not view.soft or not cards):
+        digits = "".join(_DIGITS.findall(text))
+        return digits[-4:] if len(digits) >= 4 else None
+    if len(cards) == 1 and len(cards[0][2]) == 1:
+        begin, end, fours = cards[0]
+        last4 = next(iter(fours))
+        others = [
+            g.group(0)
+            for g in _DIGITS.finditer(view.text)
+            if len(g.group(0)) >= 4 and (g.end() <= begin or g.start() >= end)
+        ]
+        return last4 if all(o[-4:] == last4 for o in others) else None
+    long_groups = [g for g in _DIGITS.findall(view.text) if len(g) >= 4]
+    return long_groups[0][-4:] if len(long_groups) == 1 else None
+
+
+# What can sit between the digit groups of a printed card number: any run of
+# whitespace (newlines and no-break, figure and em spaces included), or a
+# hyphen, dash, minus, dot or slash with any whitespace around it.
+_PUNCT = "-\u2010-\u2015\u2212./"
+_SEPARATOR = rf"(?:\s+|\s*[{_PUNCT}]\s*)"
+# A run of digit groups joined by separators: where a card number can sit
+# among dates, prices, codes and other numbers.
+_DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
+_DOT_OR_SLASH = re.compile(r"[./]")
+# How a printed card number is grouped, by digits per group.
+_CARD_SHAPES = frozenset({(4, 4, 4, 4), (4, 4, 4, 4, 3), (4, 6, 5), (4, 6, 4)})
+# For each card length, the digit positions where its shapes have group
+# boundaries.
+_BOUNDARIES: dict[int, set[frozenset[int]]] = {}
+for _shape in _CARD_SHAPES:
+    _BOUNDARIES.setdefault(sum(_shape), set()).add(
+        frozenset(sum(_shape[: k + 1]) for k in range(len(_shape) - 1))
+    )
+_REMOVED = "[card number removed]"
+
+
+def _luhn_valid(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch)
+        if i % 2:
+            n = n * 2 - 9 if n > 4 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def _is_card(digits: str) -> bool:
+    return 13 <= len(digits) <= 19 and len(set(digits)) > 1 and _luhn_valid(digits)
+
+
+def _separator_kind(sep: str) -> str:
+    """A dot or a slash is its own kind; whitespace and dashes are one kind.
+
+    Spacing is ignored, since text from a PDF spaces unevenly.
+    """
+    found = _DOT_OR_SLASH.search(sep)
+    return found.group(0) if found else " "
+
+
+def _run_candidates(
+    run: str, offset: int, soft: frozenset[int]
+) -> list[tuple[int, int, str]]:
+    """The card numbers in one digit run, as ``(start, end, last four)``.
+
+    The run is cut into digit pieces at its separators and at soft breaks.
+    A candidate is consecutive pieces holding 13 to 19 digits, not all one
+    digit, that pass the Luhn check, and either have no separator between
+    them (one unbroken number, soft breaks read as nothing), or fall into a
+    card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with every separator on
+    a group boundary, all of one kind (see ``_separator_kind``), and every
+    other boundary on a soft break. Shapes keep dates, prices, phone and
+    order numbers out; trying every starting piece finds a card with another
+    number beside it.
+    """
+    pieces: list[tuple[int, int]] = []
+    joins: list[str | None] = []  # between piece k and k+1; None is soft
+    groups = list(_DIGITS.finditer(run))
+    for g_index, group in enumerate(groups):
+        if g_index:
+            gap = run[groups[g_index - 1].end() : group.start()]
+            joins.append(_separator_kind(gap))
+        cuts = [
+            cut for cut in range(group.start() + 1, group.end()) if offset + cut in soft
+        ]
+        # Dense soft breaks (obfuscated text: more than four, between more
+        # than half of the digits) break nothing inside the dense stretch: it
+        # is one number. A soft break beside an ordinary gap stays, since it
+        # may be the only break between that number and another.
+        if len(cuts) > 4 and len(cuts) * 2 > group.end() - group.start():
+            cut_set = set(cuts)
+            cuts = [
+                cut
+                for cut in cuts
+                if (cut - 1 > group.start() and cut - 1 not in cut_set)
+                or (cut + 1 < group.end() and cut + 1 not in cut_set)
+            ]
+        begin = group.start()
+        for cut in cuts:
+            pieces.append((begin, cut))
+            joins.append(None)
+            begin = cut
+        pieces.append((begin, group.end()))
+
+    found: list[tuple[int, int, str]] = []
+    for i in range(len(pieces)):
+        digits = ""
+        real: dict[int, str] = {}
+        softs: set[int] = set()
+        for j in range(i, len(pieces)):
+            if j > i:
+                join = joins[j - 1]
+                if join is None:
+                    softs.add(len(digits))
+                else:
+                    real[len(digits)] = join
+            digits += run[pieces[j][0] : pieces[j][1]]
+            if len(digits) > 19:
+                break
+            if not _is_card(digits):
+                continue
+            fits = not real or any(
+                set(real) <= bounds
+                and bounds <= set(real) | softs
+                and len(set(real.values())) == 1
+                for bounds in _BOUNDARIES.get(len(digits), ())
+            )
+            if fits:
+                found.append(
+                    (offset + pieces[i][0], offset + pieces[j][1], digits[-4:])
+                )
+    return found
+
+
+def _cards(view: _Visible) -> list[tuple[int, int, set[str]]]:
+    """The card numbers in ``view.text``, as ``(start, end, last fours)``.
+
+    Candidates that overlap are merged, so no part of a card is left: one
+    replacement covers them all.
+    """
+    found: list[tuple[int, int, str]] = []
+    for run in _DIGIT_RUN.finditer(view.text):
+        found += _run_candidates(run.group(0), run.start(), view.soft)
+    found.sort()
+    merged: list[tuple[int, int, set[str]]] = []
+    for begin, end, last4 in found:
+        if merged and begin < merged[-1][1]:
+            b, e, fours = merged[-1]
+            if len(fours) < 2:  # only "one last four or not" matters
+                fours.add(last4)
+            merged[-1] = (b, max(e, end), fours)
+        else:
+            merged.append((begin, end, {last4}))
+    return merged
+
+
+def scrub_card_numbers(text: str) -> str:
+    """``text`` with each card number replaced by "ending NNNN", its last four
+    digits, or "[card number removed]" when overlapping candidates disagree
+    on them. See ``_run_candidates`` for what counts as a card number; digits
+    in any script count, and invisible characters may be nothing or a
+    break."""
+    view = _visible(text)
+    out, pos = [], 0
+    for begin, end, fours in _cards(view):
+        first, last = view.index[begin], view.index[end - 1] + 1
+        out.append(text[pos:first])
+        out.append(f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
+        pos = last
+    out.append(text[pos:])
+    return "".join(out)
+
+
+PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
+
+
+class Payment(BaseModel):
+    """How the receipt says it was paid, as printed on it."""
+
+    method: PaymentMethod | None = None
+    # Only ever the last four digits of the card or account.
+    last4: str | None = Field(default=None, pattern=r"^[0-9]{4}$")
+    # The cardholder or bill-to name as printed; not who forwarded the email.
+    payer: str | None = None
+
+    @field_validator("last4", mode="before")
+    @classmethod
+    def _last_four(cls, value: object) -> str | None:
+        return last_four_digits(value)
+
+    @field_validator("payer", mode="before")
+    @classmethod
+    def _payer(cls, value: object) -> object:
+        # Free text, stored in the append-only history: no card numbers.
+        value = _blank_to_none(value)
+        return scrub_card_numbers(value) if isinstance(value, str) else value
+
+    def is_empty(self) -> bool:
+        return self.method is None and self.last4 is None and self.payer is None
 
 
 class ReceiptMetadata(BaseModel):
@@ -147,6 +441,9 @@ class ReceiptMetadata(BaseModel):
     currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     date: date
     description: str | None = None
+    # The order, confirmation or invoice number as printed. Not unique.
+    order_number: str | None = None
+    payment: Payment | None = None
     # Which part of an email held the receipt: an attachment's file name as
     # listed, or "body". None when the extractor can't tell, and always None
     # for a Drive document or a rendition.
@@ -160,6 +457,26 @@ class ReceiptMetadata(BaseModel):
     # bad link can't fail the extraction. Left out of model_dump, so the
     # append-only extraction history never holds a token it can't drop.
     receipt_link: str | None = Field(default=None, exclude=True)
+
+    @field_validator("order_number", mode="before")
+    @classmethod
+    def _order_number(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+    @field_validator("description", "vendor", mode="before")
+    @classmethod
+    def _no_card_numbers(cls, value: object) -> object:
+        # The prompt asks for no more than the last four digits anywhere; this
+        # holds whatever the model does in the free-text fields (payer too, in
+        # Payment), since the extraction history that keeps the output is
+        # append-only. order_number is left alone: real order numbers can be
+        # long digit runs that pass the check.
+        return scrub_card_numbers(value) if isinstance(value, str) else value
+
+    @field_validator("payment", mode="after")
+    @classmethod
+    def _empty_payment_is_none(cls, value: Payment | None) -> Payment | None:
+        return None if value is None or value.is_empty() else value
 
     @field_validator("receipt_link", mode="before")
     @classmethod
@@ -244,6 +561,7 @@ def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
     field confidence as ``field_confidence.<field>``: the names that
     ``extractions.applied_fields`` and ``receipts.manual_fields`` use.
     """
+    payment = metadata.payment
     values: dict[str, Any] = {
         "vendor": metadata.vendor,
         "amount": metadata.amount,
@@ -251,6 +569,10 @@ def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
         "currency": metadata.currency,
         "receipt_date": metadata.date,
         "description": metadata.description,
+        "order_number": metadata.order_number,
+        "payment_method": payment.method if payment else None,
+        "payment_last4": payment.last4 if payment else None,
+        "payer": payment.payer if payment else None,
         "confidence": metadata.confidence,
     }
     for name, value in metadata.field_confidence.model_dump().items():
@@ -286,6 +608,10 @@ class Receipt(BaseModel):
     field_confidence: dict[str, float] = Field(default_factory=dict)
     # Fields a person has edited; re-extraction never writes them.
     manual_fields: list[str] = Field(default_factory=list)
+    order_number: str | None = None
+    payment_method: str | None = None
+    payment_last4: str | None = None
+    payer: str | None = None
     pdf_path: str
     email_subject: str | None
     email_sender: str | None
@@ -302,6 +628,36 @@ class Receipt(BaseModel):
         Search filters on the same expression: COALESCE(paid_amount, amount).
         """
         return self.amount if self.paid_amount is None else self.paid_amount
+
+
+EventType = Literal[
+    "field_edited",
+    "manual_cleared",
+    "tag_added",
+    "tag_removed",
+    "link_added",
+    "link_removed",
+    "refund_linked",
+    "refund_unlinked",
+]
+ActorKind = Literal["person", "agent", "rule"]
+
+
+class ReceiptEvent(BaseModel):
+    """One change made to a receipt after extraction (``receipt_events``).
+
+    Append-only: who made the change (``actor``, and whether a person, an
+    agent or a rule), what it was (``payload``) and why (``reason``).
+    """
+
+    id: UUID
+    receipt_id: UUID
+    event_type: EventType
+    payload: dict[str, Any]
+    actor: str
+    actor_kind: ActorKind
+    reason: str | None = None
+    created_at: datetime
 
 
 class IngestLogEntry(BaseModel):

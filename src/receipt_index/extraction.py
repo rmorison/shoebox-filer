@@ -36,8 +36,9 @@ _R = TypeVar("_R")
 # run records it. 0 means a receipt has no extraction history; 1 was the
 # paid-amount prompt, which was never recorded. 3 added receipt_link, and
 # likely receipt link URLs in the text of an HTML-only email. 4 sends a
-# scanned PDF attachment (no text layer) to the model as a document.
-EXTRACTION_PROMPT_VERSION = 4
+# scanned PDF attachment (no text layer) to the model as a document. 5 added
+# order_number and payment, with their field confidences.
+EXTRACTION_PROMPT_VERSION = 5
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
@@ -77,7 +78,27 @@ _FIELD_CONFIDENCE_RULE = """\
 - field_confidence: Your confidence in each of vendor, amount, paid_amount and \
 date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
 (then it is your confidence that the document does not say what was paid). Go \
-below 0.5 when a figure is inferred rather than printed on the document.
+below 0.5 when a figure is inferred rather than printed on the document. For \
+order_number and payment: your confidence in each, or null when the field is \
+null.
+"""
+
+# The order number and payment fields, shared by both prompts. See the receipt
+# data-model design, §4. Only the last four digits of a card are ever kept.
+_ORDER_PAYMENT_RULES = """\
+- order_number: The order, confirmation or invoice number as printed, without \
+its label (for "Order #A-100" give "A-100"). When several are shown, the order \
+number. Use null when there is none.
+- payment: How this document says it was paid, or null when it shows no \
+payment details. A card named with no amount still counts here. Its fields:
+  - method: one of card, bank, wallet, cash, transfer or other (null when \
+not shown).
+  - last4: only the last four digits of the card or account number, even when \
+the document shows more (null when not shown).
+  - payer: the cardholder or bill-to name as printed (null when not shown), \
+not the person who sent or forwarded the email.
+Never write more than the last four digits of a card or account number \
+anywhere in your output, the description included.
 """
 
 # A receipt that is only a link to a hosted receipt. Shared by both prompts.
@@ -101,6 +122,7 @@ a receipt, extract the following fields:
 - currency: ISO 4217 currency code (e.g. "USD", "CAD", "EUR")
 - date: The purchase/transaction date (YYYY-MM-DD), NOT the email send date
 - description: Brief summary of what was purchased (optional)
+{_ORDER_PAYMENT_RULES}\
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if the email may not be a receipt or key fields are uncertain.
 {_FIELD_CONFIDENCE_RULE}\
@@ -139,6 +161,7 @@ or PDF), extract the following fields:
 - currency: ISO 4217 currency code (e.g. "USD")
 - date: The transaction date (YYYY-MM-DD)
 - description: Brief summary of what was purchased (optional)
+{_ORDER_PAYMENT_RULES}\
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if this does not appear to be a receipt or key fields are unclear.
 {_FIELD_CONFIDENCE_RULE}\

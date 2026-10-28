@@ -23,6 +23,7 @@ from pydantic import (
     Field,
     Tag,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -178,6 +179,24 @@ class IngestConfig(BaseModel):
         return self
 
 
+class AnnotationsConfig(BaseModel):
+    """Changes made after extraction (the ``annotations:`` block).
+
+    ``actor`` is the name the CLI records on each change it makes, unless
+    ``--as`` gives another. Attribution, not authentication.
+    """
+
+    actor: str = Field(default="operator", min_length=1)
+
+    @field_validator("actor")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("annotations.actor must not be blank")
+        return value
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -187,6 +206,7 @@ class AppConfig(BaseModel):
     llm: LlmConfig
     logging: LoggingConfig = LoggingConfig()
     ingest: IngestConfig = IngestConfig()
+    annotations: AnnotationsConfig = AnnotationsConfig()
 
 
 # ---------------------------------------------------------------------------
