@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
@@ -278,7 +279,7 @@ def _extract_from_email(
     # request as the email text. The IMAP body is often empty for these.
     message: list[Any] = [prompt]
     for att in pdfs.documents:
-        message.append(f"--- PDF Attachment (scanned): {att.filename} ---")
+        message.append(f"--- PDF Attachment (scanned): {_label_name(att.filename)} ---")
         message.append(BinaryContent(data=att.data, media_type="application/pdf"))
     for att in images:
         message.append(
@@ -436,12 +437,16 @@ def _build_prompt(
         parts.append("")
         parts.append("--- Attachments ---")
         for att in raw.attachments:
-            parts.append(f"- {att.filename} ({_base_content_type(att.content_type)})")
+            name = _label_name(att.filename)
+            parts.append(f"- {name} ({_base_content_type(att.content_type)})")
 
     if pdf_text:
         parts.append("")
         heading = "--- PDF Attachment Content"
-        parts.append(f"{heading}: {pdf_name} ---" if pdf_name else f"{heading} ---")
+        if pdf_name:
+            parts.append(f"{heading}: {_label_name(pdf_name)} ---")
+        else:
+            parts.append(f"{heading} ---")
         parts.append(pdf_text)
 
     return "\n".join(parts)
@@ -508,7 +513,9 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
         limit = _MAX_EMAIL_PDF_PAGES if pdfs.text is not None else None
         read = _read_pdf(att.data, text_up_to_pages=limit)
         if read is None:
-            logger.info("PDF attachment %s can't be read; left out", att.filename)
+            logger.info(
+                "PDF attachment %s can't be read; left out", _label_name(att.filename)
+            )
             continue
         if read.text is None:
             reason = f"{read.pages} pages, over {_MAX_EMAIL_PDF_PAGES}"
@@ -528,8 +535,30 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
             pdfs.documents.append(att)
             sent_bytes += len(att.data)
             continue
-        logger.info("PDF attachment %s left out: %s", att.filename, reason)
+        logger.info("PDF attachment %s left out: %s", _label_name(att.filename), reason)
     return pdfs
+
+
+_MAX_LABEL_NAME = 100
+
+
+def _label_name(filename: str) -> str:
+    """An attachment's file name, safe to put in a prompt label or a log line.
+
+    The name comes from the email, so it can't be allowed to end its label
+    and fake a section: control and line-separator characters become
+    spaces, whitespace collapses to one space, runs of dashes become one,
+    and the name is cut to 100 characters. An ordinary name is unchanged,
+    so the model can still give it back as receipt_document.
+    """
+    chars = (
+        " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
+        for ch in filename
+    )
+    name = re.sub(r"-{2,}", "-", " ".join("".join(chars).split()))
+    if len(name) > _MAX_LABEL_NAME:
+        name = name[: _MAX_LABEL_NAME - 1].rstrip() + "…"
+    return name or "(no name)"
 
 
 def _base_content_type(content_type: str) -> str:

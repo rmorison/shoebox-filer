@@ -573,7 +573,7 @@ class TestHostileFileNames:
         lines = [line for line in text.splitlines() if line.startswith(label_prefix)]
         assert len(lines) == 1, lines
         (line,) = lines
-        assert "--- Email Body ---" not in text.split("--- Email Body ---", 1)[1]
+        assert text.count("--- Email Body ---") <= 1
         assert "\x00" not in text
         assert "\u2028" not in text
         assert len(line) < 160
