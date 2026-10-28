@@ -106,6 +106,13 @@ The stack also runs under [rootless Docker](https://docs.docker.com/engine/secur
   systemctl --user is-enabled docker   # must print "enabled"
   ```
 
+  Point the CLI at it with the `rootless` context rather than a `DOCKER_HOST` set in a shell startup file, which an SSH command such as the search wrapper may not read. Check from the laptop:
+
+  ```bash
+  ssh receipt-server docker context use rootless
+  ssh receipt-server docker info --format '{{.SecurityOptions}}'   # must include name=rootless
+  ```
+
 - **Linger, for reboot survival.** Without it, the user's services, the daemon among them, start only when the user logs in and stop when the last session ends. With it, they start at boot:
 
   ```bash
@@ -122,7 +129,13 @@ The stack also runs under [rootless Docker](https://docs.docker.com/engine/secur
   docker run --rm -v "$PWD:/w" -w /w busybox chmod 700 rclone-config
   ```
 
-  Afterwards your host user can't write into these directories directly, so later changes, such as a new rclone config, go through a container the same way. Gate B's sentinel step proves the result.
+  Afterwards your host user can't write into these directories directly, so later changes, such as a new rclone config, go through a container the same way. Gate B's sentinel step proves the result. The same applies to every later `chown 1000:1000` in this guide (6.5, 8.3 and 10.1): run it in the container form. To write into a directory from the host, as the cutover rsync in 6.5 does, hand it to container root first, which is your host user, then back:
+
+  ```bash
+  docker run --rm -v "$PWD:/w" -w /w busybox chown -R 0:0 data/receipts
+  # ... host-side writes ...
+  docker run --rm -v "$PWD:/w" -w /w busybox chown -R 1000:1000 data/receipts
+  ```
 
   The app config is a single read-only file mount, so it needs only to be world-readable ([3.2b](#32b-create-the-server-app-config)).
 
@@ -572,6 +585,8 @@ Then on the server:
 chown -R 1000:1000 data/receipts      # sudo if not your uid
 ```
 
+On [rootless Docker](#rootless-docker), hand `data/receipts` to your host user before the rsync above, and use the container form of this `chown` after it.
+
 The database stores paths **relative to the store root**, so the tree transplants with no database rewriting.
 
 ### 6.6 Verification queries
@@ -867,6 +882,8 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    ls -l data/backups/          # pick the newest receipt_index-<dow>.dump
    chown -R 1000:1000 data      # sudo if not your uid
    ```
+
+   On [rootless Docker](#rootless-docker), run this `chown` in the container form.
 
 4. Restore into the fresh, empty database — again **without** `--no-owner` and **without** `--no-acl`:
 
