@@ -68,7 +68,7 @@ def orphan_report(
     ids = [c.source_id for c in candidates]
     report = OrphanReport()
     for source_id, refs in orphaned_refs(conn, ids).items():
-        present = [ref for ref in refs if _exists(store, ref)]
+        present = [ref for ref in refs if stored_file_exists(store, ref)]
         if present:
             report.files[source_id] = present
     # A row without a class was written before failures were classified,
@@ -81,7 +81,8 @@ def orphan_report(
     return report
 
 
-def _exists(store: EvidenceStore, ref: str) -> bool:
+def stored_file_exists(store: EvidenceStore, ref: str) -> bool:
+    """Whether a stored file exists; a store error is logged and counts as no."""
     try:
         return store.exists(ref)
     except Exception:

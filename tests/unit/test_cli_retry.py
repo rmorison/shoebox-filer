@@ -373,3 +373,40 @@ class TestOrphans:
 
     def test_none(self, tmp_path: Path) -> None:
         assert "No orphaned files." in self._invoke(tmp_path, exists=set()).output
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["--source", "test-email"],
+            ["--since", "2026-10-01"],
+            ["--status", "skipped"],
+        ],
+    )
+    def test_filters_are_refused(self, tmp_path: Path, args: list[str]) -> None:
+        path = tmp_path / "receipt-index.yaml"
+        path.write_text(_MINIMAL_CONFIG_YAML)
+        with (
+            patch("receipt_index.cli.load_config", return_value=_make_config()),
+            patch("receipt_index.db.get_connection"),
+            patch("receipt_index.store.open_store"),
+            patch("receipt_index.repository.orphaned_refs", return_value={}) as found,
+        ):
+            result = CliRunner().invoke(
+                cli, ["--config", str(path), "failures", "--orphans", *args]
+            )
+        assert result.exit_code == 2
+        assert "takes no --status, --since or --source" in result.output
+        found.assert_not_called()
+
+    def test_a_store_error_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from receipt_index.requeue import stored_file_exists
+
+        store = MagicMock()
+        store.exists.side_effect = PermissionError("store root")
+        with caplog.at_level("WARNING"):
+            assert stored_file_exists(store, "local:a.pdf") is False
+        assert "local:a.pdf" in caplog.text

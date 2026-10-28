@@ -401,13 +401,14 @@ def _print_orphans(config: AppConfig, output_format: str) -> None:
     """`failures --orphans`: renditions left by failed attempts."""
     from receipt_index.db import get_connection
     from receipt_index.repository import orphaned_refs
+    from receipt_index.requeue import stored_file_exists
     from receipt_index.store import open_store
 
     store = open_store(config.store)
     with get_connection(config.database.url) as conn:
         found = orphaned_refs(conn, None)
     rows = [
-        {"source_id": sid, "stored_ref": ref, "exists": _exists(store, ref)}
+        {"source_id": sid, "stored_ref": ref, "exists": stored_file_exists(store, ref)}
         for sid, refs in found.items()
         for ref in refs
     ]
@@ -424,13 +425,6 @@ def _print_orphans(config: AppConfig, output_format: str) -> None:
         f"\n{len(present)} orphaned file(s): stored by a failed attempt, "
         "referenced by no receipt. Nothing was deleted."
     )
-
-
-def _exists(store: Any, ref: str) -> bool:
-    try:
-        return bool(store.exists(ref))
-    except Exception:
-        return False
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -494,6 +488,11 @@ def failures(
     _configure_logging(config)
 
     if orphans:
+        if since is not None or source_name is not None or status != "failed":
+            raise click.UsageError(
+                "--orphans lists every orphaned file; it takes no --status, "
+                "--since or --source"
+            )
         _print_orphans(config, output_format)
         return
 
