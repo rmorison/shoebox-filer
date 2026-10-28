@@ -6,9 +6,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 @dataclass
@@ -144,6 +145,41 @@ class ReceiptMetadata(BaseModel):
     # Whether this is a receipt at all; below 0.5 the item is skipped.
     confidence: float = Field(ge=0.0, le=1.0)
     field_confidence: FieldConfidence
+    # The hosted receipt's URL when the receipt's details are only behind a
+    # link. A low-confidence item with a link is recorded as a link-only skip.
+    # Anything but an http(s) URL of up to 2048 characters becomes None, so a
+    # bad link can't fail the extraction. Left out of model_dump, so the
+    # append-only extraction history never holds a token it can't drop.
+    receipt_link: str | None = Field(default=None, exclude=True)
+
+    @field_validator("receipt_link", mode="before")
+    @classmethod
+    def _http_link_or_none(cls, value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        link = value.strip()
+        if len(link) > MAX_RECEIPT_LINK_LENGTH:
+            return None
+        try:
+            parts = urlsplit(link)
+        except ValueError:
+            return None
+        if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+            return None
+        return link
+
+
+# The longest receipt link kept; the ingest_log column has the same limit.
+MAX_RECEIPT_LINK_LENGTH = 2048
+
+
+def link_host(url: str) -> str:
+    """A link's host name alone: safe to log, unlike its path and query."""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        host = None
+    return host or "unknown host"
 
 
 # Below this overall confidence an extraction isn't treated as a receipt:
@@ -250,4 +286,6 @@ class IngestLogEntry(BaseModel):
     error_class: Literal["transient", "content", "config"] | None = None
     stored_ref: str | None = None
     retry_request_id: UUID | None = None
+    # A link-only skip's hosted receipt URL (may carry a personal token).
+    receipt_link: str | None = None
     created_at: datetime

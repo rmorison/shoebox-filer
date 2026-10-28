@@ -477,6 +477,7 @@ def insert_ingest_log(
     error_class: str | None = None,
     stored_ref: str | None = None,
     retry_request_id: UUID | None = None,
+    receipt_link: str | None = None,
     commit: bool = True,
 ) -> IngestLogEntry:
     """Insert an ingest log entry and return the validated model.
@@ -491,7 +492,7 @@ def insert_ingest_log(
             llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
             llm_requests, llm_model, paid_amount, source_name,
             attempt, counts_attempt, next_retry_at, error_class, stored_ref,
-            retry_request_id
+            retry_request_id, receipt_link
         ) VALUES (
             %(source_id)s, %(source_type)s, %(status)s, %(receipt_id)s,
             %(vendor)s, %(amount)s, %(email_subject)s, %(email_sender)s,
@@ -499,7 +500,7 @@ def insert_ingest_log(
             %(llm_input_tokens)s, %(llm_output_tokens)s, %(llm_cache_read_tokens)s,
             %(llm_requests)s, %(llm_model)s, %(paid_amount)s, %(source_name)s,
             %(attempt)s, %(counts_attempt)s, %(next_retry_at)s, %(error_class)s,
-            %(stored_ref)s, %(retry_request_id)s
+            %(stored_ref)s, %(retry_request_id)s, %(receipt_link)s
         )
         RETURNING *
         """,
@@ -510,6 +511,7 @@ def insert_ingest_log(
             "error_class": error_class,
             "stored_ref": stored_ref,
             "retry_request_id": retry_request_id,
+            "receipt_link": receipt_link,
             "source_id": source_id,
             "source_type": source_type,
             "status": status,
@@ -542,7 +544,12 @@ FROM receipt.ingest_log
 ORDER BY source_id, created_at DESC, id DESC
 """
 
-FailureStatus = Literal["failed", "retrying", "terminal", "skipped", "queued"]
+FailureStatus = Literal[
+    "failed", "retrying", "terminal", "skipped", "queued", "link-only"
+]
+
+# A skip whose receipt is only a link to a hosted receipt, not followed yet.
+_LINK_ONLY = "l.status = 'skipped' AND l.receipt_link IS NOT NULL"
 
 # Each --status value, over the latest row.
 _FAILURE_STATUS = {
@@ -551,6 +558,7 @@ _FAILURE_STATUS = {
     "terminal": "l.status = 'failed' AND l.next_retry_at IS NULL",
     "skipped": "l.status = 'skipped'",
     "queued": "l.status = 'queued'",
+    "link-only": _LINK_ONLY,
 }
 
 
@@ -703,7 +711,7 @@ def select_due(
 class RetryFilter:
     """What ``retry`` selects. Every set filter must match (AND)."""
 
-    status: Literal["failed", "skipped"] = "failed"
+    status: Literal["failed", "skipped", "link-only"] = "failed"
     source_ids: tuple[str, ...] = ()
     error_like: str | None = None
     error_class: str | None = None
@@ -743,7 +751,7 @@ def select_retry_candidates(
 ) -> list[IngestLogEntry]:
     """The items ``retry`` would requeue: their latest rows, oldest first."""
     clauses = [
-        "l.status = %(status)s",
+        _LINK_ONLY if spec.status == "link-only" else "l.status = %(status)s",
         "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
     ]
     params: dict[str, object] = {"status": spec.status}

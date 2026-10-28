@@ -1245,3 +1245,69 @@ class TestRetryOrphans:
 
 def _past() -> datetime:
     return datetime.now(tz=UTC) - timedelta(minutes=1)
+
+
+# ---------------------------------------------------------------------------
+# Link-only receipts
+# ---------------------------------------------------------------------------
+
+_LINK = "https://receipts.example.com/r/abc123?token=s3cr3t-t0ken"
+
+
+def _link_extraction(confidence: float, link: str | None = _LINK) -> ExtractionResult:
+    result = _extraction(confidence=confidence)
+    result.metadata = result.metadata.model_copy(update={"receipt_link": link})
+    return result
+
+
+class TestLinkOnly:
+    def test_low_confidence_link_is_a_link_only_skip(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _link_extraction(confidence=0.2)
+        render = pipeline.render_pdf
+        result = _run(FakeAdapter(_imap_read([1])))
+
+        assert result.skipped == 1
+        assert repo.statuses("<msg-1@example.com>") == ["started", "skipped"]
+        row = next(k for k in repo.row_kwargs if k["status"] == "skipped")
+        assert row["receipt_link"] == _LINK
+        assert row["error_message"] == (
+            "Skipped: link-only receipt (receipts.example.com)"
+        )
+        assert render.call_count == 0  # type: ignore[attr-defined]
+        assert repo.receipts == set()
+
+    def test_high_confidence_link_is_indexed_as_today(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _link_extraction(confidence=0.95)
+        result = _run(FakeAdapter(_imap_read([1])))
+
+        assert result.processed == 1
+        assert repo.statuses("<msg-1@example.com>") == ["started", "success"]
+        assert all(k.get("receipt_link") is None for k in repo.row_kwargs)
+
+    def test_low_confidence_without_link_is_a_plain_skip(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _link_extraction(confidence=0.2, link=None)
+        _run(FakeAdapter(_imap_read([1])))
+
+        row = next(k for k in repo.row_kwargs if k["status"] == "skipped")
+        assert row.get("receipt_link") is None
+        assert row["error_message"].startswith("Skipped: amount=")
+
+    def test_the_link_is_never_logged(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        extract.return_value = _link_extraction(confidence=0.2)
+        with caplog.at_level(logging.DEBUG):
+            _run(FakeAdapter(_imap_read([1])))
+
+        assert "receipts.example.com" in caplog.text
+        assert "/r/abc123" not in caplog.text
+        assert "s3cr3t-t0ken" not in caplog.text

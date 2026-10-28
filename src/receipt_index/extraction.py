@@ -30,8 +30,8 @@ _R = TypeVar("_R")
 
 # Raised whenever the prompts or the output model change; every extraction
 # run records it. 0 means a receipt has no extraction history; 1 was the
-# paid-amount prompt, which was never recorded.
-EXTRACTION_PROMPT_VERSION = 2
+# paid-amount prompt, which was never recorded. 3 added receipt_link.
+EXTRACTION_PROMPT_VERSION = 3
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
@@ -74,6 +74,18 @@ date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
 below 0.5 when a figure is inferred rather than printed on the document.
 """
 
+# A receipt that is only a link to a hosted receipt. Shared by both prompts.
+_RECEIPT_LINK_RULE = """\
+- receipt_link: When the receipt's details (the amounts, the items) are not \
+in the document and are only behind a link to a hosted receipt (for example \
+"View your receipt"), give that link's full URL exactly as written, and use \
+a confidence below 0.5. Still give vendor, amount (0 when no amount is \
+shown) and date (the date of the document when no purchase date is shown). \
+Use null when the receipt's details are in the \
+document, its text or its attachments, even if it also has a link to view \
+them online. Use null too when there is no such link.
+"""
+
 _SYSTEM_PROMPT = f"""\
 You are a receipt metadata extractor. Given an email that contains or forwards \
 a receipt, extract the following fields:
@@ -90,6 +102,7 @@ Use below 0.5 if the email may not be a receipt or key fields are uncertain.
 of the attachment exactly as listed under "Attachments", or "body" when the \
 receipt is in the email text itself. Use null when you can't tell, for \
 example when the only attachment holds terms and conditions.
+{_RECEIPT_LINK_RULE}\
 
 If PDF attachment content is provided below the email body, use it as additional \
 context for extraction. The PDF content often contains the detailed receipt with \
@@ -118,7 +131,8 @@ or PDF), extract the following fields:
 - description: Brief summary of what was purchased (optional)
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if this does not appear to be a receipt or key fields are unclear.
-{_FIELD_CONFIDENCE_RULE}
+{_FIELD_CONFIDENCE_RULE}\
+{_RECEIPT_LINK_RULE}
 Payment confirmations (Zelle, Venmo, PayPal, bank transfers, wire transfers) \
 are valid receipts. The vendor is the payment recipient. Use high confidence \
 if the amount, recipient, and date are clearly visible.

@@ -684,3 +684,20 @@ class TestPaidAmountPrompts:
         # A null paid_amount still gets a numeric confidence; null would fail
         # validation and lose the receipt.
         assert "always a number, even when paid_amount is null" in flat
+
+
+class TestReceiptLinkPrompts:
+    """Both system prompts carry the link-only rule (a receipt that is a link)."""
+
+    @_PROMPTS
+    def test_receipt_link_rule_present(self, prompt: str) -> None:
+        flat = " ".join(prompt.split())
+        assert "receipt_link:" in flat
+        assert "only behind a link" in flat
+
+    @_PROMPTS
+    def test_receipt_link_null_when_receipt_is_present(self, prompt: str) -> None:
+        # A full receipt with a "view online" link is not link-only: setting
+        # the field there would be noise, though the pipeline ignores it.
+        flat = " ".join(prompt.split())
+        assert "Use null when the receipt's details are in the" in flat
