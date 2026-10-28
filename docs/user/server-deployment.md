@@ -376,10 +376,10 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
 
 | Migration table | Expected version | dirty |
 |---|---|---|
-| `schema_migrations_public` | `1` | `f` |
-| `schema_migrations_receipt` | `7` | `f` |
+| `schema_migrations_public` | the highest number in `db/migrations/public` (`1`) | `f` |
+| `schema_migrations_receipt` | the highest number in `db/migrations/receipt` (`14` as of the separate database logins) | `f` |
 
-(As of 2026-08-01. A `dirty = t` means a migration aborted half-applied; fix it before anything else touches the database.)
+(A `dirty = t` means a migration aborted half-applied; fix it before anything else touches the database.)
 
 The query runs as the read login, the one the nightly backup uses, so it also proves that login can read the version tables, which `pg_dump` needs. `permission denied for table schema_migrations_public` means migration 000014 hasn't run.
 
