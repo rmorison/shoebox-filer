@@ -145,9 +145,99 @@ class TestStripHtmlTags:
         assert "tax" in result
 
     def test_attributes_stripped(self) -> None:
-        result = _strip_html_tags('<a href="http://example.com">Link</a>')
+        result = _strip_html_tags('<a class="btn" href="#top">Link</a>')
         assert result == "Link"
         assert "href" not in result
+        assert "btn" not in result
+
+    def test_link_url_follows_its_text(self) -> None:
+        # An HTML-only "View your receipt" email: the model must see the URL
+        # to give receipt_link.
+        html = (
+            '<p>Thanks!</p><a href="https://receipts.example.com/r/abc123">'
+            "View your <b>receipt</b></a>"
+        )
+        assert _strip_html_tags(html) == (
+            "Thanks!View your receipt <https://receipts.example.com/r/abc123>"
+        )
+
+    @pytest.mark.parametrize(
+        "href", ["mailto:help@example.com", "#top", "javascript:void(0)", ""]
+    )
+    def test_only_http_links_are_kept(self, href: str) -> None:
+        assert _strip_html_tags(f'<a href="{href}">Help</a>') == "Help"
+
+    def test_a_url_shown_as_its_own_text_is_not_repeated(self) -> None:
+        url = "https://receipts.example.com/r/abc123"
+        assert _strip_html_tags(f'<a href="{url}">{url}</a>') == url
+
+    def test_entities_in_the_href_are_decoded(self) -> None:
+        html = '<a href="https://receipts.example.com/r?a=1&amp;b=2">Receipt</a>'
+        assert _strip_html_tags(html) == (
+            "Receipt <https://receipts.example.com/r?a=1&b=2>"
+        )
+
+    def test_a_newsletter_keeps_none_of_its_links(self) -> None:
+        # Tracking, shop and unsubscribe links: no receipt or order word in
+        # their text or URL, so none reaches the prompt.
+        links = [
+            ("https://click.example.com/t/a1b2?u=xyz", "Shop the sale"),
+            ("https://click.example.com/t/c3d4?u=xyz", "New arrivals"),
+            ("https://www.example.com/stores", "Find a store"),
+            ("https://social.example.com/acme", "Follow us"),
+            ("https://click.example.com/unsub?u=xyz", "Unsubscribe"),
+        ]
+        html = "".join(f'<a href="{url}">{text}</a> ' for url, text in links)
+        assert "http" not in _strip_html_tags(html)
+
+    @pytest.mark.parametrize(
+        ("text", "url"),
+        [
+            ("View your receipt", "https://pos.example.com/r/abc123"),
+            ("Click here", "https://shop.example.com/orders/123"),
+            ("Your INVOICE", "https://billing.example.com/d/9"),
+            ("Transaction details", "https://pay.example.com/t/7"),
+            ("Your purchase", "https://shop.example.com/p/7"),
+        ],
+    )
+    def test_a_receipt_or_order_link_is_kept(self, text: str, url: str) -> None:
+        assert _strip_html_tags(f'<a href="{url}">{text}</a>') == f"{text} <{url}>"
+
+    def test_an_image_button_matches_on_its_alt_text(self) -> None:
+        html = (
+            '<a href="https://t.example.com/c/9">'
+            '<img src="https://t.example.com/b.png" alt="View receipt"></a>'
+        )
+        assert _strip_html_tags(html) == " <https://t.example.com/c/9>"
+
+    def test_alt_text_of_an_image_outside_a_link_is_ignored(self) -> None:
+        assert _strip_html_tags('<img alt="View receipt">') == ""
+
+    def test_at_most_ten_links_are_kept(self) -> None:
+        html = "".join(
+            f'<a href="https://shop.example.com/orders/{n}">Order {n}</a> '
+            for n in range(12)
+        )
+        text = _strip_html_tags(html)
+        assert text.count("<https://") == 10
+        assert "orders/9>" in text
+        assert "orders/10>" not in text
+        # The text of every link stays, kept URL or not.
+        assert "Order 11" in text
+
+    def test_html_only_email_prompt_carries_the_link(self) -> None:
+        raw = RawReceipt(
+            source_id="<link@example.com>",
+            source_name="test",
+            source_type="imap",
+            date=datetime(2025, 6, 15, tzinfo=UTC),
+            subject="Your receipt",
+            sender="receipts@example.com",
+            html_body=(
+                '<a href="https://receipts.example.com/r/abc123">View your receipt</a>'
+            ),
+        )
+        assert "https://receipts.example.com/r/abc123" in _build_prompt(raw)
 
 
 class TestExtractMetadata:
@@ -684,3 +774,20 @@ class TestPaidAmountPrompts:
         # A null paid_amount still gets a numeric confidence; null would fail
         # validation and lose the receipt.
         assert "always a number, even when paid_amount is null" in flat
+
+
+class TestReceiptLinkPrompts:
+    """Both system prompts carry the link-only rule (a receipt that is a link)."""
+
+    @_PROMPTS
+    def test_receipt_link_rule_present(self, prompt: str) -> None:
+        flat = " ".join(prompt.split())
+        assert "receipt_link:" in flat
+        assert "only behind a link" in flat
+
+    @_PROMPTS
+    def test_receipt_link_null_when_receipt_is_present(self, prompt: str) -> None:
+        # A full receipt with a "view online" link is not link-only: setting
+        # the field there would be noise, though the pipeline ignores it.
+        flat = " ".join(prompt.split())
+        assert "Use null when the receipt's details are in the" in flat

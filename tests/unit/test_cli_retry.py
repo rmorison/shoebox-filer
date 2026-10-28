@@ -410,3 +410,56 @@ class TestOrphans:
         with caplog.at_level("WARNING"):
             assert stored_file_exists(store, "local:a.pdf") is False
         assert "local:a.pdf" in caplog.text
+
+
+class TestLinkOnly:
+    def test_failures_lists_link_only_items(self, tmp_path: Path) -> None:
+        path = tmp_path / "receipt-index.yaml"
+        path.write_text(_MINIMAL_CONFIG_YAML)
+        entry = _entry(
+            "<link@example.com>",
+            status="skipped",
+            error_class=None,
+            error_message="Skipped: link-only receipt (receipts.example.com)",
+            receipt_link="https://receipts.example.com/r/abc123",
+        )
+        with (
+            patch("receipt_index.cli.load_config", return_value=_make_config()),
+            patch("receipt_index.db.get_connection"),
+            patch(
+                "receipt_index.repository.get_ingest_failures", return_value=[entry]
+            ) as get,
+        ):
+            text = CliRunner().invoke(
+                cli, ["--config", str(path), "failures", "--status", "link-only"]
+            )
+            as_json = CliRunner().invoke(
+                cli,
+                [
+                    "--config",
+                    str(path),
+                    "failures",
+                    "--status",
+                    "link-only",
+                    "--output",
+                    "json",
+                ],
+            )
+
+        assert text.exit_code == 0, text.output
+        assert get.call_args.kwargs["status"] == "link-only"
+        # The text output names the host only: the path can carry a token.
+        assert "receipts.example.com" in text.output
+        assert "/r/abc123" not in text.output
+        assert "1 link-only item(s)." in text.output
+        data = json.loads(as_json.output)
+        assert data[0]["receipt_link"] == "https://receipts.example.com/r/abc123"
+
+    def test_retry_link_only_is_status_wide(self, env: dict[str, Any]) -> None:
+        # Like --status skipped: a filter on the status alone needs --all.
+        refused = _invoke(env, "--status", "link-only")
+        assert refused.exit_code == 2
+        assert "would requeue every link-only item" in refused.output
+
+        assert _invoke(env, "--status", "link-only", "--all").exit_code == 0
+        assert env["select"].call_args.args[1].status == "link-only"

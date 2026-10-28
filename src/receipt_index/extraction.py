@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
@@ -30,8 +31,9 @@ _R = TypeVar("_R")
 
 # Raised whenever the prompts or the output model change; every extraction
 # run records it. 0 means a receipt has no extraction history; 1 was the
-# paid-amount prompt, which was never recorded.
-EXTRACTION_PROMPT_VERSION = 2
+# paid-amount prompt, which was never recorded. 3 added receipt_link, and
+# likely receipt link URLs in the text of an HTML-only email.
+EXTRACTION_PROMPT_VERSION = 3
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
@@ -74,6 +76,18 @@ date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
 below 0.5 when a figure is inferred rather than printed on the document.
 """
 
+# A receipt that is only a link to a hosted receipt. Shared by both prompts.
+_RECEIPT_LINK_RULE = """\
+- receipt_link: When the receipt's details (the amounts, the items) are not \
+in the document and are only behind a link to a hosted receipt (for example \
+"View your receipt"), give that link's full URL exactly as written, and use \
+a confidence below 0.5. Still give vendor, amount (0 when no amount is \
+shown) and date (the date of the document when no purchase date is shown). \
+Use null when the receipt's details are in the \
+document, its text or its attachments, even if it also has a link to view \
+them online. Use null too when there is no such link.
+"""
+
 _SYSTEM_PROMPT = f"""\
 You are a receipt metadata extractor. Given an email that contains or forwards \
 a receipt, extract the following fields:
@@ -90,6 +104,7 @@ Use below 0.5 if the email may not be a receipt or key fields are uncertain.
 of the attachment exactly as listed under "Attachments", or "body" when the \
 receipt is in the email text itself. Use null when you can't tell, for \
 example when the only attachment holds terms and conditions.
+{_RECEIPT_LINK_RULE}\
 
 If PDF attachment content is provided below the email body, use it as additional \
 context for extraction. The PDF content often contains the detailed receipt with \
@@ -118,7 +133,8 @@ or PDF), extract the following fields:
 - description: Brief summary of what was purchased (optional)
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if this does not appear to be a receipt or key fields are unclear.
-{_FIELD_CONFIDENCE_RULE}
+{_FIELD_CONFIDENCE_RULE}\
+{_RECEIPT_LINK_RULE}
 Payment confirmations (Zelle, Venmo, PayPal, bank transfers, wire transfers) \
 are valid receipts. The vendor is the payment recipient. Use high confidence \
 if the amount, recipient, and date are clearly visible.
@@ -447,12 +463,62 @@ def _strip_html_tags(html: str) -> str:
     return stripper.get_text()
 
 
+# A link worth showing the extractor: its text (an image button's alt text
+# included) or URL names a receipt or an order. A best guess: most of a
+# newsletter's tracking links stay out of the prompt, though a "View this
+# email in your browser" link matches, and receipt_link stays a likely
+# receipt.
+_RECEIPT_LINK_WORDS = re.compile(
+    r"receipt|order|invoice|transaction|purchase|view", re.IGNORECASE
+)
+# The most link URLs kept from one email.
+_MAX_LINKS_KEPT = 10
+
+
 class _HTMLTagStripper(HTMLParser):
-    """HTMLParser subclass that strips tags and returns text."""
+    """HTMLParser subclass that strips tags and returns text.
+
+    The http(s) URL of a link whose text or URL suggests a receipt or an
+    order is kept after its text ("View your receipt <https://...>"), up to
+    ten per email, so the extractor can see where a receipt that is only a
+    link lives.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self._parts: list[str] = []
+        # The open anchor's URL and where its text starts in _parts.
+        self._href: str | None = None
+        self._href_start = 0
+        self._alt: list[str] = []
+        self._kept = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "img" and self._href is not None:
+            # An image button's alt text is its text, for matching only.
+            self._alt.append(dict(attrs).get("alt") or "")
+            return
+        if tag != "a":
+            return
+        href = (dict(attrs).get("href") or "").strip()
+        if href.lower().startswith(("http://", "https://")):
+            self._href = href
+            self._href_start = len(self._parts)
+            self._alt = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._href is None:
+            return
+        href, self._href = self._href, None
+        text = "".join(self._parts[self._href_start :]).strip()
+        alt = " ".join(self._alt)
+        if self._kept >= _MAX_LINKS_KEPT or not _RECEIPT_LINK_WORDS.search(
+            f"{text} {alt} {href}"
+        ):
+            return
+        self._kept += 1
+        if text != href:
+            self._parts.append(f" <{href}>")
 
     def handle_data(self, data: str) -> None:
         self._parts.append(data)

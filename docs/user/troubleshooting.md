@@ -68,6 +68,17 @@ Ensure `IMAP_USE_SSL=true` and `IMAP_PORT=993` for standard SSL connections. STA
 
 Skipped messages are those the LLM determined are not receipts (low confidence). This is expected for non-receipt emails in the folder. To reduce skips, move only actual receipt emails into your designated folder.
 
+### A receipt that is only a link
+
+Some merchants, point-of-sale systems especially, send an email that holds only a link to a hosted receipt. Ingest doesn't follow the link, since most receipt and order pages need a login. It records the item as a link-only receipt, with the link, instead of skipping it silently:
+
+```bash
+uv run receipt-index failures --status link-only                # host and subject
+uv run receipt-index failures --status link-only --output json  # with receipt_link
+```
+
+Open each link and save the receipt by hand. The item stays on this list, since a receipt saved by hand is a new item, so use `--since YYYY-MM-DD` to see only the new ones. Items skipped before link-only receipts were recorded can be re-checked with `retry --status skipped --since YYYY-MM-DD --yes`: their links then show up in this list.
+
 ### `amount > 0` validation errors
 
 Some emails (newsletters, shipping notifications without amounts) may cause the LLM to return a zero amount. These are correctly skipped. If a legitimate receipt is being skipped, check that the email contains a clear purchase amount.

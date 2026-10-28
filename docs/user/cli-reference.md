@@ -74,7 +74,7 @@ uv run receipt-index ingest
 3. For each new item:
    - Records that work on it has started, so the run's position can move past it safely
    - Sends the email or file content to Claude Haiku to extract vendor, total, paid amount, date, description and per-field confidence (see [Amounts](#amounts))
-   - If the LLM confidence is too low, the item is skipped (not a receipt)
+   - If the LLM confidence is too low, the item is skipped (not a receipt). When the email's receipt is only a link to a hosted receipt ("View your receipt"), the skip is recorded as a link-only receipt, with the link, so that [`failures --status link-only`](#failures) lists it for the operator to save by hand. Ingest never follows the link
    - Renders the email as a PDF (using Playwright headless Chromium, with weasyprint fallback)
    - Stores the metadata in PostgreSQL and the PDF in the file store
 4. Saves each source's new read position.
@@ -151,6 +151,8 @@ uv run receipt-index search [OPTIONS]
 Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
 
 Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all.
+
+A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are (only `--source` narrows that count; vendor, amount and date filters don't apply to them) and points to `failures --status link-only`. The JSON output stays a list of receipts.
 
 ### Examples
 
@@ -282,13 +284,13 @@ uv run receipt-index failures [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt) or `queued` (requeued with `retry`, waiting for the next ingest) |
+| `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt), `queued` (requeued with `retry`, waiting for the next ingest) or `link-only` (skipped because the receipt is only a link to a hosted receipt, which ingest doesn't follow; `skipped` lists these too) |
 | `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
 | `--source NAME` | Only items from this source |
 | `--orphans` | Instead, list stored PDFs that a failed attempt left behind and no receipt references, whatever the item's state now (for example after a retry succeeded and stored a new one). Nothing is deleted |
 | `--output text\|json` | Output format (default: `text`) |
 
-The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class` and `stored_ref`.
+The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class`, `stored_ref` and, for a link-only receipt, `receipt_link`. The link comes from the email and may carry a personal token: the text output shows only its host, and logs never show more than that.
 
 ---
 
@@ -305,7 +307,7 @@ uv run receipt-index retry [SOURCE_ID ...] [OPTIONS]
 | Option | Description |
 |---|---|
 | `SOURCE_ID ...`, `--source-id ID` | Only these items (repeatable) |
-| `--status failed\|skipped` | Requeue items whose latest record has this status (default: `failed`). Drive files skipped for an unsupported file type are never requeued |
+| `--status failed\|skipped\|link-only` | Requeue items whose latest record has this status (default: `failed`). `link-only` selects the link-only receipts, which `skipped` also covers. Drive files skipped for an unsupported file type are never requeued |
 | `--error-like TEXT` | Only items whose error contains this text, ignoring case |
 | `--class transient\|content\|config` | Only items whose failure has this class |
 | `--transient` | The same as `--class transient` |
@@ -342,6 +344,9 @@ uv run receipt-index retry --error-like "renderer" --yes
 
 # Take a second look at skipped items from one source
 uv run receipt-index retry --status skipped --source personal-email --all --yes
+
+# Requeue the link-only receipts, for example after a prompt change
+uv run receipt-index retry --status link-only --all --yes
 
 # Who requeued what
 psql "$DATABASE_URL" -c "SELECT requested_at, requested_by, filters, matched, requeued
@@ -485,7 +490,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 | `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source` (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
-| `list_failures` | `limit`, `offset` | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives (items whose latest attempt failed), newest first |
+| `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |
 
 Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. The `source` filter is an exact match on `source_name`. Results carry no file content; only `get_receipt_file` returns content.
 

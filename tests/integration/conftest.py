@@ -34,7 +34,7 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000012 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000013 (tables, indexes and
     constraints; not the grants, since CI's Postgres has no application roles).
     Keep in sync with db/migrations/ when schema changes.
     """
@@ -210,6 +210,10 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # CREATE TABLE IF NOT EXISTS builds a fresh one.
     conn.execute("DROP TABLE IF EXISTS receipt.retry_requests CASCADE")
     conn.execute(_schema_part("receipt", "000012"))
+
+    # receipt/000013 — ingest_log.receipt_link for link-only receipts. Run
+    # from the migration file, up to its grants.
+    conn.execute(_schema_part("receipt", "000013"))
     conn.commit()
 
 

@@ -612,6 +612,75 @@ class TestIngestCommand:
 class TestSearchCommand:
     """Tests for the search CLI command."""
 
+    @patch("receipt_index.repository.count_ingest_failures", return_value=2)
+    @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_needs_review_points_at_link_only_items(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        runner = CliRunner()
+        args = ["--config", str(config_file), "search", "--needs-review"]
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 0, result.output
+        assert "2 link-only item(s) (not filtered by vendor, amount or date)" in (
+            result.output
+        )
+        assert "failures --status link-only" in result.output
+        assert mock_count.call_args.kwargs["status"] == "link-only"
+
+        # JSON stays a plain list of receipts.
+        as_json = runner.invoke(cli, [*args, "--output", "json"])
+        assert isinstance(json.loads(as_json.output), list)
+
+    @patch("receipt_index.repository.count_ingest_failures", return_value=1)
+    @patch("receipt_index.repository.search_receipts", return_value=[])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_needs_review_footer_with_no_receipts(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = CliRunner().invoke(
+            cli, ["--config", str(config_file), "search", "--needs-review"]
+        )
+        assert "No receipts found." in result.output
+        assert "1 link-only item(s)" in result.output
+
+    @patch("receipt_index.repository.count_ingest_failures", return_value=0)
+    @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_no_footer_without_link_only_items_or_needs_review(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        runner = CliRunner()
+        quiet = runner.invoke(
+            cli, ["--config", str(config_file), "search", "--needs-review"]
+        )
+        assert "link-only" not in quiet.output
+        mock_count.reset_mock()
+        plain = runner.invoke(cli, ["--config", str(config_file), "search"])
+        assert "link-only" not in plain.output
+        mock_count.assert_not_called()
+
     @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
     @patch("receipt_index.db.get_connection")
     @patch("receipt_index.cli.load_config")

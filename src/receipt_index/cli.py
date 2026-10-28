@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
     from receipt_index.adapters.base import SourceAdapter
     from receipt_index.config import SourceConfig
-    from receipt_index.models import IngestLogEntry
+    from receipt_index.models import IngestLogEntry, Receipt
     from receipt_index.requeue import OrphanReport, RequeueOutcome
 
 logger = logging.getLogger(__name__)
@@ -307,7 +307,8 @@ def ingest(
     help=(
         "Only receipts still missing a paid amount, or whose latest extraction "
         "failed or was below the confidence gate; lowest paid-amount "
-        "confidence first."
+        "confidence first. Link-only receipts aren't indexed: the text output "
+        "counts them, and `failures --status link-only` lists them."
     ),
 )
 @click.option(
@@ -334,7 +335,7 @@ def search(
     from decimal import Decimal, InvalidOperation
 
     from receipt_index.db import get_connection
-    from receipt_index.repository import search_receipts
+    from receipt_index.repository import count_ingest_failures, search_receipts
 
     config = _load_config_or_exit(ctx)
 
@@ -370,31 +371,45 @@ def search(
             source_name=source_name,
             needs_review=needs_review,
         )
+        # Items with no receipt to search: counted for the text output only,
+        # so the JSON stays a list of receipts.
+        link_only = (
+            count_ingest_failures(conn, status="link-only", source_name=source_name)
+            if needs_review and output_format == "text"
+            else 0
+        )
 
     if output_format == "json":
         data = [r.model_dump(mode="json") for r in results]
         click.echo(json.dumps(data, indent=2, default=str))
     else:
-        if not results:
-            click.echo("No receipts found.")
-            return
-        # Amount is the effective amount (paid when known, else the total).
-        click.echo(
-            f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Amount':>10} {'Total':>10}"
-        )
-        click.echo("-" * 93)
-        for r in results:
-            vendor_display = (
-                r.vendor[:19] + "\u2026" if len(r.vendor) > 20 else r.vendor
-            )
+        _print_receipts(results)
+        if link_only:
             click.echo(
-                f"{r.id!s:<38} "
-                f"{r.receipt_date.isoformat():<12} "
-                f"{vendor_display:<20} "
-                f"{r.effective_amount!s:>10} "
-                f"{r.amount!s:>10}"
+                f"\n{link_only} link-only item(s) (not filtered by vendor, "
+                "amount or date): receipts that are only a link aren't indexed. See "
+                "`receipt-index failures --status link-only`."
             )
-        click.echo(f"\n{len(results)} receipt(s) found.")
+
+
+def _print_receipts(results: list[Receipt]) -> None:
+    """The `search` text table."""
+    if not results:
+        click.echo("No receipts found.")
+        return
+    # Amount is the effective amount (paid when known, else the total).
+    click.echo(f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Amount':>10} {'Total':>10}")
+    click.echo("-" * 93)
+    for r in results:
+        vendor_display = r.vendor[:19] + "\u2026" if len(r.vendor) > 20 else r.vendor
+        click.echo(
+            f"{r.id!s:<38} "
+            f"{r.receipt_date.isoformat():<12} "
+            f"{vendor_display:<20} "
+            f"{r.effective_amount!s:>10} "
+            f"{r.amount!s:>10}"
+        )
+    click.echo(f"\n{len(results)} receipt(s) found.")
 
 
 def _print_orphans(config: AppConfig, output_format: str) -> None:
@@ -435,13 +450,17 @@ def _aware(value: datetime | None) -> datetime | None:
 @cli.command()
 @click.option(
     "--status",
-    type=click.Choice(["failed", "retrying", "terminal", "skipped", "queued"]),
+    type=click.Choice(
+        ["failed", "retrying", "terminal", "skipped", "queued", "link-only"]
+    ),
     default="failed",
     show_default=True,
     help=(
         "Items whose latest row is: failed (retrying or terminal); retrying "
         "(due again later); terminal (not retried automatically); skipped "
-        "(judged not a receipt); queued (requeued by `retry`)."
+        "(judged not a receipt); queued (requeued by `retry`); link-only "
+        "(skipped because the receipt is only a link, which ingest doesn't "
+        "follow; --output json gives the link)."
     ),
 )
 @click.option(
@@ -481,6 +500,7 @@ def failures(
     failed attempts left behind instead; nothing is deleted.
     """
     from receipt_index.db import get_connection
+    from receipt_index.models import link_host
     from receipt_index.repository import get_ingest_failures
 
     config = _load_config_or_exit(ctx)
@@ -522,7 +542,11 @@ def failures(
             )
             sender = (r.email_sender or "\u2014")[:29]
             subject = (r.email_subject or r.source_id or "\u2014")[:39]
-            error = (r.error_message or "\u2014")[:29]
+            if r.receipt_link is not None:
+                # The host alone: the path and query can carry a token.
+                error = f"link: {link_host(r.receipt_link)}"[:29]
+            else:
+                error = (r.error_message or "\u2014")[:29]
             klass = r.error_class or "\u2014"
             if r.status == "failed" and r.next_retry_at is None:
                 next_retry = "terminal"
@@ -626,10 +650,13 @@ def _print_retry(
 )
 @click.option(
     "--status",
-    type=click.Choice(["failed", "skipped"]),
+    type=click.Choice(["failed", "skipped", "link-only"]),
     default="failed",
     show_default=True,
-    help="Requeue items whose latest row has this status.",
+    help=(
+        "Requeue items whose latest row has this status (link-only: the "
+        "link-only skips, which skipped also covers)."
+    ),
 )
 @click.option(
     "--error-like",

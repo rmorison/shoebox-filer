@@ -26,7 +26,12 @@ from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
 from receipt_index.fetching import SourceDownError, fetch_item
 from receipt_index.locks import SourceLockLostError, item_lock
-from receipt_index.models import MIN_RECEIPT_CONFIDENCE, receipt_values
+from receipt_index.models import (
+    MIN_RECEIPT_CONFIDENCE,
+    link_host,
+    receipt_values,
+    redacted_traceback,
+)
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
     get_item_history,
@@ -208,13 +213,31 @@ def process_item(
         # Skip non-receipts based on low LLM confidence only.
         # amount == 0 is valid (e.g. prepaid postage receipts).
         if metadata.confidence < _MIN_CONFIDENCE:
-            reason = f"amount={metadata.amount}, confidence={metadata.confidence:.2f}"
-            logger.info(
-                "Skipped non-receipt %s (%s): %s",
-                raw.source_id,
-                raw.subject,
-                reason,
-            )
+            # A low-confidence item whose receipt is only behind a link is a
+            # link-only skip: listed for review, never silently dropped. Only
+            # the host is logged; the path and query can carry a personal
+            # token, so the link itself goes on the row alone.
+            link = metadata.receipt_link
+            if link is not None:
+                host = link_host(link)
+                message = f"Skipped: link-only receipt ({host})"
+                logger.info(
+                    "Skipped link-only receipt %s (%s): host=%s",
+                    raw.source_id,
+                    raw.subject,
+                    host,
+                )
+            else:
+                reason = (
+                    f"amount={metadata.amount}, confidence={metadata.confidence:.2f}"
+                )
+                message = f"Skipped: {reason}"
+                logger.info(
+                    "Skipped non-receipt %s (%s): %s",
+                    raw.source_id,
+                    raw.subject,
+                    reason,
+                )
             insert_ingest_log(
                 conn,
                 source_id=raw.source_id,
@@ -227,7 +250,8 @@ def process_item(
                 email_subject=raw.subject,
                 email_sender=raw.sender,
                 email_date=_email_date(raw.source_type, raw),
-                error_message=f"Skipped: {reason}",
+                error_message=message,
+                receipt_link=link,
                 llm_input_tokens=extraction.input_tokens,
                 llm_output_tokens=extraction.output_tokens,
                 llm_cache_read_tokens=extraction.cache_read_tokens,
@@ -333,13 +357,14 @@ def process_item(
             state=state,
             stored_ref=stored_ref,
         )
+        # Not exc_info: the chain can hold the model's output and its link.
         logger.warning(
-            "Failed to process message %s (subject=%s, sender=%s; %s failure)",
+            "Failed to process message %s (subject=%s, sender=%s; %s failure)\n%s",
             raw.source_id,
             raw.subject,
             raw.sender,
             cls,
-            exc_info=True,
+            redacted_traceback(exc),
         )
         return ItemOutcome("failed", error_class=cls)
 

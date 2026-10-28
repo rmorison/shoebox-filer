@@ -72,8 +72,9 @@ def _raw(attachments: list[Attachment]) -> RawReceipt:
 
 class TestPromptVersion:
     def test_current_version(self) -> None:
-        # 0 is "no history"; 1 was the paid-amount prompt, never recorded.
-        assert EXTRACTION_PROMPT_VERSION == 2
+        # 0 is "no history"; 1 was the paid-amount prompt, never recorded;
+        # 3 added receipt_link.
+        assert EXTRACTION_PROMPT_VERSION == 3
 
 
 class TestReceiptDocument:

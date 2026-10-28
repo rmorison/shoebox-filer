@@ -28,6 +28,7 @@ from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
     receipt_values,
+    redacted_traceback,
 )
 from receipt_index.repository import (
     get_extraction_history,
@@ -429,7 +430,10 @@ def reextract_receipt(
                     agent=agents["document"],
                 )
         except Exception as exc:
-            logger.warning("Re-extraction of %s failed", receipt.id, exc_info=True)
+            # Not exc_info: the chain can hold the model's output and its link.
+            logger.warning(
+                "Re-extraction of %s failed\n%s", receipt.id, redacted_traceback(exc)
+            )
             error = f"{type(exc).__name__}: {exc}"
             _record_failure(
                 conn, receipt, input_kind=input_kind, llm_model=llm_model, error=error
