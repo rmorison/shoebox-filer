@@ -10,6 +10,7 @@ extraction agent unmocked, against the stub Messages API in
 from __future__ import annotations
 
 import base64
+import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -250,3 +251,34 @@ def test_refusal_without_details(stub: StubAnthropic) -> None:
     assert info.value.category is None
     assert info.value.explanation is None
     assert str(info.value) == "The model declined to extract this receipt."
+
+
+def test_order_number_and_payment_through_locked_stack(stub: StubAnthropic) -> None:
+    # The real stack, not a mocked agent: the output schema the API receives
+    # carries the new fields, and a full card number in the answer is cut to
+    # its last four digits before anything is stored.
+    stub.tool_input = {
+        **_OUTPUT,
+        "description": "Parking, card 4111 1111 1111 1111 exp 12 27",
+        "order_number": "A-100",
+        "payment": {"method": "card", "last4": "4111111111111111", "payer": "J DOE"},
+        "field_confidence": {**_OUTPUT["field_confidence"], "payment": 0.8},
+    }
+    agent = create_extraction_agent(api_key=_KEY, model=_MODEL)
+
+    result = extract_metadata(_email(), agent=agent)
+
+    meta = result.metadata
+    assert meta.order_number == "A-100"
+    assert meta.payment is not None
+    assert (meta.payment.method, meta.payment.last4, meta.payment.payer) == (
+        "card",
+        "1111",
+        "J DOE",
+    )
+    assert meta.description == "Parking, card ending 1111 exp 12 27"
+    assert meta.field_confidence.payment == 0.8
+    request = stub.requests[0]
+    schema = json.dumps(request.get("tools") or request["output_config"]["format"])
+    assert '"order_number"' in schema
+    assert '"transfer"' in schema  # the payment method enum
