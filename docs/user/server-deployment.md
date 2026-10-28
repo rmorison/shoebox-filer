@@ -831,7 +831,12 @@ docker compose -f deploy/docker-compose.yml build
 # committing its row leaves an orphan file behind. Check for an in-flight cycle
 # first — ticks land on :00/:15/:30/:45 and normally finish in well under a
 # minute, so there is a wide idle window.
-docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+# Idle only when the output is exactly `pgrep-exit=1`. `pgrep-exit=0` lists a
+# running ingest: wait and check again. Anything else, or no `pgrep-exit` line
+# at all (the container is down, or the exec failed), means the check didn't
+# run: find out why before going on. The `[r]` keeps pgrep from matching the
+# shell that runs it.
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
@@ -982,15 +987,19 @@ openssl rand -hex 24
 docker compose -f deploy/docker-compose.yml exec db sh -c 'psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
 ```
 
-Run these, and type each password at its `\password` prompt, so it never appears in a command line or the shell history:
+Run these, and type each password at its `\password` prompt, so it never appears in a command line or the shell history. Each `CREATE ROLE` runs only when the role doesn't exist yet, and the rest can be repeated, so after a partial failure run the whole block again:
 
 ```sql
-CREATE ROLE receipt_index_write LOGIN;
+SELECT 'CREATE ROLE receipt_index_write LOGIN'
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'receipt_index_write')
+\gexec
 GRANT receipt_index_dev_write TO receipt_index_write;
 GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_write;
 \password receipt_index_write
 
-CREATE ROLE receipt_index_read LOGIN;
+SELECT 'CREATE ROLE receipt_index_read LOGIN'
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'receipt_index_read')
+\gexec
 GRANT receipt_index_dev_read TO receipt_index_read;
 GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_read;
 \password receipt_index_read
@@ -1022,10 +1031,10 @@ Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. Leave `
 docker compose -f deploy/docker-compose.yml config --quiet
 ```
 
-**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container:
+**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints exactly `pgrep-exit=1`, as in [8.1](#81-upgrade):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1068,14 +1077,14 @@ docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
 
 **Pass:** `ERROR:  must be owner of table extractions`.
 
-**8. Retire the old MCP login.** If you set up the MCP server before this section existed, it logged in as `receipt_index_mcp`. Once check (e) passes on the read login, drop it in the psql session of step 4. Its `CONNECT` grant has to go first, or `DROP ROLE` refuses:
+**8. Retire the old MCP login.** If you set up the MCP server before this section existed, it logged in as `receipt_index_mcp`. Once check (e) passes on the read login, drop it in the psql session of step 4. `DROP ROLE` refuses while the role holds any privilege, so `DROP OWNED BY` goes first: it revokes every privilege the role holds in this database, its `CONNECT` included, and drops anything it owns (it should own nothing):
 
 ```sql
-REVOKE CONNECT ON DATABASE :"DBNAME" FROM receipt_index_mcp;
+DROP OWNED BY receipt_index_mcp;
 DROP ROLE receipt_index_mcp;
 ```
 
-**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. The logins and migration 000014 can stay. To remove a login, revoke its `CONNECT` and drop it, as in step 8.
+**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove a login, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8.
 
 ---
 
@@ -1142,10 +1151,10 @@ On [rootless Docker](#rootless-docker), chown it from inside a container instead
 RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 ```
 
-**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first:
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints exactly `pgrep-exit=1`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'pgrep -af "[r]eceipt-index ingest"; echo "pgrep-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
