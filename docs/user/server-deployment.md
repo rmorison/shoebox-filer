@@ -38,7 +38,8 @@ Layout after provisioning:
 
 ```
 ~/receipt-index/                 <- clone root; all compose commands run from here
-├── .env                         <- secrets (git-ignored, chmod 600)
+├── .env                         <- the scheduler's secrets (git-ignored, chmod 600)
+├── .env.db                      <- the owner and superuser credentials (git-ignored, chmod 600)
 ├── data/
 │   ├── receipts/                <- rendered PDF tree      (uid 1000)
 │   ├── backups/                 <- nightly pg_dump files  (uid 1000)
@@ -52,10 +53,13 @@ Layout after provisioning:
     ├── receipt-index.yaml       <- your copy (git-ignored; no secrets, only ${VAR})
     ├── db-init/01-create-roles.sh
     ├── example.env
+    ├── example.env.db
     └── rclone-setup.md
 ```
 
-Compose resolves relative paths against the directory holding the compose file, so `deploy/docker-compose.yml` refers to the four state directories with a `../` prefix (`../.env`, `../data/receipts`, `../data/backups`, `../rclone-config`) and to its own siblings with `./`. That is why `.env` belongs at the **clone root** and not in `deploy/`.
+Compose resolves relative paths against the directory holding the compose file, so `deploy/docker-compose.yml` refers to the state at the clone root with a `../` prefix (`../.env`, `../.env.db`, `../data/receipts`, `../data/backups`, `../rclone-config`) and to its own siblings with `./`. That is why `.env` and `.env.db` belong at the **clone root** and not in `deploy/`.
+
+The two env files keep the database owner's credentials out of the application container. Only the `db` service and the host-side `make migrate-up` read `.env.db`; the scheduler reads `.env`, which holds no owner or superuser credential. Anyone with a shell in the scheduler sees only the application's logins.
 
 Every command in this document assumes:
 
@@ -150,24 +154,30 @@ git clone https://github.com/rmorison/shoebox-filer.git ~/receipt-index
 cd ~/receipt-index
 ```
 
-### 3.2 Create `.env` at the clone root
+### 3.2 Create `.env` and `.env.db` at the clone root
 
 ```bash
-cp deploy/example.env .env
-chmod 600 .env
+(umask 077; cp deploy/example.env .env; cp deploy/example.env.db .env.db)
 ```
 
-`deploy/example.env` documents every variable. Real values come from 1Password (`.env` is git-ignored and is never committed):
+Two files, so that the owner's credentials never reach the application container:
 
-| Variable | Source |
-|---|---|
-| `POSTGRES_PASSWORD` | Generate: `openssl rand -hex 24` |
-| `RECEIPT_INDEX_PASSWORD` | Generate: `openssl rand -hex 24` — the owner login `receipt_index`; must match the password inside `MIGRATION_DATABASE_URL` |
-| `RECEIPT_INDEX_WRITE_PASSWORD` | Generate: `openssl rand -hex 24` — the application's login `receipt_index_write`; must match the password inside `DATABASE_URL` |
-| `RECEIPT_INDEX_READ_PASSWORD` | Generate: `openssl rand -hex 24` — the read login `receipt_index_read`; must match the password inside `RECEIPT_INDEX_READ_DATABASE_URL` and `RECEIPT_INDEX_MCP_DATABASE_URL` |
-| `IMAP_PASSWORD` | 1Password — your IMAP mailbox item |
-| `ANTHROPIC_API_KEY` | 1Password — your Anthropic API key item |
-| `GDRIVE_TOKEN_JSON` | Output of `receipt-index auth gdrive --client-credentials <client_secret.json>`, run on the laptop |
+- **`.env.db`** ([`deploy/example.env.db`](../../deploy/example.env.db)): the superuser (`POSTGRES_*`), the three login passwords and `MIGRATION_DATABASE_URL`. Read by the `db` service and by the Makefile, on the host.
+- **`.env`** ([`deploy/example.env`](../../deploy/example.env)): the application's URLs, which log in as `receipt_index_write` and `receipt_index_read`, and its other secrets. Read by the scheduler and by the Makefile.
+
+No variable belongs in both. Never put a `POSTGRES_*`, `RECEIPT_INDEX_*PASSWORD` or `MIGRATION_DATABASE_URL` line in `.env`: Gate B's step 5 checks for them.
+
+Real values come from 1Password (both files are git-ignored and never committed). Store both files there:
+
+| Variable | File | Source |
+|---|---|---|
+| `POSTGRES_PASSWORD` | `.env.db` | Generate: `openssl rand -hex 24` |
+| `RECEIPT_INDEX_PASSWORD` | `.env.db` | Generate: `openssl rand -hex 24` — the owner login `receipt_index`; must match the password inside `MIGRATION_DATABASE_URL` |
+| `RECEIPT_INDEX_WRITE_PASSWORD` | `.env.db` | Generate: `openssl rand -hex 24` — the application's login `receipt_index_write`; must match the password inside `DATABASE_URL` in `.env` |
+| `RECEIPT_INDEX_READ_PASSWORD` | `.env.db` | Generate: `openssl rand -hex 24` — the read login `receipt_index_read`; must match the password inside `RECEIPT_INDEX_READ_DATABASE_URL` and `RECEIPT_INDEX_MCP_DATABASE_URL` in `.env` |
+| `IMAP_PASSWORD` | `.env` | 1Password — your IMAP mailbox item |
+| `ANTHROPIC_API_KEY` | `.env` | 1Password — your Anthropic API key item |
+| `GDRIVE_TOKEN_JSON` | `.env` | Output of `receipt-index auth gdrive --client-credentials <client_secret.json>`, run on the laptop |
 
 ### 3.2b Create the server app config
 
@@ -189,13 +199,13 @@ Also do **not** set `PLAYWRIGHT_BROWSERS_PATH` in the server `.env`. The image b
 
 ### 3.3 The `$`-in-secrets hazard — read before pasting a password
 
-Docker Compose performs variable expansion on values inside an `env_file`. **A secret containing `$` is silently corrupted.** Verified behaviour: a value written as
+Docker Compose performs variable expansion on values inside an `env_file`, `.env` and `.env.db` alike. **A secret containing `$` is silently corrupted.** Verified behaviour: a value written as
 
 ```
 IMAP_PASSWORD=ab$wcd$$ef
 ```
 
-is delivered to the container as `ab$ef` — `$wcd` expands to the empty string (compose only mutters `The "wcd" variable is not set` on stderr) and `$$` collapses to a literal `$`. Authentication then fails with an error that says nothing about the real cause. `make`, which also reads this file, has the same hazard.
+is delivered to the container as `ab$ef` — `$wcd` expands to the empty string (compose only mutters `The "wcd" variable is not set` on stderr) and `$$` collapses to a literal `$`. Authentication then fails with an error that says nothing about the real cause. `make`, which also reads both files, has the same hazard.
 
 Rules:
 
@@ -256,10 +266,10 @@ This tags `receipt-index:latest` (the compose `image: receipt-index` key), which
 
 ### 4.2 Start only the database
 
-First check that `.env` sets all three login passwords. db-init needs them, and it runs only once (below):
+First check that `.env.db` sets all three login passwords. db-init needs them, and it runs only once (below):
 
 ```bash
-grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env   # must print 3
+grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env.db   # must print 3
 ```
 
 ```bash
@@ -275,13 +285,13 @@ On first boot of an empty volume, `deploy/db-init/01-create-roles.sh` runs once.
 - `receipt_index_write`, the application's login, a member of `receipt_index_dev_write`;
 - `receipt_index_read`, for backups, forensic queries and the MCP server, a member of `receipt_index_dev_read`.
 
-It never runs again — a later role change is an `ALTER ROLE`, by hand. If it fails, for example on a missing password, the `db` logs say so, and the volume is left initialized without the roles: on a **new, empty** server only, remove it with `docker compose -f deploy/docker-compose.yml down -v`, fix `.env`, and start again.
+It never runs again — a later role change is an `ALTER ROLE`, by hand. If it fails, for example on a missing password, the `db` logs say so, and the volume is left initialized without the roles: on a **new, empty** server only, remove it with `docker compose -f deploy/docker-compose.yml down -v`, fix `.env.db`, and start again.
 
 ### 4.3 Apply migrations — an explicit deploy step
 
 Migrations are **not** run by the container. They are a deliberate host-side step, before the scheduler ever starts, and again after every upgrade.
 
-Set `MIGRATION_DATABASE_URL` in `.env`. It connects over the loopback-published host port, and it **must already contain a `?` query parameter** — the Makefile appends `&x-migrations-table=...` to whatever you give it, so a URL without `?sslmode=disable` is malformed and golang-migrate fails to connect:
+Set `MIGRATION_DATABASE_URL` in `.env.db`, never in `.env`, which the scheduler reads. It connects over the loopback-published host port, and it **must already contain a `?` query parameter** — the Makefile appends `&x-migrations-table=...` to whatever you give it, so a URL without `?sslmode=disable` is malformed and golang-migrate fails to connect:
 
 ```
 MIGRATION_DATABASE_URL=postgresql://receipt_index:<RECEIPT_INDEX_PASSWORD>@127.0.0.1:15432/receipt_index?sslmode=disable
@@ -289,7 +299,7 @@ MIGRATION_DATABASE_URL=postgresql://receipt_index:<RECEIPT_INDEX_PASSWORD>@127.0
 
 **Run migrations as the `receipt_index` role, not as the superuser.** `receipt_index` owns the database and schema `public` (via `db-init`), and the cutover dump restores every object owned by `receipt_index`. If migrations run as `postgres`, a freshly built server ends up with schema `receipt` and its tables owned by the superuser while a restored server has them owned by `receipt_index` — two servers with divergent ownership from the same repo. The owner has everything it needs: `pg_trgm` is a *trusted* extension in Postgres 13+, so the database owner can `CREATE EXTENSION` without superuser.
 
-> `deploy/example.env` ships this line with the `receipt_index` role already in place — migrations run as the database owner, not the superuser. The superuser credentials (`POSTGRES_PASSWORD`) are still needed separately for the cutover `pg_restore` (section 6).
+> `deploy/example.env.db` ships this line with the `receipt_index` role already in place — migrations run as the database owner, not the superuser. The superuser credentials (`POSTGRES_PASSWORD`) are still needed separately for the cutover `pg_restore` (section 6).
 
 Then:
 
@@ -297,7 +307,7 @@ Then:
 make migrate-up
 ```
 
-The Makefile auto-exports `.env`, downloads golang-migrate v4.18.3 into `.bin/` if absent, and applies both migration directories with separate version tables (`schema_migrations_public`, `schema_migrations_receipt`) — both directories start at `000001`, so a shared table would corrupt the state.
+The Makefile auto-exports `.env` and then `.env.db`, downloads golang-migrate v4.18.3 into `.bin/` if absent, and applies both migration directories with separate version tables (`schema_migrations_public`, `schema_migrations_receipt`) — both directories start at `000001`, so a shared table would corrupt the state.
 
 ---
 
@@ -357,9 +367,14 @@ for d in ("/app/data/receipts", "/app/data/backups", "/app/data/mcp-logs", "/app
     sentinel.touch()
     sentinel.unlink()
 print("ALL-MOUNTS-WRITABLE")'
+
+# 5. The scheduler's environment holds no owner or superuser credential.
+#    Prints variable names only, never values.
+docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c \
+    'found=$( { env | cut -d= -f1 | grep -xE "MIGRATION_DATABASE_URL|POSTGRES_(USER|PASSWORD)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD"; env | grep -E "://(receipt_index|postgres)[:@]" | cut -d= -f1; } | sort -u | tr "\n" " "); echo "owner credentials: ${found:-none}"'
 ```
 
-**Pass:** (1) prints nothing at all — any `variable is not set` warning is a broken `.env`; (2) `db` shows `healthy`; (3) `PGDATA` is `/var/lib/postgresql/18/docker`, i.e. *inside* the volume mounted at `/var/lib/postgresql` — if the volume were mounted at `/var/lib/postgresql/data` instead, the cluster would live outside the volume and vanish on the next container restart; (4) prints `1000` then `ALL-MOUNTS-WRITABLE`; a `PermissionError` names the mount that isn't writable.
+**Pass:** (1) prints nothing at all — any `variable is not set` warning is a broken `.env` or `.env.db`, and an `env file ... not found` error a missing one; (2) `db` shows `healthy`; (3) `PGDATA` is `/var/lib/postgresql/18/docker`, i.e. *inside* the volume mounted at `/var/lib/postgresql` — if the volume were mounted at `/var/lib/postgresql/data` instead, the cluster would live outside the volume and vanish on the next container restart; (4) prints `1000` then `ALL-MOUNTS-WRITABLE`; a `PermissionError` names the mount that isn't writable; (5) prints exactly `owner credentials: none`. Any name it prints is in `.env` and belongs in `.env.db` ([3.2](#32-create-env-and-envdb-at-the-clone-root)); a `DATABASE_URL` it names logs in as the owner, not as `receipt_index_write`.
 
 A host-side `ls -l` is **not** a substitute for step 4. Only a write from inside the container as uid 1000 proves the thing that matters.
 
@@ -821,6 +836,8 @@ A dead-man's-snitch (healthchecks.io-style) ping as a fourth crontab line after 
 
 ### 8.1 Upgrade
 
+The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once.
+
 ```bash
 cd ~/receipt-index
 git pull
@@ -896,12 +913,12 @@ Only requeue for **environmental** causes: a rendering gap, a permissions proble
 
 The full-loss story: the server is gone and Dropbox holds everything — the nightly dumps under `receipt-index/backups` and the complete receipt tree under `receipt-index/receipts`.
 
-1. Rebuild the host per [section 2](#2-server-prerequisites), then provision per [section 3](#3-provisioning) (clone, `.env` from 1Password, directories with uid 1000, rclone config).
+1. Rebuild the host per [section 2](#2-server-prerequisites), then provision per [section 3](#3-provisioning) (clone, `.env` and `.env.db` from 1Password, directories with uid 1000, rclone config). A single `.env` saved before [8.5](#85-split-the-owner-credentials-out-of-env) still holds the owner's lines: split it with 8.5 steps 2 and 3 first.
 
-2. Check that `.env` sets all three login passwords, as in [4.2](#42-start-only-the-database). Roles are cluster-level and `pg_dump` doesn't carry them, so the logins come back only from `db-init`, which reads the passwords from `.env`. An `.env` saved before [8.4](#84-separate-database-logins) lacks `RECEIPT_INDEX_WRITE_PASSWORD` and `RECEIPT_INDEX_READ_PASSWORD`: add them from 1Password, or generate new ones and put the same values in the URLs that use them, before going on.
+2. Check that `.env.db` sets all three login passwords, as in [4.2](#42-start-only-the-database). Roles are cluster-level and `pg_dump` doesn't carry them, so the logins come back only from `db-init`, which reads the passwords from `.env.db`. An env file saved before [8.4](#84-separate-database-logins) lacks `RECEIPT_INDEX_WRITE_PASSWORD` and `RECEIPT_INDEX_READ_PASSWORD`: add them from 1Password, or generate new ones and put the same values in the URLs that use them, before going on.
 
    ```bash
-   grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env   # must print 3
+   grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env.db   # must print 3
    ```
 
    Then `docker compose -f deploy/docker-compose.yml build && docker compose -f deploy/docker-compose.yml up -d db`. First boot of the empty volume runs `db-init`, creating the `receipt_index` owner role, the write and read logins and the grant-target roles — this must happen **before** the restore, or the dump's `OWNER TO` statements fail and the app is locked out.
@@ -934,7 +951,7 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
 
-5. Run the checks in [8.4](#84-separate-database-logins) step 7: each URL connects as its login, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
+5. Run the checks in [8.4](#84-separate-database-logins) step 7 and Gate B step 5: each URL connects as its login, the scheduler holds no owner credential, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
 6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
 
@@ -1085,7 +1102,85 @@ DROP OWNED BY receipt_index_mcp;
 DROP ROLE receipt_index_mcp;
 ```
 
-**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
+**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again, so an owner credential is back in the scheduler's environment, and the check in [8.5](#85-split-the-owner-credentials-out-of-env) step 6 names `DATABASE_URL` until you switch again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
+
+### 8.5 Split the owner credentials out of `.env`
+
+A server provisioned with this version of [3.2](#32-create-env-and-envdb-at-the-clone-root) has two env files from the start. A server provisioned earlier keeps every variable in one `.env`, which both containers read, so the scheduler holds the owner's and the superuser's credentials. It moves over once, with the steps below. From this release, `deploy/docker-compose.yml` needs `.env.db`: without it, `docker compose config` and `up` fail with `env file ... not found` before touching a container.
+
+**Precondition: [8.4](#84-separate-database-logins) is done,** so `DATABASE_URL` logs in as `receipt_index_write`. Otherwise `DATABASE_URL` is itself an owner credential and this split protects nothing. On a server still on the owner login, run 8.4 on the current checkout first, **before** `git pull` brings in this release: 8.4 step 6 recreates the scheduler, which needs `.env.db` once the new compose file is in place.
+
+**1. Keep a copy** of the current file, for rollback. `cp -p` keeps its mode, and `.env.*` is git-ignored:
+
+```bash
+cd ~/receipt-index
+cp -p .env .env.pre-split
+```
+
+**2. Move the owner's lines** into `.env.db`. The subshell's `umask` creates both new files mode 600, and `grep` writes the lines to files without printing them:
+
+```bash
+(umask 077
+ grep -E '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.db &&
+ grep -vE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.new &&
+ mv .env.new .env)
+```
+
+**3. Check by count and by mode,** still printing no values:
+
+```bash
+grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env.db   # must print 7
+grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env      # must print 0
+grep -c '^DATABASE_URL=' .env                                     # must print 1
+stat -c '%a %n' .env .env.db                                      # both 600
+```
+
+If `.env.db` holds fewer than 7 lines, `.env` lacked one of them: a server provisioned before 8.4 may lack the two login passwords; add them to `.env.db` from 1Password, as 8.3 step 2 says. Store `.env.db` in 1Password next to `.env`.
+
+**4. Pull and check the compose file:**
+
+```bash
+git pull
+docker compose -f deploy/docker-compose.yml build
+docker compose -f deploy/docker-compose.yml config --quiet   # must print nothing
+```
+
+**5. Recreate both containers between ingest cycles.** `db`'s environment changed, so `up -d` recreates it as well as the scheduler: Postgres restarts on the same volume, which takes seconds. Stop the scheduler first, as in [8.1](#81-upgrade), so no cycle runs while the database restarts. Go on past the check only when it prints exactly `check-exit=1`:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml stop scheduler
+make migrate-up      # "no change", or this release's migrations; it reads .env.db
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`make migrate-up` succeeding shows the Makefile found `MIGRATION_DATABASE_URL` in `.env.db`.
+
+**6. Verify.**
+
+a. The scheduler's environment holds no owner or superuser credential. The command prints variable names, never values:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c \
+    'found=$( { env | cut -d= -f1 | grep -xE "MIGRATION_DATABASE_URL|POSTGRES_(USER|PASSWORD)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD"; env | grep -E "://(receipt_index|postgres)[:@]" | cut -d= -f1; } | sort -u | tr "\n" " "); echo "owner credentials: ${found:-none}"'
+```
+
+**Pass:** exactly `owner credentials: none`.
+
+b. [8.4](#84-separate-database-logins) step 7: each URL connects as its login, Gate C, one supervised ingest, a backup by hand, and the MCP check if the MCP server is set up.
+
+**7. Delete the copy** once every check passes: `rm .env.pre-split`.
+
+**Rollback.** Put the old file back and recreate the scheduler between ingest cycles, as in step 5:
+
+```bash
+cp -p .env.pre-split .env
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml stop scheduler
+docker compose -f deploy/docker-compose.yml up -d scheduler
+```
+
+The scheduler then holds the owner credentials again, as before this section, and `db` keeps reading `.env.db`. To also go back to the previous release, check out its commit and run `up -d`: its compose file reads the restored `.env` for both services, and `.env.db` is ignored.
 
 ---
 

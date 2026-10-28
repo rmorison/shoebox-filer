@@ -11,7 +11,7 @@
 #   ./  -> deploy/            (config that is version-controlled)
 #   ../ -> the clone root     (secrets and mutable server state, git-ignored)
 #
-# Server state that lives at the clone root: .env, data/receipts,
+# Server state that lives at the clone root: .env, .env.db, data/receipts,
 # data/backups, rclone-config/. All three data directories must be owned by
 # uid/gid 1000 (the image's appuser) — see docs/user/server-deployment.md.
 
@@ -23,11 +23,16 @@ services:
     restart: unless-stopped
     # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD and the three login
     # passwords db-init reads (RECEIPT_INDEX_PASSWORD, RECEIPT_INDEX_WRITE_PASSWORD,
-    # RECEIPT_INDEX_READ_PASSWORD) come from here. env_file (container environment) is used rather than
-    # ${VAR} interpolation because the .env lives at the clone root, and
-    # compose only auto-loads a .env sitting next to the compose file — so
-    # interpolated values would silently resolve to empty.
-    env_file: ../.env
+    # RECEIPT_INDEX_READ_PASSWORD) come from ../.env.db, which holds the
+    # owner and superuser credentials and which only this service and the
+    # host-side `make migrate-up` read. The scheduler never sees it. See
+    # deploy/example.env.db. env_file (container environment) is used rather
+    # than ${VAR} interpolation because the env files live at the clone root,
+    # and compose only auto-loads a .env sitting next to the compose file — so
+    # interpolated values would silently resolve to empty. The file is
+    # required: if it is missing, `config` and `up` fail before touching a
+    # container.
+    env_file: ../.env.db
     ports:
       # Loopback only. Enough for `make migrate-up`, psql, and pg_restore on
       # the server (and from the laptop over an SSH tunnel); not reachable
@@ -79,7 +84,10 @@ services:
         condition: service_healthy
     # Secrets: IMAP_PASSWORD, ANTHROPIC_API_KEY, GDRIVE_TOKEN_JSON,
     # DATABASE_URL (the write login), RECEIPT_INDEX_READ_DATABASE_URL and
-    # RECEIPT_INDEX_MCP_DATABASE_URL (the read login). Never baked into the image. See deploy/example.env.
+    # RECEIPT_INDEX_MCP_DATABASE_URL (the read login). Never baked into the
+    # image. See deploy/example.env. No owner or superuser credential belongs
+    # in ../.env: those live in ../.env.db, which this service doesn't read
+    # (tests/unit/test_deploy_env_split.py checks it).
     env_file: ../.env
     environment:
       # Explicit rather than relying on CWD-relative config discovery, which
