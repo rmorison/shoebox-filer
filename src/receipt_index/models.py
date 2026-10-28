@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import traceback
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -147,33 +148,60 @@ def _blank_to_none(value: object) -> object:
     return value
 
 
-_NOT_DIGIT = re.compile(r"[^0-9]")
+def _ascii_digits(text: str) -> str:
+    """``text`` with every decimal digit as ASCII, one character for one.
+
+    Full-width and other scripts' digits become ``0``-``9``, and full-width
+    punctuation its ASCII form, so a card printed that way is found too. The
+    length never changes, so a span found here is the same span in ``text``.
+    """
+    out = []
+    for ch in text:
+        if ch.isascii():
+            out.append(ch)
+        elif ch.isdecimal():
+            out.append(str(unicodedata.decimal(ch)))
+        else:
+            folded = unicodedata.normalize("NFKC", ch)
+            out.append(folded if len(folded) == 1 else ch)
+    return "".join(out)
+
+
+_GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015]+")
+_DIGITS = re.compile(r"[0-9]+")
 
 
 def last_four_digits(value: object) -> str | None:
-    """The last four digits of ``value``, or None when it has fewer.
+    """The last four digits of the card or account in ``value``, or None.
 
-    Only the last four digits of a card or account number are ever kept, so
-    a longer number is cut here, whatever its type. The result always
+    Only the last four digits are ever kept, so a longer number is cut here,
+    whatever its type. A value that is only digit groups (``4111 1111 1111
+    1111``) is read as one number. Otherwise the one group of four or more
+    digits is the card's (``Visa ending 4242, exp 12/25`` gives ``4242``); with
+    none, or more than one, it is None rather than a guess. The result always
     matches ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
     validation error would echo it into a logged traceback.
     """
     if isinstance(value, bool) or not isinstance(value, str | int):
         return None
-    digits = _NOT_DIGIT.sub("", str(value))
-    return digits[-4:] if len(digits) >= 4 else None
+    text = _ascii_digits(str(value)).strip()
+    if _GROUPED_DIGITS.fullmatch(text):
+        digits = "".join(_DIGITS.findall(text))
+        return digits[-4:] if len(digits) >= 4 else None
+    long_groups = [g for g in _DIGITS.findall(text) if len(g) >= 4]
+    return long_groups[0][-4:] if len(long_groups) == 1 else None
 
 
-# What can sit between the digit groups of a printed card number: one or two
-# spaces (plain, no-break, thin, tab), or a hyphen, en or em dash, dot or slash
-# with an optional space either side.
-_SPACES = "[ \t\u00a0\u2009\u202f]"
-_SEPARATOR = rf"(?:{_SPACES}{{1,2}}|{_SPACES}?[-\u2010-\u2015./]{_SPACES}?)"
+# What can sit between the digit groups of a printed card number: any run of
+# whitespace (newlines and no-break, figure and em spaces included), or a
+# hyphen, dash, minus, dot or slash with any whitespace around it.
+_PUNCT = "-\u2010-\u2015\u2212./"
+_SEPARATOR = rf"(?:\s+|\s*[{_PUNCT}]\s*)"
 # A run of digit groups joined by separators: where a card number can sit
 # among dates, prices, codes and other numbers.
 _DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
-_DIGIT_GROUP = re.compile(r"[0-9]+")
-_ONE_SPACE = re.compile(rf"{_SPACES}")
+_DIGIT_GROUP = _DIGITS
+_DOT_OR_SLASH = re.compile(r"[./]")
 # How a printed card number is grouped, by digits per group.
 _CARD_SHAPES = frozenset({(4, 4, 4, 4), (4, 4, 4, 4, 3), (4, 6, 5), (4, 6, 4)})
 _REMOVED = "[card number removed]"
@@ -194,8 +222,12 @@ def _is_card(digits: str) -> bool:
 
 
 def _separator_kind(sep: str) -> str:
-    """A single space of any kind is one kind of separator."""
-    return " " if len(sep) == 1 and _ONE_SPACE.fullmatch(sep) else sep
+    """A dot or a slash is its own kind; whitespace and dashes are one kind.
+
+    Spacing is ignored, since text from a PDF spaces unevenly.
+    """
+    found = _DOT_OR_SLASH.search(sep)
+    return found.group(0) if found else " "
 
 
 def _card_spans(run: str) -> list[tuple[int, int, str]]:
@@ -203,12 +235,12 @@ def _card_spans(run: str) -> list[tuple[int, int, str]]:
 
     A candidate is one unbroken group of 13 to 19 digits, or consecutive
     groups in a card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with one kind
-    of separator between them (any single space counts as one kind), that is
-    not all one digit and passes the Luhn check. Shapes keep dates, prices,
-    phone and order numbers out; trying every starting group finds a card
-    with another number beside it. Candidates that overlap are removed
-    together, so no part of a card is left: as "ending NNNN" when they agree
-    on the last four digits, else as "[card number removed]".
+    of separator between them (see ``_separator_kind``), that is not all one
+    digit and passes the Luhn check. Shapes keep dates, prices, phone and
+    order numbers out; trying every starting group finds a card with another
+    number beside it. Candidates that overlap are removed together, so no
+    part of a card is left: as "ending NNNN" when they agree on the last four
+    digits, else as "[card number removed]".
     """
     groups = list(_DIGIT_GROUP.finditer(run))
     seps = [_separator_kind(run[a.end() : b.start()]) for a, b in pairwise(groups)]
@@ -242,19 +274,17 @@ def _card_spans(run: str) -> list[tuple[int, int, str]]:
 def scrub_card_numbers(text: str) -> str:
     """``text`` with each card number replaced by "ending NNNN", its last four
     digits, or "[card number removed]" when overlapping candidates disagree
-    on them. See ``_card_spans`` for what counts as a card number."""
-
-    def cut(match: re.Match[str]) -> str:
-        run = match.group(0)
-        out, pos = [], 0
-        for begin, end, replacement in _card_spans(run):
-            out.append(run[pos:begin])
+    on them. See ``_card_spans`` for what counts as a card number; digits in
+    any script count."""
+    folded = _ascii_digits(text)
+    out, pos = [], 0
+    for match in _DIGIT_RUN.finditer(folded):
+        for begin, end, replacement in _card_spans(match.group(0)):
+            out.append(text[pos : match.start() + begin])
             out.append(replacement)
-            pos = end
-        out.append(run[pos:])
-        return "".join(out)
-
-    return _DIGIT_RUN.sub(cut, text)
+            pos = match.start() + end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]

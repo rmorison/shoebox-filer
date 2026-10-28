@@ -1,6 +1,6 @@
 """Order number and payment on the extraction output and the receipt model.
 
-The receipt data-model design, §2 and §4. Only the last four digits of a
+The receipt data-model design, \u00a72 and \u00a74. Only the last four digits of a
 card or account number are ever kept: a longer number from the extractor is
 cut to its last four, and never fails validation (which would lose the
 whole receipt and echo the number into a logged error).
@@ -344,3 +344,58 @@ class TestDescriptionScrub:
         assert _metadata(order_number="4111111111111111").order_number == (
             "4111111111111111"
         )
+
+
+# Digits in other scripts: full-width (Japanese receipts) and Arabic-Indic.
+_FULL_WIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + d) for d in range(10)))
+_ARABIC_INDIC = str.maketrans("0123456789", "".join(chr(0x0660 + d) for d in range(10)))
+
+
+class TestDoneGateScrub:
+    """Layouts and digits the Done gate found getting past the scrub."""
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "card 4111  1111 1111 1111",  # two spaces, then one
+            "card 4111\n1111\n1111\n1111",  # wrapped across lines
+            "card 4111\u20071111\u20071111\u20071111",  # figure space
+            "card 4111\u20031111\u20031111\u20031111",  # em space
+            "card 4111 -1111- 1111 - 1111",  # uneven spaces around a dash
+            "card 4111 1111-1111 1111",  # spaces and hyphens mixed
+            "card 4111 / 1111/1111 /1111",
+        ],
+    )
+    def test_uneven_layouts(self, raw: str) -> None:
+        assert _metadata(description=raw).description == "card ending 1111"
+
+    def test_amex_with_uneven_spaces(self) -> None:
+        raw = "Amex 3782  822463 10005"
+        assert _metadata(description=raw).description == "Amex ending 0005"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "card " + "4111 1111 1111 1111".translate(_FULL_WIDTH),
+            "card " + "4111111111111111".translate(_ARABIC_INDIC),
+        ],
+    )
+    def test_non_ascii_digits(self, raw: str) -> None:
+        assert _metadata(description=raw).description == "card ending 1111"
+
+
+class TestDoneGateLast4:
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            ("Visa ending 4242, exp 12/25", "4242"),
+            ("4242 (exp 12/25)", "4242"),
+            ("•••• 4242 (12/2026)", None),  # two candidates
+            ("4242".translate(_FULL_WIDTH), "4242"),
+            ("4111 1111 1111 4321", "4321"),
+        ],
+    )
+    def test_takes_the_card_group_not_trailing_digits(
+        self, raw: str, kept: str | None
+    ) -> None:
+        assert Payment.model_validate({"last4": raw, "method": "card"}).last4 == kept
