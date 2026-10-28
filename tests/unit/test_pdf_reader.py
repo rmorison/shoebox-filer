@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pydantic_ai import BinaryContent
+from pydantic_ai.exceptions import ContentFilterError, ModelHTTPError
 
 from receipt_index.pdf_reader import (
     _extract_with_pdfplumber,
@@ -80,12 +82,30 @@ class TestExtractWithVision:
         assert isinstance(call_args[1], BinaryContent)
         assert call_args[1].media_type == "application/pdf"
 
-    def test_returns_empty_on_agent_failure(self) -> None:
+    def test_returns_empty_on_model_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         mock_agent = MagicMock()
-        mock_agent.run_sync.side_effect = RuntimeError("API error")
+        mock_agent.run_sync.side_effect = ModelHTTPError(400, "claude-haiku-5-5")
 
         result = _extract_with_vision(b"%PDF-fake", agent=mock_agent)
+
         assert result == ""
+        assert "Vision extraction failed for PDF: ModelHTTPError" in caplog.text
+
+    def test_library_error_is_not_swallowed(self) -> None:
+        mock_agent = MagicMock()
+        mock_agent.run_sync.side_effect = TypeError("unexpected keyword argument")
+
+        with pytest.raises(TypeError):
+            _extract_with_vision(b"%PDF-fake", agent=mock_agent)
+
+    def test_refusal_is_not_swallowed(self) -> None:
+        mock_agent = MagicMock()
+        mock_agent.run_sync.side_effect = ContentFilterError("refused")
+
+        with pytest.raises(ContentFilterError):
+            _extract_with_vision(b"%PDF-fake", agent=mock_agent)
 
 
 class TestExtractText:

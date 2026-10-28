@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import functools
+import json
 import logging
 from html.parser import HTMLParser
-from typing import Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai.capabilities import RaiseContentFilterError
+from pydantic_ai.exceptions import ContentFilterError
 
+from receipt_index.llm import anthropic_model
 from receipt_index.models import (
     Attachment,
     ExtractionResult,
@@ -15,7 +20,13 @@ from receipt_index.models import (
     ReceiptMetadata,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 logger = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 # Raised whenever the prompts or the output model change; every extraction
 # run records it. 0 means a receipt has no extraction history; 1 was the
@@ -142,13 +153,58 @@ def create_extraction_agent(
     system_prompt: str = _SYSTEM_PROMPT,
 ) -> Agent[None, ReceiptMetadata]:
     """Create a pydantic-ai Agent configured for receipt extraction."""
+    llm, settings = anthropic_model(api_key=api_key, model=model)
     return Agent(
-        f"anthropic:{model}",
+        llm,
         output_type=ReceiptMetadata,
         system_prompt=system_prompt,
+        model_settings=settings,
+        # A refusal ends the run, even after partial text.
+        capabilities=[RaiseContentFilterError()],
     )
 
 
+class ExtractionRefusedError(Exception):
+    """The model declined the request (``stop_reason: "refusal"``).
+
+    Haiku 5.5's safety classifiers can decline a request, and it has no
+    server-side fallback. Asking again repeats the same request, so this is
+    an item failure, not a transient one. Raised from the pydantic-ai
+    ``ContentFilterError``.
+    """
+
+    def __init__(self, category: str | None, explanation: str | None) -> None:
+        self.category = category
+        self.explanation = explanation
+        msg = "The model declined to extract this receipt"
+        if category:
+            msg += f" (category: {category})"
+        super().__init__(f"{msg}: {explanation}" if explanation else f"{msg}.")
+
+
+def _refusal_details(exc: ContentFilterError) -> tuple[str | None, str | None]:
+    """The refusal's category and explanation, from the refused response."""
+    try:
+        details = json.loads(exc.body or "[]")[-1].get("provider_details") or {}
+    except (ValueError, IndexError, AttributeError):
+        details = {}
+    return details.get("refusal_category"), details.get("refusal")
+
+
+def _refusals_as_item_errors(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Turn a model refusal into an ``ExtractionRefusedError``."""
+
+    @functools.wraps(func)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return func(*args, **kwargs)
+        except ContentFilterError as exc:
+            raise ExtractionRefusedError(*_refusal_details(exc)) from exc
+
+    return wrapper
+
+
+@_refusals_as_item_errors
 def extract_metadata(
     raw: RawReceipt,
     *,
@@ -278,6 +334,7 @@ def _extract_from_image(
     return _to_extraction_result(result)
 
 
+@_refusals_as_item_errors
 def extract_from_rendition(
     pdf_bytes: bytes,
     *,

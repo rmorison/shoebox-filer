@@ -215,7 +215,7 @@ class TestLoadConfig:
         assert config.store.path == "./data/receipts"
         assert config.store.backend == "local"
         assert config.logging.level == "INFO"
-        assert config.llm.model == "claude-haiku-4-5-20251001"
+        assert config.llm.model == "claude-haiku-5-5"
 
 
 class TestIngestConfig:

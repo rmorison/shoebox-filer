@@ -88,7 +88,7 @@ store:
   path: ./data/receipts
 
 llm:
-  model: claude-haiku-4-5-20251001       # default
+  model: claude-haiku-5-5                # default
   api_key: ${ANTHROPIC_API_KEY}
 
 logging:
@@ -127,7 +127,7 @@ class StoreConfig(BaseModel):
     path: str = "./data/receipts"
 
 class LlmConfig(BaseModel):
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-haiku-5-5"
     api_key: str
 
 class LoggingConfig(BaseModel):

@@ -47,7 +47,7 @@ store:
   path: ./data/receipts
 
 llm:
-  model: claude-haiku-4-5-20251001
+  model: claude-haiku-5-5
   api_key: ${ANTHROPIC_API_KEY}
 
 logging:
@@ -120,7 +120,7 @@ class StoreConfig(BaseModel):
 class LlmConfig(BaseModel):
     """LLM provider configuration."""
 
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-haiku-5-5"
     api_key: str
     # List prices per million tokens, for `reextract --dry-run` cost
     # estimates. Optional: prices change, so they are configuration.
