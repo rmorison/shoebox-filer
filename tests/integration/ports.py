@@ -19,8 +19,11 @@ if TYPE_CHECKING:
 PORT_VARS = ("POSTGRES_HOST_PORT", "GREENMAIL_SMTP_PORT", "GREENMAIL_IMAP_PORT")
 
 # Stands in for a missing port so the module-level names keep their types.
-# The skip happens before anything uses it, and port 0 is never listening.
-_UNSET = 0
+# The conftest skips before anything uses it. If the conftest is turned off
+# (--noconftest), test bodies can run, so the value must not be a port any
+# client would use: smtplib reads 0 as port 25, while socket, libpq and
+# IMAPClient all refuse -1 before connecting.
+UNSET_PORT = -1
 
 
 def parse_port(value: str | None) -> int | None:
@@ -46,7 +49,7 @@ def skip_reason(missing: list[str]) -> str:
 
 
 def _port(var: str) -> int:
-    return parse_port(os.environ.get(var)) or _UNSET
+    return parse_port(os.environ.get(var)) or UNSET_PORT
 
 
 # Read once, when the conftest imports this module and before any test module

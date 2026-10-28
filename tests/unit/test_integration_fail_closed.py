@@ -12,14 +12,17 @@ from __future__ import annotations
 
 import json
 import os
+import smtplib
+import socket
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 
-from tests.integration.ports import missing_ports, parse_port
+from tests.integration.ports import UNSET_PORT, missing_ports, parse_port
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PORT_VARS = ("POSTGRES_HOST_PORT", "GREENMAIL_SMTP_PORT", "GREENMAIL_IMAP_PORT")
@@ -139,3 +142,32 @@ class TestMissingPorts:
     def test_parse_port(self) -> None:
         assert parse_port("23143") == 23143
         assert parse_port(" 23143 ") == 23143
+
+
+class TestUnsetPlaceholder:
+    """With the conftest turned off, a test body could use the placeholder.
+
+    Each client must refuse it while resolving the address, before any
+    socket connects; the fixture fails the test if one tries.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_connect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("a socket connect was attempted")
+
+        monkeypatch.setattr(socket.socket, "connect", refuse)
+        monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+
+    def test_socket_refuses_it(self) -> None:
+        with pytest.raises((OSError, OverflowError)):
+            socket.create_connection(("localhost", UNSET_PORT), timeout=1)
+
+    def test_smtplib_does_not_turn_it_into_port_25(self) -> None:
+        with pytest.raises((OSError, OverflowError)):
+            smtplib.SMTP("localhost", UNSET_PORT, timeout=1)
+
+    def test_libpq_refuses_it(self) -> None:
+        dsn = f"postgresql://nobody@localhost:{UNSET_PORT}/none"
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(dsn, connect_timeout=1)

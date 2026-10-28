@@ -40,19 +40,20 @@ class ConnectionRefusedByGuard(RuntimeError):  # noqa: N818 - reads as a sentenc
     """Raised in place of any outbound connection."""
 
 
-def _refuse(kind: str) -> Any:
+def _refuse(kind: str, *, method: bool = False) -> Any:
     def guarded(*args: Any, **kwargs: Any) -> NoReturn:
-        _record["attempts"].append({"kind": kind, "args": _describe(args)})
+        # A guarded method's first argument is the object itself, whose repr
+        # can fail; a function's first argument is the address or DSN.
+        described = _describe(args[1:] if method else args, kwargs)
+        _record["attempts"].append({"kind": kind, "args": described})
         raise ConnectionRefusedByGuard(f"connect guard: {kind} refused")
 
     return guarded
 
 
-def _describe(args: tuple[Any, ...]) -> str:
-    # The first argument of a guarded method is a half-built object whose
-    # repr can fail, so describe only the rest.
+def _describe(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     try:
-        return repr(args[1:])[:200]
+        return repr((args, kwargs))[:200]
     except Exception:
         return "<unprintable>"
 
@@ -70,8 +71,8 @@ def _guarded_popen_init(self: subprocess.Popen[Any], *args: Any, **kwargs: Any) 
     _real_popen_init(self, *args, **kwargs)
 
 
-socket.socket.connect = _refuse("socket.connect")  # type: ignore[method-assign]
-socket.socket.connect_ex = _refuse("socket.connect_ex")  # type: ignore[method-assign]
+socket.socket.connect = _refuse("socket.connect", method=True)  # type: ignore[method-assign]
+socket.socket.connect_ex = _refuse("socket.connect_ex", method=True)  # type: ignore[method-assign]
 socket.create_connection = _refuse("socket.create_connection")
 psycopg.connect = _refuse("psycopg.connect")
 psycopg.Connection.connect = _refuse("psycopg.Connection.connect")  # type: ignore[method-assign]
