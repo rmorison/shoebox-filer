@@ -14,8 +14,8 @@ from receipt_index.extraction import (
     DOCUMENT_SYSTEM_PROMPT,
     _build_prompt,
     _extract_from_document,
-    _extract_pdf_text,
     _has_sufficient_text,
+    _read_pdf_attachments,
     _strip_html_tags,
     extract_metadata,
 )
@@ -25,6 +25,7 @@ from receipt_index.models import (
     RawReceipt,
     ReceiptMetadata,
 )
+from tests.pdfs import make_pdf
 
 _FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
@@ -304,11 +305,7 @@ class TestExtractMetadata:
         # Agent's run_sync should have been called exactly once
         mock_agent.run_sync.assert_called_once()
 
-    @patch(
-        "receipt_index.pdf_reader.extract_text",
-        return_value="PDF Amount: $99.00",
-    )
-    def test_includes_pdf_text_in_prompt(self, _mock_pdf_extract: MagicMock) -> None:
+    def test_includes_pdf_text_in_prompt(self) -> None:
         raw = RawReceipt(
             source_id="test",
             source_name="test-source",
@@ -321,7 +318,7 @@ class TestExtractMetadata:
                 Attachment(
                     filename="receipt.pdf",
                     content_type="application/pdf",
-                    data=b"%PDF",
+                    data=make_pdf("Shop receipt. PDF Amount: $99.00"),
                 ),
             ],
         )
@@ -343,9 +340,8 @@ class TestExtractMetadata:
         assert "PDF Amount: $99.00" in prompt
         assert "--- PDF Attachment Content: receipt.pdf ---" in prompt
 
-    @patch("receipt_index.extraction._extract_pdf_text", return_value=None)
     def test_no_pdf_section_without_attachments(
-        self, _mock_pdf_extract: MagicMock, sample_raw_receipt: RawReceipt
+        self, sample_raw_receipt: RawReceipt
     ) -> None:
         mock_result = _mock_agent_result(
             ReceiptMetadata(
@@ -365,26 +361,159 @@ class TestExtractMetadata:
         assert "--- PDF Attachment Content ---" not in prompt
 
 
-class TestExtractPdfText:
-    """Tests for _extract_pdf_text."""
+def _pdf(name: str, data: bytes) -> Attachment:
+    return Attachment(filename=name, content_type="application/pdf", data=data)
 
-    @patch("receipt_index.pdf_reader.extract_text", return_value="first pdf text")
-    def test_extracts_only_first_pdf(self, mock_extract: MagicMock) -> None:
-        attachments = [
-            Attachment(
-                filename="receipt1.pdf",
-                content_type="application/pdf",
-                data=b"%PDF-first",
-            ),
-            Attachment(
-                filename="receipt2.pdf",
-                content_type="application/pdf",
-                data=b"%PDF-second",
-            ),
+
+_RECEIPT_TEXT = "Acme Parking (U.S.), LLC. Total 12.34"
+
+
+class TestReadPdfAttachments:
+    """Which PDFs go as text, which as documents, and which are left out."""
+
+    def test_text_comes_from_the_first_pdf_with_text(self) -> None:
+        pdfs = _read_pdf_attachments(
+            [
+                _pdf("first.pdf", make_pdf("First receipt, total 12.34")),
+                _pdf("second.pdf", make_pdf("Second receipt, total 56.78")),
+            ]
+        )
+        assert pdfs.text_name == "first.pdf"
+        assert pdfs.text is not None
+        assert "First receipt" in pdfs.text
+        assert pdfs.documents == []
+
+    def test_a_scan_first_does_not_hide_a_later_text_pdf(self) -> None:
+        scan = _pdf("scan.pdf", make_pdf())
+        pdfs = _read_pdf_attachments([scan, _pdf("terms.pdf", make_pdf(_RECEIPT_TEXT))])
+        assert pdfs.text_name == "terms.pdf"
+        assert pdfs.documents == [scan]
+
+    def test_content_type_parameters_are_ignored(self) -> None:
+        scan = Attachment("s.pdf", "Application/PDF; name=s.pdf", make_pdf())
+        assert _read_pdf_attachments([scan]).documents == [scan]
+
+    def test_at_most_three_scans(self, caplog: pytest.LogCaptureFixture) -> None:
+        scans = [_pdf(f"scan{i}.pdf", make_pdf()) for i in range(4)]
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments(scans)
+        assert pdfs.documents == scans[:3]
+        assert "scan3.pdf" in caplog.text
+
+    def test_ten_pages_go_eleven_do_not(self, caplog: pytest.LogCaptureFixture) -> None:
+        ten = _pdf("ten.pdf", make_pdf(pages=10))
+        eleven = _pdf("eleven.pdf", make_pdf(pages=11))
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments([eleven, ten])
+        assert pdfs.documents == [ten]
+        assert "eleven.pdf" in caplog.text
+        assert "11 pages" in caplog.text
+
+    def test_byte_cap_across_the_email(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        first = _pdf("first.pdf", make_pdf())
+        second = _pdf("second.pdf", make_pdf())
+        monkeypatch.setattr(
+            "receipt_index.extraction._MAX_EMAIL_PDF_BYTES", len(first.data) + 1
+        )
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments([first, second])
+        assert pdfs.documents == [first]
+        assert "second.pdf" in caplog.text
+
+    @pytest.mark.parametrize(
+        "data", [b"%PDF-1.4 broken", b"not a pdf at all", make_pdf(encrypted=True)]
+    )
+    def test_unreadable_or_encrypted_pdfs_are_left_out(
+        self, data: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments([_pdf("odd.pdf", data)])
+        assert pdfs.documents == []
+        assert pdfs.text is None
+        assert "odd.pdf" in caplog.text
+
+    def test_a_page_read_error_is_unreadable_not_scanned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(*_args: object, **_kwargs: object) -> str:
+            raise ValueError("bad page")
+
+        monkeypatch.setattr("pdfplumber.page.Page.extract_text", boom)
+        pdfs = _read_pdf_attachments([_pdf("odd.pdf", make_pdf(_RECEIPT_TEXT))])
+        assert pdfs.documents == []
+        assert pdfs.text is None
+
+    def test_images_and_other_types_are_not_read(self) -> None:
+        pdfs = _read_pdf_attachments(
+            [
+                Attachment("s.png", "image/png", b"\x89PNG"),
+                Attachment("a.txt", "text/plain", b"x"),
+            ]
+        )
+        assert pdfs.text is None
+        assert pdfs.documents == []
+
+
+class TestEmailScannedPdfs:
+    """The message the email path sends when an attachment is a scan."""
+
+    def _raw(self, attachments: list[Attachment]) -> RawReceipt:
+        return RawReceipt(
+            source_id="msg-3",
+            source_name="personal-email",
+            source_type="imap",
+            date=datetime(2026, 6, 6, tzinfo=UTC),
+            subject="Your receipt",
+            sender="user@example.com",
+            text_body="Your receipt is attached.",
+            attachments=attachments,
+        )
+
+    def _message(self, attachments: list[Attachment]) -> list[object]:
+        agent = MagicMock()
+        agent.run_sync.return_value = _mock_agent_result(
+            ReceiptMetadata(
+                vendor="Acme Parking (U.S.), LLC",
+                amount=Decimal("12.34"),
+                date=date(2026, 6, 6),
+                confidence=0.9,
+                field_confidence=_FIELD_CONFIDENCE,
+            )
+        )
+        extract_metadata(self._raw(attachments), agent=agent)
+        agent.run_sync.assert_called_once()
+        message = agent.run_sync.call_args[0][0]
+        assert isinstance(message, list)
+        return message
+
+    def test_each_scan_follows_its_label_in_order(self) -> None:
+        a, b = make_pdf(), make_pdf(pages=2)
+        message = self._message([_pdf("a.pdf", a), _pdf("b.pdf", b)])
+        assert "Your receipt is attached." in str(message[0])
+        assert message[1:] == [
+            "--- PDF Attachment (scanned): a.pdf ---",
+            BinaryContent(data=a, media_type="application/pdf"),
+            "--- PDF Attachment (scanned): b.pdf ---",
+            BinaryContent(data=b, media_type="application/pdf"),
         ]
-        result = _extract_pdf_text(attachments)
-        assert result == "first pdf text"
-        mock_extract.assert_called_once_with(b"%PDF-first")
+
+    def test_scan_and_text_pdf_in_one_call(self) -> None:
+        scan = make_pdf()
+        message = self._message(
+            [_pdf("scan.pdf", scan), _pdf("terms.pdf", make_pdf(_RECEIPT_TEXT))]
+        )
+        assert "--- PDF Attachment Content: terms.pdf ---" in str(message[0])
+        assert BinaryContent(data=scan, media_type="application/pdf") in message
+
+    def test_scan_and_image_in_one_call(self) -> None:
+        scan = make_pdf()
+        message = self._message(
+            [_pdf("scan.pdf", scan), Attachment("s.png", "image/png", b"\x89PNG")]
+        )
+        binaries = [m for m in message if isinstance(m, BinaryContent)]
+        assert [m.media_type for m in binaries] == ["application/pdf", "image/png"]
 
 
 class TestHasSufficientText:
@@ -657,15 +786,13 @@ class TestEmailImageAttachments:
         binaries = [m for m in message if isinstance(m, BinaryContent)]
         assert len(binaries) == 4
 
-    @patch(
-        "receipt_index.pdf_reader.extract_text",
-        return_value="Vendor: Shop Total: $25",
-    )
-    def test_pdf_and_image_combined(self, _mock_extract: MagicMock) -> None:
+    def test_pdf_and_image_combined(self) -> None:
         raw = self._raw(
             [
                 Attachment(
-                    filename="r.pdf", content_type="application/pdf", data=b"%PDF"
+                    filename="r.pdf",
+                    content_type="application/pdf",
+                    data=make_pdf("Vendor: Shop Total: $25"),
                 ),
                 Attachment(filename="s.png", content_type="image/png", data=b"\x89PNG"),
             ]
