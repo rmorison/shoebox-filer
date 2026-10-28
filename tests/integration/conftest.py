@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import smtplib
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -21,8 +22,9 @@ if TYPE_CHECKING:
 # Postgres fixtures
 # ---------------------------------------------------------------------------
 
-# TODO: Tests run as superuser (main). Ideally bootstrap schema as main,
-# then run pipeline tests as receipt_index_dev_write to catch missing GRANTs.
+# Tests run as superuser (main). test_db_logins.py applies the migrations'
+# grants (apply_migration_grants) and runs the write and read paths as logins
+# that hold only those grants, to catch a missing GRANT.
 _MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
 _POSTGRES_HOST_PORT = os.environ.get("POSTGRES_HOST_PORT", "15432")
 _DB_DSN = (
@@ -34,8 +36,10 @@ _DB_DSN = (
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000013 (tables, indexes and
-    constraints; not the grants, since CI's Postgres has no application roles).
+    Mirrors: public/000001, receipt/000001-000014 (tables, indexes and
+    constraints). receipt/000014 holds grants only. The grants are not applied
+    here, since CI's Postgres has no application roles; apply_migration_grants
+    applies them for the tests that need them.
     Keep in sync with db/migrations/ when schema changes.
     """
     # public/000001 — set_updated_at trigger function
@@ -224,6 +228,82 @@ def _schema_part(schema: str, version: str) -> str:
     head, sep, _ = sql.partition("-- _all:")
     assert sep, f"{path.name}: no '-- _all:' grants marker"
     return head
+
+
+# The grant-target roles every migration grants to by name. db/init creates
+# them for the dev stack and deploy/db-init for production; CI has none.
+GRANT_ROLES = (
+    "receipt_index_dev_all",
+    "receipt_index_dev_write",
+    "receipt_index_dev_read",
+)
+
+# golang-migrate's version tables, under the names the Makefile gives them.
+# The inline migrations above don't create them; migration 000014 grants on
+# them, and pg_dump reads them.
+_VERSION_TABLES = ("schema_migrations_public", "schema_migrations_receipt")
+
+# A GRANT or REVOKE at the start of a line, through its semicolon; or a DO
+# block (000014 grants inside one, guarded on the version tables existing).
+_GRANT_STATEMENT = re.compile(
+    r"^(?:(?:GRANT|REVOKE)\b[^;]*;|DO \$\$.*?^END \$\$;)", re.MULTILINE | re.DOTALL
+)
+
+
+def apply_migration_grants(conn: psycopg.Connection[dict[str, Any]]) -> None:
+    """Run every migration's grants, as the files ship them, in order.
+
+    Creates the grant-target roles and the version tables where they're
+    missing, then clears the roles' grants on the schema, its tables and the
+    version tables, so a grant left by an earlier run on a local database
+    can't stand in for one a migration no longer makes. A grant removed from
+    a migration file is then missing here too, which is what lets
+    test_db_logins.py catch it.
+    """
+    sql = psycopg.sql
+    for role in GRANT_ROLES:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)
+        ).fetchone()
+        if not exists:
+            # LOGIN with the dev password, as db/init/01-create-roles.sql makes
+            # them: test_mcp_stdio.py logs in as these roles, and creates them
+            # with a login only when they are absent.
+            conn.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(role),
+                    sql.Literal("localpass"),  # pragma: allowlist secret
+                )
+            )
+    for table in _VERSION_TABLES:
+        conn.execute(
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS public.{} "
+                "(version BIGINT NOT NULL PRIMARY KEY, dirty BOOLEAN NOT NULL)"
+            ).format(sql.Identifier(table))
+        )
+    roles = sql.SQL(", ").join(sql.Identifier(r) for r in GRANT_ROLES)
+    conn.execute(sql.SQL("REVOKE ALL ON SCHEMA receipt FROM {}").format(roles))
+    conn.execute(
+        sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA receipt FROM {}").format(roles)
+    )
+    for table in _VERSION_TABLES:
+        conn.execute(
+            sql.SQL("REVOKE ALL ON public.{} FROM {}").format(
+                sql.Identifier(table), roles
+            )
+        )
+    for schema in ("public", "receipt"):
+        for path in sorted((_MIGRATIONS / schema).glob("*.up.sql")):
+            text = path.read_text()
+            for match in _GRANT_STATEMENT.finditer(text):
+                statement = match.group(0)
+                if statement.startswith("DO") and not re.search(
+                    r"\b(GRANT|REVOKE)\b", statement
+                ):
+                    continue
+                conn.execute(statement)  # type: ignore[arg-type]
+    conn.commit()
 
 
 @pytest.fixture(scope="session")
