@@ -5,6 +5,8 @@
 - [`uv run receipt-index ingest`](#ingest) — Fetch and process receipts from email
 - [`uv run receipt-index search`](#search) — Find receipts by metadata
 - [`uv run receipt-index show`](#show) — View full details for a receipt
+- [`uv run receipt-index edit`](#edit) — Correct a receipt's fields by hand
+- [`uv run receipt-index history`](#history) — List the changes made to a receipt after extraction
 - [`uv run receipt-index failures`](#failures) — List items that failed or were skipped
 - [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
@@ -32,7 +34,18 @@ The search amount filters and the `Amount` column in text output use the effecti
 
 Receipts ingested before the paid amount was added have `paid_amount: null`, so their effective amount is their `amount`. Their `amount` may be the payment rather than the total, because the earlier extraction prompt asked for "the total amount charged". When these receipts are re-extracted ([`reextract`](#reextract)), `paid_amount` is filled in and `amount` can be corrected to the total, so an `amount` already read from an old receipt can change.
 
-**Field confidence.** `field_confidence` holds the extractor's own confidence, from 0 to 1, for each of `vendor`, `amount`, `paid_amount` and `date`; it is below 0.5 when a figure was inferred rather than printed. It is the model's estimate, not a measured probability: use it to choose which receipts to check first, not as a pass mark. It is empty (`{}`) for receipts ingested before it was recorded.
+**Field confidence.** `field_confidence` holds the extractor's own confidence, from 0 to 1, for each of `vendor`, `amount`, `paid_amount` and `date`; it is below 0.5 when a figure was inferred rather than printed. It is the model's estimate, not a measured probability: use it to choose which receipts to check first, not as a pass mark. It is empty (`{}`) for receipts ingested before it was recorded. Receipts extracted since the order number and payment were added also carry `order_number` and `payment` entries when those fields are known. An entry is removed when a person edits its field by hand, since it described the extracted value.
+
+### Order number and payment
+
+| Field | Meaning |
+|---|---|
+| `order_number` | The order, confirmation or invoice number as printed. Not unique: a confirmation, a shipment, a refund and an invoice can share one |
+| `payment_method` | `card`, `bank`, `wallet`, `cash`, `transfer` or `other` |
+| `payment_last4` | The last four digits of the card or account. No more is ever stored: a longer number, in this field or in the description, is cut to its last four digits |
+| `payer` | The cardholder or bill-to name as printed on the receipt, not who forwarded the email |
+
+Each is `null` when the receipt doesn't show it, and on receipts extracted before these fields were added, until they are [re-extracted](#reextract).
 
 ---
 
@@ -146,6 +159,9 @@ uv run receipt-index search [OPTIONS]
 | `--date-from YYYY-MM-DD` | Filter by start date (inclusive) |
 | `--date-to YYYY-MM-DD` | Filter by end date (inclusive) |
 | `--needs-review` | Only receipts still needing a look: `paid_amount` is `null`, or the latest extraction failed or fell below the confidence gate (see [reextract](#reextract)) |
+| `--order-number TEXT` | Filter by order number (exact match) |
+| `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
+| `--payer TEXT` | Filter by payer name (case-insensitive substring match) |
 | `--output text\|json` | Output format (default: `text`) |
 
 Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
@@ -172,19 +188,25 @@ uv run receipt-index search --vendor "whole foods" --date-from 2026-01-01
 # Find an exact amount paid (useful for reconciliation)
 uv run receipt-index search --amount 47.99
 
+# Match a card statement line: the card's last four and the amount
+uv run receipt-index search --last4 1234 --amount 47.99
+
+# Every receipt for one order (confirmation, shipments, refund)
+uv run receipt-index search --order-number 123-4567890
+
 # Output as JSON for scripting
 uv run receipt-index search --vendor amazon --output json
 ```
 
 ### Text Output
 
-The default text output shows a table. `Amount` is the effective amount and `Total` is `amount`; they differ when, for example, part of an order was paid with a gift card:
+The default text output shows a table. `Order` is the order number and `Last4` the payment card's last four digits, blank when not known. `Amount` is the effective amount and `Total` is `amount`; they differ when, for example, part of an order was paid with a gift card:
 
 ```
-ID                                     Date         Vendor                   Amount      Total
----------------------------------------------------------------------------------------------
-01942a3b-...                           2026-01-15   Amazon                    47.99      47.99
-01942a3c-...                           2026-01-22   Acme Parking (U.S.)…      30.00      50.00
+ID                                     Date         Vendor               Order            Last4     Amount      Total
+--------------------------------------------------------------------------------------------------------------------
+01942a3b-...                           2026-01-15   Amazon               123-4567890      1234       47.99      47.99
+01942a3c-...                           2026-01-22   Acme Parking (U.S.)…                             30.00      50.00
 
 2 receipt(s) found.
 ```
@@ -203,7 +225,13 @@ Use `--output json` for machine-readable output:
     "effective_amount": "47.99",
     "currency": "USD",
     "receipt_date": "2026-01-15",
-    "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97},
+    "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97,
+                         "order_number": 0.95, "payment": 0.9},
+    "manual_fields": [],
+    "order_number": "123-4567890",
+    "payment_method": "card",
+    "payment_last4": "1234",
+    "payer": "Jane Doe",
     "pdf_path": "2026/01/2026-01-15__amazon__47.99.pdf",
     ...
   }
@@ -245,7 +273,9 @@ Amount:       47.99 USD (paid)
 Paid:         47.99
 Total:        47.99
 Date:         2026-01-15
-Description:  Order #123-4567890 - Wireless keyboard
+Description:  Wireless keyboard
+Order:        123-4567890
+Payment:      card ending 1234 (Jane Doe)
 Confidence:   0.95
 Field Conf:   vendor 0.98, amount 0.95, paid_amount 0.90, date 0.97
 PDF:          renditions/2026/01/2026-01-15__amazon__47.99.pdf
@@ -256,7 +286,7 @@ Sender:       ship-confirm@amazon.com
 Email Date:   2026-01-15T10:30:00
 ```
 
-`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded. A `Hand-edited:` line lists the fields a person has edited (`manual_fields` in JSON); re-extraction never writes them.
+`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded. A `Hand-edited:` line lists the fields a person has edited (`manual_fields` in JSON); re-extraction never writes them. `Order` and `Payment` are left out when the receipt doesn't show them; `Payment` shows whichever of the method, the last four digits and the payer are known.
 
 The `PDF` path is relative to the store root, `store.path` in the config. `Rendition` is the same file's evidence-store reference: `local:` followed by that path.
 
@@ -271,6 +301,92 @@ store:
 ```
 
 `store.backend` selects the evidence store. Any value other than `local` is a config error.
+
+---
+
+## edit
+
+Correct a receipt's fields by hand, or hand them back to re-extraction.
+
+```bash
+uv run receipt-index edit RECEIPT_ID [--paid-amount DECIMAL] [--vendor TEXT]
+                         [--date YYYY-MM-DD] [--order-number TEXT]
+                         [--reason TEXT] [--as NAME] [--output text|json]
+uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD ...]
+                         [--reason TEXT] [--as NAME]
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--paid-amount DECIMAL` | What was charged, or for a refund returned: 0 or more, at most two decimal places |
+| `--vendor TEXT` | Vendor name |
+| `--date YYYY-MM-DD` | Receipt date (`receipt_date`) |
+| `--order-number TEXT` | Order number |
+| `--clear-manual FIELD` | Hand `FIELD` back to re-extraction: `paid_amount`, `vendor`, `date` (or `receipt_date`) or `order_number`. Repeatable. Can't be combined with the field options |
+| `--reason TEXT` | Why, recorded with each change |
+| `--as NAME` | Who made the change. Default: `annotations.actor` in the config, else `operator` |
+| `--output text\|json` | Output format (default: `text`). JSON gives the receipt as it now is and the events written |
+
+### What it does
+
+Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown.
+
+`--clear-manual` takes a field off `manual_fields` and records that in the history. The field keeps its value, but the next `reextract --overwrite` may replace it (fill-only runs leave it, since it isn't empty). It is refused, and nothing is written, when a field isn't hand-edited.
+
+Other fields (the total, the currency, the description, the payment) can't be edited by hand yet.
+
+The receipt is locked while the edit is written, so an edit and a re-extraction of the same receipt never interleave: a run that is waiting on the LLM sees the edit before it applies anything.
+
+### Who made the change
+
+Every change records an actor, the name given with `--as`, else the `annotations.actor` setting:
+
+```yaml
+annotations:
+  actor: operator   # the default
+```
+
+The name is attribution, not authentication: the CLI records whatever name it is given, as a person.
+
+### Examples
+
+```bash
+# The card statement shows 25.00 was charged
+uv run receipt-index edit 01942a3b-1234-7def-8abc-567890abcdef \
+    --paid-amount 25.00 --reason "card statement"
+
+# Fix the order number and the date together
+uv run receipt-index edit 01942a3b-1234-7def-8abc-567890abcdef \
+    --order-number 123-4567890 --date 2026-01-14
+
+# Let re-extraction decide the paid amount again
+uv run receipt-index edit 01942a3b-1234-7def-8abc-567890abcdef --clear-manual paid_amount
+```
+
+---
+
+## history
+
+List every change made to a receipt after extraction, oldest first: hand edits and fields handed back to re-extraction. Re-extraction runs themselves are kept separately, in the extraction history.
+
+```bash
+uv run receipt-index history RECEIPT_ID [--output text|json]
+```
+
+### Text Output
+
+One line per change: the time (UTC), the event type, who made it (and whether a person, an agent or a rule), what changed, and the reason:
+
+```
+2026-02-01 09:00:00Z  field_edited     operator (person)  paid_amount 30.00 → 25.00  — card statement
+2026-02-02 09:00:00Z  manual_cleared   operator (person)  paid_amount handed back to re-extraction
+```
+
+`—` stands for an empty value. With `--output json` each event has its `event_type`, `payload` (for an edit: `field`, `old`, `new` and the removed `old_confidence`; for a cleared field: `field` and its `value`), `actor`, `actor_kind`, `reason` and `created_at`.
+
+The history is append-only: nothing in the application can change or delete an event. Deleting a receipt by hand in SQL deletes its history with it.
 
 ---
 
@@ -374,7 +490,7 @@ At least one of these, `--limit` or `--all` is required, so that a bare command 
 | `--source NAME` | Receipts from this configured source |
 | `--id UUID` | This receipt (repeatable) |
 | `--model-not MODEL` | Receipts whose latest extraction used a different model, or that have none |
-| `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing |
+| `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing. A receipt where that field is hand-edited is left out, since a run can't change it |
 | `--all` | Every receipt |
 | `--limit N` | At most `N` receipts, oldest first |
 
@@ -392,14 +508,14 @@ A receipt whose latest extraction already used the current prompt version **and*
 
 ### What a run writes
 
-By default a run fills only **empty** fields: a `null` `paid_amount` or `description`, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (ingested before extraction history was recorded, with an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)). A gated or failed run doesn't change that; the first run that applies a result does.
+By default a run fills only **empty** fields: a `null` `paid_amount`, `description`, order number or payment column, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (ingested before extraction history was recorded, with an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)). A gated or failed run doesn't change that; the first run that applies a result does.
 
-With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. On a receipt ingested before extraction history was recorded, every field counts as machine-extracted, before and after its first re-extraction: only `manual_fields` marks a hand edit.
+With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. On a receipt ingested before extraction history was recorded, every field counts as machine-extracted, before and after its first re-extraction: only `manual_fields` marks a hand edit. A field handed back with [`edit --clear-manual`](#edit) counts as machine-extracted too, even when ingest found it empty.
 
 In both modes:
 
 - a field a person has edited (`manual_fields`) is never written;
-- a field's confidence entry changes with the field;
+- a field's confidence entry changes with the field. One `payment` entry covers the three payment columns: it is written when they all hold the extracted values afterwards, and removed (and kept with the run) when a run changes some of them but leaves another that no longer matches, so it never describes values the receipt doesn't hold;
 - a `null` result never clears a value;
 - every change is printed as old and new, and kept with the run in the receipt's history (`receipt.extractions`: the full output, the fields applied and the values they replaced), so any run can be undone by hand.
 
@@ -487,7 +603,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source` (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. |
+| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields. |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
 | `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |

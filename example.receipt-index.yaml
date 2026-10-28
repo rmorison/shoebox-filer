@@ -67,3 +67,9 @@ ingest:
   retry_max_attempts: 3                # a content failure's last attempt is terminal; 1 = no automatic retries
   retry_backoff_seconds: [300, 1800, 7200, 43200]  # wait after attempt 1, 2, ...
   transient_item_max_seconds: 21600    # wall time since an item's first transient failure; after it, each one counts
+
+# ---------------------------------------------------------------------------
+# Annotations — changes made after extraction (optional block)
+# ---------------------------------------------------------------------------
+annotations:
+  actor: operator                      # the name `edit` records; `--as NAME` overrides it
