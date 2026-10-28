@@ -125,3 +125,30 @@ class TestManualAndCleared:
             receipt, _paid_meta(order_number="A-100"), _INGESTED, overwrite=True
         )
         assert "order_number" not in changes
+
+
+class TestDoneGateConfidence:
+    def test_a_null_confidence_for_a_changed_group_removes_the_entry(self) -> None:
+        # The stored 0.9 was the confidence in "card" alone. A run fills the
+        # last four and the payer but gives no payment confidence: the old
+        # entry no longer describes what the receipt holds.
+        receipt = _receipt(
+            payment_method="card", field_confidence={**_FC, "payment": 0.9}
+        )
+        meta = _meta(
+            payment={"method": "card", "last4": "1234", "payer": "Jane Doe"},
+            field_confidence=FieldConfidence(**_FC),
+        )
+        changes = plan_changes(receipt, meta, _INGESTED, overwrite=False)
+        assert changes["payment_last4"] == (None, "1234")
+        assert changes["field_confidence.payment"] == (0.9, None)
+
+    def test_nothing_changed_keeps_it(self) -> None:
+        receipt = _receipt(
+            payment_method="card", field_confidence={**_FC, "payment": 0.9}
+        )
+        meta = _meta(
+            payment={"method": "card"}, field_confidence=FieldConfidence(**_FC)
+        )
+        changes = plan_changes(receipt, meta, _INGESTED, overwrite=False)
+        assert "field_confidence.payment" not in changes

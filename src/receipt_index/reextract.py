@@ -132,8 +132,9 @@ def plan_changes(
       every field in its group holds the extracted value, and either one of
       them changed or the entry itself may be written. When a field in the
       group changes and the group then doesn't match (a null result left a
-      stored value in place), the entry is removed: listed as ``(old,
-      None)``. So an entry never describes a value the receipt doesn't hold.
+      stored value in place), or the run gives no confidence for the group,
+      the entry is removed: listed as ``(old, None)``. So an entry never
+      describes a value the receipt doesn't hold.
     - ``overwrite`` replaces the overall ``confidence`` when anything else
       changes; fill-only never writes it.
     - A null result never clears a value, and an unchanged value isn't listed.
@@ -171,13 +172,19 @@ def plan_changes(
             f: changes[f][1] if f in changes else _current(receipt, f) for f in group
         }
         group_changed = any(f in changes for f in group)
-        if all(_same(after[f], values[f]) for f in group):
+        if (
+            group_changed
+            and current is not None
+            and (new is None or not all(_same(after[f], values[f]) for f in group))
+        ):
+            # The stored entry described the group before this run changed
+            # it, and the run gives none that fits: remove it.
+            changes[name] = (current, None)
+        elif all(_same(after[f], values[f]) for f in group):
             if new is None or _same(current, new):
                 continue
             if group_changed or allowed(name, current):
                 changes[name] = (current, new)
-        elif group_changed and current is not None:
-            changes[name] = (current, None)
 
     if overwrite and changes and "confidence" not in manual:
         current = receipt.confidence
