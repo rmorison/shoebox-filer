@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 STUB_INPUT_TOKENS = 321
 STUB_OUTPUT_TOKENS = 45
 
-Reply = Literal["answer", "refusal"]
+Reply = Literal["answer", "refusal", "partial_refusal"]
 
 
 @dataclass
@@ -34,7 +34,8 @@ class StubAnthropic:
     ``reply`` is ``"answer"`` (a thinking block, then ``tool_input`` as a
     call to the request's first tool or, under structured output, as JSON
     text; or ``text`` when the request asks for neither) or ``"refusal"``
-    (``stop_reason: "refusal"`` with no content, as Haiku 5.5 declines).
+    (``stop_reason: "refusal"`` with no content, as Haiku 5.5 declines) or
+    ``"partial_refusal"`` (some text, then the refusal).
     """
 
     tool_input: dict[str, Any] = field(default_factory=dict)
@@ -53,6 +54,8 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 def _blocks(stub: StubAnthropic, request: dict[str, Any]) -> list[dict[str, Any]]:
     if stub.reply == "refusal":
         return []
+    if stub.reply == "partial_refusal":
+        return [{"type": "text", "text": '{"vendor": "Acme'}]
     # Haiku 5.5 thinks by default; its thinking text is omitted (empty).
     thinking = {"type": "thinking", "thinking": "", "signature": "sig_stub"}
     answer: dict[str, Any]
@@ -73,7 +76,7 @@ def _blocks(stub: StubAnthropic, request: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _stop(stub: StubAnthropic, request: dict[str, Any]) -> dict[str, Any]:
-    if stub.reply == "refusal":
+    if stub.reply in ("refusal", "partial_refusal"):
         return {
             "stop_reason": "refusal",
             "stop_details": {

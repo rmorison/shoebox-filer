@@ -28,7 +28,7 @@ from receipt_index.pdf_reader import create_vision_agent, extract_text
 from tests.unit.conftest import STUB_INPUT_TOKENS, STUB_OUTPUT_TOKENS
 
 if TYPE_CHECKING:
-    from tests.unit.conftest import StubAnthropic
+    from tests.unit.conftest import Reply, StubAnthropic
 
 _MODEL = "claude-haiku-5-5"
 _KEY = "stub-key-passed-in"
@@ -156,8 +156,9 @@ def test_pdf_vision_path_through_locked_stack(stub: StubAnthropic) -> None:
     assert "document" in _content_types(stub.requests[0])
 
 
-def test_refusal_is_a_clear_item_error(stub: StubAnthropic) -> None:
-    stub.reply = "refusal"
+@pytest.mark.parametrize("reply", ["refusal", "partial_refusal"])
+def test_refusal_is_a_clear_item_error(stub: StubAnthropic, reply: Reply) -> None:
+    stub.reply = reply
     agent = create_extraction_agent(api_key=_KEY, model=_MODEL)
 
     with pytest.raises(ExtractionRefusedError) as info:
@@ -200,8 +201,11 @@ def test_vision_text_path_through_locked_stack(stub: StubAnthropic) -> None:
     assert "document" in _content_types(stub.requests[0])
 
 
-def test_vision_text_refusal_is_not_swallowed(stub: StubAnthropic) -> None:
-    stub.reply = "refusal"
+@pytest.mark.parametrize("reply", ["refusal", "partial_refusal"])
+def test_vision_text_refusal_is_not_swallowed(
+    stub: StubAnthropic, reply: Reply
+) -> None:
+    stub.reply = reply
     agent = create_vision_agent(api_key=_KEY, model=_MODEL)
 
     with pytest.raises(ContentFilterError):

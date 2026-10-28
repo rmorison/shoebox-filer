@@ -8,6 +8,7 @@ from typing import Any
 
 import pdfplumber
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import AgentRunError, ContentFilterError
 
 from receipt_index.llm import DEFAULT_MODEL, anthropic_model
@@ -88,6 +89,8 @@ def create_vision_agent(
         output_type=str,
         system_prompt=_VISION_SYSTEM_PROMPT,
         model_settings=settings,
+        # A refusal ends the run, even after partial text.
+        capabilities=[RaiseContentFilterError()],
     )
 
 

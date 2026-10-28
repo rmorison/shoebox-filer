@@ -9,6 +9,7 @@ from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from pydantic_ai import Agent, BinaryContent
+from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import ContentFilterError
 
 from receipt_index.llm import anthropic_model
@@ -158,6 +159,8 @@ def create_extraction_agent(
         output_type=ReceiptMetadata,
         system_prompt=system_prompt,
         model_settings=settings,
+        # A refusal ends the run, even after partial text.
+        capabilities=[RaiseContentFilterError()],
     )
 
 
