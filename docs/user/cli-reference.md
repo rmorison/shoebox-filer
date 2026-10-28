@@ -5,6 +5,8 @@
 - [`uv run receipt-index ingest`](#ingest) — Fetch and process receipts from email
 - [`uv run receipt-index search`](#search) — Find receipts by metadata
 - [`uv run receipt-index show`](#show) — View full details for a receipt
+- [`uv run receipt-index failures`](#failures) — List items that failed or were skipped
+- [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
@@ -75,18 +77,48 @@ uv run receipt-index ingest
    - If the LLM confidence is too low, the item is skipped (not a receipt)
    - Renders the email as a PDF (using Playwright headless Chromium, with weasyprint fallback)
    - Stores the metadata in PostgreSQL and the PDF in the file store
-4. Saves each source's new read position, and reports processed/skipped/failed counts
+4. Saves each source's new read position.
+5. Runs the source's items that are due for a [retry](#retries), then reports processed/skipped/failed counts, retries included.
 
 Re-running `ingest` is safe — previously processed items are automatically skipped. Deleting a source's row from `receipt.sync_state` is safe too: the next run rescans that source from the start and skips everything already processed.
 
-At the start of each run, `ingest` logs a warning listing any item whose processing started more than an hour ago with no outcome recorded, which means the run handling it stopped mid-item. Such an item isn't retried automatically yet.
+### Retries
+
+A failed item is retried by a later run. Each failure is recorded with a class:
+
+| Class | Examples | Uses up an attempt | Retried after |
+|---|---|---|---|
+| `transient` | The LLM is overloaded or rate-limited, a server error, a dropped connection or timeout, a source that can't be reached | No | 30 seconds, doubling with each such failure in a row, up to 15 minutes |
+| `config` | The LLM API key is rejected, or the account's credits ran out | No | The same as `transient` |
+| `content` | The message can't be parsed or rendered, the extraction fails validation, the model declines the request | Yes | `ingest.retry_backoff_seconds` for that attempt (5 minutes, then 30 minutes) |
+
+The failure of attempt `ingest.retry_max_attempts` (default 3) is **terminal**: the item isn't retried automatically again, and only [`retry`](#retry) puts it back. An item that keeps failing transiently for `ingest.transient_item_max_seconds` (default six hours) has its next transient failure count as an attempt, so it can't hold up retries for ever. A `config` failure never counts, since it isn't the item's fault.
+
+A `transient` or `config` failure also stops the source for the rest of the run, since the next item would most likely fail the same way. An LLM outage during a large backfill therefore costs one failed item per run, not one per item.
+
+Each run's retry pass picks up, for the sources it holds:
+
+- failed items whose retry time has come;
+- items requeued with [`retry`](#retry);
+- items whose processing started but has no outcome, because the run handling them stopped mid-item. Each is recorded as a failure that uses up an attempt, then retried after the normal backoff.
+
+A retry finds the item again by its source ID: an IMAP message by its `Message-ID` in the watched folder, a Drive file by its file ID. An item that can't be found fails as `content`. Messages without a `Message-ID` can't be found yet. Skipped items (not receipts) are never retried automatically.
+
+Failures recorded before retries existed have no class, and start out terminal. Use [`retry`](#retry) to run them again.
+
+```yaml
+ingest:
+  retry_max_attempts: 3                         # 1 turns automatic retries off
+  retry_backoff_seconds: [300, 1800, 7200, 43200]  # needs at least retry_max_attempts - 1 entries
+  transient_item_max_seconds: 21600
+```
 
 **Exit codes**:
 
 | Code | Meaning |
 |---|---|
 | 0 | Success, even if some items were skipped |
-| 1 | An item failed to process, or a source couldn't be read |
+| 1 | An item failed to process, a source couldn't be read, or a source stopped after a transient or config failure |
 | 3 | A source was skipped because another process holds it (a running `ingest`). The other sources still run |
 
 Useful for cron job monitoring.
@@ -240,6 +272,83 @@ store:
 
 ---
 
+## failures
+
+List the items whose latest attempt failed, one line per item, newest first.
+
+```bash
+uv run receipt-index failures [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt) or `queued` (requeued with `retry`, waiting for the next ingest) |
+| `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
+| `--source NAME` | Only items from this source |
+| `--output text\|json` | Output format (default: `text`) |
+
+The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class` and `stored_ref`.
+
+---
+
+## retry
+
+Requeue failed or skipped items, so that the next `ingest` runs them again. Without `--yes` it only previews.
+
+```bash
+uv run receipt-index retry [SOURCE_ID ...] [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `SOURCE_ID ...`, `--source-id ID` | Only these items (repeatable) |
+| `--status failed\|skipped` | Requeue items whose latest record has this status (default: `failed`) |
+| `--error-like TEXT` | Only items whose error contains this text, ignoring case |
+| `--class transient\|content\|config` | Only items whose failure has this class |
+| `--transient` | The same as `--class transient` |
+| `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
+| `--source NAME` | Only items from this source |
+| `--all` | Allow a selection that matches every item of the status |
+| `--yes` | Requeue the items. Without it, nothing is written |
+| `--output text\|json` | Output format (default: `text`) |
+
+Filters combine with AND. A selection with nothing narrower than `--status` (and `--source`) is refused unless `--all` is given, so a typo can't requeue every failure.
+
+### What it does
+
+- **Without `--yes`** it lists the matching items (when, status, class, attempt, subject or source ID, error), and the count. Nothing is written.
+- **With `--yes`** it requeues the same list. For each item it takes the item's lock and checks that its latest record hasn't changed since it was listed. An item another process holds, or that changed, is reported and left alone. Each requeued item gets a new `queued` record; the log is never edited or deleted. The item's attempt count starts again at 1.
+- **Each requeue is recorded** in `receipt.retry_requests`: who ran it (the operating-system user and the database user), when, the filters, how many items matched and how many were requeued. The `queued` records point to it by `retry_request_id`.
+- **Orphaned files.** A failure after the PDF was stored but before the database write leaves a file no receipt points to. The failure records the file (`stored_ref`), and `retry` lists each matched item's file that still exists and no receipt references. Failures recorded before this existed can't be checked; `retry` says how many there are, so they can be checked by hand. Nothing is deleted.
+
+The next `ingest` runs the queued items, whether it runs from the schedule or by hand.
+
+Exit codes: 0 on success, including a dry run; 1 when an item couldn't be requeued; 2 for a usage error or a refused selection.
+
+### Examples
+
+```bash
+# What would requeue the transient failures since a date?
+uv run receipt-index retry --transient --since 2026-10-01
+
+# Requeue them
+uv run receipt-index retry --transient --since 2026-10-01 --yes
+
+# Requeue failures with a known environmental cause
+uv run receipt-index retry --error-like "renderer" --yes
+
+# Take a second look at skipped items from one source
+uv run receipt-index retry --status skipped --source personal-email --all --yes
+
+# Who requeued what
+psql "$DATABASE_URL" -c "SELECT requested_at, requested_by, filters, matched, requeued
+                         FROM receipt.retry_requests ORDER BY requested_at DESC;"
+```
+
+---
+
 ## reextract
 
 Re-extract existing receipts with the current extraction prompt and model, and record each run in the receipt's extraction history. This is how receipts ingested before a field existed get it, such as the paid amount.
@@ -375,7 +484,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 | `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source` (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
-| `list_failures` | `limit`, `offset` | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives, newest first |
+| `list_failures` | `limit`, `offset` | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives (items whose latest attempt failed), newest first |
 
 Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. The `source` filter is an exact match on `source_name`. Results carry no file content; only `get_receipt_file` returns content.
 
