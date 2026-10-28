@@ -328,6 +328,74 @@ class TestIngestLocking:
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
+    def test_a_stopped_retry_pass_fails_the_run(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        from receipt_index.pipeline import RetryResult
+
+        mock_load_config.return_value = _make_config()
+        mock_run.return_value = IngestResult()
+        with (
+            patch(
+                "receipt_index.repository.select_due",
+                return_value=[MagicMock(source_id="<a@example.com>")],
+            ),
+            patch(
+                "receipt_index.pipeline.run_due_retries",
+                return_value=RetryResult(stopped="stopped after a transient failure"),
+            ),
+        ):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        assert result.exit_code == 1
+        assert "retries stopped after a transient failure" in result.output
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_dry_run_counts_due_retries_without_running_them(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        mock_run.return_value = IngestResult()
+        due = [MagicMock(), MagicMock()]
+        with (
+            patch("receipt_index.repository.select_due", return_value=due) as sel,
+            patch("receipt_index.pipeline.run_due_retries") as retries,
+        ):
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(config_file), "ingest", "--dry-run", "--limit", "5"],
+            )
+        retries.assert_not_called()
+        assert result.exit_code == 0
+        assert "Source test-email: 2 item(s) due for a retry" in result.output
+        kw = sel.call_args.kwargs
+        assert kw["limit"] == 5
+        assert kw["configured"] == ["test-email", "other-email"]
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
     def test_no_retries_when_the_read_stopped(
         self,
         mock_load_config: MagicMock,

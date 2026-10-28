@@ -13,10 +13,11 @@ A ``content`` failure uses up an attempt. The failure of attempt
 after ``retry_backoff_seconds[n - 1]``. A ``transient`` or ``config``
 failure uses up no attempt (``counts_attempt = false``) and is due again
 after 30 seconds, doubling with each such failure in a row up to 15 minutes.
-Once an item has been failing transiently for ``transient_item_max_seconds``
-(counted from the first of those failures in a row), its next transient
-failure uses up an attempt like a content failure. Config failures, which
-aren't the item's fault, never do.
+Once ``transient_item_max_seconds`` have passed since an item's first
+transient failure (since it was last requeued), each further transient
+failure uses up an attempt like a content failure, so the item can't hold up
+retries for ever. Config failures, which aren't the item's fault, never
+count towards that time and never use up an attempt.
 """
 
 from __future__ import annotations
@@ -58,13 +59,14 @@ class AttemptState:
     """Where an item stands before its next attempt.
 
     ``number`` is the attempt about to run. ``uncounted`` is how many
-    uncounted failures came in a row just before it, and ``uncounted_since``
-    when the first of them was written.
+    uncounted failures came in a row just before it (for the transient
+    delay). ``transient_since`` is when the item first failed transiently
+    since it was last requeued (for the transient cap).
     """
 
     number: int = 1
     uncounted: int = 0
-    uncounted_since: datetime | None = None
+    transient_since: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -81,29 +83,32 @@ def attempt_state(history: Sequence[IngestLogEntry]) -> AttemptState:
     """The state of an item from its rows, newest first.
 
     ``started`` rows are passed over: the attempt they began is numbered by
-    the failed row that ends it (or by this state, for a dead one).
+    the failed row that ends it (or by this state, for a dead one). History
+    before the latest ``queued`` row doesn't count: a requeue starts afresh.
     """
-    uncounted = 0
-    since: datetime | None = None
-    number = 1
+    since_queue: list[IngestLogEntry] = []
     for row in history:
-        if row.status == "started":
-            continue
         if row.status == "queued":
-            return AttemptState(1, uncounted, since)
-        if row.status != "failed":
             break
+        if row.status == "failed":
+            since_queue.append(row)
+        elif row.status != "started":
+            # A final outcome before the failures: nothing older matters.
+            break
+
+    number = 1
+    uncounted = 0
+    for row in since_queue:
         if row.counts_attempt:
-            return AttemptState(row.attempt + 1, uncounted, since)
-        uncounted += 1
-        since = row.created_at
-        # An uncounted failure keeps its attempt number; keep looking back
-        # for where the run of them started.
-        if uncounted == 1:
+            number = row.attempt + 1
+            break
+        if uncounted == 0:
+            # An uncounted failure keeps its attempt number.
             number = row.attempt
-    if uncounted:
-        return AttemptState(number, uncounted, since)
-    return AttemptState()
+        uncounted += 1
+
+    transient = [r.created_at for r in since_queue if r.error_class == "transient"]
+    return AttemptState(number, uncounted, min(transient) if transient else None)
 
 
 def failure_fields(
@@ -114,8 +119,8 @@ def failure_fields(
 ) -> FailureFields:
     """The retry columns for a failure of attempt ``state.number``."""
     counts = error_class == "content"
-    if error_class == "transient" and state.uncounted_since is not None:
-        elapsed = (now - state.uncounted_since).total_seconds()
+    if error_class == "transient" and state.transient_since is not None:
+        elapsed = (now - state.transient_since).total_seconds()
         counts = elapsed >= policy.transient_item_max_seconds
     if not counts:
         delay = min(TRANSIENT_FIRST_SECONDS * 2**state.uncounted, TRANSIENT_MAX_SECONDS)

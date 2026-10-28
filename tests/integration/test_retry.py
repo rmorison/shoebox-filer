@@ -368,3 +368,29 @@ def test_failures_filters_over_the_latest_row(
         "<twice@x>",
     ]
     pg_conn.commit()
+
+
+def test_type_skips_are_not_requeued(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+) -> None:
+    """A Drive file skipped for its type can't be ingested by a retry."""
+    insert_ingest_log(
+        pg_conn,
+        source_id="file-zip",
+        source_type="gdrive",
+        status="skipped",
+        error_message="Skipped: unsupported file type (application/zip, a.zip)",
+    )
+    insert_ingest_log(
+        pg_conn,
+        source_id="file-pdf",
+        source_type="gdrive",
+        status="skipped",
+        error_message="Skipped: amount=0, confidence=0.20",
+    )
+    insert_ingest_log(
+        pg_conn, source_id="<legacy@x>", source_type="imap", status="skipped"
+    )
+    found = select_retry_candidates(pg_conn, RetryFilter(status="skipped"))
+    pg_conn.commit()
+    assert sorted(e.source_id for e in found) == ["<legacy@x>", "file-pdf"]

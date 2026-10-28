@@ -255,3 +255,40 @@ class TestFailures:
         data = json.loads(result.output)
         assert data[0]["error_class"] == "transient"
         assert data[1]["next_retry_at"].startswith("2026-10-27")
+
+
+def test_requeue_count_is_written_after_a_failed_write() -> None:
+    """A write that fails mid-loop aborts the transaction; the count still lands."""
+    from unittest.mock import MagicMock
+
+    from receipt_index import requeue
+    from receipt_index.repository import RetryFilter
+
+    entries = [_entry("<a@example.com>"), _entry("<b@example.com>")]
+    conn = MagicMock()
+    calls: list[str] = []
+    conn.rollback.side_effect = lambda: calls.append("rollback")
+    with (
+        patch.object(requeue, "insert_retry_request", return_value=_REQUEST),
+        patch.object(
+            requeue,
+            "get_item_history",
+            side_effect=lambda c, sid, limit: [
+                e for e in entries if e.source_id == sid
+            ],
+        ),
+        patch.object(requeue, "has_receipt", return_value=False),
+        patch.object(
+            requeue,
+            "insert_ingest_log",
+            side_effect=[None, RuntimeError("connection reset")],
+        ),
+        patch.object(
+            requeue,
+            "set_retry_request_count",
+            side_effect=lambda c, rid, n: calls.append(f"count={n}"),
+        ),
+        pytest.raises(RuntimeError),
+    ):
+        requeue.apply_requeue(conn, RetryFilter(error_class="transient"), entries)
+    assert calls[-2:] == ["rollback", "count=1"]

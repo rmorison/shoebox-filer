@@ -74,19 +74,49 @@ class TestAttemptState:
 
     def test_uncounted_failures_keep_the_number_and_count_the_run(self) -> None:
         history = [
-            _row("failed", 1, attempt=2, counts_attempt=False),
+            _row("failed", 1, attempt=2, counts_attempt=False, error_class="transient"),
             _row("started", 2, attempt=2),
-            _row("failed", 3, attempt=2, counts_attempt=False),
-            _row("failed", 60, attempt=1),
+            _row("failed", 3, attempt=2, counts_attempt=False, error_class="transient"),
+            _row("failed", 60, attempt=1, error_class="content"),
         ]
         state = attempt_state(history)
         assert state.number == 2
         assert state.uncounted == 2
-        assert state.uncounted_since == _NOW - timedelta(minutes=3)
+        assert state.transient_since == _NOW - timedelta(minutes=3)
+
+    def test_transient_window_spans_counted_failures(self) -> None:
+        """The cap is six hours in total, not six hours per attempt."""
+        history = [
+            _row("failed", 1, attempt=2, counts_attempt=False, error_class="transient"),
+            _row("failed", 400, attempt=1, error_class="transient"),  # cap tripped
+            _row(
+                "failed", 800, attempt=1, counts_attempt=False, error_class="transient"
+            ),
+        ]
+        state = attempt_state(history)
+        assert state.number == 2
+        assert state.transient_since == _NOW - timedelta(minutes=800)
+
+    def test_config_failures_dont_start_the_transient_window(self) -> None:
+        history = [
+            _row("failed", 1, attempt=1, counts_attempt=False, error_class="config"),
+            _row("failed", 900, attempt=1, counts_attempt=False, error_class="config"),
+        ]
+        state = attempt_state(history)
+        assert (state.number, state.uncounted, state.transient_since) == (1, 2, None)
+
+    def test_history_before_a_requeue_is_ignored(self) -> None:
+        history = [
+            _row("failed", 1, attempt=1, counts_attempt=False, error_class="transient"),
+            _row("queued", 5, attempt=0, counts_attempt=False),
+            _row("failed", 900, attempt=3, error_class="transient"),
+        ]
+        state = attempt_state(history)
+        assert state.transient_since == _NOW - timedelta(minutes=1)
 
     def test_uncounted_after_a_queue_starts_from_one(self) -> None:
         history = [
-            _row("failed", 1, attempt=1, counts_attempt=False),
+            _row("failed", 1, attempt=1, counts_attempt=False, error_class="transient"),
             _row("queued", 5, attempt=0, counts_attempt=False),
         ]
         assert attempt_state(history) == AttemptState(1, 1, _NOW - timedelta(minutes=1))

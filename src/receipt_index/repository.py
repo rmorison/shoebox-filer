@@ -8,6 +8,7 @@ from uuid import UUID
 
 from psycopg.types.json import Jsonb
 
+from receipt_index.adapters.gdrive import UNSUPPORTED_REASON
 from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
@@ -661,18 +662,30 @@ def select_due(
     *,
     source_name: str,
     source_type: str,
+    configured: list[str] | None = None,
     limit: int | None = None,
 ) -> list[IngestLogEntry]:
     """Items due for a retry from one source, oldest first.
 
-    A row with no ``source_name`` (written before rows named their source)
-    belongs to every source of its type.
+    A row that names no source (written before rows named their source), or
+    a source not in ``configured`` (renamed or removed), belongs to every
+    source of its type; the re-fetch tries each of them. The item lock keeps
+    two passes from running it twice.
     """
-    params: dict[str, object] = {"name": source_name, "type": source_type}
+    params: dict[str, object] = {
+        "name": source_name,
+        "type": source_type,
+        # Without the configured names, only rows that name no source fall
+        # through.
+        "configured": list(configured) if configured is not None else None,
+    }
     sql = (
         f"SELECT * FROM ({_LATEST}) l WHERE {_DUE} "
         "AND (l.source_name = %(name)s"
-        " OR (l.source_name IS NULL AND l.source_type = %(type)s)) "
+        " OR ((l.source_name IS NULL"
+        " OR (%(configured)s::text[] IS NOT NULL"
+        " AND l.source_name <> ALL(%(configured)s::text[])))"
+        " AND l.source_type = %(type)s)) "
         "AND NOT EXISTS (SELECT 1 FROM receipt.receipts r"
         " WHERE r.source_id = l.source_id) "
         "ORDER BY created_at ASC, id ASC"
@@ -734,6 +747,11 @@ def select_retry_candidates(
         "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
     ]
     params: dict[str, object] = {"status": spec.status}
+    if spec.status == "skipped":
+        # A file skipped for its type can't be ingested however often it is
+        # asked: only skips the model judged are worth a second look.
+        clauses.append("COALESCE(l.error_message, '') NOT LIKE %(type_skip)s")
+        params["type_skip"] = f"Skipped: {_escape_like(UNSUPPORTED_REASON)} (%"
     if spec.source_ids:
         clauses.append("l.source_id = ANY(%(ids)s)")
         params["ids"] = list(spec.source_ids)

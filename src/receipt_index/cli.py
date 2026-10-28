@@ -207,6 +207,7 @@ def ingest(
                         conn,
                         source_name=source_config.name,
                         source_type=source_config.type,
+                        configured=[s.name for s in config.sources],
                         limit=limit,
                     )
                     if dry_run:

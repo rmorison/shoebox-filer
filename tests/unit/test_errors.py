@@ -8,6 +8,7 @@ from pydantic_ai.exceptions import (
     ModelAuthenticationError,
     ModelConnectionError,
     ModelHTTPError,
+    ModelNotFoundError,
     ModelOverloadedError,
     ModelQuotaExceededError,
     ModelRateLimitError,
@@ -57,6 +58,8 @@ def test_transient(exc: Exception) -> None:
         ModelQuotaExceededError(_M, "Your credit balance is too low"),
         ModelHTTPError(401, _M),
         ModelHTTPError(403, _M),
+        ModelNotFoundError(_M, "model: claude-retired"),
+        ModelHTTPError(404, _M),
     ],
     ids=lambda e: type(e).__name__,
 )

@@ -283,6 +283,30 @@ class TestSyncStateRepository:
             )
         ] == ["<legacy@example.com>"]
 
+        # A source renamed in the config: its rows belong to the sources of
+        # its type, like rows that name no source.
+        renamed = select_due(
+            pg_conn,
+            source_name="mail",
+            source_type="imap",
+            configured=["mail", "drive-scans"],
+        )
+        assert [r.source_id for r in renamed] == [
+            "<legacy@example.com>",
+            "<other@example.com>",
+            "<queued@example.com>",
+            "<due@example.com>",
+            "<dead@example.com>",
+        ]
+        # ...but never a configured source's rows.
+        still_configured = select_due(
+            pg_conn,
+            source_name="mail",
+            source_type="imap",
+            configured=["mail", "other"],
+        )
+        assert "<other@example.com>" not in [r.source_id for r in still_configured]
+
 
 # ---------------------------------------------------------------------------
 # Locks

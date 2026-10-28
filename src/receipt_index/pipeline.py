@@ -130,7 +130,7 @@ def _record_failure(
     *,
     source_id: str,
     source_type: str,
-    source_name: str,
+    source_name: str | None,
     subject: str,
     sender: str,
     email_date: Any,
@@ -749,7 +749,7 @@ def run_due_retries(
                     conn,
                     source_id=entry.source_id,
                     source_type=source_type,
-                    source_name=source_name or "",
+                    source_name=source_name,
                     subject=latest.email_subject or "",
                     sender=latest.email_sender or "",
                     email_date=email_date,
@@ -775,12 +775,14 @@ def run_due_retries(
                 logger.error("Retries stopped: %s", exc)
                 break
 
-            name = fetched.source_name or source_name or ""
+            # A row that names no source keeps NULL, so the retry pass of
+            # every source of its type still selects it.
+            name = fetched.source_name or source_name
             insert_ingest_log(
                 conn,
                 source_id=entry.source_id,
                 source_type=source_type,
-                source_name=name or None,
+                source_name=name,
                 status="started",
                 email_subject=latest.email_subject,
                 email_sender=latest.email_sender,
@@ -816,7 +818,8 @@ def run_due_retries(
                 conn,
                 raw,
                 store=store,
-                source_name=name,
+                # Found, so the source that had it is known.
+                source_name=fetched.source_name or raw.source_name,
                 source_type=source_type,
                 agent=agent,
                 llm_model=llm_model,

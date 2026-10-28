@@ -57,10 +57,13 @@ def _transient_types() -> tuple[type[BaseException], ...]:
 def _config_types() -> tuple[type[BaseException], ...]:
     from pydantic_ai.exceptions import (
         ModelAuthenticationError,
+        ModelNotFoundError,
         ModelQuotaExceededError,
     )
 
-    return (ModelAuthenticationError, ModelQuotaExceededError)
+    # A model the API doesn't know (a retired or mistyped llm.model) fails
+    # every item the same way, like a rejected key.
+    return (ModelAuthenticationError, ModelNotFoundError, ModelQuotaExceededError)
 
 
 def _chain(exc: BaseException) -> list[BaseException]:
@@ -99,7 +102,7 @@ def classify(exc: BaseException) -> ErrorClass:
     if any(isinstance(e, refusal) for e in chain):
         return "content"
     config = _config_types()
-    if any(isinstance(e, config) or _http_status(e) in (401, 403) for e in chain):
+    if any(isinstance(e, config) or _http_status(e) in (401, 403, 404) for e in chain):
         return "config"
     transient = _transient_types()
     if any(isinstance(e, transient) or _http_transient(e) for e in chain):

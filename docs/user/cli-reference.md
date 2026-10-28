@@ -89,10 +89,10 @@ A failed item is retried by a later run. Each failure is recorded with a class:
 | Class | Examples | Uses up an attempt | Retried after |
 |---|---|---|---|
 | `transient` | The LLM is overloaded or rate-limited, a server error, a dropped connection or timeout, a source that can't be reached | No | 30 seconds, doubling with each such failure in a row, up to 15 minutes |
-| `config` | The LLM API key is rejected, or the account's credits ran out | No | The same as `transient` |
+| `config` | The LLM API key is rejected, the account's credits ran out, or the configured model doesn't exist (a retired or mistyped `llm.model`) | No | The same as `transient` |
 | `content` | The message can't be parsed or rendered, the extraction fails validation, the model declines the request | Yes | `ingest.retry_backoff_seconds` for that attempt (5 minutes, then 30 minutes) |
 
-The failure of attempt `ingest.retry_max_attempts` (default 3) is **terminal**: the item isn't retried automatically again, and only [`retry`](#retry) puts it back. An item that keeps failing transiently for `ingest.transient_item_max_seconds` (default six hours) has its next transient failure count as an attempt, so it can't hold up retries for ever. A `config` failure never counts, since it isn't the item's fault.
+The failure of attempt `ingest.retry_max_attempts` (default 3) is **terminal**: the item isn't retried automatically again, and only [`retry`](#retry) puts it back. Once `ingest.transient_item_max_seconds` (default six hours) have passed since an item's first transient failure, each further transient failure counts as an attempt, so the item can't hold up retries for ever. A `config` failure never counts, since it isn't the item's fault.
 
 A `transient` or `config` failure also stops the source for the rest of the run, since the next item would most likely fail the same way. An LLM outage during a large backfill therefore costs one failed item per run, not one per item.
 
@@ -102,7 +102,7 @@ Each run's retry pass picks up, for the sources it holds:
 - items requeued with [`retry`](#retry);
 - items whose processing started but has no outcome, because the run handling them stopped mid-item. Each is recorded as a failure that uses up an attempt, then retried after the normal backoff.
 
-A retry finds the item again by its source ID: an IMAP message by its `Message-ID` in the watched folder, a Drive file by its file ID. An item that can't be found fails as `content`. Messages without a `Message-ID` can't be found yet. Skipped items (not receipts) are never retried automatically.
+A retry finds the item again by its source ID: an IMAP message by its `Message-ID` in the watched folder, a Drive file by its file ID. An item recorded before records named their source, or under a source since renamed or removed from the configuration, is looked for in every configured source of its type. An item that can't be found fails as `content`. Messages without a `Message-ID` can't be found yet. Skipped items (not receipts) are never retried automatically.
 
 Failures recorded before retries existed have no class, and start out terminal. Use [`retry`](#retry) to run them again.
 
@@ -304,7 +304,7 @@ uv run receipt-index retry [SOURCE_ID ...] [OPTIONS]
 | Option | Description |
 |---|---|
 | `SOURCE_ID ...`, `--source-id ID` | Only these items (repeatable) |
-| `--status failed\|skipped` | Requeue items whose latest record has this status (default: `failed`) |
+| `--status failed\|skipped` | Requeue items whose latest record has this status (default: `failed`). Drive files skipped for an unsupported file type are never requeued |
 | `--error-like TEXT` | Only items whose error contains this text, ignoring case |
 | `--class transient\|content\|config` | Only items whose failure has this class |
 | `--transient` | The same as `--class transient` |

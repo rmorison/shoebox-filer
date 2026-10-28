@@ -1114,5 +1114,36 @@ class TestRetryScheduler:
         assert row["next_retry_at"] is None  # attempt 3 of 3: terminal
 
 
+class TestRetrySourceName:
+    """A row that names no source keeps NULL, so later passes still find it."""
+
+    def test_gone_legacy_item_keeps_no_source_name(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "queued", attempt=0, source_name=None)]
+        _retry(history[sid], FetchByIdAdapter(gone={sid}))
+        assert [k["source_name"] for k in repo.row_kwargs] == [None, None]
+
+    def test_dead_started_legacy_item_keeps_no_source_name(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "started", source_name=None)]
+        _retry(history[sid], FetchByIdAdapter())
+        assert [k["source_name"] for k in repo.row_kwargs] == [None]
+
+    def test_found_legacy_item_records_the_source_that_had_it(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "queued", attempt=0, source_name=None)]
+        _retry(history[sid], FetchByIdAdapter())
+        assert [k["source_name"] for k in repo.row_kwargs] == [
+            "personal-email",
+            "personal-email",
+        ]
+
+
 def _past() -> datetime:
     return datetime.now(tz=UTC) - timedelta(minutes=1)

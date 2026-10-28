@@ -150,5 +150,8 @@ def apply_requeue(
                 )
                 outcome.requeued.append(entry.source_id)
     finally:
+        # Every queued row so far is committed; a write that failed mid-loop
+        # left an aborted transaction, which the count update can't use.
+        conn.rollback()
         set_retry_request_count(conn, request_id, len(outcome.requeued))
     return outcome
