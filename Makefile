@@ -7,6 +7,14 @@ ifneq (,$(wildcard .env))
   $(foreach var,$(ENV_VARS),$(eval export $(var)))
 endif
 
+# On the server, the owner credentials (MIGRATION_DATABASE_URL among them) live
+# in .env.db, which the scheduler container never reads. Load it after .env so
+# `make migrate-up` finds them. A dev checkout has no .env.db.
+ifneq (,$(wildcard .env.db))
+  DB_ENV_VARS := $(shell sed -e '/^\#/d' -e '/^$$/d' -e 's/\#.*//' -e 's/ *$$//' .env.db)
+  $(foreach var,$(DB_ENV_VARS),$(eval export $(var)))
+endif
+
 # golang-migrate — auto-downloaded to .bin/ if not present
 MIGRATE_VERSION := 4.18.3
 MIGRATE_BIN := .bin/migrate

@@ -16,7 +16,7 @@ docker compose ps          # Verify it's healthy
 Ensure you're using the migration superuser URL, not the app URL:
 
 ```bash
-# Uses MIGRATION_DATABASE_URL from .env
+# Uses MIGRATION_DATABASE_URL: from .env in a dev checkout, from .env.db on the server
 make migrate-up
 ```
 

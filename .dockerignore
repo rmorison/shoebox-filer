@@ -13,6 +13,7 @@ build/
 htmlcov/
 .coverage
 .env
+.env.*
 data/
 deploy/
 docs/

@@ -22,6 +22,8 @@ env/
 
 # Environment and config
 .env
+# Server owner credentials, and backup copies such as .env.pre-split
+.env.*
 receipt-index.yaml
 # ...but the server config in deploy/ holds no secrets (only ${VAR} refs) and
 # is version-controlled. The bare pattern above matches at any depth.
