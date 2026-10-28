@@ -1145,5 +1145,30 @@ class TestRetrySourceName:
         ]
 
 
+class TestRetryOtherSourceDown:
+    def test_another_source_down_skips_only_that_item(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        ids = ["<msg-1@example.com>", "<msg-2@example.com>"]
+        for sid in ids:
+            history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        adapter = FetchByIdAdapter(unavailable_from=ids[0])
+        due = [history[s][0] for s in ids]
+        # The pass runs for "mail"; the item is looked for in "personal-email".
+        result = _retry(due, adapter, own_source="mail")
+        assert result.stopped is None
+        assert repo.rows == []  # the second item hits the same down source
+        assert adapter.fetched == [ids[0]]
+
+    def test_own_source_down_stops_the_pass(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        adapter = FetchByIdAdapter(unavailable_from=sid)
+        result = _retry(history[sid], adapter, own_source="personal-email")
+        assert result.stopped is not None
+
+
 def _past() -> datetime:
     return datetime.now(tz=UTC) - timedelta(minutes=1)

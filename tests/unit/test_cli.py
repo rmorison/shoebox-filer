@@ -374,7 +374,7 @@ class TestIngestLocking:
     ) -> None:
         mock_load_config.return_value = _two_source_config()
         mock_run.return_value = IngestResult()
-        due = [MagicMock(), MagicMock()]
+        due = [MagicMock(source_id="<a@x>"), MagicMock(source_id="<b@x>")]
         with (
             patch("receipt_index.repository.select_due", return_value=due) as sel,
             patch("receipt_index.pipeline.run_due_retries") as retries,
@@ -386,6 +386,8 @@ class TestIngestLocking:
         retries.assert_not_called()
         assert result.exit_code == 0
         assert "Source test-email: 2 item(s) due for a retry" in result.output
+        # The same items, due in the second source's pass too, count once.
+        assert "Source other-email: 2 item(s) due" not in result.output
         kw = sel.call_args.kwargs
         assert kw["limit"] == 5
         assert kw["configured"] == ["test-email", "other-email"]

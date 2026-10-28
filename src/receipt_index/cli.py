@@ -159,6 +159,7 @@ def ingest(
     # The retry adapters are closed when the command's context ends.
     stack = ctx.with_resource(ExitStack())
     pool = SourcePool(config.sources, _source_adapter(config), stack)
+    counted_due: set[str] = set()
 
     for source_config in sources:
         if isinstance(source_config, ImapSourceConfig):
@@ -211,6 +212,10 @@ def ingest(
                         limit=limit,
                     )
                     if dry_run:
+                        # An item that names no configured source is due in
+                        # every pass of its type: count it once.
+                        due = [d for d in due if d.source_id not in counted_due]
+                        counted_due.update(d.source_id for d in due)
                         if due:
                             click.echo(
                                 f"Source {source_config.name}: "
@@ -225,6 +230,7 @@ def ingest(
                             agents=agents,
                             llm_model=config.llm.model,
                             policy=policy,
+                            own_source=source_config.name,
                         )
                         result.processed += retried.processed
                         result.skipped += retried.skipped

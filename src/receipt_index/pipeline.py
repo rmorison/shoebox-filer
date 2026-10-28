@@ -702,6 +702,7 @@ def run_due_retries(
     agents: Mapping[str, Agent[None, ReceiptMetadata]],
     llm_model: str,
     policy: RetryPolicy | None = None,
+    own_source: str | None = None,
 ) -> RetryResult:
     """Run the items that are due again, one at a time.
 
@@ -714,8 +715,10 @@ def run_due_retries(
       ``started``, so an unreachable source leaves no row and uses up no
       attempt, then process it as attempt ``n``.
 
-    ``agents`` maps ``"email"`` and ``"document"`` to their agents. A source
-    that can't be reached, or a transient or config failure, ends the pass.
+    ``agents`` maps ``"email"`` and ``"document"`` to their agents. The pass
+    ends when ``own_source`` (the source it runs for) can't be reached, or
+    on a transient or config failure. When another source of the type can't
+    be reached, only the item being looked for there is left for later.
     """
     policy = policy or RetryPolicy()
     result = RetryResult()
@@ -771,9 +774,15 @@ def run_due_retries(
                     source_type=source_type,
                 )
             except SourceDownError as exc:
-                result.stopped = str(exc)
-                logger.error("Retries stopped: %s", exc)
-                break
+                if own_source is None or own_source in pool.unavailable:
+                    result.stopped = str(exc)
+                    logger.error("Retries stopped: %s", exc)
+                    break
+                # Another source of the type is down (an item that names no
+                # configured source is looked for in each): leave this item
+                # for a later run, and carry on with the rest of the pass.
+                logger.warning("Retry of %s left for later: %s", entry.source_id, exc)
+                continue
 
             # A row that names no source keeps NULL, so the retry pass of
             # every source of its type still selects it.
