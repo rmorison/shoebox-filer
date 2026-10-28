@@ -855,7 +855,7 @@ docker compose -f deploy/docker-compose.yml build
 # container or a failed exec never reads as idle. If `docker compose ps` shows
 # the scheduler isn't running, there is no cycle to wait for. The `[r]` keeps
 # grep from matching the shell that runs it.
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
@@ -1064,10 +1064,10 @@ Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. The ser
 docker compose -f deploy/docker-compose.yml config --quiet
 ```
 
-**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints `idle`, as in [8.1](#81-upgrade):
+**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. When step 5 changed a file `db` reads (the single `.env`, or `.env.db`), `up -d scheduler` recreates `db` too: Postgres restarts on the same volume, which takes seconds, and the scheduler waits for it to be healthy. Go on past the check only when it prints `idle`, as in [8.1](#81-upgrade):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1117,7 +1117,7 @@ DROP OWNED BY receipt_index_mcp;
 DROP ROLE receipt_index_mcp;
 ```
 
-**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again, so an owner credential is back in the scheduler's environment, and the check in [8.5](#85-split-the-owner-credentials-out-of-env) step 6 names `DATABASE_URL` until you switch again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
+**Rollback.** Put the old `DATABASE_URL` line back in `.env` (the application logs in as `receipt_index` again, so an owner credential is back in the scheduler's environment, and the check in [8.5](#85-split-the-owner-credentials-out-of-env) step 6 names `DATABASE_URL` until you switch again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it. On a server that has split, the old line is the comment you kept in `.env.db`: move it into `.env`. Uncommenting it in `.env.db` changes nothing the scheduler reads.
 
 ### 8.5 Split the owner credentials out of `.env`
 
@@ -1170,7 +1170,7 @@ docker compose -f deploy/docker-compose.yml config --quiet   # must print nothin
 **5. Recreate both containers between ingest cycles.** `db`'s environment changed, so `up -d` recreates it as well as the scheduler: Postgres restarts on the same volume, which takes seconds. Stop the scheduler first, as in [8.1](#81-upgrade), so no cycle runs while the database restarts. Go on past the check only when it prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 make migrate-up      # "no change", or this release's migrations; it reads .env.db
 docker compose -f deploy/docker-compose.yml up -d
@@ -1197,7 +1197,7 @@ b. [8.4](#84-separate-database-logins) step 7: each URL connects as its login, G
 
 ```bash
 cp -p .env.pre-split .env
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1272,7 +1272,7 @@ RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 **4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
