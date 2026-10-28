@@ -548,3 +548,27 @@ class TestDenseSoftBreaks:
         self, raw: str, kept: str
     ) -> None:
         assert Payment.model_validate({"last4": raw}).last4 == kept
+
+
+_DENSE_CARD = "​".join("4111111111111111")
+
+
+class TestDenseCardBesideNumbers:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "1234​" + _DENSE_CARD,
+            "12​" + _DENSE_CARD,
+            _DENSE_CARD + "​2028",
+        ],
+    )
+    def test_cut_beside_other_digits(self, raw: str) -> None:
+        out = _metadata(description=raw).description
+        assert out is not None
+        assert "ending 1111" in out
+        rest = out.replace("ending 1111", " ")
+        assert "41111" not in "".join(ch for ch in rest if ch.isdigit())
+
+    def test_last4(self) -> None:
+        raw = _DENSE_CARD + "​2028"
+        assert Payment.model_validate({"last4": raw}).last4 == "1111"

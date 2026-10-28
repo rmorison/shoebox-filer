@@ -314,9 +314,17 @@ def _run_candidates(
             cut for cut in range(group.start() + 1, group.end()) if offset + cut in soft
         ]
         # Dense soft breaks (obfuscated text: more than four, between more
-        # than half of the digits) break nothing: one number.
+        # than half of the digits) break nothing inside the dense stretch: it
+        # is one number. A soft break beside an ordinary gap stays, since it
+        # may be the only break between that number and another.
         if len(cuts) > 4 and len(cuts) * 2 > group.end() - group.start():
-            cuts = []
+            cut_set = set(cuts)
+            cuts = [
+                cut
+                for cut in cuts
+                if (cut - 1 > group.start() and cut - 1 not in cut_set)
+                or (cut + 1 < group.end() and cut + 1 not in cut_set)
+            ]
         begin = group.start()
         for cut in cuts:
             pieces.append((begin, cut))
