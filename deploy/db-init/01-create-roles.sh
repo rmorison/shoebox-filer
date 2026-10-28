@@ -36,6 +36,13 @@
 # application, and it can't drop or disable the history guard triggers,
 # which only the owner can.
 #
+# Passwords reach SQL as psql variables, never in command text. The ALTER ROLE
+# statements that set them hold the password in clear, so the session first
+# turns statement logging off: log_statement = 'none' keeps them out of the
+# server log, and log_min_error_statement = panic keeps a failing statement
+# out of it too. (The values sit in psql's arguments inside the container
+# while the init runs.)
+#
 # Roles are cluster-level and pg_dump doesn't carry them. A disaster-recovery
 # rebuild gets them back from this script, run on the new empty volume with
 # the restored .env, before the restore.
@@ -63,6 +70,11 @@ psql \
     --set read_password="${RECEIPT_INDEX_READ_PASSWORD}" \
     --set db="${POSTGRES_DB}" \
     <<'EOSQL'
+-- 0. Keep this session's statements, which carry passwords, out of the
+--    server log, even when one fails.
+SET log_statement = 'none';
+SET log_min_error_statement = panic;
+
 -- 1. Application login role. Created without a password, then ALTERed, so the
 --    secret is passed as a psql variable (:'app_password' is quoted as a SQL
 --    literal by psql) rather than interpolated by the shell.

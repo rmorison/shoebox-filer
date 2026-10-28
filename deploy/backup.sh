@@ -31,6 +31,12 @@ set -eu
 # docs/user/server-deployment.md, "Separate database logins").
 DUMP_URL="${RECEIPT_INDEX_READ_DATABASE_URL:-${DATABASE_URL:-}}"
 : "${DUMP_URL:?RECEIPT_INDEX_READ_DATABASE_URL or DATABASE_URL must be set in the container environment}"
+if [ -z "${RECEIPT_INDEX_READ_DATABASE_URL:-}" ]; then
+    echo "backup: RECEIPT_INDEX_READ_DATABASE_URL is unset; dumping through DATABASE_URL"
+fi
+# Say which login the dump runs as, so a run that falls back to another login
+# shows it in the log even when it succeeds.
+dump_user="$(psql --no-psqlrc --no-password -Atc 'SELECT current_user' "${DUMP_URL}")"
 
 BACKUP_DIR="${BACKUP_DIR:-/app/data/backups}"
 
@@ -46,7 +52,7 @@ tmp="${target}.tmp"
 # suspenders (--exclude "*.tmp" on the crontab mirror line).
 trap 'rm -f "${tmp}"' EXIT
 
-echo "backup: dumping to ${target}"
+echo "backup: dumping as ${dump_user} to ${target}"
 
 pg_dump --format=custom --no-password --file="${tmp}" "${DUMP_URL}"
 mv -f "${tmp}" "${target}"
