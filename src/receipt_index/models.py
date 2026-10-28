@@ -148,35 +148,35 @@ def _blank_to_none(value: object) -> object:
     return value
 
 
-# Unicode categories that print nothing between digits: format characters
-# (zero-width space and joiner, soft hyphen) and combining marks.
+# Unicode categories that print nothing: format characters (zero-width space
+# and joiner, soft hyphen) and combining marks. A card is read as if they
+# weren't there, wherever they sit, even inside a digit group.
 _INVISIBLE = frozenset({"Cf", "Mn", "Me"})
 
 
-def _ascii_digits(text: str) -> str:
-    """``text`` with every decimal digit as ASCII, one character for one.
+def _fold(ch: str) -> str:
+    """One character with its digit as ASCII, and full-width punctuation as
+    its ASCII form; a superscript, subscript or circled digit (a footnote
+    mark) is left alone, being no digit of a card."""
+    if ch.isascii():
+        return ch
+    if ch.isdecimal():
+        return str(unicodedata.decimal(ch))
+    folded = unicodedata.normalize("NFKC", ch)
+    return folded if len(folded) == 1 and not folded.isdigit() else ch
 
-    Full-width and other scripts' digits become ``0``-``9``, full-width
-    punctuation its ASCII form, and invisible format characters and
-    combining marks a space, so a card printed that way is found too. The
-    length never changes, so a span found here is the same span in ``text``.
-    """
-    out = []
-    for ch in text:
-        if ch.isascii():
-            out.append(ch)
-        elif ch.isdecimal():
-            out.append(str(unicodedata.decimal(ch)))
-        elif unicodedata.category(ch) in _INVISIBLE:
-            # Zero-width and soft-hyphen characters, combining marks: they
-            # separate digit groups, as a space would.
-            out.append(" ")
-        else:
-            # Full-width punctuation to ASCII; but a superscript, subscript
-            # or circled digit (a footnote mark) is no digit of a card.
-            folded = unicodedata.normalize("NFKC", ch)
-            out.append(folded if len(folded) == 1 and not folded.isdigit() else ch)
-    return "".join(out)
+
+def _visible(text: str) -> tuple[str, list[int]]:
+    """``text`` folded (``_fold``) without its invisible characters, and for
+    each character kept, its index in ``text``: a span found in the first is
+    mapped back to ``text`` through the second."""
+    chars, index = [], []
+    for i, ch in enumerate(text):
+        if not ch.isascii() and unicodedata.category(ch) in _INVISIBLE:
+            continue
+        chars.append(_fold(ch))
+        index.append(i)
+    return "".join(chars), index
 
 
 _GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015\u2212]+")
@@ -197,18 +197,28 @@ def last_four_digits(value: object) -> str | None:
     """
     if isinstance(value, bool) or not isinstance(value, str | int):
         return None
-    text = _ascii_digits(str(value)).strip()
+    text = _visible(str(value))[0].strip()
     if _GROUPED_DIGITS.fullmatch(text):
         digits = "".join(_DIGITS.findall(text))
         return digits[-4:] if len(digits) >= 4 else None
-    # A full card number among other text ("Visa 4111 1111 1111 1111").
+    # A full card number among other text ("Visa 4111 1111 1111 1111"), when
+    # no other number of four or more digits says otherwise.
     cards = [
-        fours
+        (run.start() + b, run.start() + e, fours)
         for run in _DIGIT_RUN.finditer(text)
-        for _, _, fours in _card_candidates(run.group(0))
+        for b, e, fours in _card_candidates(run.group(0))
     ]
-    if len(cards) == 1 and len(cards[0]) == 1:
-        return next(iter(cards[0]))
+    if len(cards) == 1 and len(cards[0][2]) == 1:
+        begin, end, fours = cards[0]
+        last4 = next(iter(fours))
+        others = [
+            g.group(0)
+            for g in _DIGITS.finditer(text)
+            if len(g.group(0)) >= 4 and (g.end() <= begin or g.start() >= end)
+        ]
+        if all(other[-4:] == last4 for other in others):
+            return last4
+        return None
     long_groups = [g for g in _DIGITS.findall(text) if len(g) >= 4]
     return long_groups[0][-4:] if len(long_groups) == 1 else None
 
@@ -300,15 +310,17 @@ def _card_spans(run: str) -> list[tuple[int, int, str]]:
 def scrub_card_numbers(text: str) -> str:
     """``text`` with each card number replaced by "ending NNNN", its last four
     digits, or "[card number removed]" when overlapping candidates disagree
-    on them. See ``_card_spans`` for what counts as a card number; digits in
-    any script count."""
-    folded = _ascii_digits(text)
+    on them. See ``_card_candidates`` for what counts as a card number;
+    digits in any script count, and invisible characters are ignored."""
+    visible, index = _visible(text)
     out, pos = [], 0
-    for match in _DIGIT_RUN.finditer(folded):
+    for match in _DIGIT_RUN.finditer(visible):
         for begin, end, replacement in _card_spans(match.group(0)):
-            out.append(text[pos : match.start() + begin])
+            first = index[match.start() + begin]
+            last = index[match.start() + end - 1] + 1
+            out.append(text[pos:first])
             out.append(replacement)
-            pos = match.start() + end
+            pos = last
     out.append(text[pos:])
     return "".join(out)
 

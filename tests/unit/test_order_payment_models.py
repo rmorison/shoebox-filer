@@ -431,3 +431,21 @@ class TestFixReviewScrub:
     )
     def test_last4_finds_a_labelled_card(self, raw: str, kept: str | None) -> None:
         assert Payment.model_validate({"last4": raw}).last4 == kept
+
+
+class TestInvisibleInsideGroups:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "card 41​11 1111 1111 1111",
+            "card 4111 1111 1111 11­11",
+            "card 4̲1̲1̲1̲ 1111 1111 1111",
+        ],
+    )
+    def test_invisible_characters_inside_a_group(self, raw: str) -> None:
+        assert _metadata(description=raw).description == "card ending 1111"
+
+    def test_last4_does_not_trust_a_number_beside_another_group(self) -> None:
+        # The order number passes Luhn; the card's own last four is 4242.
+        raw = "Order 1234567812345670, Visa ending 4242"
+        assert Payment.model_validate({"last4": raw}).last4 is None
