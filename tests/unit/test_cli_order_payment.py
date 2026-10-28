@@ -219,3 +219,23 @@ class TestShowOutput:
         assert result.exit_code == 0, result.output
         assert "Order:" not in result.output
         assert "Payment:" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("columns", "line"),
+    [
+        ({"payment_method": None, "payment_last4": None}, "Jane Doe"),
+        ({"payment_last4": None, "payer": None}, "card"),
+        ({"payment_method": None, "payer": None}, "ending 1234"),
+        ({"payment_method": None}, "ending 1234 (Jane Doe)"),
+    ],
+)
+@patch("receipt_index.db.get_connection")
+def test_partial_payment_line(
+    mock_conn: MagicMock, config_file: Path, columns: dict[str, Any], line: str
+) -> None:
+    receipt = Receipt.model_validate({**_ROW, **columns})
+    with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+        result = _invoke(config_file, "show", str(receipt.id))
+    assert result.exit_code == 0, result.output
+    assert f"Payment:      {line}\n" in result.output

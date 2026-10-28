@@ -120,7 +120,10 @@ class TestEditValues:
         assert kwargs == {"actor": "operator", "reason": "statement shows 25.00"}
         assert "paid_amount: 30.00 → 25.00" in result.output
 
-    @pytest.mark.parametrize("bad", ["-1", "1.234", "abc", "NaN", "Infinity"])
+    @pytest.mark.parametrize(
+        "bad",
+        ["-1", "1.234", "abc", "NaN", "Infinity", "1e15", "10000000000", "9" * 40],
+    )
     def test_bad_paid_amount(
         self, edit: MagicMock, config_file: Path, bad: str
     ) -> None:

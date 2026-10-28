@@ -113,3 +113,27 @@ class TestHistory:
         result = _invoke(config_file, "history", "not-a-uuid")
         assert result.exit_code == 1
         assert "invalid UUID" in result.output
+
+
+@patch("receipt_index.repository.get_receipt_by_id", return_value=_RECEIPT)
+@patch("receipt_index.db.get_connection")
+def test_other_event_types_show_their_payload(
+    conn: MagicMock, get: MagicMock, config_file: Path
+) -> None:
+    # Later tickets write these (a refund linked by a rule, a tag by an agent).
+    event = ReceiptEvent(
+        id=UUID("019572a0-0000-7000-8000-0000000000e4"),
+        receipt_id=_RECEIPT.id,
+        event_type="refund_linked",
+        payload={"refund_id": str(_RECEIPT.id), "amount": "5.00"},
+        actor="ingest",
+        actor_kind="rule",
+        created_at=datetime(2026, 2, 3, 9, 0, tzinfo=UTC),
+    )
+    with patch("receipt_index.repository.get_receipt_events", return_value=[event]):
+        result = _invoke(config_file, "history", str(_RECEIPT.id))
+    assert result.exit_code == 0, result.output
+    (line,) = result.output.splitlines()
+    assert "refund_linked" in line
+    assert "ingest (rule)" in line
+    assert f'{{"amount": "5.00", "refund_id": "{_RECEIPT.id}"}}' in line

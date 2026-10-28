@@ -994,6 +994,9 @@ def history(ctx: click.Context, receipt_id: str, output_format: str) -> None:
         click.echo(line)
 
 
+_MAX_PAID_AMOUNT = 10_000_000_000
+
+
 def _paid_amount(
     ctx: click.Context, param: click.Parameter, value: str | None
 ) -> Decimal | None:
@@ -1008,6 +1011,9 @@ def _paid_amount(
         raise click.BadParameter(f"not a decimal amount: {value}") from None
     if not amount.is_finite() or amount < 0:
         raise click.BadParameter("must be 0 or more")
+    # The column is NUMERIC(12,2): at most ten digits before the point.
+    if amount >= _MAX_PAID_AMOUNT:
+        raise click.BadParameter(f"must be less than {_MAX_PAID_AMOUNT}")
     if amount != amount.quantize(Decimal("0.01")):
         raise click.BadParameter("at most two decimal places")
     return amount
