@@ -190,10 +190,15 @@ def _meta(subject: str) -> ReceiptMetadata:
 
 
 class _Llm:
-    """A mock agent: content failure while ``failing`` names the subject."""
+    """A mock agent: content failure while ``failing`` names the subject.
+
+    It stands in for extraction only, so the write paths run without an API
+    key; it says nothing about the real LLM stack.
+    """
 
     def __init__(self) -> None:
         self.failing: set[str] = set()
+        self.output = _meta("ok")
         self.agent = MagicMock()
         self.agent.run_sync.side_effect = self._run
 
@@ -208,7 +213,7 @@ class _Llm:
         usage.cache_read_tokens = 0
         usage.requests = 1
         result = MagicMock()
-        result.output = _meta("ok")
+        result.output = self.output
         result.usage = usage
         return result
 
@@ -332,8 +337,21 @@ def test_write_paths_run_as_the_write_login(
     assert result.exit_code == 0, result.output
     assert _statuses(pg_conn, bad_id)[-1] == "success"
 
-    # 4. reextract: reads the receipt FOR UPDATE, rewrites its fields and
-    #    appends to the extraction history.
+    # 4. reextract: reads the receipt FOR UPDATE, rewrites every column it
+    #    may write (each needs its UPDATE grant) and appends to the history.
+    #    The new answer differs in every field, or reextract writes nothing.
+    llm.output = ReceiptMetadata(
+        vendor="Acme Parking (U.S.), LLC, Garage 2",
+        amount=Decimal("20.00"),
+        paid_amount=Decimal("18.00"),
+        currency="EUR",
+        date=date(2026, 10, 2),
+        description="re-extracted",
+        confidence=0.99,
+        field_confidence=FieldConfidence(
+            vendor=0.8, amount=0.8, paid_amount=0.8, date=0.8
+        ),
+    )
     before = pg_conn.execute(
         "SELECT count(*) AS n FROM receipt.extractions WHERE receipt_id = %s",
         (receipt["id"],),
@@ -356,6 +374,25 @@ def test_write_paths_run_as_the_write_login(
     ).fetchone()
     assert before is not None and after is not None
     assert after["n"] == before["n"] + 1
+    row = pg_conn.execute(
+        "SELECT vendor, amount, paid_amount, currency, receipt_date, description, "
+        "field_confidence FROM receipt.receipts WHERE id = %s",
+        (receipt["id"],),
+    ).fetchone()
+    assert row == {
+        "vendor": "Acme Parking (U.S.), LLC, Garage 2",
+        "amount": Decimal("20.00"),
+        "paid_amount": Decimal("18.00"),
+        "currency": "EUR",
+        "receipt_date": date(2026, 10, 2),
+        "description": "re-extracted",
+        "field_confidence": {
+            "vendor": 0.8,
+            "amount": 0.8,
+            "paid_amount": 0.8,
+            "date": 0.8,
+        },
+    }, result.output
     pg_conn.commit()
 
     # 5. The Drive cursor (CI has no Drive to ingest from).
