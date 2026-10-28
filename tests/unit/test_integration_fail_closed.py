@@ -27,7 +27,9 @@ _PORT_VARS = ("POSTGRES_HOST_PORT", "GREENMAIL_SMTP_PORT", "GREENMAIL_IMAP_PORT"
 _OTHER_VARS = ("DATABASE_URL", "MIGRATION_DATABASE_URL")
 
 
-def _run_guarded(tmp_path: Path, ports: dict[str, str]) -> dict[str, Any]:
+def _run_guarded(
+    tmp_path: Path, ports: dict[str, str], target: str, extra: list[str]
+) -> dict[str, Any]:
     env = {
         k: v
         for k, v in os.environ.items()
@@ -41,7 +43,7 @@ def _run_guarded(tmp_path: Path, ports: dict[str, str]) -> dict[str, Any]:
             sys.executable,
             "-m",
             "pytest",
-            "tests/integration",
+            target,
             "-m",
             "integration",
             "-p",
@@ -50,6 +52,7 @@ def _run_guarded(tmp_path: Path, ports: dict[str, str]) -> dict[str, Any]:
             "no:cacheprovider",
             "--no-cov",
             "-q",
+            *extra,
         ],
         cwd=_ROOT,
         env=env,
@@ -66,13 +69,22 @@ def _run_guarded(tmp_path: Path, ports: dict[str, str]) -> dict[str, Any]:
 
 
 # The guard refuses every connection, so a port set here is never reached.
-_SCENARIOS = {
-    "all unset": {},
-    "one not a port": {
-        "POSTGRES_HOST_PORT": "45432",
-        "GREENMAIL_SMTP_PORT": "43025",
-        "GREENMAIL_IMAP_PORT": "not-a-port",
-    },
+_INTEGRATION = "tests/integration"
+_SCENARIOS: dict[str, tuple[dict[str, str], str, list[str]]] = {
+    "all unset": ({}, _INTEGRATION, []),
+    "one not a port": (
+        {
+            "POSTGRES_HOST_PORT": "45432",
+            "GREENMAIL_SMTP_PORT": "43025",
+            "GREENMAIL_IMAP_PORT": "not-a-port",
+        },
+        _INTEGRATION,
+        [],
+    ),
+    # The same directory by a path that isn't the resolved one.
+    "non-canonical path": ({}, f"/proc/self/root{_ROOT}/tests/integration", []),
+    # Skip marks do nothing without the skipping plugin; the gate must hold.
+    "skipping plugin off": ({}, _INTEGRATION, ["-p", "no:skipping"]),
 }
 
 
@@ -80,7 +92,10 @@ _SCENARIOS = {
 def guarded_run(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> dict[str, Any]:
-    return _run_guarded(tmp_path_factory.mktemp("guard"), _SCENARIOS[request.param])
+    ports, target, extra = _SCENARIOS[request.param]
+    if target.startswith("/proc/") and not Path("/proc/self/root").is_dir():
+        pytest.skip("no /proc on this platform")
+    return _run_guarded(tmp_path_factory.mktemp("guard"), ports, target, extra)
 
 
 class TestWithoutThePortVariables:

@@ -35,29 +35,24 @@ if TYPE_CHECKING:
 # Tests run as superuser (main). test_db_logins.py applies the migrations'
 # grants (apply_migration_grants) and runs the write and read paths as logins
 # that hold only those grants, to catch a missing GRANT.
-_HERE = Path(__file__).resolve().parent
-_MIGRATIONS = _HERE.parents[1] / "db" / "migrations"
+_MIGRATIONS = Path(__file__).resolve().parents[2] / "db" / "migrations"
 _POSTGRES_HOST_PORT = POSTGRES_HOST_PORT
 _DB_DSN = dsn("main", "localpass")  # pragma: allowlist secret
 
 
 @pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
+def pytest_runtest_setup(item: pytest.Item) -> None:
     """Fail closed: skip every integration test unless all ports are set.
 
     There is no default port to fall back to, so a run without the devtest
     variables skips here, before any fixture runs or connection opens.
+    pytest calls a conftest's setup hook only for the items under its own
+    directory, however that directory was named on the command line, and
+    the skip is raised here rather than through a skip mark, so it holds
+    with the skipping plugin turned off too.
     """
-    if not MISSING:
-        return
-    # A skipif placed first: pytest reads skipif marks before skip marks, so
-    # this reason wins over a test's own skip condition.
-    skip = pytest.mark.skipif(True, reason=skip_reason(MISSING))
-    for item in items:
-        if _HERE in item.path.parents:
-            item.add_marker(skip, append=False)
+    if MISSING:
+        pytest.skip(skip_reason(MISSING))
 
 
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
