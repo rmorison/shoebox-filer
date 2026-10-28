@@ -23,7 +23,14 @@
 
 set -eu
 
-: "${DATABASE_URL:?DATABASE_URL must be set in the container environment}"
+# Dump as the read login when RECEIPT_INDEX_READ_DATABASE_URL is set: it can
+# read every table, golang-migrate's version tables included (migration
+# 000014), and nothing else. Without it, fall back to DATABASE_URL, as before
+# the separate logins. Once DATABASE_URL is the write login, that fallback
+# fails on schema_migrations_public, so set the read URL first (see
+# docs/user/server-deployment.md, "Separate database logins").
+DUMP_URL="${RECEIPT_INDEX_READ_DATABASE_URL:-${DATABASE_URL:-}}"
+: "${DUMP_URL:?RECEIPT_INDEX_READ_DATABASE_URL or DATABASE_URL must be set in the container environment}"
 
 BACKUP_DIR="${BACKUP_DIR:-/app/data/backups}"
 
@@ -41,7 +48,7 @@ trap 'rm -f "${tmp}"' EXIT
 
 echo "backup: dumping to ${target}"
 
-pg_dump --format=custom --no-password --file="${tmp}" "${DATABASE_URL}"
+pg_dump --format=custom --no-password --file="${tmp}" "${DUMP_URL}"
 mv -f "${tmp}" "${target}"
 
 echo "backup: wrote ${target} ($(wc -c < "${target}") bytes)"
