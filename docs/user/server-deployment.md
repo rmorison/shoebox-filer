@@ -95,6 +95,37 @@ Laptop-side commands use **`receipt-server`** as the SSH target. Either define t
 
 - **Disk**: the pgdata volume, the receipt tree, seven database dumps, and capped container logs (10 MB × 7 per service). A few GB is plenty; check with `df -h` before starting.
 
+### Rootless Docker
+
+The stack also runs under [rootless Docker](https://docs.docker.com/engine/security/rootless/), where the daemon runs as the deploy user rather than as root. Three things change.
+
+- **The daemon is a user service.** It replaces the system `docker` unit and the `docker` group above:
+
+  ```bash
+  systemctl --user enable --now docker
+  systemctl --user is-enabled docker   # must print "enabled"
+  ```
+
+- **Linger, for reboot survival.** Without it, the user's services, the daemon among them, start only when the user logs in and stop when the last session ends. With it, they start at boot:
+
+  ```bash
+  sudo loginctl enable-linger "$USER"
+  loginctl show-user "$USER" --property=Linger   # must print "Linger=yes"
+  ```
+
+- **Bind-mount ownership.** Container uids map to subordinate host uids, so the container's uid 1000 isn't host uid 1000, and a host-side `chown 1000:1000` gives the directories the wrong owner. Container root is your host user, though, so chown from inside a container. Do this in place of the `chown` and `chmod` in [3.4](#34-create-the-bind-mount-directories-before-the-first-up--d), once [3.5](#35-one-time-rclonedropbox-authorization) has put the rclone config in place:
+
+  ```bash
+  cd ~/receipt-index
+  docker run --rm -v "$PWD:/w" -w /w busybox \
+      chown -R 1000:1000 data/receipts data/backups data/mcp-logs rclone-config
+  docker run --rm -v "$PWD:/w" -w /w busybox chmod 700 rclone-config
+  ```
+
+  Afterwards your host user can't write into these directories directly, so later changes, such as a new rclone config, go through a container the same way. Gate B's sentinel step proves the result.
+
+  The app config is a single read-only file mount, so it needs only to be world-readable ([3.2b](#32b-create-the-server-app-config)).
+
 ---
 
 ## 3. Provisioning
@@ -130,6 +161,12 @@ cp deploy/example.receipt-index.yaml deploy/receipt-index.yaml
 ```
 
 Edit the copy (it is git-ignored) with your real source definitions: IMAP host, username, and folder, and the Google Drive folder id. Secrets stay as `${VAR}` references into `.env`.
+
+On [rootless Docker](#rootless-docker), the container's uid 1000 isn't your host user and reads this file as "other", so make it world-readable. It holds no secrets:
+
+```bash
+chmod 644 deploy/receipt-index.yaml
+```
 
 `GDRIVE_CREDENTIALS_JSON` is **not** required on the server. The template deliberately drops that key from the gdrive source, and the OAuth client id/secret needed for refresh already live inside `GDRIVE_TOKEN_JSON`. (The dev config may still interpolate it; do not copy that line over.)
 
@@ -179,6 +216,8 @@ mkdir -p data/receipts data/backups data/mcp-logs rclone-config
 chown -R 1000:1000 data/receipts data/backups data/mcp-logs rclone-config   # sudo if not your uid
 chmod 700 rclone-config                                        # holds a standing Dropbox refresh token
 ```
+
+On [rootless Docker](#rootless-docker), run only the `mkdir` here, and set ownership and mode from inside a container after 3.5.
 
 `chmod 700` on `rclone-config/` is not decoration: `rclone.conf` contains a long-lived Dropbox refresh token with write access to the mirror.
 
@@ -282,16 +321,18 @@ docker compose -f deploy/docker-compose.yml ps
 docker compose -f deploy/docker-compose.yml exec db \
     sh -c 'echo "$PGDATA"; ls -d "$PGDATA"'
 
-# 4. Sentinel write as uid 1000 to both writable mounts
-docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
-    id -u
-    touch /app/data/receipts/.sentinel && rm /app/data/receipts/.sentinel
-    touch /app/data/backups/.sentinel  && rm /app/data/backups/.sentinel
-    touch /app/.rclone/.sentinel       && rm /app/.rclone/.sentinel
-    echo ALL-MOUNTS-WRITABLE'
+# 4. Sentinel write as uid 1000 to every writable mount
+docker compose -f deploy/docker-compose.yml run --rm --entrypoint python scheduler -c '
+import os, pathlib
+print(os.getuid())
+for d in ("/app/data/receipts", "/app/data/backups", "/app/data/mcp-logs", "/app/.rclone"):
+    sentinel = pathlib.Path(d, ".sentinel")
+    sentinel.touch()
+    sentinel.unlink()
+print("ALL-MOUNTS-WRITABLE")'
 ```
 
-**Pass:** (1) prints nothing at all — any `variable is not set` warning is a broken `.env`; (2) `db` shows `healthy`; (3) `PGDATA` is `/var/lib/postgresql/18/docker`, i.e. *inside* the volume mounted at `/var/lib/postgresql` — if the volume were mounted at `/var/lib/postgresql/data` instead, the cluster would live outside the volume and vanish on the next container restart; (4) prints `1000` then `ALL-MOUNTS-WRITABLE`.
+**Pass:** (1) prints nothing at all — any `variable is not set` warning is a broken `.env`; (2) `db` shows `healthy`; (3) `PGDATA` is `/var/lib/postgresql/18/docker`, i.e. *inside* the volume mounted at `/var/lib/postgresql` — if the volume were mounted at `/var/lib/postgresql/data` instead, the cluster would live outside the volume and vanish on the next container restart; (4) prints `1000` then `ALL-MOUNTS-WRITABLE`; a `PermissionError` names the mount that isn't writable.
 
 A host-side `ls -l` is **not** a substitute for step 4. Only a write from inside the container as uid 1000 proves the thing that matters.
 
@@ -403,7 +444,7 @@ docker compose -f deploy/docker-compose.yml ps        # both services up
 docker compose -f deploy/docker-compose.yml logs --since 20m scheduler
 ```
 
-**Pass:** both services return without human intervention and a scheduled tick fires. See [section 7](#7-weekly-monitoring) about the one expected failed tick immediately after a reboot.
+**Pass:** both services return without human intervention and a scheduled tick fires. On [rootless Docker](#rootless-docker) this needs linger. See [section 7](#7-weekly-monitoring) about the one expected failed tick immediately after a reboot.
 
 ---
 
@@ -897,6 +938,8 @@ mkdir -p data/mcp-logs
 chown 1000:1000 data/mcp-logs   # sudo if not your uid
 ```
 
+On [rootless Docker](#rootless-docker), chown it from inside a container instead.
+
 **2. Create a read-only login role.** Create it as a member of `receipt_index_dev_read`, which the migrations grant `SELECT` on both tables and nothing else. Open psql in the db container, then run the statements and type the password at the `\password` prompt, so it never appears in a command line or the shell history:
 
 ```bash
@@ -928,6 +971,18 @@ Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`.
 docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
+```
+
+`up -d scheduler` also starts supercronic, and with it the 15-minute schedule. Where the schedule must stay off, as before Gate G, leave the scheduler stopped. A one-off container reads `.env` when it starts, so run the check in step 5 as:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint receipt-index scheduler mcp </dev/null; echo "exit=$?"
+```
+
+`exec` needs a running scheduler, so an MCP client connecting over SSH uses the same one-off form in place of the command in [section 10](#10-read-only-mcp-server). `run` reads the compose file, so it runs from the clone:
+
+```bash
+ssh receipt-server 'cd ~/receipt-index && docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint receipt-index scheduler mcp'
 ```
 
 **5. Check it.** Run the startup check with stdin closed, so the server starts and exits at once:
