@@ -162,7 +162,9 @@ chmod 600 .env
 | Variable | Source |
 |---|---|
 | `POSTGRES_PASSWORD` | Generate: `openssl rand -hex 24` |
-| `RECEIPT_INDEX_PASSWORD` | Generate: `openssl rand -hex 24` — must match the password inside `DATABASE_URL` |
+| `RECEIPT_INDEX_PASSWORD` | Generate: `openssl rand -hex 24` — the owner login `receipt_index`; must match the password inside `MIGRATION_DATABASE_URL` |
+| `RECEIPT_INDEX_WRITE_PASSWORD` | Generate: `openssl rand -hex 24` — the application's login `receipt_index_write`; must match the password inside `DATABASE_URL` |
+| `RECEIPT_INDEX_READ_PASSWORD` | Generate: `openssl rand -hex 24` — the read login `receipt_index_read`; must match the password inside `RECEIPT_INDEX_READ_DATABASE_URL` and `RECEIPT_INDEX_MCP_DATABASE_URL` |
 | `IMAP_PASSWORD` | 1Password — your IMAP mailbox item |
 | `ANTHROPIC_API_KEY` | 1Password — your Anthropic API key item |
 | `GDRIVE_TOKEN_JSON` | Output of `receipt-index auth gdrive --client-credentials <client_secret.json>`, run on the laptop |
@@ -198,7 +200,7 @@ is delivered to the container as `ab$ef` — `$wcd` expands to the empty string 
 Rules:
 
 - Escape every literal dollar sign by doubling it: `ab$wcd` → `ab$$wcd`.
-- Applies to `IMAP_PASSWORD`, `ANTHROPIC_API_KEY`, both Postgres passwords, and the passwords embedded in `DATABASE_URL` / `MIGRATION_DATABASE_URL`.
+- Applies to `IMAP_PASSWORD`, `ANTHROPIC_API_KEY`, every Postgres password, and the passwords embedded in the `*_DATABASE_URL` variables.
 - Generate the Postgres passwords from an alphanumeric alphabet (`openssl rand -hex 24`) so the question never comes up for those.
 
 Two checks. First, no expansion warnings at all:
@@ -254,6 +256,12 @@ This tags `receipt-index:latest` (the compose `image: receipt-index` key), which
 
 ### 4.2 Start only the database
 
+First check that `.env` sets all three login passwords. db-init needs them, and it runs only once (below):
+
+```bash
+grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env   # must print 3
+```
+
 ```bash
 docker compose -f deploy/docker-compose.yml up -d db
 docker compose -f deploy/docker-compose.yml ps          # db must reach "healthy"
@@ -261,7 +269,13 @@ docker compose -f deploy/docker-compose.yml ps          # db must reach "healthy
 
 The scheduler stays down. **Starting the scheduler is what enables the schedule**, and that is the last thing that happens on launch day (see Gate G). Everything before then runs as one-off `docker compose run --rm` commands.
 
-On first boot of an empty volume, `deploy/db-init/01-create-roles.sh` runs once and creates the `receipt_index` login role (owner of the database and of schema `public`) plus the three NOLOGIN grant-target roles the migrations reference by name (`receipt_index_dev_all` / `_write` / `_read`). It never runs again — a later role change is an `ALTER ROLE`, by hand.
+On first boot of an empty volume, `deploy/db-init/01-create-roles.sh` runs once. It creates the three NOLOGIN grant-target roles the migrations reference by name (`receipt_index_dev_all` / `_write` / `_read`) and three logins, one per level of the Database Standards ([8.4](#84-separate-database-logins)):
+
+- `receipt_index`, the owner of the database and of schema `public`, for migrations only;
+- `receipt_index_write`, the application's login, a member of `receipt_index_dev_write`;
+- `receipt_index_read`, for backups, forensic queries and the MCP server, a member of `receipt_index_dev_read`.
+
+It never runs again — a later role change is an `ALTER ROLE`, by hand. If it fails, for example on a missing password, the `db` logs say so, and the volume is left initialized without the roles: on a **new, empty** server only, remove it with `docker compose -f deploy/docker-compose.yml down -v`, fix `.env`, and start again.
 
 ### 4.3 Apply migrations — an explicit deploy step
 
@@ -273,7 +287,7 @@ Set `MIGRATION_DATABASE_URL` in `.env`. It connects over the loopback-published 
 MIGRATION_DATABASE_URL=postgresql://receipt_index:<RECEIPT_INDEX_PASSWORD>@127.0.0.1:15432/receipt_index?sslmode=disable
 ```
 
-**Run migrations as the `receipt_index` role, not as the superuser.** `receipt_index` owns the database and schema `public` (via `db-init`), and the cutover dump restores every object owned by `receipt_index`. If migrations run as `postgres`, a freshly built server ends up with schema `receipt` and its tables owned by the superuser while a restored server has them owned by the app role — two servers with divergent ownership from the same repo. The app role has everything it needs: `pg_trgm` is a *trusted* extension in Postgres 13+, so the database owner can `CREATE EXTENSION` without superuser.
+**Run migrations as the `receipt_index` role, not as the superuser.** `receipt_index` owns the database and schema `public` (via `db-init`), and the cutover dump restores every object owned by `receipt_index`. If migrations run as `postgres`, a freshly built server ends up with schema `receipt` and its tables owned by the superuser while a restored server has them owned by `receipt_index` — two servers with divergent ownership from the same repo. The owner has everything it needs: `pg_trgm` is a *trusted* extension in Postgres 13+, so the database owner can `CREATE EXTENSION` without superuser.
 
 > `deploy/example.env` ships this line with the `receipt_index` role already in place — migrations run as the database owner, not the superuser. The superuser credentials (`POSTGRES_PASSWORD`) are still needed separately for the cutover `pg_restore` (section 6).
 
@@ -353,7 +367,7 @@ A host-side `ls -l` is **not** a substitute for step 4. Only a write from inside
 
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
-    psql "$DATABASE_URL" -c "SELECT '\''public'\'' AS dir, version, dirty FROM schema_migrations_public
+    psql "$RECEIPT_INDEX_READ_DATABASE_URL" -c "SELECT '\''public'\'' AS dir, version, dirty FROM schema_migrations_public
                              UNION ALL
                              SELECT '\''receipt'\'', version, dirty FROM schema_migrations_receipt;"'
 ```
@@ -362,12 +376,16 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
 
 | Migration table | Expected version | dirty |
 |---|---|---|
-| `schema_migrations_public` | `1` | `f` |
-| `schema_migrations_receipt` | `7` | `f` |
+| `schema_migrations_public` | the highest number in `db/migrations/public` (`1`) | `f` |
+| `schema_migrations_receipt` | the highest number in `db/migrations/receipt` (`14` as of the separate database logins) | `f` |
 
-(As of 2026-08-01. A `dirty = t` means a migration aborted half-applied; fix it before anything else touches the database.)
+(A `dirty = t` means a migration aborted half-applied; fix it before anything else touches the database.)
 
-Then prove the **application** read path — same role, same DSN, same container the scheduler will use:
+`make migrate-up` never applies a migration numbered at or below the version a table records, and says nothing about it. A migration added to the repository after a higher-numbered one has been applied is skipped for good, so every new migration takes a number above every applied one.
+
+The query runs as the read login, the one the nightly backup uses, so it also proves that login can read the version tables, which `pg_dump` needs. `permission denied for table schema_migrations_public` means migration 000014 hasn't run.
+
+Then prove the **application** read path — the application's login (`receipt_index_write`), same DSN, same container the scheduler will use:
 
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint receipt-index scheduler \
@@ -528,7 +546,7 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
         (SELECT count(*) FROM receipt.receipts)   AS receipts,
         (SELECT count(*) FROM receipt.ingest_log) AS ingest_log;"'
 
-# Fresh, empty, owned by the app role.
+# Fresh, empty, owned by receipt_index.
 # db-init only runs on first boot of an empty volume, so the database-level
 # bits it applied must be re-applied by hand here. The roles are cluster-level
 # and survive a DROP DATABASE.
@@ -536,7 +554,7 @@ docker compose -f deploy/docker-compose.yml exec db sh -c '
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres -c "DROP DATABASE $POSTGRES_DB;"
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres -c "CREATE DATABASE $POSTGRES_DB OWNER receipt_index;"
     psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "
-        GRANT CONNECT ON DATABASE $POSTGRES_DB TO receipt_index_dev_all, receipt_index_dev_write, receipt_index_dev_read;
+        GRANT CONNECT ON DATABASE $POSTGRES_DB TO receipt_index_dev_all, receipt_index_dev_write, receipt_index_dev_read, receipt_index_write, receipt_index_read;
         ALTER SCHEMA public OWNER TO receipt_index;"'
 ```
 
@@ -553,8 +571,8 @@ docker compose -f deploy/docker-compose.yml exec db sh -c '
 
 **Without `--no-owner` and without `--no-acl`** — both omissions are deliberate:
 
-- `--no-owner` would leave every object owned by the superuser, and the application (connecting as `receipt_index`) would be running on objects it does not own. The dump's `ALTER ... OWNER TO receipt_index` statements succeed precisely because `db-init` pre-created that role.
-- `--no-acl` would drop the column-level grants the migrations issue; the only ACLs in the dump target the three `receipt_index_dev_*` roles, which exist.
+- `--no-owner` would leave every object owned by the superuser, so migrations (connecting as `receipt_index`) could no longer alter them. The dump's `ALTER ... OWNER TO receipt_index` statements succeed precisely because `db-init` pre-created that role.
+- `--no-acl` would drop the column-level grants the migrations issue, and with them every privilege the write and read logins have; the only ACLs in the dump target the three `receipt_index_dev_*` roles, which exist.
 
 The dump also carries the `pg_trgm` extension and **both** `schema_migrations_*` tables at their source versions (public `1`, receipt `7` as of 2026-08-01), which is what makes the next step a no-op rather than a re-run.
 
@@ -591,7 +609,7 @@ The database stores paths **relative to the store root**, so the tree transplant
 
 ### 6.6 Verification queries
 
-Run these **as the app role over the app DSN** — that is, inside the container, using `$DATABASE_URL`. Running them as the superuser would pass even when the application is locked out by ownership or grants, which is the exact failure class these are here to catch.
+Run these **as the application's login over the app DSN** — that is, inside the container, using `$DATABASE_URL`. Running them as the superuser would pass even when the application is locked out by ownership or grants, which is the exact failure class these are here to catch.
 
 ```bash
 docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c 'psql "$DATABASE_URL"'
@@ -731,7 +749,7 @@ The important one, and the reason it is not just `receipt-index failures`:
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
-    psql "$DATABASE_URL" -c "SELECT status, count(*) FROM receipt.ingest_log
+    psql "$RECEIPT_INDEX_READ_DATABASE_URL" -c "SELECT status, count(*) FROM receipt.ingest_log
                              GROUP BY status ORDER BY status;"'
 ```
 
@@ -739,7 +757,7 @@ Compare all three numbers against the Gate E baseline. `success` growing is norm
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
-    psql "$DATABASE_URL" -c "
+    psql "$RECEIPT_INDEX_READ_DATABASE_URL" -c "
         SELECT created_at, source_type, source_id, email_sender, email_subject, error_message
         FROM receipt.ingest_log
         WHERE status = '\''skipped'\''
@@ -813,7 +831,13 @@ docker compose -f deploy/docker-compose.yml build
 # committing its row leaves an orphan file behind. Check for an in-flight cycle
 # first — ticks land on :00/:15/:30/:45 and normally finish in well under a
 # minute, so there is a wide idle window.
-docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+# The image has no pgrep, so the check reads each process's command line
+# from /proc. Idle only when the output is exactly `check-exit=1`.
+# `check-exit=0` lists a running ingest: wait and check again. Anything else,
+# or no `check-exit` line at all (the container is down, or the exec failed),
+# means the check didn't run: find out why before going on. The `[r]` keeps
+# grep from matching the shell that runs it.
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
@@ -863,7 +887,7 @@ Only requeue for **environmental** causes: a rendering gap, a permissions proble
 
    ```bash
    docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
-       psql "$DATABASE_URL" -c "
+       psql "$RECEIPT_INDEX_READ_DATABASE_URL" -c "
            SELECT requested_at, requested_by, filters, matched, requeued
            FROM receipt.retry_requests ORDER BY requested_at DESC LIMIT 10;"'
    ```
@@ -874,7 +898,13 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
 
 1. Rebuild the host per [section 2](#2-server-prerequisites), then provision per [section 3](#3-provisioning) (clone, `.env` from 1Password, directories with uid 1000, rclone config).
 
-2. `docker compose -f deploy/docker-compose.yml build && docker compose -f deploy/docker-compose.yml up -d db`. First boot of the empty volume runs `db-init`, creating the `receipt_index` owner role and the grant-target roles — this must happen **before** the restore, or the dump's `OWNER TO` statements fail and the app is locked out.
+2. Check that `.env` sets all three login passwords, as in [4.2](#42-start-only-the-database). Roles are cluster-level and `pg_dump` doesn't carry them, so the logins come back only from `db-init`, which reads the passwords from `.env`. An `.env` saved before [8.4](#84-separate-database-logins) lacks `RECEIPT_INDEX_WRITE_PASSWORD` and `RECEIPT_INDEX_READ_PASSWORD`: add them from 1Password, or generate new ones and put the same values in the URLs that use them, before going on.
+
+   ```bash
+   grep -c -E '^RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD=.' .env   # must print 3
+   ```
+
+   Then `docker compose -f deploy/docker-compose.yml build && docker compose -f deploy/docker-compose.yml up -d db`. First boot of the empty volume runs `db-init`, creating the `receipt_index` owner role, the write and read logins and the grant-target roles — this must happen **before** the restore, or the dump's `OWNER TO` statements fail and the app is locked out.
 
 3. Pull both trees back:
 
@@ -904,9 +934,158 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
 
-5. If the MCP server was set up, recreate its read-only role: all of [10.1](#101-one-time-setup) step 2, with the password already in `RECEIPT_INDEX_MCP_DATABASE_URL` in the restored `.env`. Then run its check, step 5.
+5. Run the checks in [8.4](#84-separate-database-logins) step 7: each URL connects as its login, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
 6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
+
+### 8.4 Separate database logins
+
+The application, the backups and the MCP server each log in with only the privileges they need, at the three levels of the [Database Standards](https://github.com/rmorison/engineering-standards/blob/main/code/database-standards.md):
+
+| Level | Login | Used by | Gets its access from |
+|---|---|---|---|
+| `_all` | `receipt_index` | migrations (`MIGRATION_DATABASE_URL`) | owns every object |
+| `_write` | `receipt_index_write` | the application (`DATABASE_URL`) | membership of `receipt_index_dev_write` |
+| `_read` | `receipt_index_read` | the nightly backup and forensic queries (`RECEIPT_INDEX_READ_DATABASE_URL`), the MCP server (`RECEIPT_INDEX_MCP_DATABASE_URL`) | membership of `receipt_index_dev_read` |
+
+Because the application doesn't own the tables, the migrations' column-level grants bind it, and it can't drop or disable the triggers that keep the extraction history append-only. Only the owner can, and only migrations log in as the owner.
+
+**Known deviation from the standard.** The grant-target roles keep `_dev_` in their names (`receipt_index_dev_write`, not `receipt_index_prod_write`). The names are historical: every migration grants to them by name, so renaming them would be a migration change for no gain. The logins carry no environment in their names, to match `receipt_index`.
+
+**Every new table needs a `SELECT` grant to `receipt_index_dev_read`.** The nightly backup runs as the read login, and `pg_dump` stops at the first table it can't read. A missing grant shows only as a failed backup in the scheduler's log.
+
+A server provisioned with this version of `db-init` ([4.2](#42-start-only-the-database)) has these logins from first boot. A server provisioned earlier, where the application still logs in as `receipt_index`, switches once with the steps below. Nothing in the repository changes this by itself. Each step can run while the scheduler runs, apart from step 6, which recreates it between ingest cycles.
+
+**1. Check who owns the migration version tables.** Migration 000014 grants on them, and only their owner can:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec db sh -c '
+    psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "
+        SELECT tablename, tableowner FROM pg_tables
+         WHERE tablename LIKE '\''schema_migrations_%'\'' ORDER BY 1;"'
+```
+
+**Pass:** both rows show `receipt_index`. If one doesn't, hand it over before migrating, then re-run the check:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec db sh -c '
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "
+        ALTER TABLE public.schema_migrations_public OWNER TO receipt_index;
+        ALTER TABLE public.schema_migrations_receipt OWNER TO receipt_index;"'
+```
+
+**2. Migrate.** `make migrate-up`, as in [4.3](#43-apply-migrations--an-explicit-deploy-step). It brings in migration 000014, which lets `receipt_index_dev_read` read the two version tables and takes back an `UPDATE` grant on `receipt.ingest_log` that no code used.
+
+**3. Generate two passwords,** one per login, and store each in 1Password:
+
+```bash
+openssl rand -hex 24
+```
+
+**4. Create the logins.** Open psql in the db container as the superuser:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec db sh -c 'psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
+```
+
+Run these, and type each password at its `\password` prompt, so it never appears in a command line or the shell history. Each `CREATE ROLE` runs only when the role doesn't exist yet, and the rest can be repeated, so after a partial failure run the whole block again:
+
+```sql
+SELECT 'CREATE ROLE receipt_index_write LOGIN'
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'receipt_index_write')
+\gexec
+GRANT receipt_index_dev_write TO receipt_index_write;
+GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_write;
+\password receipt_index_write
+
+SELECT 'CREATE ROLE receipt_index_read LOGIN'
+ WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'receipt_index_read')
+\gexec
+GRANT receipt_index_dev_read TO receipt_index_read;
+GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_read;
+\password receipt_index_read
+
+SELECT r.rolname, r.rolsuper, array_agg(g.rolname) AS member_of
+  FROM pg_roles r
+  JOIN pg_auth_members m ON m.member = r.oid
+  JOIN pg_roles g ON g.oid = m.roleid
+ WHERE r.rolname IN ('receipt_index_write', 'receipt_index_read')
+ GROUP BY r.rolname, r.rolsuper ORDER BY 1;
+\q
+```
+
+**Pass:** two rows, `receipt_index_read | f | {receipt_index_dev_read}` and `receipt_index_write | f | {receipt_index_dev_write}`. Each login is a member of its one role and nothing else.
+
+**5. Edit `.env`** in an editor. Keep the current `DATABASE_URL` line as a comment, for rollback, and set:
+
+```bash
+RECEIPT_INDEX_WRITE_PASSWORD=<write password>
+RECEIPT_INDEX_READ_PASSWORD=<read password>
+DATABASE_URL=postgresql://receipt_index_write:<write password>@db:5432/receipt_index  # pragma: allowlist secret
+RECEIPT_INDEX_READ_DATABASE_URL=postgresql://receipt_index_read:<read password>@db:5432/receipt_index  # pragma: allowlist secret
+RECEIPT_INDEX_MCP_DATABASE_URL=postgresql://receipt_index_read:<read password>@db:5432/receipt_index  # pragma: allowlist secret
+```
+
+Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. Leave `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` as they are: migrations still run as the owner. The service doesn't read the two password variables; `db-init` does, on a disaster-recovery rebuild ([8.3](#83-disaster-recovery-from-dropbox)). Then check for expansion warnings, as in [3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password):
+
+```bash
+docker compose -f deploy/docker-compose.yml config --quiet
+```
+
+**6. Recreate the scheduler** between ingest cycles. Compose reads `env_file` only when it creates a container. Go on past the check only when it prints exactly `check-exit=1`, as in [8.1](#81-upgrade):
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
+docker compose -f deploy/docker-compose.yml stop scheduler
+docker compose -f deploy/docker-compose.yml up -d scheduler
+```
+
+**7. Verify.**
+
+a. Each URL connects as its login:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
+    psql "$DATABASE_URL" -Atc "SELECT current_user"
+    psql "$RECEIPT_INDEX_READ_DATABASE_URL" -Atc "SELECT current_user"
+    psql "$RECEIPT_INDEX_MCP_DATABASE_URL" -Atc "SELECT current_user"'
+```
+
+**Pass:** `receipt_index_write`, `receipt_index_read`, `receipt_index_read`.
+
+b. [Gate C](#gate-c--schema): the version query, now through the read login, and the application's search.
+
+c. One supervised ingest. **Pass:** exit 0, and no `permission denied` in its output:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler receipt-index ingest; echo "exit=$?"
+```
+
+d. A backup, by hand. It replaces today's dump with a fresh one. **Pass:** `backup: wrote /app/data/backups/receipt_index-<day>.dump (<size> bytes)`, with no `permission denied`:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler /app/backup.sh
+```
+
+e. If the MCP server is set up, its check, [10.1](#101-one-time-setup) step 5.
+
+f. The application can't switch off the history guard:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
+    psql "$DATABASE_URL" -c "ALTER TABLE receipt.extractions DISABLE TRIGGER trg_extractions_append_only"'
+```
+
+**Pass:** `ERROR:  must be owner of table extractions`.
+
+**8. Retire the old MCP login.** If you set up the MCP server before this section existed, it logged in as `receipt_index_mcp`. Once check (e) passes on the read login, drop it in the psql session of step 4. `DROP ROLE` refuses while the role holds any privilege, so `DROP OWNED BY` goes first: it revokes every privilege the role holds in this database, its `CONNECT` included, and drops anything it owns (it should own nothing):
+
+```sql
+DROP OWNED BY receipt_index_mcp;
+DROP ROLE receipt_index_mcp;
+```
+
+**Rollback.** Put the old `DATABASE_URL` line back (the application logs in as `receipt_index` again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
 
 ---
 
@@ -951,7 +1130,7 @@ Anything the CLI can do is available this way, including `ingest`, but leave sch
 ssh receipt-server docker compose -p receipt-index exec -T scheduler receipt-index mcp
 ```
 
-The server refuses to start unless its database role is read-only. The only login role db-init creates is `receipt_index`, which owns everything, so production needs a one-time setup first.
+The server refuses to start unless its database role is read-only. It logs in as the read login, `receipt_index_read`, a member of `receipt_index_dev_read` only, which `db-init` creates on a new server and [8.4](#84-separate-database-logins) creates on an older one. The application's logins, `receipt_index` and `receipt_index_write`, can write, so the server refuses them.
 
 ### 10.1 One-time setup
 
@@ -965,35 +1144,18 @@ chown 1000:1000 data/mcp-logs   # sudo if not your uid
 
 On [rootless Docker](#rootless-docker), chown it from inside a container instead.
 
-**2. Create a read-only login role.** Create it as a member of `receipt_index_dev_read`, which the migrations grant `SELECT` on both tables and nothing else. Open psql in the db container, then run the statements and type the password at the `\password` prompt, so it never appears in a command line or the shell history:
+**2. Use the read login.** If the server predates the separate logins, do [8.4](#84-separate-database-logins) first: it creates `receipt_index_read` and sets `RECEIPT_INDEX_MCP_DATABASE_URL` to it. An older setup used its own `receipt_index_mcp` login; 8.4 step 8 retires it. There's one read login, for the backups, forensic queries and this server.
+
+**3. Add the access-log line to the clone-root `.env`,** next to `RECEIPT_INDEX_MCP_DATABASE_URL` (which [8.4](#84-separate-database-logins) step 5, or `deploy/example.env` on a new server, already sets to the read login):
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec db sh -c 'psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"'
-```
-
-```sql
-CREATE ROLE receipt_index_mcp LOGIN;
-GRANT receipt_index_dev_read TO receipt_index_mcp;
-GRANT CONNECT ON DATABASE :"DBNAME" TO receipt_index_mcp;
-\password receipt_index_mcp
-\q
-```
-
-Generate the password from an alphanumeric alphabet (`openssl rand -hex 24`), as for the other Postgres passwords ([3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password)). The role is cluster-level. It survives a `DROP DATABASE` but its `CONNECT` grant doesn't, so after recreating the database in 6.3, run the `GRANT CONNECT` line again. Disaster recovery (8.3) starts a new cluster, and `pg_dump` doesn't carry roles, so there the role is gone: redo all of this step, setting the password already in the restored `.env`.
-
-**3. Add two lines to the clone-root `.env`:**
-
-```bash
-RECEIPT_INDEX_MCP_DATABASE_URL=postgresql://receipt_index_mcp:<password>@db:5432/receipt_index  # pragma: allowlist secret
 RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 ```
 
-Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`.
-
-**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first:
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints exactly `check-exit=1`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec scheduler pgrep -af 'receipt-index ingest' || echo "idle"
+docker compose -f deploy/docker-compose.yml exec scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"'
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
@@ -1016,7 +1178,7 @@ ssh receipt-server 'cd ~/receipt-index && docker compose -f deploy/docker-compos
 docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index mcp </dev/null; echo "exit=$?"
 ```
 
-**Pass:** `MCP server ready on stdio (access log: /app/data/mcp-logs/mcp-access.jsonl)` and `exit=0`. `Error: the database role can write (...)` means it is still connecting as `receipt_index`: the variable is unset in the container (step 4) or the URL names the wrong role. `lacks SELECT` means the role isn't a member of `receipt_index_dev_read`, or the migrations' grants are missing.
+**Pass:** `MCP server ready on stdio (access log: /app/data/mcp-logs/mcp-access.jsonl)` and `exit=0`. `Error: the database role can write (...)` means it is connecting as `receipt_index` or `receipt_index_write`: the variable is unset in the container (step 4), so the server falls back to `DATABASE_URL`, or the URL names the wrong login. `lacks SELECT` means the role isn't a member of `receipt_index_dev_read`, or the migrations' grants are missing.
 
 ### 10.2 The access log
 

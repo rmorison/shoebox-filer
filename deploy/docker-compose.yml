@@ -21,8 +21,9 @@ services:
   db:
     image: postgres:18
     restart: unless-stopped
-    # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD / RECEIPT_INDEX_PASSWORD
-    # come from here. env_file (container environment) is used rather than
+    # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD and the three login
+    # passwords db-init reads (RECEIPT_INDEX_PASSWORD, RECEIPT_INDEX_WRITE_PASSWORD,
+    # RECEIPT_INDEX_READ_PASSWORD) come from here. env_file (container environment) is used rather than
     # ${VAR} interpolation because the .env lives at the clone root, and
     # compose only auto-loads a .env sitting next to the compose file — so
     # interpolated values would silently resolve to empty.
@@ -77,7 +78,8 @@ services:
       db:
         condition: service_healthy
     # Secrets: IMAP_PASSWORD, ANTHROPIC_API_KEY, GDRIVE_TOKEN_JSON,
-    # DATABASE_URL. Never baked into the image. See deploy/example.env.
+    # DATABASE_URL (the write login), RECEIPT_INDEX_READ_DATABASE_URL and
+    # RECEIPT_INDEX_MCP_DATABASE_URL (the read login). Never baked into the image. See deploy/example.env.
     env_file: ../.env
     environment:
       # Explicit rather than relying on CWD-relative config discovery, which

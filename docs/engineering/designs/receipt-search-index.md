@@ -384,6 +384,20 @@ GRANT USAGE ON SCHEMA receipt TO receipt_index_dev_read;
 GRANT SELECT ON receipt.receipts TO receipt_index_dev_read;
 ```
 
+**Production logins.** The `_dev_` roles above are NOLOGIN grant targets in production. Each level gets one login:
+
+| Level | Production login | Connection | Gets its access from |
+|---|---|---|---|
+| `_all` | `receipt_index` | `MIGRATION_DATABASE_URL`: migrations only | owns every object |
+| `_write` | `receipt_index_write` | `DATABASE_URL`: the application | membership of `receipt_index_dev_write` |
+| `_read` | `receipt_index_read` | `RECEIPT_INDEX_READ_DATABASE_URL`: backups and forensics; `RECEIPT_INDEX_MCP_DATABASE_URL`: the MCP server | membership of `receipt_index_dev_read` |
+
+The application doesn't own the tables, so the column-level grants bind it, and it can't drop or disable the guard triggers that keep history append-only. `deploy/db-init` creates the logins on a new server; the [deployment guide](../../user/server-deployment.md#84-separate-database-logins) switches an older one. `tests/integration/test_db_logins.py` runs every write path as a member of `receipt_index_dev_write` alone, with the migrations' own grants.
+
+**Known deviation from the standard.** The grant-target roles keep `_dev_` in their names in every environment. Every migration grants to them by name, so renaming them would be a migration change for no gain.
+
+**Grants a new migration owes.** A new table grants `SELECT` to `receipt_index_dev_read`: the nightly backup runs as the read login, and `pg_dump` stops at the first table it can't read. Writes are granted to `receipt_index_dev_write` column by column, leaving out the database-managed columns, and only for what the application does: an append-only table gets `INSERT` and no `UPDATE` or `DELETE`.
+
 #### Migrations
 
 Managed by [golang-migrate](https://github.com/golang-migrate/migrate) with per-schema directories under `db/migrations/`. Migrations run in schema dependency order via Makefile:

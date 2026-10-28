@@ -23,7 +23,20 @@
 
 set -eu
 
-: "${DATABASE_URL:?DATABASE_URL must be set in the container environment}"
+# Dump as the read login when RECEIPT_INDEX_READ_DATABASE_URL is set: it can
+# read every table, golang-migrate's version tables included (migration
+# 000014), and nothing else. Without it, fall back to DATABASE_URL, as before
+# the separate logins. Once DATABASE_URL is the write login, that fallback
+# fails on schema_migrations_public, so set the read URL first (see
+# docs/user/server-deployment.md, "Separate database logins").
+DUMP_URL="${RECEIPT_INDEX_READ_DATABASE_URL:-${DATABASE_URL:-}}"
+: "${DUMP_URL:?RECEIPT_INDEX_READ_DATABASE_URL or DATABASE_URL must be set in the container environment}"
+if [ -z "${RECEIPT_INDEX_READ_DATABASE_URL:-}" ]; then
+    echo "backup: RECEIPT_INDEX_READ_DATABASE_URL is unset; dumping through DATABASE_URL"
+fi
+# Say which login the dump runs as, so a run that falls back to another login
+# shows it in the log even when it succeeds.
+dump_user="$(psql --no-psqlrc --no-password -Atc 'SELECT current_user' "${DUMP_URL}")"
 
 BACKUP_DIR="${BACKUP_DIR:-/app/data/backups}"
 
@@ -39,9 +52,9 @@ tmp="${target}.tmp"
 # suspenders (--exclude "*.tmp" on the crontab mirror line).
 trap 'rm -f "${tmp}"' EXIT
 
-echo "backup: dumping to ${target}"
+echo "backup: dumping as ${dump_user} to ${target}"
 
-pg_dump --format=custom --no-password --file="${tmp}" "${DATABASE_URL}"
+pg_dump --format=custom --no-password --file="${tmp}" "${DUMP_URL}"
 mv -f "${tmp}" "${target}"
 
 echo "backup: wrote ${target} ($(wc -c < "${target}") bytes)"
