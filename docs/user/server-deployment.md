@@ -1110,17 +1110,21 @@ A server provisioned with this version of [3.2](#32-create-env-and-envdb-at-the-
 
 **Precondition: [8.4](#84-separate-database-logins) is done,** so `DATABASE_URL` logs in as `receipt_index_write`. Otherwise `DATABASE_URL` is itself an owner credential and this split protects nothing. On a server still on the owner login, run 8.4 on the current checkout first, **before** `git pull` brings in this release: 8.4 step 6 recreates the scheduler, which needs `.env.db` once the new compose file is in place.
 
-**1. Keep a copy** of the current file, for rollback. `cp -p` keeps its mode, and `.env.*` is git-ignored:
+Steps 1 and 2 run once. If `.env.pre-split` or `.env.db` already exists, an earlier run got that far: don't run them again, since a second split of the already-split `.env` would replace both files with ones that hold no owner lines. Go on from step 3, or put `.env.pre-split` back as in the rollback, delete `.env.db`, and start over. The commands below refuse to overwrite either file.
+
+**1. Keep a copy** of the current file, for rollback. `cp -p` keeps its mode, `-n` never overwrites an earlier copy, and `.env.*` is git-ignored:
 
 ```bash
 cd ~/receipt-index
-cp -p .env .env.pre-split
+test ! -e .env.pre-split && cp -pn .env .env.pre-split && echo copied
 ```
 
-**2. Move the owner's lines** into `.env.db`. The subshell's `umask` creates both new files mode 600, and `grep` writes the lines to files without printing them:
+**Pass:** `copied`.
+
+**2. Move the owner's lines** into `.env.db`. The subshell's `umask` creates both new files mode 600, `set -C` refuses to overwrite an existing `.env.db`, and `grep` writes the lines to files without printing them:
 
 ```bash
-(umask 077
+(set -C; umask 077
  grep -E '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.db &&
  grep -vE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env > .env.new &&
  mv .env.new .env)
@@ -1132,8 +1136,11 @@ cp -p .env .env.pre-split
 grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env.db   # must print 7
 grep -cE '^(POSTGRES_(USER|PASSWORD|DB)|RECEIPT_INDEX_(|WRITE_|READ_)PASSWORD|MIGRATION_DATABASE_URL)=' .env      # must print 0
 grep -c '^DATABASE_URL=' .env                                     # must print 1
+grep -cE '://(receipt_index|postgres)[:@]' .env                   # must print 0
 stat -c '%a %n' .env .env.db                                      # both 600
 ```
+
+The fourth count reads comment lines too. If it isn't 0, `.env` still holds an owner URL: most likely the old `DATABASE_URL` that [8.4](#84-separate-database-logins) step 5 kept as a comment for rollback. Delete that line in an editor; `.env.pre-split` keeps a copy. Compose ignores comments, so it never reached the container, but `.env` should hold no owner password at all.
 
 If `.env.db` holds fewer than 7 lines, `.env` lacked one of them: a server provisioned before 8.4 may lack the two login passwords; add them to `.env.db` from 1Password, as 8.3 step 2 says. Store `.env.db` in 1Password next to `.env`.
 

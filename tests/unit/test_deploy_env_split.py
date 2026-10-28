@@ -154,3 +154,67 @@ def _names(path: Path) -> set[str]:
 def test_example_files_do_not_overlap() -> None:
     both = sorted(_names(DEPLOY / "example.env") & _names(DEPLOY / "example.env.db"))
     assert both == [], f"set in both example.env and example.env.db: {both}"
+
+
+def test_missing_env_db_fails_compose_config(tmp_path: Path) -> None:
+    """A server without .env.db stops at `config`, before touching a container."""
+    if not _compose_available():
+        if os.environ.get("CI"):
+            pytest.fail("docker compose is required in CI for the env split check")
+        pytest.skip("docker compose is not installed")
+    shutil.copytree(DEPLOY, tmp_path / "deploy")
+    shutil.copy(DEPLOY / "example.env", tmp_path / ".env")
+    env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "DOCKER_HOST"}}
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(tmp_path / "deploy" / "docker-compose.yml"),
+            "config",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0
+    assert ".env.db" in result.stderr
+
+
+SHOW_MIGRATION_URL = 'show:\n\t@echo "[$$MIGRATION_DATABASE_URL]"\n'
+
+
+def _make_show(root: Path) -> str:
+    if shutil.which("make") is None:
+        if os.environ.get("CI"):
+            pytest.fail("make is required in CI for the Makefile env check")
+        pytest.skip("make is not installed")
+    shutil.copy(REPO_ROOT / "Makefile", root / "Makefile")
+    (root / "show.mk").write_text(SHOW_MIGRATION_URL)
+    env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME"}}
+    result = subprocess.run(
+        ["make", "-s", "-f", "Makefile", "-f", "show.mk", "show"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+        cwd=root,
+    )
+    return result.stdout.strip()
+
+
+def test_makefile_exports_migration_url_from_env_db(tmp_path: Path) -> None:
+    """`make migrate-up` on the server finds MIGRATION_DATABASE_URL in .env.db."""
+    shutil.copy(DEPLOY / "example.env", tmp_path / ".env")
+    shutil.copy(DEPLOY / "example.env.db", tmp_path / ".env.db")
+    shown = _make_show(tmp_path)
+    assert shown.startswith("[postgresql://receipt_index:"), shown
+    assert shown.endswith("?sslmode=disable]"), shown
+
+
+def test_makefile_without_env_db_keeps_dev_env(tmp_path: Path) -> None:
+    """A dev checkout has one .env, which still sets MIGRATION_DATABASE_URL."""
+    shutil.copy(REPO_ROOT / "example.env", tmp_path / ".env")
+    assert _make_show(tmp_path) != "[]"
