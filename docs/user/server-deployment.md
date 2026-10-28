@@ -381,6 +381,8 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
 
 (A `dirty = t` means a migration aborted half-applied; fix it before anything else touches the database.)
 
+`make migrate-up` never applies a migration numbered at or below the version a table records, and says nothing about it. A migration added to the repository after a higher-numbered one has been applied is skipped for good, so every new migration takes a number above every applied one.
+
 The query runs as the read login, the one the nightly backup uses, so it also proves that login can read the version tables, which `pg_dump` needs. `permission denied for table schema_migrations_public` means migration 000014 hasn't run.
 
 Then prove the **application** read path — the application's login (`receipt_index_write`), same DSN, same container the scheduler will use:
