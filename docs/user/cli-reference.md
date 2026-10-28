@@ -524,7 +524,7 @@ At least one of these, `--limit` or `--all` is required, so that a bare command 
 | `--id UUID` | This receipt (repeatable) |
 | `--model-not MODEL` | Receipts whose latest extraction used a different model, or that have none |
 | `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing. A receipt where that field is hand-edited is left out, since a run can't change it |
-| `--refund-candidates` | Receipts still marked `purchase`, their kind not hand-edited, whose email subject, description, vendor or file name has one of these whole words, in any case: `refund`, `refunds`, `refunded`, `credit`, `credited`, `return`, `returned`, `reversal`, `reversed`, `chargeback`, `statement`, `cancel`, `cancelled`, `canceled` or `cancellation`. A word followed by `card` (`credit card`) doesn't count. The back-fill for [kind](#kinds-and-totals): run it with `--dry-run` first |
+| `--refund-candidates` | Receipts still marked `purchase`, their kind not hand-edited, whose email subject, description, vendor or file name has one of these whole words, in any case: `refund`, `refunds`, `refunded`, `credit`, `credits`, `credited`, `return`, `returned`, `reversal`, `reversals`, `reversed`, `chargeback`, `chargebacks`, `statement`, `statements`, `estatement`, `estatements`, `cancel`, `cancelled`, `canceled`, `cancellation` or `cancellations`. A word followed by `card` (`credit card`) doesn't count. The back-fill for [kind](#kinds-and-totals): run it with `--dry-run` first |
 | `--all` | Every receipt |
 | `--limit N` | At most `N` receipts, oldest first |
 

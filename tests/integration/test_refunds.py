@@ -465,6 +465,11 @@ class TestReextract:
                 "Order cancelled",
                 "Cancellation confirmed",
                 "Item returned",
+                "Your eStatement is ready",
+                "Statements for 2025",
+                "Credits applied to your account",
+                "Chargebacks and reversals",
+                "Cancellations this month",
             )
         ]
         # Whole words only, and a credit card is not a credit.

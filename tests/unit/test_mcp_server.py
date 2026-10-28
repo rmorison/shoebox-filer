@@ -1144,3 +1144,22 @@ class TestKindAndSignedAmount:
         assert data is not None
         assert (data["refunded"], data["net_paid"]) == ("10.00", "20.00")
         assert data["signed_amount"] == "30.00"
+
+
+class TestStatementOutput:
+    def test_a_statement_reads_as_described(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        receipt = _receipt(kind="statement")
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+            result = _call(
+                _server(store_root, log_path), "get_receipt", {"receipt_id": str(_ID)}
+            )
+        data = result.structured_content
+        assert data is not None
+        assert data["signed_amount"] == "0.00"
+        description = ReceiptOut.model_json_schema()["properties"]["signed_amount"][
+            "description"
+        ]
+        assert "'0.00' for a statement" in " ".join(description.split())
+        assert "0.00 for a statement" in " ".join(_INSTRUCTIONS.split())

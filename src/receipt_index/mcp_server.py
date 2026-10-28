@@ -72,7 +72,7 @@ charged). effective_amount is paid_amount when known, otherwise amount, and
 the amount filters match on it; effective_amount is never negative. kind is
 purchase, refund, credit or statement, and signed_amount is effective_amount
 with the sign a total needs: positive for a purchase, negative for a refund
-or credit, 0 for a statement (its transactions are charged or receipted
+or credit, 0.00 for a statement (its transactions are charged or receipted
 elsewhere). Sum signed_amount for net spend; a sum of effective_amount counts
 refunds and credits as charges. search_receipts returns every kind unless
 kind narrows it. A refund linked to its purchase has refund_of; a purchase
@@ -168,7 +168,7 @@ class ReceiptOut(BaseModel):
     signed_amount: str = Field(
         description=(
             "effective_amount signed for a total, as a decimal string: positive "
-            "for a purchase, negative for a refund or credit, '0' for a "
+            "for a purchase, negative for a refund or credit, '0.00' for a "
             "statement. A sum of signed_amount is the net spend."
         )
     )
