@@ -1,7 +1,7 @@
 """Linking a refund to the purchase it returns money for (data-model design, §6).
 
 A refund is its own receipt with ``kind = 'refund'``; ``refund_of`` points at
-its purchase, and the ``receipt_net`` view takes linked refunds off the
+its purchase, and the ``v_receipt_net`` view takes linked refunds off the
 purchase's paid amount.
 
 ``link_by_rule`` is the automatic rule. It runs inside the caller's

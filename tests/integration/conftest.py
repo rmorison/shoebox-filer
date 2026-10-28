@@ -248,7 +248,7 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     conn.execute(_schema_part("receipt", "000015"))
 
     # receipt/000016 — kind, refund_of, the generated signed_amount and the
-    # receipt_net view. Run from the migration file, up to its grants.
+    # v_receipt_net view. Run from the migration file, up to its grants.
     conn.execute(_schema_part("receipt", "000016"))
     conn.commit()
 

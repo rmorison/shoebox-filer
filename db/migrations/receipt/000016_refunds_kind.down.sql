@@ -1,6 +1,6 @@
 -- Dropping the columns also drops their constraints, index and column-level
 -- grants. The view reads the columns, so it goes first.
-DROP VIEW IF EXISTS receipt.receipt_net;
+DROP VIEW IF EXISTS receipt.v_receipt_net;
 
 DROP INDEX IF EXISTS receipt.idx_receipts_refund_of;
 

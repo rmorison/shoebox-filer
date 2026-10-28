@@ -624,7 +624,7 @@ class Receipt(BaseModel):
     kind: Kind = "purchase"
     # The purchase this refund returns money for; only a refund has one.
     refund_of: UUID | None = None
-    # From the receipt_net view, for a purchase read with it: the sum of its
+    # From the v_receipt_net view, for a purchase read with it: the sum of its
     # linked refunds, and what it cost after them. None otherwise.
     refunded: Decimal | None = None
     net_paid: Decimal | None = None

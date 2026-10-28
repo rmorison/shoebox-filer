@@ -1,4 +1,4 @@
-"""Migration 000016: kind, refund_of, signed_amount and the receipt_net view.
+"""Migration 000016: kind, refund_of, signed_amount and the v_receipt_net view.
 
 Runs the real migration files, grants included, in a scratch database (the
 ``scratch`` fixture from the 000011 tests, which creates and drops it), so it
@@ -50,7 +50,9 @@ class TestUpAndDown:
         conn.commit()
 
         _run(conn, _migration("000016", "down"))
-        row = conn.execute("SELECT to_regclass('receipt.receipt_net') AS v").fetchone()
+        row = conn.execute(
+            "SELECT to_regclass('receipt.v_receipt_net') AS v"
+        ).fetchone()
         assert row == {"v": None}
         columns = conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE"
@@ -172,7 +174,7 @@ class TestReceiptNet:
         _set(conn, unlinked, kind="refund", paid_amount=Decimal("5.00"))
         conn.commit()
         row = conn.execute(
-            "SELECT * FROM receipt.receipt_net WHERE receipt_id = %s", (purchase,)
+            "SELECT * FROM receipt.v_receipt_net WHERE receipt_id = %s", (purchase,)
         ).fetchone()
         assert row == {
             "receipt_id": purchase,
@@ -191,7 +193,7 @@ class TestReceiptNet:
         plain = _receipt(conn, "<p6@example.com>")
         conn.commit()
         rows = conn.execute(
-            "SELECT receipt_id, refunded, net_paid FROM receipt.receipt_net"
+            "SELECT receipt_id, refunded, net_paid FROM receipt.v_receipt_net"
         ).fetchall()
         assert rows == [
             {

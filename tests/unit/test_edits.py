@@ -228,6 +228,36 @@ class TestEditReceipt:
         assert "kind" in result.receipt.manual_fields
         assert [r.kind for r in db.linked] == ["refund"]
 
+    def test_the_rules_links_come_back_with_the_edit(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        purchase = uuid4()
+        rule_event = ReceiptEvent(
+            id=uuid4(),
+            receipt_id=_ID,
+            event_type="refund_linked",
+            payload={"purchase_id": str(purchase)},
+            actor="rule",
+            actor_kind="rule",
+            created_at=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+
+        def link_by_rule(conn: Any, receipt: Receipt) -> list[ReceiptEvent]:
+            # The rule linked it: the stored receipt now has its purchase.
+            assert db.receipt is not None
+            db.receipt = db.receipt.model_copy(
+                update={"kind": "refund", "refund_of": purchase}
+            )
+            return [rule_event]
+
+        monkeypatch.setattr(edits, "link_by_rule", link_by_rule)
+        result = edit_receipt(db.conn, _ID, {"kind": "refund"}, actor="op", reason=None)
+        assert [e.event_type for e in result.events] == [
+            "field_edited",
+            "refund_linked",
+        ]
+        assert result.receipt.refund_of == purchase
+
     def test_an_order_number_edit_runs_the_rule(self, db: FakeDb) -> None:
         edit_receipt(db.conn, _ID, {"order_number": "A-1"}, actor="op", reason=None)
         assert len(db.linked) == 1

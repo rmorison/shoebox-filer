@@ -443,7 +443,7 @@ def test_write_paths_run_as_the_write_login(
     pg_conn.commit()
 
     # 4c. edit --kind and the refund commands: kind and refund_of (UPDATE),
-    #     the receipt_net view and the rule's and a person's events.
+    #     the v_receipt_net view and the rule's and a person's events.
     purchase = pg_conn.execute(
         "INSERT INTO receipt.receipts (source_id, source_name, vendor, amount, "
         "paid_amount, currency, receipt_date, confidence, pdf_path, order_number) "

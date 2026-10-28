@@ -347,6 +347,12 @@ class TestEditKind:
         # Both receipts match each other's order: with the second now a
         # refund, the first is the only purchase left.
         assert _refund_of(pg_conn, receipt) == purchase.id
+        # The edit returns the receipt as linked, with the rule's event.
+        assert result.receipt.refund_of == purchase.id
+        assert [(e.event_type, e.actor_kind) for e in result.events] == [
+            ("field_edited", "person"),
+            ("refund_linked", "rule"),
+        ]
 
     def test_a_linked_receipt_keeps_its_kind(self, pg_conn: Conn) -> None:
         purchase = _insert(pg_conn)

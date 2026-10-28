@@ -4,7 +4,7 @@
 --
 -- A refund is its own receipt, with positive amounts; kind gives the
 -- direction. refund_of links a refund to the purchase it returns money for.
--- receipt_net gives each purchase its net paid after linked refunds.
+-- v_receipt_net gives each purchase its net paid after linked refunds.
 
 ALTER TABLE receipt.receipts
     ADD COLUMN IF NOT EXISTS kind      TEXT NOT NULL DEFAULT 'purchase',
@@ -40,7 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_receipts_refund_of
 -- Net paid is computed, not stored, so it can't fall out of step with the
 -- refunds. The merge conditions of the design's view (merged_into_id) wait
 -- for the evidence-store merge, which adds them.
-CREATE OR REPLACE VIEW receipt.receipt_net AS
+CREATE OR REPLACE VIEW receipt.v_receipt_net AS
 WITH linked_refunds AS (
     SELECT r.id,
            COALESCE(r.paid_amount, r.amount) AS refund_amount,
@@ -60,7 +60,7 @@ WHERE p.kind = 'purchase'
 GROUP BY p.id;
 
 -- _all: full DDL access (runs migrations)
-GRANT ALL PRIVILEGES ON receipt.receipt_net TO receipt_index_dev_all;
+GRANT ALL PRIVILEGES ON receipt.v_receipt_net TO receipt_index_dev_all;
 
 -- _write: kind and refund_of are written; signed_amount is generated and
 -- takes no INSERT or UPDATE grant.
@@ -68,9 +68,9 @@ GRANT INSERT (kind, refund_of), UPDATE (kind, refund_of)
     ON receipt.receipts TO receipt_index_dev_write;
 GRANT SELECT (kind, refund_of, signed_amount)
     ON receipt.receipts TO receipt_index_dev_write;
-GRANT SELECT ON receipt.receipt_net TO receipt_index_dev_write;
+GRANT SELECT ON receipt.v_receipt_net TO receipt_index_dev_write;
 
 -- _read: SELECT only (the nightly backup and the MCP server read these)
 GRANT SELECT (kind, refund_of, signed_amount)
     ON receipt.receipts TO receipt_index_dev_read;
-GRANT SELECT ON receipt.receipt_net TO receipt_index_dev_read;
+GRANT SELECT ON receipt.v_receipt_net TO receipt_index_dev_read;

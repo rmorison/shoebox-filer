@@ -41,7 +41,7 @@ _EFFECTIVE_AMOUNT = "COALESCE(paid_amount, amount)"
 # name with one of them.
 _WITH_NET = (
     "SELECT receipts.*, n.refunded, n.net_paid FROM receipt.receipts"
-    " LEFT JOIN receipt.receipt_net n ON n.receipt_id = receipts.id"
+    " LEFT JOIN receipt.v_receipt_net n ON n.receipt_id = receipts.id"
 )
 
 
@@ -1339,7 +1339,9 @@ def find_refund_purchases(
     Same order number, same vendor (any case), same currency, and a paid
     amount above zero, which leaves out confirmation and shipping emails and
     unpaid invoices that share the order number. The rule links only when
-    there is exactly one.
+    there is exactly one. The matches are read ``FOR SHARE``: a concurrent
+    change to a match's kind waits for the link, or the link waits for it
+    and sees the new kind, so a refund never links to a non-purchase.
     """
     if refund.order_number is None:
         return []
@@ -1352,6 +1354,7 @@ def find_refund_purchases(
           AND currency = %(currency)s
           AND paid_amount > 0
         ORDER BY id
+        FOR SHARE
         """,
         {
             "id": refund.id,

@@ -76,7 +76,14 @@ or credit, 0 for a statement (its transactions are charged or receipted
 elsewhere). Sum signed_amount for net spend; a sum of effective_amount counts
 refunds and credits as charges. search_receipts returns every kind unless
 kind narrows it. A refund linked to its purchase has refund_of; a purchase
-has refunded (its linked refunds) and net_paid. order_number and the payment
+has refunded (its linked refunds, '0' when none) and net_paid, its
+effective_amount less refunded. For a total, sum signed_amount over every
+receipt in range; use net_paid only to read one purchase, since adding it to
+the refunds' signed_amount counts them twice, and a refund with no refund_of
+is in no purchase's net_paid. Receipts indexed before kinds were extracted
+read kind purchase until they are re-extracted, so an older refund, credit
+or statement may still count as spend: say a total over older receipts is
+provisional. order_number and the payment
 fields (payment_method, payment_last4, payer) are as printed on the receipt,
 and null when it doesn't show them; payment_last4 is only ever the last four
 digits.

@@ -915,6 +915,10 @@ class TestPaidAmountOutput:
         assert "not yet marked" not in flat
         assert "Sum signed_amount for net spend" in flat
         assert "effective_amount is never negative" in flat
+        # net_paid isn't a second total, and the back catalogue's kinds are
+        # provisional until re-extracted.
+        assert "adding it to the refunds' signed_amount counts them twice" in flat
+        assert "say a total over older receipts is provisional" in flat
 
     def test_amount_descriptions_follow_the_design(self) -> None:
         schema = ReceiptOut.model_json_schema()["properties"]

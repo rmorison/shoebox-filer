@@ -60,7 +60,7 @@ The two designs divide the `receipt` schema as follows.
 | This design owns | The [evidence-store design](evidence-store.md) owns |
 |---|---|
 | The receipt's own fields: vendor, amounts, date, currency, description, confidence, order number, payment, kind and refund link | Stored files: originals, attachments and renditions, with their hashes and storage references |
-| `line_items`, `tags`, `receipt_tags`, `external_links`, `receipt_events`, `extractions`, the `receipt_net` view | Provenance records (one per source item), which take over `source_id`, `source_type`, `source_name`, `file_name` and the `email_*` columns |
+| `line_items`, `tags`, `receipt_tags`, `external_links`, `receipt_events`, `extractions`, the `v_receipt_net` view | Provenance records (one per source item), which take over `source_id`, `source_type`, `source_name`, `file_name` and the `email_*` columns |
 | The search document | Today's `pdf_path`, and the rendition reference that replaces it |
 | | Duplicate detection (its `duplicate_candidates` table references provenance records, not receipts), and linking and unlinking duplicates |
 
@@ -467,7 +467,7 @@ The operator widened this section when the refunds request was planned: `kind` a
 | `credit` | A credit that isn't money returned for one purchase (credit memo, account credit, rebate) | its negative |
 | `statement` | A card or bank statement, or a vendor statement summarising orders already receipted | `0` |
 
-`signed_amount` is a stored generated column (`0 - x` for the negatives, so a refund of `0.00` never reads `-0.00`), and `Receipt.signed_amount` computes the same in Python. `effective_amount` keeps its meaning and stays unsigned. Search returns every kind unless `--kind` narrows it.
+`signed_amount` is a stored generated column (`0 - x` for the negatives, so a refund of `0.00` never reads `-0.00`), and `Receipt.signed_amount` computes the same in Python. `effective_amount` keeps its meaning and stays unsigned. Search returns every kind unless `--kind` narrows it. The view is named `v_receipt_net`, with the `v_` prefix the database standards give views.
 
 ```sql
 ALTER TABLE receipt.receipts
@@ -484,7 +484,7 @@ ALTER TABLE receipt.receipts
 
 CREATE INDEX IF NOT EXISTS idx_receipts_refund_of ON receipt.receipts (refund_of);
 
-CREATE OR REPLACE VIEW receipt.receipt_net AS
+CREATE OR REPLACE VIEW receipt.v_receipt_net AS
 WITH live_refunds AS (
     -- A refund counts against the purchase that remains after any merge,
     -- and not at all if the refund was itself merged away.
@@ -636,7 +636,7 @@ CREATE INDEX IF NOT EXISTS idx_external_links_system_id
 The evidence-store design marks a merged receipt with `merged_into_id` instead of deleting it. In this design:
 
 - Search, `--needs-review`, `--untagged`, `--not-linked`, text search, totals and the JSON output leave out merged receipts (`merged_into_id IS NULL`). `show` on a merged receipt still works, and says which receipt it was merged into.
-- `receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
+- `v_receipt_net` counts a refund against the purchase that remains, and leaves out a refund that was itself merged away (above). No `refund_of` is rewritten, so undoing a merge needs no fix-up.
 - The refund linking rule and `reextract` skip merged receipts.
 - A merge always points at a receipt that isn't itself merged; the evidence-store design keeps it so (it flattens merges and checks this with a trigger), which is why one `COALESCE` is enough.
 - These conditions need the evidence-store design's columns. Whichever ticket lands second, this design's or that design's merge, adds them.
@@ -659,7 +659,7 @@ For reference, the columns this design adds to `receipt.receipts`:
 | `signed_amount` | `NUMERIC(12,2)`, generated from `kind` and the amounts | 5 |
 | `search_document` | `TSVECTOR` | 6 |
 
-New tables: `extractions` (2), `receipt_events` (3), `line_items` (4), `tags` and `receipt_tags` (7), `external_links` (8). New view: `receipt_net` (5). New grant-target role: `receipt_index_dev_annotate` (7).
+New tables: `extractions` (2), `receipt_events` (3), `line_items` (4), `tags` and `receipt_tags` (7), `external_links` (8). New view: `v_receipt_net` (5). New grant-target role: `receipt_index_dev_annotate` (7).
 
 Every column added to `receipts` gets column-level `INSERT` and `UPDATE` grants for `_write` and `SELECT` for `_read`, as the existing migrations do, apart from `search_document`, which only the trigger writes, and `signed_amount`, which is generated (`SELECT` only).
 
@@ -713,7 +713,7 @@ Against the devtest database, with every migration mirrored in the integration c
 - Ingest of a fixture receipt fills `paid_amount`, `field_confidence` and an `extractions` row.
 - `reextract --input rendition` over fixtures: the first run fills fields, a second run with the same prompt version does nothing, an edited field survives `--overwrite`.
 - The search document follows changes to line items, and `--text` finds a receipt by an item description.
-- `receipt_net` gives the right net figure for a purchase with two partial refunds.
+- `v_receipt_net` gives the right net figure for a purchase with two partial refunds.
 - The annotate role can apply a tag and add a link, each with a trigger-written event recorded as `agent`, and is refused when it tries to define a tag, update a receipt or write an event directly.
 - An update or delete of a history row is refused even for the table's owner, and deleting a receipt still cascades.
 - A fill-only re-extraction sets `kind = 'refund'` on a receipt with no extraction history, and links it to its purchase.
