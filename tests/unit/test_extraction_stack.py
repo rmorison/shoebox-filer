@@ -2,9 +2,9 @@
 
 Every other extraction test mocks the agent, so a lock that breaks the
 pydantic-ai/anthropic pairing leaves them green. These tests run the
-extraction agent unmocked, against the stub
-Messages API in ``conftest.py``, so they need no API key and make no
-network call beyond 127.0.0.1.
+extraction agent unmocked, against the stub Messages API in
+``conftest.py``, so they need no API key and make no network call beyond
+127.0.0.1.
 """
 
 from __future__ import annotations

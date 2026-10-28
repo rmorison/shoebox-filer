@@ -96,3 +96,5 @@ class TestExtractText:
     def test_has_no_vision_agent_factory(self) -> None:
         assert not hasattr(pdf_reader, "create_vision_agent")
         assert not hasattr(pdf_reader, "_extract_with_vision")
+        # No model client in this module, so extract_text can't call one.
+        assert not hasattr(pdf_reader, "Agent")
