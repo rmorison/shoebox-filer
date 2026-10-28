@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import os
+from typing import TYPE_CHECKING
 
-import pytest
 import weasyprint
 
-from receipt_index.pdf_reader import create_vision_agent, extract_text
+from receipt_index.pdf_reader import extract_text
+
+if TYPE_CHECKING:
+    import pytest
 
 
 class TestPdfTextExtraction:
@@ -47,20 +49,14 @@ class TestPdfTextExtraction:
         assert "Vendor Name Corp" in result
         assert "199.50" in result
 
+    def test_image_only_pdf_gives_no_text_and_no_model_call(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An image-only PDF gives "" with no model call.
 
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY"),
-    reason="ANTHROPIC_API_KEY required for vision integration test",
-)
-class TestPdfVisionFallback:
-    """Integration tests requiring Anthropic API for vision fallback."""
-
-    def test_vision_extracts_from_image_pdf(self) -> None:
-        """An image-only PDF should fall back to vision and extract text."""
-        # Create a PDF where text is rendered as an image (SVG path),
-        # making it unextractable by pdfplumber. We use an SVG embedded
-        # in HTML to simulate this.
+        The extraction agent then reads the PDF itself as a document block.
+        """
+        # weasyprint draws SVG text as paths, so pdfplumber finds no text.
         html = """\
         <html><body>
         <svg width="400" height="100" xmlns="http://www.w3.org/2000/svg">
@@ -70,8 +66,8 @@ class TestPdfVisionFallback:
         """
         pdf_bytes = weasyprint.HTML(string=html).write_pdf()
 
-        agent = create_vision_agent(api_key=os.environ["ANTHROPIC_API_KEY"])
-        result = extract_text(pdf_bytes, vision_agent=agent)
+        with caplog.at_level("DEBUG", logger="receipt_index.pdf_reader"):
+            result = extract_text(pdf_bytes)
 
-        # Vision should extract the text from the rendered image
-        assert "75.00" in result or "75" in result
+        assert result == ""
+        assert "vision" not in caplog.text.lower()

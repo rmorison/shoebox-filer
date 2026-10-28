@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. Amended: the separate vision-text fallback was removed; see [Amendment](#amendment-pdf-goes-to-the-extraction-agent).
 
 ## Context
 
@@ -60,5 +60,12 @@ A standalone `pdf_reader.py` module with no email/IMAP dependencies, callable fr
 ## Follow-ups
 
 - Monitor the 20-character threshold against real receipt data and adjust if needed
-- Consider caching vision extraction results if the same PDF is reprocessed
-- Track API cost of vision fallback calls in logging
+- ~~Consider caching vision extraction results if the same PDF is reprocessed~~ and ~~track API cost of vision fallback calls in logging~~: closed by the amendment below, since there is no separate vision-text call
+
+## Amendment: PDF goes to the extraction agent
+
+The vision-text fallback (a second agent that turned a scanned PDF into text) was never wired into production: no caller passed it an agent, so it always returned an empty string. It has been removed. `pdf_reader.extract_text` is now pdfplumber only, and returns an empty string when the text is under the 20-character threshold.
+
+The extraction agent reads the PDF itself instead. When a Drive PDF, a stored rendition or a PDF attached to an email has too little text, `extraction.py` sends the PDF to the extraction agent as a `document` block, in the same call that extracts the metadata. That costs one model call per scanned PDF, not two, and the model reads the layout as well as the text. The cost and caching follow-ups above no longer apply.
+
+The decision to try pdfplumber first, and to read scanned PDFs with Claude rather than with Tesseract, stands.
