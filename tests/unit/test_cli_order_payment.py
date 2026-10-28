@@ -178,6 +178,7 @@ class TestSearchOutput:
             "Vendor",
             "Order",
             "Last4",
+            "Kind",
             "Amount",
             "Total",
         ]

@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 from receipt_index import repository
 from receipt_index.db import get_connection
+from receipt_index.models import Kind  # noqa: TC001 (pydantic resolves it)
 from receipt_index.store import InvalidRefError, LocalEvidenceStore, rendition_ref
 
 if TYPE_CHECKING:
@@ -67,12 +68,18 @@ Read-only access to an index of receipts: vendor, amounts, date, source, and
 a rendered PDF for each. amount is the order, invoice or statement total;
 paid_amount is what was charged to the payer's payment methods, or for a
 refund, what was returned to them (null when not known, 0 when nothing was
-charged). A refund's paid_amount is not negative and refunds are not yet
-marked, so a sum of effective_amount values counts them as charges.
-effective_amount is paid_amount when known, otherwise amount, and the amount
-filters match on it. order_number and the payment fields (payment_method,
-payment_last4, payer) are as printed on the receipt, and null when it doesn't
-show them; payment_last4 is only ever the last four digits.
+charged). effective_amount is paid_amount when known, otherwise amount, and
+the amount filters match on it; effective_amount is never negative. kind is
+purchase, refund, credit or statement, and signed_amount is effective_amount
+with the sign a total needs: positive for a purchase, negative for a refund
+or credit, 0 for a statement (its transactions are charged or receipted
+elsewhere). Sum signed_amount for net spend; a sum of effective_amount counts
+refunds and credits as charges. search_receipts returns every kind unless
+kind narrows it. A refund linked to its purchase has refund_of; a purchase
+has refunded (its linked refunds) and net_paid. order_number and the payment
+fields (payment_method, payment_last4, payer) are as printed on the receipt,
+and null when it doesn't show them; payment_last4 is only ever the last four
+digits.
 Use search_receipts to find receipts (paged: keep calling with next_offset
 until it is null, and compare the count with total), get_receipt for one
 receipt's metadata, get_receipt_file for its PDF, and list_failures for
@@ -141,8 +148,39 @@ class ReceiptOut(BaseModel):
     effective_amount: str = Field(
         description=(
             "paid_amount when known, otherwise the total (amount), as a decimal "
-            "string. The amount filters match on this."
+            "string. The amount filters match on this. Never negative."
         )
+    )
+    kind: Kind = Field(
+        default="purchase",
+        description=(
+            "purchase, refund, credit or statement. Receipts indexed before kind "
+            "was extracted are purchase until re-extracted."
+        ),
+    )
+    signed_amount: str = Field(
+        description=(
+            "effective_amount signed for a total, as a decimal string: positive "
+            "for a purchase, negative for a refund or credit, '0' for a "
+            "statement. A sum of signed_amount is the net spend."
+        )
+    )
+    refund_of: UUID | None = Field(
+        default=None,
+        description="For a refund linked to its purchase, the purchase's id.",
+    )
+    refunded: str | None = Field(
+        default=None,
+        description=(
+            "For a purchase, the sum of its linked refunds' effective amounts; "
+            "null for any other kind."
+        ),
+    )
+    net_paid: str | None = Field(
+        default=None,
+        description=(
+            "For a purchase, effective_amount less refunded; null for any other kind."
+        ),
     )
     currency: str
     receipt_date: date
@@ -558,6 +596,9 @@ def build_server(
         data["amount"] = str(r.amount)
         data["paid_amount"] = _decimal_str(r.paid_amount)
         data["effective_amount"] = str(r.effective_amount)
+        data["signed_amount"] = str(r.signed_amount)
+        data["refunded"] = _decimal_str(r.refunded)
+        data["net_paid"] = _decimal_str(r.net_paid)
         return ReceiptOut(**data, file=file_ref(r.pdf_path))
 
     def failure_out(f: IngestLogEntry) -> FailureOut:
@@ -599,6 +640,15 @@ def build_server(
         payer: Annotated[
             str | None, Field(description="Payer name substring (any case).")
         ] = None,
+        kind: Annotated[
+            list[Kind] | None,
+            Field(
+                description=(
+                    "Only these kinds (purchase, refund, credit, statement). "
+                    "Default: every kind."
+                )
+            ),
+        ] = None,
         limit: Limit = DEFAULT_PAGE_SIZE,
         offset: Offset = 0,
     ) -> SearchResult:
@@ -607,7 +657,8 @@ def build_server(
         The amount filters match the effective amount (paid when known,
         otherwise the total). `amount` matches exactly and can't be combined
         with `amount_min` or `amount_max`. `order_number` and `last4` match
-        exactly (`last4` is four digits); `payer` is a substring.
+        exactly (`last4` is four digits); `payer` is a substring. `kind`
+        keeps only the kinds listed; sum `signed_amount` for net spend.
         """
         if amount is not None and (amount_min is not None or amount_max is not None):
             msg = "amount cannot be combined with amount_min/amount_max"
@@ -623,6 +674,7 @@ def build_server(
             "order_number": _parse_text(order_number, "order_number"),
             "last4": _parse_last4(last4),
             "payer": _parse_text(payer, "payer"),
+            "kinds": list(kind) if kind else None,
         }
         with snapshot() as conn:
             total = repository.count_receipts(conn, **filters)

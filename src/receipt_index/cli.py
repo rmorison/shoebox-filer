@@ -15,6 +15,7 @@ import click
 from dotenv import load_dotenv
 
 from receipt_index.config import AppConfig, ConfigError, load_config
+from receipt_index.models import KINDS
 
 # Load .env before any config interpolation
 load_dotenv()
@@ -359,6 +360,16 @@ def _last4_filter(
     help="Filter by payer name (substring, any case).",
 )
 @click.option(
+    "--kind",
+    "kinds",
+    multiple=True,
+    type=click.Choice(KINDS),
+    help=(
+        "Only this kind (repeatable): purchase, refund, credit or statement. "
+        "Default: every kind."
+    ),
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -379,9 +390,15 @@ def search(
     order_number: str | None,
     last4: str | None,
     payer: str | None,
+    kinds: tuple[str, ...],
     output_format: str,
 ) -> None:
-    """Search indexed receipts."""
+    """Search indexed receipts.
+
+    JSON output gives each receipt's kind and signed_amount: a sum of
+    signed_amount is the net spend (a refund or credit counts against it, a
+    statement not at all). A purchase also gives refunded and net_paid.
+    """
     from decimal import Decimal, InvalidOperation
 
     from receipt_index.db import get_connection
@@ -423,6 +440,7 @@ def search(
             order_number=order_number,
             last4=last4,
             payer=payer,
+            kinds=list(kinds) or None,
         )
         # Items with no receipt to search: counted for the text output only,
         # so the JSON stays a list of receipts.
@@ -467,12 +485,13 @@ def _print_receipts(results: list[Receipt]) -> None:
     if not results:
         click.echo("No receipts found.")
         return
-    # Amount is the effective amount (paid when known, else the total).
+    # Amount is the effective amount (paid when known, else the total),
+    # unsigned; Kind says which way it counts.
     click.echo(
         f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Order':<16} {'Last4':<5} "
-        f"{'Amount':>10} {'Total':>10}"
+        f"{'Kind':<9} {'Amount':>10} {'Total':>10}"
     )
-    click.echo("-" * 116)
+    click.echo("-" * 126)
     for r in results:
         click.echo(
             f"{r.id!s:<38} "
@@ -480,6 +499,7 @@ def _print_receipts(results: list[Receipt]) -> None:
             f"{_clip(r.vendor, 20):<20} "
             f"{_clip(r.order_number or '', 16):<16} "
             f"{r.payment_last4 or '':<5} "
+            f"{r.kind:<9} "
             f"{r.effective_amount!s:>10} "
             f"{r.amount!s:>10}"
         )
@@ -892,6 +912,16 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
         )
         click.echo(f"Paid:         {paid}")
         click.echo(f"Total:        {receipt.amount}")
+        if receipt.kind == "purchase":
+            click.echo("Kind:         purchase")
+        else:
+            click.echo(f"Kind:         {receipt.kind} (counts {receipt.signed_amount})")
+        if receipt.refund_of is not None:
+            click.echo(f"Refund of:    {receipt.refund_of}")
+        if receipt.net_paid is not None and receipt.refunded:
+            click.echo(
+                f"Net paid:     {receipt.net_paid} (refunded {receipt.refunded})"
+            )
         click.echo(f"Date:         {receipt.receipt_date}")
         desc = receipt.description or "\u2014"
         click.echo(f"Description:  {desc}")
@@ -1039,11 +1069,20 @@ def _paid_amount(
     "--order-number", callback=_text_filter, default=None, help="Order number."
 )
 @click.option(
+    "--kind",
+    type=click.Choice(KINDS),
+    default=None,
+    help=(
+        "purchase, refund, credit or statement. Refused while the receipt is "
+        "in a refund link (use `refund unlink` first)."
+    ),
+)
+@click.option(
     "--clear-manual",
     "clear",
     multiple=True,
     type=click.Choice(
-        ["paid_amount", "vendor", "date", "receipt_date", "order_number"]
+        ["paid_amount", "vendor", "date", "receipt_date", "order_number", "kind"]
     ),
     help=(
         "Hand FIELD back to re-extraction (repeatable). Can't be combined "
@@ -1073,6 +1112,7 @@ def edit(
     vendor: str | None,
     receipt_date: datetime | None,
     order_number: str | None,
+    kind: str | None,
     clear: tuple[str, ...],
     reason: str | None,
     actor: str | None,
@@ -1093,6 +1133,7 @@ def edit(
             ("vendor", vendor),
             ("receipt_date", receipt_date.date() if receipt_date else None),
             ("order_number", order_number),
+            ("kind", kind),
         )
         if value is not None
     }
@@ -1101,7 +1142,7 @@ def edit(
     if not clear and not values:
         raise click.UsageError(
             "nothing to edit: give --paid-amount, --vendor, --date, "
-            "--order-number or --clear-manual"
+            "--order-number, --kind or --clear-manual"
         )
 
     config = _load_config_or_exit(ctx)
@@ -1139,6 +1180,11 @@ def edit(
     for event in result.events:
         if event.event_type == "manual_cleared":
             click.echo(_event_summary(event))
+        elif event.event_type == "refund_linked":
+            click.echo(
+                f"Refund {event.receipt_id} linked to purchase "
+                f"{event.payload.get('purchase_id')} (rule)"
+            )
     click.echo(f"Recorded as {who} (person). See `receipt-index history {uid}`.")
 
 
@@ -1226,6 +1272,15 @@ def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
     ),
 )
 @click.option(
+    "--refund-candidates",
+    is_flag=True,
+    help=(
+        "Only receipts still marked purchase whose subject, description, "
+        "vendor or file name says refund, credit, return, reversal, reversed, "
+        "chargeback or statement: the back-fill for kind."
+    ),
+)
+@click.option(
     "--all", "select_all", is_flag=True, help="Select every receipt (no filter)."
 )
 @click.option(
@@ -1265,6 +1320,7 @@ def reextract(
     ids: tuple[str, ...],
     model_not: str | None,
     confidence_below: str | None,
+    refund_candidates: bool,
     select_all: bool,
     overwrite: bool,
     force: bool,
@@ -1300,11 +1356,20 @@ def reextract(
     from receipt_index.repository import select_for_reextract, token_averages
     from receipt_index.store import open_store
 
-    selectors = (date_from, date_to, source_name, ids, model_not, confidence_below)
+    selectors = (
+        date_from,
+        date_to,
+        source_name,
+        ids,
+        model_not,
+        confidence_below,
+        refund_candidates,
+    )
     if not select_all and limit is None and not any(selectors):
         raise click.UsageError(
             "Select receipts with --date-from, --date-to, --source, --id, "
-            "--model-not, --confidence-below or --limit, or pass --all."
+            "--model-not, --confidence-below, --refund-candidates or --limit, "
+            "or pass --all."
         )
     below = _parse_confidence_below(confidence_below)
     try:
@@ -1328,6 +1393,7 @@ def reextract(
             force=force,
             model_not=model_not,
             confidence_below=below,
+            refund_candidates=refund_candidates,
             limit=limit,
         )
         conn.commit()
@@ -1455,6 +1521,11 @@ def reextract(
                 )
                 for name, (old, new) in outcome.changes.items():
                     click.echo(f"    {name}: {old} -> {new}")
+                if outcome.kind_kept:
+                    click.echo(
+                        f"    kind: kept (extracted {outcome.kind_kept}); the "
+                        "receipt is in a refund link, `refund unlink` it first"
+                    )
                 if outcome.error:
                     click.echo(f"    error: {outcome.error}")
 
@@ -1500,6 +1571,137 @@ def reextract(
             click.echo(f"Run {result.stopped}", err=True)
     if not result.ok:
         sys.exit(1)
+
+
+@cli.group()
+def refund() -> None:
+    """Link refunds to the purchases they return money for.
+
+    Ingest, re-extraction and `edit` link a refund by rule when exactly one
+    purchase has its order number, vendor and currency and a paid amount.
+    These commands link and unlink by hand, and list refunds.
+    """
+
+
+def _refund_actor(config: AppConfig, actor: str | None) -> str:
+    return actor or config.annotations.actor
+
+
+@refund.command("link")
+@click.argument("refund_id")
+@click.argument("purchase_id")
+@click.option("--reason", default=None, help="Why: recorded with the link.")
+@click.option(
+    "--as",
+    "actor",
+    callback=_text_filter,
+    default=None,
+    help="Who made the change (default: annotations.actor, else 'operator').",
+)
+@click.pass_context
+def refund_link(
+    ctx: click.Context,
+    refund_id: str,
+    purchase_id: str,
+    reason: str | None,
+    actor: str | None,
+) -> None:
+    """Link REFUND_ID to PURCHASE_ID (same currency; refund not yet linked)."""
+    from receipt_index import refunds
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    refund_uid = _parse_receipt_id(refund_id)
+    purchase_uid = _parse_receipt_id(purchase_id)
+    who = _refund_actor(config, actor)
+    try:
+        with get_connection(config.database.url) as conn:
+            refunds.link(
+                conn,
+                refund_uid,
+                purchase_uid,
+                actor=who,
+                reason=(reason or "").strip() or None,
+            )
+    except refunds.RefundError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    click.echo(f"Linked refund {refund_uid} to purchase {purchase_uid} as {who}.")
+
+
+@refund.command("unlink")
+@click.argument("refund_id")
+@click.option("--reason", default=None, help="Why: recorded with the change.")
+@click.option(
+    "--as",
+    "actor",
+    callback=_text_filter,
+    default=None,
+    help="Who made the change (default: annotations.actor, else 'operator').",
+)
+@click.pass_context
+def refund_unlink(
+    ctx: click.Context, refund_id: str, reason: str | None, actor: str | None
+) -> None:
+    """Unlink REFUND_ID from its purchase. The rule won't link it again."""
+    from receipt_index import refunds
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _parse_receipt_id(refund_id)
+    who = _refund_actor(config, actor)
+    try:
+        with get_connection(config.database.url) as conn:
+            refunds.unlink(conn, uid, actor=who, reason=(reason or "").strip() or None)
+    except refunds.RefundError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    click.echo(f"Unlinked refund {uid} as {who}.")
+
+
+@refund.command("list")
+@click.option("--unlinked", is_flag=True, help="Only refunds with no purchase.")
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def refund_list(ctx: click.Context, unlinked: bool, output_format: str) -> None:
+    """List refunds, newest first, with the purchase each is linked to."""
+    from receipt_index.db import get_connection
+    from receipt_index.repository import list_refunds
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    with get_connection(config.database.url, read_only=True) as conn:
+        rows = list_refunds(conn, unlinked=unlinked)
+
+    if output_format == "json":
+        click.echo(json.dumps([r.model_dump(mode="json") for r in rows], indent=2))
+        return
+    if not rows:
+        click.echo("No refunds found.")
+        return
+    click.echo(
+        f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Order':<16} "
+        f"{'Amount':>10}  Refund of"
+    )
+    click.echo("-" * 136)
+    for r in rows:
+        click.echo(
+            f"{r.id!s:<38} "
+            f"{r.receipt_date.isoformat():<12} "
+            f"{_clip(r.vendor, 20):<20} "
+            f"{_clip(r.order_number or '', 16):<16} "
+            f"{r.effective_amount!s:>10}  "
+            f"{r.refund_of or '(unlinked)'}"
+        )
+    click.echo(f"\n{len(rows)} refund(s).")
 
 
 @cli.command("mcp")

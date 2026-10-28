@@ -58,7 +58,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000015 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000016 (tables, indexes and
     constraints). receipt/000014 holds grants only. The grants are not applied
     here, since CI's Postgres has no application roles; apply_migration_grants
     applies them for the tests that need them.
@@ -246,6 +246,10 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # receipt/000015 — order number and payment columns, receipt_events and
     # its append-only guard. Run from the migration file, up to its grants.
     conn.execute(_schema_part("receipt", "000015"))
+
+    # receipt/000016 — kind, refund_of, the generated signed_amount and the
+    # receipt_net view. Run from the migration file, up to its grants.
+    conn.execute(_schema_part("receipt", "000016"))
     conn.commit()
 
 

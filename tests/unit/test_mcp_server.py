@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import anyio
 import pytest
@@ -910,7 +910,11 @@ class TestPaidAmountOutput:
     def test_instructions_cover_refunds(self) -> None:
         flat = " ".join(_INSTRUCTIONS.split())
         assert "for a refund, what was returned to them" in flat
-        assert "a sum of effective_amount values counts them as charges" in flat
+        # Refunds are marked now: the old warning is gone, and a consumer is
+        # told what to sum instead.
+        assert "not yet marked" not in flat
+        assert "Sum signed_amount for net spend" in flat
+        assert "effective_amount is never negative" in flat
 
     def test_amount_descriptions_follow_the_design(self) -> None:
         schema = ReceiptOut.model_json_schema()["properties"]
@@ -1058,3 +1062,81 @@ class TestOrderAndPayment:
         assert data["payment_method"] == "card"
         assert data["payment_last4"] == "1234"
         assert data["payer"] == "Jane Doe"
+
+
+class TestKindAndSignedAmount:
+    """search_receipts filters on kind, and the output carries kind,
+    signed_amount, refund_of and a purchase's net paid (data-model design,
+    \u00a76, widened by the operator)."""
+
+    def test_kind_filter_reaches_the_repository(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with (
+            patch("receipt_index.repository.search_receipts", return_value=[]) as s,
+            patch("receipt_index.repository.count_receipts", return_value=0) as c,
+        ):
+            result = _call(
+                _server(store_root, log_path),
+                "search_receipts",
+                {"kind": ["purchase", "credit"]},
+            )
+        assert result.is_error is False, _text(result)
+        for mock in (s, c):
+            assert mock.call_args.kwargs["kinds"] == ["purchase", "credit"]
+
+    def test_every_kind_by_default(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with (
+            patch("receipt_index.repository.search_receipts", return_value=[]) as s,
+            patch("receipt_index.repository.count_receipts", return_value=0),
+        ):
+            _call(_server(store_root, log_path), "search_receipts", {})
+        assert s.call_args.kwargs["kinds"] is None
+
+    def test_unknown_kind_is_refused(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        with patch("receipt_index.repository.search_receipts") as search:
+            result = _call(
+                _server(store_root, log_path), "search_receipts", {"kind": ["other"]}
+            )
+        assert result.is_error is True
+        search.assert_not_called()
+
+    def test_output_has_the_fields(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        purchase = uuid4()
+        receipt = _receipt(
+            kind="refund", paid_amount=Decimal("10.00"), refund_of=purchase
+        )
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+            result = _call(
+                _server(store_root, log_path), "get_receipt", {"receipt_id": str(_ID)}
+            )
+        data = result.structured_content
+        assert data is not None
+        assert data["kind"] == "refund"
+        assert data["signed_amount"] == "-10.00"
+        assert data["effective_amount"] == "10.00"
+        assert data["refund_of"] == str(purchase)
+        assert data["net_paid"] is None
+
+    def test_a_purchase_has_its_net_paid(
+        self, conn: MagicMock, store_root: Path, log_path: Path
+    ) -> None:
+        receipt = _receipt(
+            paid_amount=Decimal("30.00"),
+            refunded=Decimal("10.00"),
+            net_paid=Decimal("20.00"),
+        )
+        with patch("receipt_index.repository.get_receipt_by_id", return_value=receipt):
+            result = _call(
+                _server(store_root, log_path), "get_receipt", {"receipt_id": str(_ID)}
+            )
+        data = result.structured_content
+        assert data is not None
+        assert (data["refunded"], data["net_paid"]) == ("10.00", "20.00")
+        assert data["signed_amount"] == "30.00"

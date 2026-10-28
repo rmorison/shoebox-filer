@@ -37,8 +37,9 @@ _R = TypeVar("_R")
 # paid-amount prompt, which was never recorded. 3 added receipt_link, and
 # likely receipt link URLs in the text of an HTML-only email. 4 sends a
 # scanned PDF attachment (no text layer) to the model as a document. 5 added
-# order_number and payment, with their field confidences.
-EXTRACTION_PROMPT_VERSION = 5
+# order_number and payment, with their field confidences. 6 added kind, and
+# asks a refund or credit for the original order number it refers to.
+EXTRACTION_PROMPT_VERSION = 6
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
 # so that they can't drift apart. See the receipt data-model design, §1 and §2.
@@ -79,8 +80,8 @@ _FIELD_CONFIDENCE_RULE = """\
 date, from 0.0 to 1.0. Each is always a number, even when paid_amount is null \
 (then it is your confidence that the document does not say what was paid). Go \
 below 0.5 when a figure is inferred rather than printed on the document. For \
-order_number and payment: your confidence in each, or null when the field is \
-null.
+order_number, payment and kind: your confidence in each, or null when the \
+field is null.
 """
 
 # The order number and payment fields, shared by both prompts. See the receipt
@@ -88,6 +89,8 @@ null.
 _ORDER_PAYMENT_RULES = """\
 - order_number: The order, confirmation or invoice number as printed, without \
 its label (for "Order #A-100" give "A-100"). When several are shown, the order \
+number. For a refund or credit, the original order or invoice number it \
+refers to when the document shows one, rather than the refund's own reference \
 number. Use null when there is none.
 - payment: How this document says it was paid, or null when it shows no \
 payment details. A card named with no amount still counts here. Its fields:
@@ -99,6 +102,25 @@ the document shows more (null when not shown).
 not the person who sent or forwarded the email.
 Never write more than the last four digits of a card or account number \
 anywhere in your output, the description included.
+"""
+
+# What the document is, which sets the sign of its amount in a total. Shared
+# by both prompts. See the receipt data-model design, §6.
+_KIND_RULES = """\
+- kind: one of purchase, refund, credit or statement. Rules:
+  - purchase: a charge or payment for goods or services: a receipt, an order \
+confirmation, an invoice or bill (one for a single service period included), \
+or a payment confirmation.
+  - refund: money returned for an earlier purchase: a return, a cancellation, \
+a reversal or a chargeback.
+  - credit: a credit that is not money returned for one purchase: a credit \
+memo, an account or statement credit, a goodwill credit or a rebate.
+  - statement: a periodic statement whose transactions are charged or \
+receipted elsewhere: card and bank statements, and vendor statements that \
+summarise orders already receipted. A statement that bills a new charge for \
+its own period (a utility, phone or subscription statement) is a purchase.
+  When you are unsure, use purchase with a low kind confidence. amount and \
+paid_amount are never negative, whatever the kind.
 """
 
 # A receipt that is only a link to a hosted receipt. Shared by both prompts.
@@ -123,6 +145,7 @@ a receipt, extract the following fields:
 - date: The purchase/transaction date (YYYY-MM-DD), NOT the email send date
 - description: Brief summary of what was purchased (optional)
 {_ORDER_PAYMENT_RULES}\
+{_KIND_RULES}\
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if the email may not be a receipt or key fields are uncertain.
 {_FIELD_CONFIDENCE_RULE}\
@@ -162,6 +185,7 @@ or PDF), extract the following fields:
 - date: The transaction date (YYYY-MM-DD)
 - description: Brief summary of what was purchased (optional)
 {_ORDER_PAYMENT_RULES}\
+{_KIND_RULES}\
 - confidence: Your confidence in the extraction from 0.0 to 1.0. \
 Use below 0.5 if this does not appear to be a receipt or key fields are unclear.
 {_FIELD_CONFIDENCE_RULE}\

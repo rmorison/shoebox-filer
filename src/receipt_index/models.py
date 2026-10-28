@@ -128,7 +128,7 @@ class FieldConfidence(BaseModel):
 
     An estimate, not a measured probability: good for ordering a review,
     not for a hard threshold. ``order_number`` and ``payment`` are null when
-    their field is.
+    their field is; ``kind`` is null on output from before it was asked for.
     """
 
     vendor: float = Field(ge=0.0, le=1.0)
@@ -137,6 +137,7 @@ class FieldConfidence(BaseModel):
     date: float = Field(ge=0.0, le=1.0)
     order_number: float | None = Field(default=None, ge=0.0, le=1.0)
     payment: float | None = Field(default=None, ge=0.0, le=1.0)
+    kind: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 def _blank_to_none(value: object) -> object:
@@ -403,6 +404,12 @@ def scrub_card_numbers(text: str) -> str:
 
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]
 
+# What a receipt is, which sets the sign of its amount in a total: a purchase
+# counts for, a refund or credit against, and a statement not at all (its
+# transactions are charged or receipted elsewhere).
+Kind = Literal["purchase", "refund", "credit", "statement"]
+KINDS: tuple[Kind, ...] = ("purchase", "refund", "credit", "statement")
+
 
 class Payment(BaseModel):
     """How the receipt says it was paid, as printed on it."""
@@ -444,6 +451,7 @@ class ReceiptMetadata(BaseModel):
     # The order, confirmation or invoice number as printed. Not unique.
     order_number: str | None = None
     payment: Payment | None = None
+    kind: Kind = "purchase"
     # Which part of an email held the receipt: an attachment's file name as
     # listed, or "body". None when the extractor can't tell, and always None
     # for a Drive document or a rendition.
@@ -573,6 +581,7 @@ def receipt_values(metadata: ReceiptMetadata) -> dict[str, Any]:
         "payment_method": payment.method if payment else None,
         "payment_last4": payment.last4 if payment else None,
         "payer": payment.payer if payment else None,
+        "kind": metadata.kind,
         "confidence": metadata.confidence,
     }
     for name, value in metadata.field_confidence.model_dump().items():
@@ -612,6 +621,13 @@ class Receipt(BaseModel):
     payment_method: str | None = None
     payment_last4: str | None = None
     payer: str | None = None
+    kind: Kind = "purchase"
+    # The purchase this refund returns money for; only a refund has one.
+    refund_of: UUID | None = None
+    # From the receipt_net view, for a purchase read with it: the sum of its
+    # linked refunds, and what it cost after them. None otherwise.
+    refunded: Decimal | None = None
+    net_paid: Decimal | None = None
     pdf_path: str
     email_subject: str | None
     email_sender: str | None
@@ -628,6 +644,23 @@ class Receipt(BaseModel):
         Search filters on the same expression: COALESCE(paid_amount, amount).
         """
         return self.amount if self.paid_amount is None else self.paid_amount
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def signed_amount(self) -> Decimal:
+        """The effective amount with the sign a total needs.
+
+        A purchase counts for, a refund or credit against, and a statement
+        counts nothing, so a plain sum is the net spend. The generated column
+        receipts.signed_amount gives the same value in SQL.
+        """
+        if self.kind == "purchase":
+            return self.effective_amount
+        if self.kind == "statement":
+            return Decimal(0)
+        # 0 - x, not -x: a refund of 0.00 (all store credit) stays 0.00,
+        # where -Decimal("0.00") would print as -0.00.
+        return Decimal(0) - self.effective_amount
 
 
 EventType = Literal[

@@ -245,3 +245,63 @@ class TestOverwrite:
         )
         changes = plan_changes(receipt, _meta(), _INGESTED, overwrite=True)
         assert changes == {}
+
+
+class TestKind:
+    """kind is NOT NULL with a default: it is empty while it holds 'purchase'
+    and no earlier run applied it (data-model design, §3)."""
+
+    def test_fill_only_sets_kind_on_a_receipt_from_before_it(self) -> None:
+        receipt = _receipt(field_confidence=_FC_FULL)
+        meta = _meta(
+            kind="refund",
+            field_confidence=FieldConfidence(
+                vendor=0.95, amount=0.9, paid_amount=0.8, date=0.9, kind=0.85
+            ),
+        )
+        changes = plan_changes(receipt, meta, _INGESTED, overwrite=False)
+        assert changes["kind"] == ("purchase", "refund")
+        assert changes["field_confidence.kind"] == (None, 0.85)
+
+    def test_fill_only_sets_kind_with_no_history(self) -> None:
+        changes = plan_changes(
+            _receipt(), _meta(kind="statement"), _NO_HISTORY, overwrite=False
+        )
+        assert changes["kind"] == ("purchase", "statement")
+
+    def test_fill_only_leaves_a_kind_a_run_applied(self) -> None:
+        applied = History(
+            ingested=True, applied=_INGESTED.applied | frozenset({"kind"})
+        )
+        changes = plan_changes(
+            _receipt(field_confidence=_FC_FULL),
+            _meta(kind="refund"),
+            applied,
+            overwrite=False,
+        )
+        assert "kind" not in changes
+
+    def test_fill_only_leaves_a_kind_other_than_the_default(self) -> None:
+        changes = plan_changes(
+            _receipt(kind="credit"), _meta(kind="refund"), _INGESTED, overwrite=False
+        )
+        assert "kind" not in changes
+
+    def test_overwrite_replaces_an_applied_kind(self) -> None:
+        applied = History(
+            ingested=True, applied=_INGESTED.applied | frozenset({"kind"})
+        )
+        changes = plan_changes(
+            _receipt(kind="refund"), _meta(kind="purchase"), applied, overwrite=True
+        )
+        assert changes["kind"] == ("refund", "purchase")
+
+    def test_never_writes_a_hand_edited_kind(self) -> None:
+        changes = plan_changes(
+            _receipt(manual_fields=["kind"]),
+            _meta(kind="refund"),
+            _NO_HISTORY,
+            overwrite=True,
+        )
+        assert "kind" not in changes
+        assert "field_confidence.kind" not in changes

@@ -74,8 +74,8 @@ class TestPromptVersion:
     def test_current_version(self) -> None:
         # 0 is "no history"; 1 was the paid-amount prompt, never recorded;
         # 3 added receipt_link; 4 sends scanned PDF attachments as documents;
-        # 5 added order_number and payment.
-        assert EXTRACTION_PROMPT_VERSION == 5
+        # 5 added order_number and payment; 6 added kind.
+        assert EXTRACTION_PROMPT_VERSION == 6
 
     def test_email_prompt_explains_scanned_pdfs(self) -> None:
         flat = " ".join(_SYSTEM_PROMPT.split())
@@ -98,8 +98,8 @@ class TestOrderPaymentPrompt:
         "payer: the cardholder or bill-to name as printed",
         "Never write more than the last four digits of a card or account "
         "number anywhere in your output, the description included.",
-        "order_number and payment: your confidence in each, or null when the "
-        "field is null.",
+        "order_number, payment and kind: your confidence in each, or null when "
+        "the field is null.",
     )
 
     def test_both_prompts_carry_every_rule(self) -> None:

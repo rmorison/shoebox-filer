@@ -10,6 +10,7 @@
 - [`uv run receipt-index failures`](#failures) — List items that failed or were skipped
 - [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
+- [`uv run receipt-index refund`](#refund) — Link refunds to their purchases, unlink them, and list them
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
 All commands require a configured `.env` file (see [Getting Started](getting-started.md)).
@@ -28,13 +29,30 @@ Each receipt has three amounts:
 | `paid_amount` | What the transaction charged to the payer's card, bank account, wallet or cash; for a refund, what it returned to them. `null` when the document doesn't say; `0` when nothing was charged, such as on an unpaid invoice |
 | `effective_amount` | `paid_amount` when it is known, otherwise `amount` |
 
-`paid_amount` includes tax, shipping and tip, and is after discounts. It leaves out anything paid with gift cards, store credit, points or vouchers, since those never reach a bank or card statement; the description says when they were used. It is never assumed from `amount`. When the document shows a payment, such as a card line or an amount charged, that is the paid amount even when it equals the total; for cash, it is the amount charged, not the cash handed over. A payment method named without an amount, such as a card on file or a guarantee, doesn't show a payment. When the document shows no payment, `paid_amount` is `null`, not the total. A refund's `paid_amount` is what it returned to the payer's card or account, never negative, so a sum of effective amounts counts refunds as spending, not as money back.
+`paid_amount` includes tax, shipping and tip, and is after discounts. It leaves out anything paid with gift cards, store credit, points or vouchers, since those never reach a bank or card statement; the description says when they were used. It is never assumed from `amount`. When the document shows a payment, such as a card line or an amount charged, that is the paid amount even when it equals the total; for cash, it is the amount charged, not the cash handed over. A payment method named without an amount, such as a card on file or a guarantee, doesn't show a payment. When the document shows no payment, `paid_amount` is `null`, not the total. A refund's `paid_amount` is what it returned to the payer's card or account, never negative, so a sum of effective amounts counts refunds as spending, not as money back: sum `signed_amount` instead (see [Kinds and totals](#kinds-and-totals)).
 
 The search amount filters and the `Amount` column in text output use the effective amount. JSON output keeps `amount` as the total and adds `paid_amount` and `effective_amount`, so a script that reads `amount` keeps working; read `effective_amount` for what was paid.
 
 Receipts ingested before the paid amount was added have `paid_amount: null`, so their effective amount is their `amount`. Their `amount` may be the payment rather than the total, because the earlier extraction prompt asked for "the total amount charged". When these receipts are re-extracted ([`reextract`](#reextract)), `paid_amount` is filled in and `amount` can be corrected to the total, so an `amount` already read from an old receipt can change.
 
 **Field confidence.** `field_confidence` holds the extractor's own confidence, from 0 to 1, for each of `vendor`, `amount`, `paid_amount` and `date`; it is below 0.5 when a figure was inferred rather than printed. It is the model's estimate, not a measured probability: use it to choose which receipts to check first, not as a pass mark. It is empty (`{}`) for receipts ingested before it was recorded. Receipts extracted since the order number and payment were added also carry `order_number` and `payment` entries when those fields are known. An entry is removed when a person edits its field by hand, since it described the extracted value.
+
+### Kinds and totals
+
+Each receipt has a `kind`, which says which way its amount counts in a total:
+
+| `kind` | What it is | `signed_amount` |
+|---|---|---|
+| `purchase` | A charge or payment for goods or services: a receipt, an order confirmation, an invoice or bill, a payment confirmation. A statement that bills a new charge for its own period (a utility, phone or subscription statement) is a purchase | `effective_amount` |
+| `refund` | Money returned for an earlier purchase: a return, a cancellation, a reversal or a chargeback | minus `effective_amount` |
+| `credit` | A credit that isn't money returned for one purchase: a credit memo, an account or statement credit, a goodwill credit, a rebate | minus `effective_amount` |
+| `statement` | A card or bank statement, or a vendor statement that summarises orders already receipted. Its transactions are charged or receipted elsewhere | `0` |
+
+**A sum of `signed_amount` is the net spend.** `amount`, `paid_amount` and `effective_amount` are never negative, whatever the kind, and keep their meanings above, so a script that sums `effective_amount` sees the same figures it always did (and still counts refunds as charges). A refund given wholly as store credit has a `paid_amount` of `0`, so it counts `0`.
+
+Receipts ingested before kinds were extracted are all `purchase` until they are [re-extracted](#reextract): `reextract --refund-candidates` finds the likely refunds, credits and statements among them.
+
+A refund can be linked to the purchase it returns money for. Its `refund_of` is then that purchase's ID, and the purchase shows `refunded` (the sum of its linked refunds' effective amounts) and `net_paid` (its effective amount less `refunded`). `refunded` and `net_paid` are `null` on any other kind. Ingest, re-extraction and `edit` link a refund by rule; [`refund`](#refund) links and unlinks by hand.
 
 ### Order number and payment
 
@@ -162,6 +180,7 @@ uv run receipt-index search [OPTIONS]
 | `--order-number TEXT` | Filter by order number (exact match) |
 | `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
 | `--payer TEXT` | Filter by payer name (case-insensitive substring match) |
+| `--kind KIND` | Only receipts of this [kind](#kinds-and-totals): `purchase`, `refund`, `credit` or `statement`. Repeatable. Default: every kind |
 | `--output text\|json` | Output format (default: `text`) |
 
 Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
@@ -194,19 +213,23 @@ uv run receipt-index search --last4 1234 --amount 47.99
 # Every receipt for one order (confirmation, shipments, refund)
 uv run receipt-index search --order-number 123-4567890
 
+# Purchases only: leave out refunds, credits and statements
+uv run receipt-index search --kind purchase --date-from 2026-01-01
+
 # Output as JSON for scripting
 uv run receipt-index search --vendor amazon --output json
 ```
 
 ### Text Output
 
-The default text output shows a table. `Order` is the order number and `Last4` the payment card's last four digits, blank when not known. `Amount` is the effective amount and `Total` is `amount`; they differ when, for example, part of an order was paid with a gift card:
+The default text output shows a table. `Order` is the order number and `Last4` the payment card's last four digits, blank when not known. `Kind` is the [kind](#kinds-and-totals). `Amount` is the effective amount, unsigned, and `Total` is `amount`; they differ when, for example, part of an order was paid with a gift card:
 
 ```
-ID                                     Date         Vendor               Order            Last4     Amount      Total
---------------------------------------------------------------------------------------------------------------------
-01942a3b-...                           2026-01-15   Amazon               123-4567890      1234       47.99      47.99
-01942a3c-...                           2026-01-22   Acme Parking (U.S.)…                             30.00      50.00
+ID                                     Date         Vendor               Order            Last4 Kind          Amount      Total
+------------------------------------------------------------------------------------------------------------------------------
+01942a3b-...                           2026-01-15   Amazon               123-4567890      1234  purchase       47.99      47.99
+01942a3c-...                           2026-01-22   Acme Parking (U.S.)…                        purchase       30.00      50.00
+01942a3d-...                           2026-01-29   Amazon               123-4567890      1234  refund         12.00      12.00
 
 2 receipt(s) found.
 ```
@@ -223,6 +246,11 @@ Use `--output json` for machine-readable output:
     "amount": "47.99",
     "paid_amount": "47.99",
     "effective_amount": "47.99",
+    "kind": "purchase",
+    "signed_amount": "47.99",
+    "refund_of": null,
+    "refunded": "12.00",
+    "net_paid": "35.99",
     "currency": "USD",
     "receipt_date": "2026-01-15",
     "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97,
@@ -276,6 +304,8 @@ Date:         2026-01-15
 Description:  Wireless keyboard
 Order:        123-4567890
 Payment:      card ending 1234 (Jane Doe)
+Kind:         purchase
+Net paid:     35.99 (refunded 12.00)
 Confidence:   0.95
 Field Conf:   vendor 0.98, amount 0.95, paid_amount 0.90, date 0.97
 PDF:          renditions/2026/01/2026-01-15__amazon__47.99.pdf
@@ -286,7 +316,7 @@ Sender:       ship-confirm@amazon.com
 Email Date:   2026-01-15T10:30:00
 ```
 
-`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded. A `Hand-edited:` line lists the fields a person has edited (`manual_fields` in JSON); re-extraction never writes them. `Order` and `Payment` are left out when the receipt doesn't show them; `Payment` shows whichever of the method, the last four digits and the payer are known.
+`Amount` is the effective amount. When the paid amount isn't known, it shows the total and says so (`50.00 USD (total; paid amount not known)`), and `Paid` shows `— (not known)`. `Field Conf` is left out for receipts ingested before field confidence was recorded. A `Hand-edited:` line lists the fields a person has edited (`manual_fields` in JSON); re-extraction never writes them. `Order` and `Payment` are left out when the receipt doesn't show them; `Payment` shows whichever of the method, the last four digits and the payer are known. `Kind` shows a refund, credit or statement with what it counts in a total (`refund (counts -12.00)`); a linked refund adds `Refund of:` and its purchase's ID, and a purchase with linked refunds adds `Net paid:`.
 
 The `PDF` path is relative to the store root, `store.path` in the config. `Rendition` is the same file's evidence-store reference: `local:` followed by that path.
 
@@ -310,7 +340,7 @@ Correct a receipt's fields by hand, or hand them back to re-extraction.
 
 ```bash
 uv run receipt-index edit RECEIPT_ID [--paid-amount DECIMAL] [--vendor TEXT]
-                         [--date YYYY-MM-DD] [--order-number TEXT]
+                         [--date YYYY-MM-DD] [--order-number TEXT] [--kind KIND]
                          [--reason TEXT] [--as NAME] [--output text|json]
 uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD ...]
                          [--reason TEXT] [--as NAME]
@@ -324,7 +354,8 @@ uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD 
 | `--vendor TEXT` | Vendor name |
 | `--date YYYY-MM-DD` | Receipt date (`receipt_date`) |
 | `--order-number TEXT` | Order number |
-| `--clear-manual FIELD` | Hand `FIELD` back to re-extraction: `paid_amount`, `vendor`, `date` (or `receipt_date`) or `order_number`. Repeatable. Can't be combined with the field options |
+| `--kind KIND` | `purchase`, `refund`, `credit` or `statement` (see [Kinds and totals](#kinds-and-totals)). Refused while the receipt is in a refund link: a linked refund, or a purchase with linked refunds. Unlink it with [`refund unlink`](#refund) first |
+| `--clear-manual FIELD` | Hand `FIELD` back to re-extraction: `paid_amount`, `vendor`, `date` (or `receipt_date`), `order_number` or `kind`. Repeatable. Can't be combined with the field options |
 | `--reason TEXT` | Why, recorded with each change |
 | `--as NAME` | Who made the change. Default: `annotations.actor` in the config, else `operator` |
 | `--output text\|json` | Output format (default: `text`). JSON gives the receipt as it now is and the events written |
@@ -332,6 +363,8 @@ uv run receipt-index edit RECEIPT_ID --clear-manual FIELD [--clear-manual FIELD 
 ### What it does
 
 Each field you set is written, added to `manual_fields` so that [re-extraction](#reextract) leaves it alone, and recorded in the receipt's [history](#history) with its old and new value and your reason. Setting a field to the value it already has still marks it hand-edited: you have confirmed it. The field's `field_confidence` entry is removed, since it was the extractor's confidence in the value you replaced. A field can't be set to empty; only re-extraction decides that a figure is unknown. A card number typed into `--vendor`, `--reason` or `--as` is cut to its last four digits, as at extraction.
+
+Editing `--kind` or `--order-number` runs the refund linking rule (see [`refund`](#refund)): a receipt that becomes a refund may be linked to its purchase, and a purchase may get its waiting refunds. Each link is printed and recorded in the refund's history.
 
 `--clear-manual` takes a field off `manual_fields` and records that in the history. The field keeps its value, but the next `reextract --overwrite` may replace it (fill-only runs leave it, since it isn't empty). It is refused, and nothing is written, when a field isn't hand-edited.
 
@@ -491,6 +524,7 @@ At least one of these, `--limit` or `--all` is required, so that a bare command 
 | `--id UUID` | This receipt (repeatable) |
 | `--model-not MODEL` | Receipts whose latest extraction used a different model, or that have none |
 | `--confidence-below X` | Receipts whose overall confidence is below `X`; or, as `FIELD=X` (`vendor`, `amount`, `paid_amount`, `date`), whose confidence for that field is below `X` or missing. A receipt where that field is hand-edited is left out, since a run can't change it |
+| `--refund-candidates` | Receipts still marked `purchase`, their kind not hand-edited, whose email subject, description, vendor or file name contains `refund`, `credit`, `return`, `reversal`, `reversed`, `chargeback` or `statement` (any case). The back-fill for [kind](#kinds-and-totals): run it with `--dry-run` first |
 | `--all` | Every receipt |
 | `--limit N` | At most `N` receipts, oldest first |
 
@@ -508,7 +542,7 @@ A receipt whose latest extraction already used the current prompt version **and*
 
 ### What a run writes
 
-By default a run fills only **empty** fields: a `null` `paid_amount`, `description`, order number or payment column, or a missing `field_confidence` entry. On a receipt extracted under the original prompt (ingested before extraction history was recorded, with an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)). A gated or failed run doesn't change that; the first run that applies a result does.
+By default a run fills only **empty** fields: a `null` `paid_amount`, `description`, order number or payment column, a missing `field_confidence` entry, or a `kind` still at its default (`purchase`) that no earlier run set. On a receipt extracted under the original prompt (ingested before extraction history was recorded, with an empty `field_confidence`), `amount` counts as empty too, so it is replaced by the total (see [Amounts](#amounts)). A gated or failed run doesn't change that; the first run that applies a result does.
 
 With `--overwrite`, a run also replaces fields an earlier extraction set, and the overall `confidence`. On a receipt ingested before extraction history was recorded, every field counts as machine-extracted, before and after its first re-extraction: only `manual_fields` marks a hand edit. A field handed back with [`edit --clear-manual`](#edit) counts as machine-extracted too, even when ingest found it empty.
 
@@ -520,6 +554,8 @@ In both modes:
 - every change is printed as old and new, and kept with the run in the receipt's history (`receipt.extractions`: the full output, the fields applied and the values they replaced), so any run can be undone by hand.
 
 If the new overall confidence is below 0.5, the run is recorded and nothing is applied (`gated`). The rendition's file name is never changed.
+
+When a run changes a receipt's `kind` or order number, it runs the refund linking rule (see [`refund`](#refund)). A run never changes the kind of a receipt in a refund link (a linked refund, or a purchase with linked refunds): it keeps the stored kind and prints `kind: kept` with the extracted one (`kind_kept` in JSON). Unlink it with `refund unlink`, then edit or re-extract it.
 
 ### Inputs
 
@@ -560,6 +596,10 @@ uv run receipt-index reextract --model-not claude-haiku-5-5 --all --dry-run
 
 # Look again at receipts whose paid amount was uncertain
 uv run receipt-index reextract --confidence-below paid_amount=0.5 --force --all
+
+# Back-fill kind: the likely refunds, credits and statements
+uv run receipt-index reextract --refund-candidates --dry-run
+uv run receipt-index reextract --refund-candidates
 ```
 
 ### Accuracy check
@@ -571,6 +611,45 @@ Before re-extracting the whole back catalogue after a prompt or model change, ch
 3. For each receipt, compare `extracted_paid_amount` (present whether or not it was applied) with what was actually charged, and mark it correct, wrong or null.
 4. For each null, note whether the document names a card or account with no amount, such as an order confirmation with a card on file. Such a document keeps `paid_amount` null by design; the tally shows how often that happens.
 5. Record the tally, and whether it meets the success criterion, before running over the back catalogue.
+
+---
+
+## refund
+
+Link a refund to the purchase it returns money for, unlink it, and list refunds. A linked refund lowers its purchase's `net_paid` (see [Kinds and totals](#kinds-and-totals)).
+
+```bash
+uv run receipt-index refund link REFUND_ID PURCHASE_ID [--reason TEXT] [--as NAME]
+uv run receipt-index refund unlink REFUND_ID [--reason TEXT] [--as NAME]
+uv run receipt-index refund list [--unlinked] [--output text|json]
+```
+
+### The linking rule
+
+Ingest, re-extraction and [`edit`](#edit) link a refund by rule. An unlinked refund is linked when **exactly one** purchase has the same order number, the same vendor (ignoring case), the same currency and a paid amount above zero. The paid-amount condition leaves out confirmation and shipping emails, and unpaid invoices, that share the order number but charged nothing. When several purchases match (an order charged on each shipment), or none does, the refund stays unlinked: `refund list --unlinked` shows it, and `refund link` links it by hand.
+
+The rule runs whenever a refund gets its kind or order number, and whenever a purchase is ingested or gets an order number, so a purchase that arrives after its refund still links it. Each link is a `refund_linked` event in the refund's [history](#history), with the actor `rule`. The rule trusts the email: a message that claims to be a refund for a known order is linked, and lowers that purchase's net paid. `refund list` and `history` show every link it made.
+
+Credits and statements are never linked.
+
+### Linking by hand
+
+`refund link` links an unlinked refund to a purchase in the same currency. It refuses, writing nothing, when the first receipt isn't a refund, the second isn't a purchase, the currencies differ, or the refund is already linked (unlink it first). `refund unlink` removes a refund's link. Both write one event with your reason, as the `--as` actor (default: `annotations.actor` in the config, else `operator`).
+
+**A refund you unlink stays unlinked.** The rule never links a refund that has been unlinked by hand; only `refund link` links it again.
+
+### Examples
+
+```bash
+# Refunds the rule couldn't link
+uv run receipt-index refund list --unlinked
+
+# Link one by hand
+uv run receipt-index refund link 01942a3d-1234-7def-8abc-567890abcdef 01942a3b-1234-7def-8abc-567890abcdef --reason "partial refund for the March order"
+
+# Undo a link the rule made
+uv run receipt-index refund unlink 01942a3d-1234-7def-8abc-567890abcdef --reason "refund for a different order"
+```
 
 ---
 
@@ -603,7 +682,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields. |
+| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring), `kind` (a list of kinds; default every kind) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields, and `kind`, `signed_amount`, `refund_of`, `refunded` and `net_paid` ([Kinds and totals](#kinds-and-totals)). |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
 | `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |
