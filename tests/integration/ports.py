@@ -31,7 +31,7 @@ UNSET_PORT = -1
 
 def parse_port(value: str | None) -> int | None:
     """The port in ``value``, or None if it is unset, empty or not a port."""
-    if value is None or not value.strip().isdigit():
+    if value is None or not value.strip().isdecimal():
         return None
     port = int(value)
     return port if 0 < port < 65536 else None

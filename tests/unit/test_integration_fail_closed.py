@@ -133,7 +133,7 @@ class TestMissingPorts:
         env = dict.fromkeys(_PORT_VARS, "25432")
         assert missing_ports(env) == []
 
-    @pytest.mark.parametrize("value", [None, "", " ", "abc", "0", "65536", "-1"])
+    @pytest.mark.parametrize("value", [None, "", " ", "abc", "0", "65536", "-1", "²"])
     def test_unusable_values_count_as_missing(self, value: str | None) -> None:
         env = dict.fromkeys(_PORT_VARS, "25432")
         if value is None:
