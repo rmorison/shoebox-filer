@@ -399,3 +399,35 @@ class TestDoneGateLast4:
         self, raw: str, kept: str | None
     ) -> None:
         assert Payment.model_validate({"last4": raw, "method": "card"}).last4 == kept
+
+
+class TestFixReviewScrub:
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            # A footnote or circled mark is no digit of the card.
+            (
+                "Visa 4111 1111 1111 1111\u00b9 see note",
+                "Visa ending 1111\u00b9 see note",
+            ),
+            ("Visa 4111 1111 1111 1111\u2460", "Visa ending 1111\u2460"),
+            # Invisible characters from HTML email and PDF text separate groups.
+            ("card 4111\u200b1111\u200b1111\u200b1111", "card ending 1111"),
+            ("card 4111\u00ad1111\u00ad1111\u00ad1111", "card ending 1111"),
+            ("card 4111\u200d1111\u200d1111\u200d1111", "card ending 1111"),
+            ("card 4111\u0301 1111 1111 1111", "card ending 1111"),
+        ],
+    )
+    def test_marks_and_invisible_characters(self, raw: str, kept: str) -> None:
+        assert _metadata(description=raw).description == kept
+
+    @pytest.mark.parametrize(
+        ("raw", "kept"),
+        [
+            ("Visa 4111 1111 1111 1111", "1111"),
+            # Two groups of four or more and no card: no guess.
+            ("Card ending 4242 (Auth 123456)", None),
+        ],
+    )
+    def test_last4_finds_a_labelled_card(self, raw: str, kept: str | None) -> None:
+        assert Payment.model_validate({"last4": raw}).last4 == kept

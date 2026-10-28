@@ -148,11 +148,17 @@ def _blank_to_none(value: object) -> object:
     return value
 
 
+# Unicode categories that print nothing between digits: format characters
+# (zero-width space and joiner, soft hyphen) and combining marks.
+_INVISIBLE = frozenset({"Cf", "Mn", "Me"})
+
+
 def _ascii_digits(text: str) -> str:
     """``text`` with every decimal digit as ASCII, one character for one.
 
-    Full-width and other scripts' digits become ``0``-``9``, and full-width
-    punctuation its ASCII form, so a card printed that way is found too. The
+    Full-width and other scripts' digits become ``0``-``9``, full-width
+    punctuation its ASCII form, and invisible format characters and
+    combining marks a space, so a card printed that way is found too. The
     length never changes, so a span found here is the same span in ``text``.
     """
     out = []
@@ -161,13 +167,19 @@ def _ascii_digits(text: str) -> str:
             out.append(ch)
         elif ch.isdecimal():
             out.append(str(unicodedata.decimal(ch)))
+        elif unicodedata.category(ch) in _INVISIBLE:
+            # Zero-width and soft-hyphen characters, combining marks: they
+            # separate digit groups, as a space would.
+            out.append(" ")
         else:
+            # Full-width punctuation to ASCII; but a superscript, subscript
+            # or circled digit (a footnote mark) is no digit of a card.
             folded = unicodedata.normalize("NFKC", ch)
-            out.append(folded if len(folded) == 1 else ch)
+            out.append(folded if len(folded) == 1 and not folded.isdigit() else ch)
     return "".join(out)
 
 
-_GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015]+")
+_GROUPED_DIGITS = re.compile(r"[0-9\s\-\u2010-\u2015\u2212]+")
 _DIGITS = re.compile(r"[0-9]+")
 
 
@@ -176,7 +188,8 @@ def last_four_digits(value: object) -> str | None:
 
     Only the last four digits are ever kept, so a longer number is cut here,
     whatever its type. A value that is only digit groups (``4111 1111 1111
-    1111``) is read as one number. Otherwise the one group of four or more
+    1111``) is read as one number; a value holding one card number among
+    other text gives that card's. Otherwise the one group of four or more
     digits is the card's (``Visa ending 4242, exp 12/25`` gives ``4242``); with
     none, or more than one, it is None rather than a guess. The result always
     matches ``^[0-9]{4}$``: the raw value never reaches a pattern check whose
@@ -188,6 +201,14 @@ def last_four_digits(value: object) -> str | None:
     if _GROUPED_DIGITS.fullmatch(text):
         digits = "".join(_DIGITS.findall(text))
         return digits[-4:] if len(digits) >= 4 else None
+    # A full card number among other text ("Visa 4111 1111 1111 1111").
+    cards = [
+        fours
+        for run in _DIGIT_RUN.finditer(text)
+        for _, _, fours in _card_candidates(run.group(0))
+    ]
+    if len(cards) == 1 and len(cards[0]) == 1:
+        return next(iter(cards[0]))
     long_groups = [g for g in _DIGITS.findall(text) if len(g) >= 4]
     return long_groups[0][-4:] if len(long_groups) == 1 else None
 
@@ -230,8 +251,8 @@ def _separator_kind(sep: str) -> str:
     return found.group(0) if found else " "
 
 
-def _card_spans(run: str) -> list[tuple[int, int, str]]:
-    """The card numbers in ``run``, as ``(start, end, replacement)``.
+def _card_candidates(run: str) -> list[tuple[int, int, set[str]]]:
+    """The card numbers in ``run``, as ``(start, end, last fours)``.
 
     A candidate is one unbroken group of 13 to 19 digits, or consecutive
     groups in a card's shape (4-4-4-4, 4-4-4-4-3, 4-6-5, 4-6-4) with one kind
@@ -265,9 +286,14 @@ def _card_spans(run: str) -> list[tuple[int, int, str]]:
             spans[-1] = (b, max(e, end), fours | {last4})
         else:
             spans.append((begin, end, {last4}))
+    return spans
+
+
+def _card_spans(run: str) -> list[tuple[int, int, str]]:
+    """The card numbers in ``run``, as ``(start, end, replacement)``."""
     return [
         (b, e, f"ending {next(iter(fours))}" if len(fours) == 1 else _REMOVED)
-        for b, e, fours in spans
+        for b, e, fours in _card_candidates(run)
     ]
 
 
