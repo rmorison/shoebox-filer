@@ -12,7 +12,7 @@ import uuid
 from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,6 +22,7 @@ from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import get_processed_source_ids, search_receipts
 from receipt_index.store import LocalEvidenceStore, rendition_ref
+from tests.pdfs import make_pdf
 
 from .conftest import GREENMAIL_IMAP_PORT, seed_email
 
@@ -285,26 +286,21 @@ class TestFullPipelineE2E:
 
         assert result.processed == 2
 
-    @patch(
-        "receipt_index.extraction._extract_pdf_text",
-        return_value="Invoice Total: $199.99",
-    )
     def test_email_with_pdf_attachment(
         self,
-        _mock_pdf: MagicMock,
         greenmail_available: bool,
         pg_conn: psycopg.Connection[dict[str, Any]],
         tmp_path: Path,
     ) -> None:
         """Pipeline handles emails with PDF attachments."""
         user = _unique_user("pdfattach")
-        fake_pdf = b"%PDF-1.4 fake pdf content for testing"
+        pdf = make_pdf("Invoice 9876. Invoice Total: $199.99")
         seed_email(
             to_addr=user,
             from_addr="billing@example.com",
             subject="Invoice #9876",
             text_body="See attached invoice.",
-            pdf_attachment=("invoice.pdf", fake_pdf),
+            pdf_attachment=("invoice.pdf", pdf),
         )
 
         adapter = ImapAdapter(_greenmail_imap_config(user))
@@ -325,6 +321,10 @@ class TestFullPipelineE2E:
         receipt = result.receipts[0]
         assert receipt.vendor == "BillingCo"
         assert store.exists(rendition_ref(receipt.pdf_path))
+        # A text PDF goes as its text, not as a document.
+        (prompt,), _ = agent.run_sync.call_args
+        assert isinstance(prompt, str)
+        assert "Invoice Total: $199.99" in prompt
 
     def test_search_filters_on_seeded_data(
         self,

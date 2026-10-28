@@ -73,8 +73,13 @@ def _raw(attachments: list[Attachment]) -> RawReceipt:
 class TestPromptVersion:
     def test_current_version(self) -> None:
         # 0 is "no history"; 1 was the paid-amount prompt, never recorded;
-        # 3 added receipt_link.
-        assert EXTRACTION_PROMPT_VERSION == 3
+        # 3 added receipt_link; 4 sends scanned PDF attachments as documents.
+        assert EXTRACTION_PROMPT_VERSION == 4
+
+    def test_email_prompt_explains_scanned_pdfs(self) -> None:
+        flat = " ".join(_SYSTEM_PROMPT.split())
+        assert "--- PDF Attachment (scanned): <file name> ---" in flat
+        assert "give that file name as receipt_document" in flat
 
 
 class TestReceiptDocument:

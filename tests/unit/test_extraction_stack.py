@@ -9,6 +9,7 @@ network call beyond 127.0.0.1.
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -23,8 +24,9 @@ from receipt_index.extraction import (
     extract_from_rendition,
     extract_metadata,
 )
-from receipt_index.models import RawReceipt
+from receipt_index.models import Attachment, RawReceipt
 from receipt_index.pdf_reader import create_vision_agent, extract_text
+from tests.pdfs import make_pdf
 from tests.unit.conftest import STUB_INPUT_TOKENS, STUB_OUTPUT_TOKENS
 
 if TYPE_CHECKING:
@@ -80,6 +82,29 @@ def _email() -> RawReceipt:
         subject="Your receipt",
         sender="user@example.com",
         text_body="Acme Parking (U.S.), LLC. 2026-10-27. Total $12.34",
+    )
+
+
+def _blocks(request: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    return [
+        block
+        for message in request["messages"]
+        if isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == kind
+    ]
+
+
+def _email_with(attachment: Attachment) -> RawReceipt:
+    return RawReceipt(
+        source_id="4",
+        source_name="mail",
+        source_type="imap",
+        date=datetime(2026, 10, 27, tzinfo=UTC),
+        subject="Your receipt",
+        sender="user@example.com",
+        text_body="Your receipt is attached.",
+        attachments=[attachment],
     )
 
 
@@ -154,6 +179,45 @@ def test_pdf_vision_path_through_locked_stack(stub: StubAnthropic) -> None:
     _assert_result(result)
     _assert_request(stub)
     assert "document" in _content_types(stub.requests[0])
+
+
+def test_scanned_pdf_email_attachment_through_locked_stack(
+    stub: StubAnthropic,
+) -> None:
+    # A scan has no text layer: the PDF itself goes as a document block,
+    # after a label naming the file, in the same request as the email text.
+    scan = make_pdf()
+    raw = _email_with(Attachment("receipt.pdf", "application/pdf", scan))
+    agent = create_extraction_agent(api_key=_KEY, model=_MODEL)
+
+    result = extract_metadata(raw, agent=agent)
+
+    _assert_result(result)
+    _assert_request(stub)
+    (document,) = _blocks(stub.requests[0], "document")
+    assert document["source"]["media_type"] == "application/pdf"
+    assert base64.b64decode(document["source"]["data"]) == scan
+    texts = [block["text"] for block in _blocks(stub.requests[0], "text")]
+    assert "Your receipt is attached." in texts[0]
+    assert "--- PDF Attachment (scanned): receipt.pdf ---" in texts
+
+
+def test_text_pdf_email_attachment_through_locked_stack(stub: StubAnthropic) -> None:
+    # A PDF with text goes as its text, as before: no document block.
+    pdf = make_pdf("Acme Parking (U.S.), LLC 2026-10-27 Total $12.34")
+    raw = _email_with(Attachment("receipt.pdf", "application/pdf", pdf))
+    agent = create_extraction_agent(api_key=_KEY, model=_MODEL)
+
+    result = extract_metadata(raw, agent=agent)
+
+    _assert_result(result)
+    _assert_request(stub)
+    assert "document" not in _content_types(stub.requests[0])
+    (message,) = stub.requests[0]["messages"]
+    content = message["content"]
+    prompt = content if isinstance(content, str) else content[0]["text"]
+    assert "--- PDF Attachment Content: receipt.pdf ---" in prompt
+    assert "Total $12.34" in prompt
 
 
 @pytest.mark.parametrize("reply", ["refusal", "partial_refusal"])
