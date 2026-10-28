@@ -163,14 +163,28 @@ def last_four_digits(value: object) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-# What can sit between the digit groups of a printed card number: one or two
-# spaces (including no-break and thin spaces from HTML email), or a dash, en
-# or em dash, dot or slash with an optional space either side.
-_SPACE = "[ \t\u00a0\u2009\u202f]"
-_SEPARATOR = rf"(?:{_SPACE}{{1,2}}|{_SPACE}?[-\u2010-\u2015./]{_SPACE}?)"
-# A run of digit groups joined by separators: where a card number, printed
-# with or without them, can sit among other numbers.
-_DIGIT_RUN = re.compile(rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]+)*(?![0-9])")
+# A run of digit groups joined by single spaces or dashes: where a card
+# number, printed with or without separators, can sit among other numbers.
+_DIGIT_RUN = re.compile(r"(?<![0-9])[0-9]+(?:[ -][0-9]+)*(?![0-9])")
+# Other separators a printed card number may carry (no-break and thin spaces
+# from HTML email, double spaces, en and em dashes, dots, slashes, a spaced
+# dash). These also join dates, prices, times and phone numbers, so they count
+# only between groups shaped like a card, one separator throughout: 4-4-4-4,
+# 4-4-4-4-3, or 4-6-5 and 4-6-4. A single plain space or hyphen is left to
+# _DIGIT_RUN, which also catches a card with other numbers beside it.
+_WIDE = (
+    r"(?:[\t\u00a0\u2009\u202f]"  # one no-break, thin or tab space
+    r"|[ \t\u00a0\u2009\u202f]{2}"  # two spaces of any kind
+    r"|[ \u00a0]?[\u2010-\u2015./][ \u00a0]?"  # en or em dash, dot, slash
+    r"|[ \u00a0]-[ \u00a0]?|-[ \u00a0])"  # a spaced hyphen
+)
+_CARD_SHAPED = re.compile(
+    rf"(?<![0-9])(?:"
+    rf"[0-9]{{4}}(?P<a>{_WIDE})[0-9]{{4}}(?P=a)[0-9]{{4}}(?P=a)[0-9]{{4}}"
+    rf"(?:(?P=a)[0-9]{{3}})?"
+    rf"|[0-9]{{4}}(?P<b>{_WIDE})[0-9]{{6}}(?P=b)[0-9]{{4,5}}"
+    rf")(?![0-9])"
+)
 _DIGIT_GROUP = re.compile(r"[0-9]+")
 
 
@@ -223,8 +237,9 @@ _REMOVED = "[card number removed]"
 
 
 def scrub_card_numbers(text: str) -> str:
-    """``text`` with each card number (13 to 19 digits, spaces, dashes,
-    dots or slashes allowed between groups, that pass the Luhn check) replaced by
+    """``text`` with each card number (13 to 19 digits, single spaces or
+    dashes allowed between groups, or other separators between card-shaped
+    groups, that pass the Luhn check) replaced by
     "ending NNNN", its last four digits, or "[card number removed]" when
     overlapping candidates disagree on them."""
 
@@ -238,7 +253,13 @@ def scrub_card_numbers(text: str) -> str:
         out.append(run[pos:])
         return "".join(out)
 
-    return _DIGIT_RUN.sub(cut, text)
+    def cut_shaped(match: re.Match[str]) -> str:
+        digits = _NOT_DIGIT.sub("", match.group(0))
+        if len(set(digits)) > 1 and _luhn_valid(digits):
+            return f"ending {digits[-4:]}"
+        return match.group(0)
+
+    return _DIGIT_RUN.sub(cut, _CARD_SHAPED.sub(cut_shaped, text))
 
 
 PaymentMethod = Literal["card", "bank", "wallet", "cash", "transfer", "other"]

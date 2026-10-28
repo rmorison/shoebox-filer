@@ -244,7 +244,7 @@ class TestDescriptionScrub:
         [
             "card 4111\u00a01111\u00a01111\u00a01111",  # no-break space
             "card 4111\u20131111\u20131111\u20131111",  # en dash
-            "card 4111  1111 1111 1111",
+            "card 4111  1111  1111  1111",
             "card 4111 - 1111 - 1111 - 1111",
             "card 4111.1111.1111.1111",
             "card 4111/1111/1111/1111",
@@ -253,6 +253,26 @@ class TestDescriptionScrub:
     def test_other_separators(self, raw: str) -> None:
         # HTML email often carries no-break spaces and en dashes.
         assert _metadata(description=raw).description == "card ending 1111"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Subtotal 138.72 868.97 65.32 121.63",
+            "Period 05/28/2025 - 06/27/2025",
+            "Period 2026-10-25 \u2013 2026-11-24",
+            "Period 2026-10-25 - 2026-11-24",
+            "12/28/2026 12.04.36",
+            "70.198.123.99 54319",
+            "Ref 310892/4943390",
+            "450.694.3171 / 912.357.4230",
+            "Order 2026-10-28, 2 items at 12.50",
+            "Call 1-800-555-0199",
+        ],
+    )
+    def test_ordinary_numbers_are_kept(self, raw: str) -> None:
+        # Dates, prices, times, addresses and phone numbers are no card,
+        # whatever their digits happen to add up to.
+        assert _metadata(description=raw).description == raw
 
     def test_a_run_of_one_repeated_digit_is_kept(self) -> None:
         # All-zero spans always pass the Luhn check; they are no card.
