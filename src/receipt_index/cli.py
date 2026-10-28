@@ -994,6 +994,148 @@ def history(ctx: click.Context, receipt_id: str, output_format: str) -> None:
         click.echo(line)
 
 
+def _paid_amount(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> Decimal | None:
+    """A paid amount: 0 or more, with at most two decimal places."""
+    from decimal import Decimal, InvalidOperation
+
+    if value is None:
+        return None
+    try:
+        amount = Decimal(value.strip())
+    except InvalidOperation:
+        raise click.BadParameter(f"not a decimal amount: {value}") from None
+    if not amount.is_finite() or amount < 0:
+        raise click.BadParameter("must be 0 or more")
+    if amount != amount.quantize(Decimal("0.01")):
+        raise click.BadParameter("at most two decimal places")
+    return amount
+
+
+@cli.command()
+@click.argument("receipt_id")
+@click.option(
+    "--paid-amount",
+    callback=_paid_amount,
+    default=None,
+    help="What was charged, or for a refund returned (0 or more).",
+)
+@click.option("--vendor", callback=_text_filter, default=None, help="Vendor name.")
+@click.option(
+    "--date",
+    "receipt_date",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Receipt date (YYYY-MM-DD).",
+)
+@click.option(
+    "--order-number", callback=_text_filter, default=None, help="Order number."
+)
+@click.option(
+    "--clear-manual",
+    "clear",
+    multiple=True,
+    type=click.Choice(
+        ["paid_amount", "vendor", "date", "receipt_date", "order_number"]
+    ),
+    help=(
+        "Hand FIELD back to re-extraction (repeatable). Can't be combined "
+        "with the field options."
+    ),
+)
+@click.option("--reason", default=None, help="Why: recorded with each change.")
+@click.option(
+    "--as",
+    "actor",
+    callback=_text_filter,
+    default=None,
+    help="Who made the change (default: annotations.actor, else 'operator').",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def edit(
+    ctx: click.Context,
+    receipt_id: str,
+    paid_amount: Decimal | None,
+    vendor: str | None,
+    receipt_date: datetime | None,
+    order_number: str | None,
+    clear: tuple[str, ...],
+    reason: str | None,
+    actor: str | None,
+    output_format: str,
+) -> None:
+    """Correct a receipt's fields by hand, or hand them back.
+
+    Each edited field is marked manual, so re-extraction leaves it alone,
+    and recorded in the receipt's history with its old and new value.
+    """
+    from receipt_index import edits
+    from receipt_index.db import get_connection
+
+    values: dict[str, Any] = {
+        name: value
+        for name, value in (
+            ("paid_amount", paid_amount),
+            ("vendor", vendor),
+            ("receipt_date", receipt_date.date() if receipt_date else None),
+            ("order_number", order_number),
+        )
+        if value is not None
+    }
+    if clear and values:
+        raise click.UsageError("--clear-manual can't be combined with field options")
+    if not clear and not values:
+        raise click.UsageError(
+            "nothing to edit: give --paid-amount, --vendor, --date, "
+            "--order-number or --clear-manual"
+        )
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _parse_receipt_id(receipt_id)
+    who = actor or config.annotations.actor
+    reason = (reason or "").strip() or None
+
+    try:
+        with get_connection(config.database.url) as conn:
+            if clear:
+                result = edits.clear_manual(conn, uid, clear, actor=who, reason=reason)
+            else:
+                result = edits.edit_receipt(conn, uid, values, actor=who, reason=reason)
+    except edits.EditError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if output_format == "json":
+        data = {
+            "receipt": result.receipt.model_dump(mode="json"),
+            "events": [e.model_dump(mode="json") for e in result.events],
+        }
+        click.echo(json.dumps(data, indent=2))
+        return
+    for change in result.changes:
+        if change.unchanged:
+            click.echo(
+                f"{change.field}: {_shown(change.old)} (unchanged; now hand-set)"
+            )
+        else:
+            click.echo(
+                f"{change.field}: {_shown(change.old)} \u2192 {_shown(change.new)}"
+            )
+    for event in result.events:
+        if event.event_type == "manual_cleared":
+            click.echo(_event_summary(event))
+    click.echo(f"Recorded as {who} (person). See `receipt-index history {uid}`.")
+
+
 # The per-field confidences --confidence-below can name.
 _CONFIDENCE_FIELDS = ("vendor", "amount", "paid_amount", "date")
 

@@ -1113,6 +1113,45 @@ def update_receipt_fields(
     )
 
 
+# The receipt columns a person may edit by hand (receipt data-model design, §4).
+_EDITABLE_COLUMNS = frozenset({"paid_amount", "vendor", "receipt_date", "order_number"})
+
+
+def update_edited_fields(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    columns: dict[str, Any],
+    *,
+    manual_fields: list[str],
+    field_confidence: dict[str, float],
+) -> Receipt:
+    """Write a hand edit (or a cleared mark) to one receipt. The caller commits."""
+    from psycopg import sql
+
+    unknown = set(columns) - _EDITABLE_COLUMNS
+    if unknown:
+        raise ValueError(f"not an editable column: {sorted(unknown)}")
+    sets = [
+        sql.SQL("{} = {}").format(sql.Identifier(name), sql.Placeholder(name))
+        for name in sorted(columns)
+    ]
+    sets.append(sql.SQL("manual_fields = {}").format(sql.Placeholder("manual")))
+    sets.append(sql.SQL("field_confidence = {}").format(sql.Placeholder("fc")))
+    params: dict[str, Any] = {
+        **columns,
+        "manual": manual_fields,
+        "fc": Jsonb(field_confidence),
+        "id": receipt_id,
+    }
+    cur = conn.execute(
+        sql.SQL("UPDATE receipt.receipts SET {} WHERE id = {} RETURNING *").format(
+            sql.SQL(", ").join(sets), sql.Placeholder("id")
+        ),
+        params,
+    )
+    return Receipt.model_validate(cur.fetchone())
+
+
 # How many runs at the current version and model an average needs before it
 # stands in for the ingest_log figures.
 _MIN_RUNS_FOR_AVERAGE = 10
