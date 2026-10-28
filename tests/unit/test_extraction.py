@@ -145,9 +145,51 @@ class TestStripHtmlTags:
         assert "tax" in result
 
     def test_attributes_stripped(self) -> None:
-        result = _strip_html_tags('<a href="http://example.com">Link</a>')
+        result = _strip_html_tags('<a class="btn" href="#top">Link</a>')
         assert result == "Link"
         assert "href" not in result
+        assert "btn" not in result
+
+    def test_link_url_follows_its_text(self) -> None:
+        # An HTML-only "View your receipt" email: the model must see the URL
+        # to give receipt_link.
+        html = (
+            '<p>Thanks!</p><a href="https://receipts.example.com/r/abc123">'
+            "View your <b>receipt</b></a>"
+        )
+        assert _strip_html_tags(html) == (
+            "Thanks!View your receipt <https://receipts.example.com/r/abc123>"
+        )
+
+    @pytest.mark.parametrize(
+        "href", ["mailto:help@example.com", "#top", "javascript:void(0)", ""]
+    )
+    def test_only_http_links_are_kept(self, href: str) -> None:
+        assert _strip_html_tags(f'<a href="{href}">Help</a>') == "Help"
+
+    def test_a_url_shown_as_its_own_text_is_not_repeated(self) -> None:
+        url = "https://receipts.example.com/r/abc123"
+        assert _strip_html_tags(f'<a href="{url}">{url}</a>') == url
+
+    def test_entities_in_the_href_are_decoded(self) -> None:
+        html = '<a href="https://receipts.example.com/r?a=1&amp;b=2">Receipt</a>'
+        assert _strip_html_tags(html) == (
+            "Receipt <https://receipts.example.com/r?a=1&b=2>"
+        )
+
+    def test_html_only_email_prompt_carries_the_link(self) -> None:
+        raw = RawReceipt(
+            source_id="<link@example.com>",
+            source_name="test",
+            source_type="imap",
+            date=datetime(2025, 6, 15, tzinfo=UTC),
+            subject="Your receipt",
+            sender="receipts@example.com",
+            html_body=(
+                '<a href="https://receipts.example.com/r/abc123">View your receipt</a>'
+            ),
+        )
+        assert "https://receipts.example.com/r/abc123" in _build_prompt(raw)
 
 
 class TestExtractMetadata:

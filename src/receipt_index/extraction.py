@@ -30,7 +30,8 @@ _R = TypeVar("_R")
 
 # Raised whenever the prompts or the output model change; every extraction
 # run records it. 0 means a receipt has no extraction history; 1 was the
-# paid-amount prompt, which was never recorded. 3 added receipt_link.
+# paid-amount prompt, which was never recorded. 3 added receipt_link, and
+# link URLs in the text of an HTML-only email.
 EXTRACTION_PROMPT_VERSION = 3
 
 # The amount, paid-amount and field-confidence rules, shared by both prompts
@@ -462,11 +463,35 @@ def _strip_html_tags(html: str) -> str:
 
 
 class _HTMLTagStripper(HTMLParser):
-    """HTMLParser subclass that strips tags and returns text."""
+    """HTMLParser subclass that strips tags and returns text.
+
+    A link's http(s) URL is kept after its text ("View your receipt
+    <https://...>"), so the extractor can see where a receipt that is only
+    a link lives.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self._parts: list[str] = []
+        # The open anchor's URL and where its text starts in _parts.
+        self._href: str | None = None
+        self._href_start = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = (dict(attrs).get("href") or "").strip()
+        if href.lower().startswith(("http://", "https://")):
+            self._href = href
+            self._href_start = len(self._parts)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._href is None:
+            return
+        text = "".join(self._parts[self._href_start :]).strip()
+        if text != self._href:
+            self._parts.append(f" <{self._href}>")
+        self._href = None
 
     def handle_data(self, data: str) -> None:
         self._parts.append(data)
