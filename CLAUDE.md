@@ -59,7 +59,7 @@ On a host that also runs the production stack, the default host ports can collid
   ```
   Docker Compose reads `COMPOSE_PROJECT_NAME` from `.env`, so plain `docker compose` commands and `make docker-up` / `make docker-down` all use the same project, and its containers and volumes stay separate from production's. Passing `docker compose -p shoebox-dev` on every command does the same; the `make docker-*` targets don't pass `-p`. Keep this `.env` to the devtest checkout: an exported `COMPOSE_PROJECT_NAME` overrides the production compose file's own project name.
 - Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env`, and in the migration URL below, from 15432 to your `POSTGRES_HOST_PORT`.
-- The integration tests read the three port variables from the environment and have no fallback. If any is unset, empty or not a port number, every integration test skips before a fixture runs or a connection opens. A value that is set is trusted, though, so on a shared host never set them to the Compose defaults. The Makefile loads `.env`, so `make test-integration` gets them; export them yourself when running `pytest` directly, or if the Makefile can't parse your `.env`. A `.env` alone isn't enough for a direct `pytest` run: the tests decide before anything loads it.
+- The integration tests read the three port variables from the environment and have no fallback. If any is unset, empty or not a port number, every integration test skips before a fixture runs or a connection opens. A value that is set is trusted, though, so on a shared host never set them to the Compose defaults. The Makefile loads `.env`, so `make test-integration` gets them; export them yourself when running `pytest` directly, or if the Makefile can't parse your `.env`. Don't rely on a `.env` for a direct `pytest` run: the tests read the variables before anything loads it (unless another test module that loads it is collected first).
 
 ### Database
 Migrations (requires [golang-migrate](https://github.com/golang-migrate/migrate)):
@@ -72,10 +72,9 @@ Note: Postgres 18 requires volume mount at `/var/lib/postgresql` (not `/data` su
 
 ### Integration Tests
 
-Requires Docker services running, and `POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT` and `GREENMAIL_IMAP_PORT` set to their host ports (from `.env` through the Makefile, or exported). After `make setup`, uncomment and set the three in `.env` (choose ports nothing else on the host uses), match the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL`, then run Compose and the tests with them. Without them every integration test skips, without connecting, with a message naming the missing variables and pointing at "Integration tests" in `docs/user/getting-started.md`:
+Requires Docker services running, and `POSTGRES_HOST_PORT`, `GREENMAIL_SMTP_PORT` and `GREENMAIL_IMAP_PORT` set to their host ports (from `.env` through the Makefile, or exported). After `make setup`, uncomment and set the three in `.env` (choose ports nothing else on the host uses), match the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL`, then run Compose and the tests with them. A `.env` made before `example.env` commented them out still sets the Compose defaults; on a shared host, change them. The suite applies the schema itself, so it needs no `make migrate-up`. Without them every integration test skips, without connecting, with a message naming the missing variables and pointing at "Integration tests" in `docs/user/getting-started.md`:
 ```bash
 docker compose up -d
-make migrate-up
 make test-integration
 ```
 

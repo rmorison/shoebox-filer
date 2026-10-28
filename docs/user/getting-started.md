@@ -148,15 +148,16 @@ GREENMAIL_SMTP_PORT=23025
 GREENMAIL_IMAP_PORT=23143
 ```
 
-Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env` to the same `POSTGRES_HOST_PORT`. Then start the stack, apply the migrations and run the tests. Docker Compose and the Makefile both read `.env`, so each command uses the same ports:
+A `.env` created from an older `example.env` still sets the three ports to Compose's defaults, so check it on a shared host.
+
+Change the port in `DATABASE_URL` and `MIGRATION_DATABASE_URL` in `.env` to the same `POSTGRES_HOST_PORT`. Then start the stack and run the tests. The tests apply the schema themselves, so they need no `make migrate-up`. Docker Compose and the Makefile both read `.env`, so each command uses the same ports:
 
 ```bash
 docker compose up -d
-make migrate-up
 make test-integration
 ```
 
-To run `pytest` directly instead of through `make`, export the three variables in your shell first: the tests read them from the environment, not from `.env`.
+To run `pytest` directly instead of through `make`, export the three variables in your shell first. Don't rely on `.env` for that: the tests read the variables from the environment before anything loads it.
 
 ## Next Steps
 
