@@ -31,6 +31,7 @@ This project runs an agent team (see [Agent Team Workflow](https://github.com/rm
 - Technical design: `docs/engineering/designs/receipt-search-index.md`
 - ADRs: `docs/engineering/adr/`
 - Server deployment (production compose): `docs/user/server-deployment.md` + `deploy/`
+- Past problems, root causes and fixes: `docs/solutions/` (check here before debugging a test failure or a dependency issue)
 
 ## Local Devtest Setup
 
