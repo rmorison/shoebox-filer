@@ -229,7 +229,7 @@ class IngestLogEntry(BaseModel):
     id: UUID
     source_id: str
     source_type: str
-    status: Literal["started", "success", "failed", "skipped"]
+    status: Literal["started", "success", "failed", "skipped", "queued"]
     receipt_id: UUID | None
     vendor: str | None
     amount: Decimal | None
@@ -244,4 +244,10 @@ class IngestLogEntry(BaseModel):
     llm_requests: int | None = None
     llm_model: str | None = None
     source_name: str | None = None
+    attempt: int = 1
+    counts_attempt: bool = True
+    next_retry_at: datetime | None = None
+    error_class: Literal["transient", "content", "config"] | None = None
+    stored_ref: str | None = None
+    retry_request_id: UUID | None = None
     created_at: datetime

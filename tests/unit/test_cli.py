@@ -185,7 +185,7 @@ def fake_source_lock() -> Iterator[type[FakeSourceLock]]:
     FakeSourceLock.acquired = []
     with (
         patch("receipt_index.locks.SourceLock", FakeSourceLock),
-        patch("receipt_index.pipeline.warn_stale_started", return_value=[]),
+        patch("receipt_index.repository.select_due", return_value=[]),
     ):
         yield FakeSourceLock
 
@@ -291,7 +291,114 @@ class TestIngestLocking:
     @patch("receipt_index.extraction.create_extraction_agent")
     @patch("receipt_index.adapters.imap.ImapAdapter")
     @patch("receipt_index.cli.load_config")
-    def test_warns_about_stale_started_rows(
+    def test_runs_due_retries_after_each_read(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        from receipt_index.pipeline import RetryResult
+
+        mock_load_config.return_value = _make_config()
+        mock_run.return_value = IngestResult(processed=1)
+        due = [MagicMock(source_id="<a@example.com>")]
+        with (
+            patch("receipt_index.repository.select_due", return_value=due) as sel,
+            patch(
+                "receipt_index.pipeline.run_due_retries",
+                return_value=RetryResult(processed=1, failed=1),
+            ) as retries,
+        ):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        sel.assert_called_once()
+        assert sel.call_args.kwargs["source_name"] == "test-email"
+        retries.assert_called_once()
+        assert retries.call_args.args[1] == due
+        assert "Processed: 2" in result.output
+        assert "Failed: 1" in result.output
+        assert result.exit_code == 1
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_a_stopped_retry_pass_fails_the_run(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        from receipt_index.pipeline import RetryResult
+
+        mock_load_config.return_value = _make_config()
+        mock_run.return_value = IngestResult()
+        with (
+            patch(
+                "receipt_index.repository.select_due",
+                return_value=[MagicMock(source_id="<a@example.com>")],
+            ),
+            patch(
+                "receipt_index.pipeline.run_due_retries",
+                return_value=RetryResult(stopped="stopped after a transient failure"),
+            ),
+        ):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        assert result.exit_code == 1
+        assert "retries stopped after a transient failure" in result.output
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_dry_run_counts_due_retries_without_running_them(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        mock_run.return_value = IngestResult()
+        due = [MagicMock(source_id="<a@x>"), MagicMock(source_id="<b@x>")]
+        with (
+            patch("receipt_index.repository.select_due", return_value=due) as sel,
+            patch("receipt_index.pipeline.run_due_retries") as retries,
+        ):
+            result = CliRunner().invoke(
+                cli,
+                ["--config", str(config_file), "ingest", "--dry-run", "--limit", "5"],
+            )
+        retries.assert_not_called()
+        assert result.exit_code == 0
+        assert "Source test-email: 2 item(s) due for a retry" in result.output
+        # The same items, due in the second source's pass too, count once.
+        assert "Source other-email: 2 item(s) due" not in result.output
+        kw = sel.call_args.kwargs
+        assert kw["limit"] == 5
+        assert kw["configured"] == ["test-email", "other-email"]
+
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_no_retries_when_the_read_stopped(
         self,
         mock_load_config: MagicMock,
         mock_adapter_cls: MagicMock,
@@ -302,12 +409,15 @@ class TestIngestLocking:
         config_file: Path,
     ) -> None:
         mock_load_config.return_value = _make_config()
-        mock_run.return_value = IngestResult()
-        with patch(
-            "receipt_index.pipeline.warn_stale_started", return_value=[]
-        ) as warn:
-            CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
-        warn.assert_called_once()
+        mock_run.return_value = IngestResult(source_error="read failed: refused")
+        with (
+            patch("receipt_index.repository.select_due") as sel,
+            patch("receipt_index.pipeline.run_due_retries") as retries,
+        ):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        sel.assert_not_called()
+        retries.assert_not_called()
+        assert result.exit_code == 1
 
 
 class TestIngestCommand:

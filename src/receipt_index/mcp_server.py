@@ -204,6 +204,29 @@ class FailureOut(BaseModel):
         default=None,
         description="Configured source the item came from; null on older rows.",
     )
+    attempt: int = Field(default=1, description="Attempt this failure belongs to.")
+    counts_attempt: bool = Field(
+        default=True,
+        description="False when the failure used up no attempt (transient, config).",
+    )
+    next_retry_at: datetime | None = Field(
+        default=None,
+        description="When the item is retried automatically; null: terminal.",
+    )
+    error_class: str | None = Field(
+        default=None,
+        description=(
+            "'transient', 'content' or 'config'; null on rows written before "
+            "errors were classified."
+        ),
+    )
+    stored_ref: str | None = Field(
+        default=None,
+        description="Rendition stored before the failure, if any (may be orphaned).",
+    )
+    retry_request_id: UUID | None = Field(
+        default=None, description="Always null for failures (set on requeue rows)."
+    )
     created_at: datetime
 
 
@@ -691,7 +714,7 @@ def build_server(
         limit: Limit = DEFAULT_PAGE_SIZE,
         offset: Offset = 0,
     ) -> FailuresResult:
-        """List failed ingest attempts, newest first."""
+        """List items whose latest ingest attempt failed, newest first."""
         with snapshot() as conn:
             total = repository.count_ingest_failures(conn)
             page = repository.get_ingest_failures(conn, limit=limit, offset=offset)

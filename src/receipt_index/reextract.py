@@ -17,12 +17,12 @@ from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
-from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.extraction import (
     EXTRACTION_PROMPT_VERSION,
     extract_from_rendition,
     extract_metadata,
 )
+from receipt_index.fetching import SourceDownError, SourcePool, fetch_item
 from receipt_index.locks import item_lock
 from receipt_index.models import (
     FAILED_RUN_KEY,
@@ -40,14 +40,11 @@ from receipt_index.store import rendition_ref
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-    from contextlib import ExitStack
     from uuid import UUID
 
     import psycopg
     from pydantic_ai import Agent
 
-    from receipt_index.adapters.base import SourceAdapter
-    from receipt_index.config import SourceConfig
     from receipt_index.models import (
         ExtractionResult,
         RawReceipt,
@@ -241,74 +238,27 @@ class ReextractResult:
         return self.stopped is None and not any(o.status in bad for o in self.outcomes)
 
 
-class SourcePool:
-    """The configured sources' adapters, opened on first use.
+def _fetch_source(pool: SourcePool, receipt: Receipt) -> RawReceipt | None:
+    """The receipt's item from its source, or None to use the rendition.
 
-    A source that raised ``SourceUnavailableError`` is not contacted again
-    in the same run.
+    An error with the item itself falls back to the rendition.
     """
-
-    def __init__(
-        self,
-        configs: list[SourceConfig],
-        factory: Callable[[SourceConfig], SourceAdapter],
-        stack: ExitStack,
-    ) -> None:
-        self._configs = {c.name: c for c in configs}
-        self._factory = factory
-        self._stack = stack
-        self._adapters: dict[str, SourceAdapter] = {}
-        self.unavailable: dict[str, str] = {}
-
-    def candidates(self, receipt: Receipt) -> list[str]:
-        """The sources to try for a receipt.
-
-        Its own source when it is still configured; otherwise every configured
-        source of its type, as the ingest design re-fetches a row whose source
-        isn't known.
-        """
-        if receipt.source_name in self._configs:
-            return [receipt.source_name]
-        return [
-            name
-            for name, config in self._configs.items()
-            if config.type == receipt.source_type
-        ]
-
-    def adapter(self, name: str) -> SourceAdapter:
-        if name not in self._adapters:
-            adapter = self._factory(self._configs[name])
-            self._adapters[name] = self._stack.enter_context(adapter)
-        return self._adapters[name]
+    try:
+        fetched = fetch_item(
+            pool,
+            source_id=receipt.source_id,
+            source_name=receipt.source_name,
+            source_type=receipt.source_type,
+        )
+    except SourceDownError as exc:
+        raise _SourceDownError(str(exc)) from exc
+    if fetched.raw is None and fetched.item_error is not None:
+        logger.warning("Re-fetch of %s failed; using the rendition", receipt.source_id)
+    return fetched.raw
 
 
 class _SourceDownError(Exception):
     """The receipt's source can't be reached in this run."""
-
-
-def _fetch_source(pool: SourcePool, receipt: Receipt) -> RawReceipt | None:
-    """The receipt's item from its source, or None to use the rendition."""
-    for name in pool.candidates(receipt):
-        if name in pool.unavailable:
-            raise _SourceDownError(pool.unavailable[name])
-        try:
-            raw = pool.adapter(name).fetch_by_id(receipt.source_id)
-        except SourceUnavailableError as exc:
-            logger.warning("Source %s is unavailable; not contacting it again", name)
-            pool.unavailable[name] = f"source {name} unavailable: {exc}"
-            raise _SourceDownError(pool.unavailable[name]) from exc
-        except Exception:
-            # The item itself is at fault (refused, unparseable): fall back.
-            logger.warning(
-                "Re-fetch of %s from %s failed; using the rendition",
-                receipt.source_id,
-                name,
-                exc_info=True,
-            )
-            continue
-        if raw is not None:
-            return raw
-    return None
 
 
 def _read_rendition(store: EvidenceStore, receipt: Receipt) -> bytes:
@@ -551,6 +501,6 @@ def run_reextract(
 
 def planned_input(pool: SourcePool | None, receipt: Receipt) -> str:
     """What a dry run says a receipt would be read from."""
-    if pool is None or not pool.candidates(receipt):
+    if pool is None or not pool.candidates(receipt.source_name, receipt.source_type):
         return "rendition"
     return "source, else rendition"

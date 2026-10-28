@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+from uuid import UUID
 
 from psycopg.types.json import Jsonb
 
+from receipt_index.adapters.gdrive import UNSUPPORTED_REASON
 from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
@@ -13,11 +16,11 @@ from receipt_index.models import (
     Receipt,
     SyncState,
 )
+from receipt_index.store import LOCAL_SCHEME
 
 if TYPE_CHECKING:
     from datetime import date, datetime
     from decimal import Decimal
-    from uuid import UUID
 
     import psycopg
 
@@ -58,36 +61,6 @@ def is_source_id_known(
     )
     row = cur.fetchone()
     return bool(row and row["known"])
-
-
-def get_stale_started(
-    conn: psycopg.Connection[dict[str, Any]],
-    *,
-    older_than_seconds: int = 3600,
-) -> list[dict[str, Any]]:
-    """Return items whose latest ingest_log row is an old ``started`` row.
-
-    Such an item was being processed when its process died. It counts as
-    known, so nothing picks it up again until the retry machinery exists;
-    the one-shot ingest lists these in a warning.
-    """
-    cur = conn.execute(
-        """\
-        SELECT l.source_id, l.source_name, l.created_at
-        FROM receipt.ingest_log l
-        WHERE l.status = 'started'
-          AND l.created_at < now() - make_interval(secs => %(secs)s)
-          AND NOT EXISTS (
-              SELECT 1 FROM receipt.ingest_log later
-              WHERE later.source_id = l.source_id
-                AND (later.created_at, later.id) > (l.created_at, l.id))
-          AND NOT EXISTS (
-              SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)
-        ORDER BY l.created_at, l.id
-        """,
-        {"secs": older_than_seconds},
-    )
-    return list(cur.fetchall())
 
 
 def get_sync_state(
@@ -498,25 +471,45 @@ def insert_ingest_log(
     llm_cache_read_tokens: int | None = None,
     llm_requests: int | None = None,
     llm_model: str | None = None,
+    attempt: int = 1,
+    counts_attempt: bool = True,
+    next_retry_at: datetime | None = None,
+    error_class: str | None = None,
+    stored_ref: str | None = None,
+    retry_request_id: UUID | None = None,
+    commit: bool = True,
 ) -> IngestLogEntry:
-    """Insert an ingest log entry and return the validated model."""
+    """Insert an ingest log entry and return the validated model.
+
+    With ``commit=False`` the caller commits.
+    """
     cur = conn.execute(
         """\
         INSERT INTO receipt.ingest_log (
             source_id, source_type, status, receipt_id, vendor, amount,
             email_subject, email_sender, email_date, error_message,
             llm_input_tokens, llm_output_tokens, llm_cache_read_tokens,
-            llm_requests, llm_model, paid_amount, source_name
+            llm_requests, llm_model, paid_amount, source_name,
+            attempt, counts_attempt, next_retry_at, error_class, stored_ref,
+            retry_request_id
         ) VALUES (
             %(source_id)s, %(source_type)s, %(status)s, %(receipt_id)s,
             %(vendor)s, %(amount)s, %(email_subject)s, %(email_sender)s,
             %(email_date)s, %(error_message)s,
             %(llm_input_tokens)s, %(llm_output_tokens)s, %(llm_cache_read_tokens)s,
-            %(llm_requests)s, %(llm_model)s, %(paid_amount)s, %(source_name)s
+            %(llm_requests)s, %(llm_model)s, %(paid_amount)s, %(source_name)s,
+            %(attempt)s, %(counts_attempt)s, %(next_retry_at)s, %(error_class)s,
+            %(stored_ref)s, %(retry_request_id)s
         )
         RETURNING *
         """,
         {
+            "attempt": attempt,
+            "counts_attempt": counts_attempt,
+            "next_retry_at": next_retry_at,
+            "error_class": error_class,
+            "stored_ref": stored_ref,
+            "retry_request_id": retry_request_id,
             "source_id": source_id,
             "source_type": source_type,
             "status": status,
@@ -537,33 +530,309 @@ def insert_ingest_log(
         },
     )
     row = cur.fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return IngestLogEntry.model_validate(row)
+
+
+# Each item's latest ingest_log row: the item's state (design section 6).
+_LATEST = """\
+SELECT DISTINCT ON (source_id) *
+FROM receipt.ingest_log
+ORDER BY source_id, created_at DESC, id DESC
+"""
+
+FailureStatus = Literal["failed", "retrying", "terminal", "skipped", "queued"]
+
+# Each --status value, over the latest row.
+_FAILURE_STATUS = {
+    "failed": "l.status = 'failed'",
+    "retrying": "l.status = 'failed' AND l.next_retry_at IS NOT NULL",
+    "terminal": "l.status = 'failed' AND l.next_retry_at IS NULL",
+    "skipped": "l.status = 'skipped'",
+    "queued": "l.status = 'queued'",
+}
+
+
+def _failure_filters(
+    status: FailureStatus,
+    since: datetime | None,
+    source_name: str | None,
+) -> tuple[str, dict[str, object]]:
+    clauses = [
+        _FAILURE_STATUS[status],
+        "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
+    ]
+    params: dict[str, object] = {}
+    if since is not None:
+        clauses.append("l.created_at >= %(since)s")
+        params["since"] = since
+    if source_name is not None:
+        clauses.append("l.source_name = %(source_name)s")
+        params["source_name"] = source_name
+    return " AND ".join(clauses), params
 
 
 def get_ingest_failures(
     conn: psycopg.Connection[dict[str, Any]],
     *,
+    status: FailureStatus = "failed",
+    since: datetime | None = None,
+    source_name: str | None = None,
     limit: int | None = None,
     offset: int | None = None,
 ) -> list[IngestLogEntry]:
-    """Return failed ingest log entries, newest first (then by id)."""
-    params: dict[str, object] = {}
+    """Items whose latest ingest_log row matches ``status``, newest first.
+
+    One entry per item: its latest row. ``failed`` covers ``retrying`` (due
+    again later) and ``terminal`` (not retried automatically).
+    """
+    where, params = _failure_filters(status, since, source_name)
     sql = (
-        "SELECT * FROM receipt.ingest_log WHERE status = 'failed' "
-        "ORDER BY created_at DESC, id ASC"
+        f"SELECT * FROM ({_LATEST}) l WHERE {where} ORDER BY created_at DESC, id ASC"
     ) + _page_clause(params, limit, offset)
     cur = conn.execute(sql, params)
     return [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
 
 
-def count_ingest_failures(conn: psycopg.Connection[dict[str, Any]]) -> int:
-    """Count failed ingest log entries."""
-    cur = conn.execute(
-        "SELECT COUNT(*) AS n FROM receipt.ingest_log WHERE status = 'failed'"
-    )
+def count_ingest_failures(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    status: FailureStatus = "failed",
+    since: datetime | None = None,
+    source_name: str | None = None,
+) -> int:
+    """Count what ``get_ingest_failures`` would return unpaged."""
+    where, params = _failure_filters(status, since, source_name)
+    cur = conn.execute(f"SELECT COUNT(*) AS n FROM ({_LATEST}) l WHERE {where}", params)
     row = cur.fetchone()
     return int(row["n"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Retries (always-on ingest design, section 6)
+# ---------------------------------------------------------------------------
+
+
+def get_item_history(
+    conn: psycopg.Connection[dict[str, Any]],
+    source_id: str,
+    *,
+    limit: int = 100,
+) -> list[IngestLogEntry]:
+    """An item's ingest_log rows, newest first."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.ingest_log WHERE source_id = %(id)s "
+        "ORDER BY created_at DESC, id DESC LIMIT %(limit)s",
+        {"id": source_id, "limit": limit},
+    )
+    return [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
+
+
+def has_receipt(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
+    """Whether a receipt exists for this source ID."""
+    cur = conn.execute(
+        "SELECT 1 FROM receipt.receipts WHERE source_id = %(id)s", {"id": source_id}
+    )
+    return cur.fetchone() is not None
+
+
+# Due for the retry scheduler, over the latest row: requeued, a failure whose
+# time has come, or a started row (whose lock the caller then tries).
+_DUE = (
+    "(l.status = 'queued'"
+    " OR (l.status = 'failed' AND l.next_retry_at <= now())"
+    " OR l.status = 'started')"
+)
+
+
+def is_due(entry: IngestLogEntry, now: datetime) -> bool:
+    """The ``_DUE`` rule for one latest row, re-checked under the item lock."""
+    if entry.status in ("queued", "started"):
+        return True
+    return (
+        entry.status == "failed"
+        and entry.next_retry_at is not None
+        and entry.next_retry_at <= now
+    )
+
+
+def select_due(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    source_name: str,
+    source_type: str,
+    configured: list[str] | None = None,
+    limit: int | None = None,
+) -> list[IngestLogEntry]:
+    """Items due for a retry from one source, oldest first.
+
+    A row that names no source (written before rows named their source), or
+    a source not in ``configured`` (renamed or removed), belongs to every
+    source of its type; the re-fetch tries each of them. The item lock keeps
+    two passes from running it twice.
+    """
+    params: dict[str, object] = {
+        "name": source_name,
+        "type": source_type,
+        # Without the configured names, only rows that name no source fall
+        # through.
+        "configured": list(configured) if configured is not None else None,
+    }
+    sql = (
+        f"SELECT * FROM ({_LATEST}) l WHERE {_DUE} "
+        "AND (l.source_name = %(name)s"
+        " OR ((l.source_name IS NULL"
+        " OR (%(configured)s::text[] IS NOT NULL"
+        " AND l.source_name <> ALL(%(configured)s::text[])))"
+        " AND l.source_type = %(type)s)) "
+        "AND NOT EXISTS (SELECT 1 FROM receipt.receipts r"
+        " WHERE r.source_id = l.source_id) "
+        "ORDER BY created_at ASC, id ASC"
+    )
+    if limit is not None:
+        sql += " LIMIT %(limit)s"
+        params["limit"] = limit
+    cur = conn.execute(sql, params)
+    rows = [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
+    conn.commit()
+    return rows
+
+
+@dataclass(frozen=True)
+class RetryFilter:
+    """What ``retry`` selects. Every set filter must match (AND)."""
+
+    status: Literal["failed", "skipped"] = "failed"
+    source_ids: tuple[str, ...] = ()
+    error_like: str | None = None
+    error_class: str | None = None
+    since: datetime | None = None
+    source_name: str | None = None
+
+    def narrows(self) -> bool:
+        """Whether anything narrower than the status is set.
+
+        ``--source`` alone doesn't count: with one configured source it
+        matches everything.
+        """
+        return bool(
+            self.source_ids
+            or self.error_like
+            or self.error_class is not None
+            or self.since is not None
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "source_ids": list(self.source_ids),
+            "error_like": self.error_like,
+            "error_class": self.error_class,
+            "since": self.since.isoformat() if self.since else None,
+            "source_name": self.source_name,
+        }
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def select_retry_candidates(
+    conn: psycopg.Connection[dict[str, Any]], spec: RetryFilter
+) -> list[IngestLogEntry]:
+    """The items ``retry`` would requeue: their latest rows, oldest first."""
+    clauses = [
+        "l.status = %(status)s",
+        "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
+    ]
+    params: dict[str, object] = {"status": spec.status}
+    if spec.status == "skipped":
+        # A file skipped for its type can't be ingested however often it is
+        # asked: only skips the model judged are worth a second look.
+        clauses.append("COALESCE(l.error_message, '') NOT LIKE %(type_skip)s")
+        params["type_skip"] = f"Skipped: {_escape_like(UNSUPPORTED_REASON)} (%"
+    if spec.source_ids:
+        clauses.append("l.source_id = ANY(%(ids)s)")
+        params["ids"] = list(spec.source_ids)
+    if spec.error_like is not None:
+        clauses.append("l.error_message ILIKE %(like)s")
+        params["like"] = f"%{_escape_like(spec.error_like)}%"
+    if spec.error_class is not None:
+        clauses.append("l.error_class = %(class)s")
+        params["class"] = spec.error_class
+    if spec.since is not None:
+        clauses.append("l.created_at >= %(since)s")
+        params["since"] = spec.since
+    if spec.source_name is not None:
+        clauses.append("l.source_name = %(source_name)s")
+        params["source_name"] = spec.source_name
+    where = " AND ".join(clauses)
+    cur = conn.execute(
+        f"SELECT * FROM ({_LATEST}) l WHERE {where} ORDER BY created_at ASC, id ASC",
+        params,
+    )
+    rows = [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
+    conn.commit()
+    return rows
+
+
+def insert_retry_request(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    requested_by: str,
+    filters: dict[str, Any],
+    matched: int,
+) -> UUID:
+    """Record a requeue, with ``requeued`` 0 until the loop sets it. Commits."""
+    cur = conn.execute(
+        "INSERT INTO receipt.retry_requests (requested_by, filters, matched, requeued) "
+        "VALUES (%(by)s, %(filters)s, %(matched)s, 0) RETURNING id",
+        {"by": requested_by, "filters": Jsonb(filters), "matched": matched},
+    )
+    row = cur.fetchone()
+    conn.commit()
+    assert row is not None
+    return UUID(str(row["id"]))
+
+
+def set_retry_request_count(
+    conn: psycopg.Connection[dict[str, Any]], request_id: UUID, requeued: int
+) -> None:
+    """Write how many items a requeue reached. Commits."""
+    conn.execute(
+        "UPDATE receipt.retry_requests SET requeued = %(n)s WHERE id = %(id)s",
+        {"n": requeued, "id": request_id},
+    )
+    conn.commit()
+
+
+def orphaned_refs(
+    conn: psycopg.Connection[dict[str, Any]], source_ids: list[str] | None
+) -> dict[str, list[str]]:
+    """Stored renditions that failed rows recorded, and that no receipt
+    references, by source ID: for these items, or for every item when
+    ``source_ids`` is None. The caller checks they still exist."""
+    if source_ids is not None and not source_ids:
+        return {}
+    cur = conn.execute(
+        """\
+        SELECT DISTINCT l.source_id, l.stored_ref
+        FROM receipt.ingest_log l
+        WHERE (%(ids)s::text[] IS NULL OR l.source_id = ANY(%(ids)s::text[]))
+          AND l.stored_ref IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM receipt.receipts r
+              WHERE %(scheme)s || r.pdf_path = l.stored_ref)
+        ORDER BY l.source_id, l.stored_ref
+        """,
+        {"ids": source_ids, "scheme": LOCAL_SCHEME},
+    )
+    found: dict[str, list[str]] = {}
+    for row in cur.fetchall():
+        found.setdefault(str(row["source_id"]), []).append(str(row["stored_ref"]))
+    conn.commit()
+    return found
 
 
 def get_receipt_by_id(

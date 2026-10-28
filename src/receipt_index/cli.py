@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
     from receipt_index.adapters.base import SourceAdapter
     from receipt_index.config import SourceConfig
+    from receipt_index.models import IngestLogEntry
+    from receipt_index.requeue import OrphanReport, RequeueOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -99,15 +101,21 @@ def ingest(
 ) -> None:
     """Ingest receipts from configured sources.
 
-    Each source is read from where the last run stopped. A source that a
-    running process holds is skipped; the exit code is then 3.
+    Each source is read from where the last run stopped, then its items that
+    are due for a retry are run (failed earlier, or requeued with `retry`).
+    A source that a running process holds is skipped; the exit code is then 3.
     """
+    from contextlib import ExitStack
+
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
     from receipt_index.db import get_connection
     from receipt_index.extraction import create_extraction_agent
+    from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
-    from receipt_index.pipeline import IngestResult, run_ingest, warn_stale_started
+    from receipt_index.pipeline import IngestResult, run_due_retries, run_ingest
+    from receipt_index.repository import select_due
+    from receipt_index.retries import RetryPolicy
     from receipt_index.store import open_store
 
     config = _load_config_or_exit(ctx)
@@ -142,13 +150,16 @@ def ingest(
         system_prompt=DOCUMENT_SYSTEM_PROMPT,
     )
 
+    agents = {"email": email_agent, "document": document_agent}
+    policy = RetryPolicy.from_config(config.ingest)
     totals = IngestResult()
     source_results: list[tuple[str, IngestResult]] = []
     locked_sources: list[str] = []
     failed_sources: list[str] = []
-
-    with get_connection(config.database.url) as conn:
-        warn_stale_started(conn)
+    # The retry adapters are closed when the command's context ends.
+    stack = ctx.with_resource(ExitStack())
+    pool = SourcePool(config.sources, _source_adapter(config), stack)
+    counted_due: set[str] = set()
 
     for source_config in sources:
         if isinstance(source_config, ImapSourceConfig):
@@ -188,7 +199,45 @@ def ingest(
                     dry_run=dry_run,
                     limit=limit,
                     source_lock=source_lock,
+                    policy=policy,
                 )
+                # Retries for the sources this run holds, after the read; not
+                # when the read itself stopped.
+                if result.source_error is None:
+                    due = select_due(
+                        conn,
+                        source_name=source_config.name,
+                        source_type=source_config.type,
+                        configured=[s.name for s in config.sources],
+                        limit=limit,
+                    )
+                    if dry_run:
+                        # An item that names no configured source is due in
+                        # every pass of its type: count it once.
+                        due = [d for d in due if d.source_id not in counted_due]
+                        counted_due.update(d.source_id for d in due)
+                        if due:
+                            click.echo(
+                                f"Source {source_config.name}: "
+                                f"{len(due)} item(s) due for a retry"
+                            )
+                    elif due:
+                        retried = run_due_retries(
+                            conn,
+                            due,
+                            pool=pool,
+                            store=store,
+                            agents=agents,
+                            llm_model=config.llm.model,
+                            policy=policy,
+                            own_source=source_config.name,
+                        )
+                        result.processed += retried.processed
+                        result.skipped += retried.skipped
+                        result.failed += retried.failed
+                        result.receipts.extend(retried.receipts)
+                        if retried.stopped is not None:
+                            result.source_error = f"retries {retried.stopped}"
 
         if result.source_error is not None:
             click.echo(
@@ -348,7 +397,68 @@ def search(
         click.echo(f"\n{len(results)} receipt(s) found.")
 
 
+def _print_orphans(config: AppConfig, output_format: str) -> None:
+    """`failures --orphans`: renditions left by failed attempts."""
+    from receipt_index.db import get_connection
+    from receipt_index.repository import orphaned_refs
+    from receipt_index.requeue import stored_file_exists
+    from receipt_index.store import open_store
+
+    store = open_store(config.store)
+    with get_connection(config.database.url) as conn:
+        found = orphaned_refs(conn, None)
+    rows = [
+        {"source_id": sid, "stored_ref": ref, "exists": stored_file_exists(store, ref)}
+        for sid, refs in found.items()
+        for ref in refs
+    ]
+    if output_format == "json":
+        click.echo(json.dumps(rows, indent=2))
+        return
+    present = [r for r in rows if r["exists"]]
+    if not present:
+        click.echo("No orphaned files.")
+        return
+    for row in present:
+        click.echo(f"{row['source_id']}  {row['stored_ref']}")
+    click.echo(
+        f"\n{len(present)} orphaned file(s): stored by a failed attempt, "
+        "referenced by no receipt. Nothing was deleted."
+    )
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """A ``--since`` date, read as local midnight."""
+    return value.astimezone() if value is not None else None
+
+
 @cli.command()
+@click.option(
+    "--status",
+    type=click.Choice(["failed", "retrying", "terminal", "skipped", "queued"]),
+    default="failed",
+    show_default=True,
+    help=(
+        "Items whose latest row is: failed (retrying or terminal); retrying "
+        "(due again later); terminal (not retried automatically); skipped "
+        "(judged not a receipt); queued (requeued by `retry`)."
+    ),
+)
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Only items whose latest row is from this date on (YYYY-MM-DD).",
+)
+@click.option("--source", "source_name", default=None, help="Filter by source name.")
+@click.option(
+    "--orphans",
+    is_flag=True,
+    help=(
+        "Instead, list stored PDFs that a failed attempt left behind and no "
+        "receipt references (whatever the item's state now)."
+    ),
+)
 @click.option(
     "--output",
     "output_format",
@@ -357,8 +467,19 @@ def search(
     help="Output format.",
 )
 @click.pass_context
-def failures(ctx: click.Context, output_format: str) -> None:
-    """List failed ingest attempts."""
+def failures(
+    ctx: click.Context,
+    status: str,
+    since: datetime | None,
+    source_name: str | None,
+    orphans: bool,
+    output_format: str,
+) -> None:
+    """List items whose latest ingest attempt failed (or was skipped).
+
+    One line per item, newest first. With --orphans, list the PDFs that
+    failed attempts left behind instead; nothing is deleted.
+    """
     from receipt_index.db import get_connection
     from receipt_index.repository import get_ingest_failures
 
@@ -366,27 +487,257 @@ def failures(ctx: click.Context, output_format: str) -> None:
 
     _configure_logging(config)
 
+    if orphans:
+        if since is not None or source_name is not None or status != "failed":
+            raise click.UsageError(
+                "--orphans lists every orphaned file; it takes no --status, "
+                "--since or --source"
+            )
+        _print_orphans(config, output_format)
+        return
+
     with get_connection(config.database.url) as conn:
-        results = get_ingest_failures(conn)
+        results = get_ingest_failures(
+            conn,
+            status=status,  # type: ignore[arg-type]
+            since=_aware(since),
+            source_name=source_name,
+        )
 
     if output_format == "json":
         data = [r.model_dump(mode="json") for r in results]
         click.echo(json.dumps(data, indent=2, default=str))
     else:
         if not results:
-            click.echo("No failed ingests.")
+            click.echo("No failed ingests." if status == "failed" else "None found.")
             return
-        click.echo(f"{'Date':<22} {'Sender':<30} {'Subject':<40} {'Error':<30}")
-        click.echo("-" * 124)
+        click.echo(
+            f"{'Date':<22} {'Sender':<30} {'Subject':<40} {'Error':<30} "
+            f"{'Class':<10} {'Next retry':<16}"
+        )
+        click.echo("-" * 152)
         for r in results:
             email_date = (
                 r.email_date.strftime("%Y-%m-%d %H:%M") if r.email_date else "\u2014"
             )
             sender = (r.email_sender or "\u2014")[:29]
-            subject = (r.email_subject or "\u2014")[:39]
+            subject = (r.email_subject or r.source_id or "\u2014")[:39]
             error = (r.error_message or "\u2014")[:29]
-            click.echo(f"{email_date:<22} {sender:<30} {subject:<40} {error:<30}")
-        click.echo(f"\n{len(results)} failed ingest(s).")
+            klass = r.error_class or "\u2014"
+            if r.status == "failed" and r.next_retry_at is None:
+                next_retry = "terminal"
+            elif r.next_retry_at is not None:
+                next_retry = r.next_retry_at.astimezone().strftime("%Y-%m-%d %H:%M")
+            else:
+                next_retry = "\u2014"
+            click.echo(
+                f"{email_date:<22} {sender:<30} {subject:<40} {error:<30} "
+                f"{klass:<10} {next_retry:<16}"
+            )
+        noun = "failed ingest(s)" if status == "failed" else f"{status} item(s)"
+        click.echo(f"\n{len(results)} {noun}.")
+
+
+def _print_retry(
+    candidates: list[IngestLogEntry],
+    report: OrphanReport,
+    outcome: RequeueOutcome | None,
+    *,
+    dry_run: bool,
+    fmt: str,
+) -> None:
+    """Print what `retry` matched, and what it did."""
+    if fmt == "json":
+        data: dict[str, Any] = {
+            "dry_run": dry_run,
+            "matched": len(candidates),
+            "items": [
+                {
+                    "source_id": c.source_id,
+                    "source_name": c.source_name,
+                    "status": c.status,
+                    "error_class": c.error_class,
+                    "attempt": c.attempt,
+                    "logged_at": c.created_at.isoformat(),
+                    "subject": c.email_subject,
+                    "sender": c.email_sender,
+                    "error": c.error_message,
+                }
+                for c in candidates
+            ],
+            "orphaned_files": report.files,
+            "orphans_not_recorded": report.unrecorded,
+        }
+        if outcome is not None:
+            data["request_id"] = str(outcome.request_id)
+            data["requeued"] = outcome.requeued
+            data["not_requeued"] = [
+                {"source_id": sid, "reason": why} for sid, why in outcome.not_requeued
+            ]
+        click.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    if not candidates:
+        click.echo("No items match.")
+        return
+    click.echo(
+        f"{'Logged':<17} {'Status':<8} {'Class':<10} {'Att':>3} "
+        f"{'Subject or source ID':<40} {'Error':<40}"
+    )
+    click.echo("-" * 123)
+    for c in candidates:
+        logged = c.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        subject = (c.email_subject or c.source_id)[:39]
+        error = (c.error_message or "\u2014")[:39]
+        klass = c.error_class or "\u2014"
+        click.echo(
+            f"{logged:<17} {c.status:<8} {klass:<10} "
+            f"{c.attempt:>3} {subject:<40} {error:<40}"
+        )
+    for source_id, refs in report.files.items():
+        for ref in refs:
+            click.echo(f"Orphaned file for {source_id}: {ref}")
+    if report.unrecorded:
+        click.echo(
+            f"{len(report.unrecorded)} item(s) failed before stored files were "
+            "recorded: check the renditions folder by hand for orphans."
+        )
+    if outcome is None:
+        click.echo(
+            f"\nDry run: {len(candidates)} item(s) would be requeued. "
+            "Pass --yes to requeue them."
+        )
+        return
+    for source_id, why in outcome.not_requeued:
+        click.echo(f"Not requeued: {source_id}: {why}")
+    click.echo(
+        f"\nRequeued {len(outcome.requeued)} of {len(candidates)} item(s) "
+        f"(request {outcome.request_id}). The next ingest runs them."
+    )
+
+
+@cli.command()
+@click.argument("source_ids", nargs=-1)
+@click.option(
+    "--source-id",
+    "more_ids",
+    multiple=True,
+    help="An item's source ID (repeatable); the same as a positional ID.",
+)
+@click.option(
+    "--status",
+    type=click.Choice(["failed", "skipped"]),
+    default="failed",
+    show_default=True,
+    help="Requeue items whose latest row has this status.",
+)
+@click.option(
+    "--error-like",
+    default=None,
+    help="Only items whose error contains this text (case-insensitive).",
+)
+@click.option(
+    "--class",
+    "error_class",
+    type=click.Choice(["transient", "content", "config"]),
+    default=None,
+    help="Only items whose failure has this class.",
+)
+@click.option("--transient", is_flag=True, help="Short for --class transient.")
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Only items whose latest row is from this date on (YYYY-MM-DD).",
+)
+@click.option("--source", "source_name", default=None, help="Filter by source name.")
+@click.option(
+    "--all",
+    "select_all",
+    is_flag=True,
+    help="Allow a filter that matches every item of the status.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help=(
+        "Requeue the items. Without it, only preview. --yes selects again, so "
+        "failures that arrived since the preview are included; pin "
+        "--source-id to requeue exactly what you reviewed."
+    ),
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def retry(
+    ctx: click.Context,
+    source_ids: tuple[str, ...],
+    more_ids: tuple[str, ...],
+    status: str,
+    error_like: str | None,
+    error_class: str | None,
+    transient: bool,
+    since: datetime | None,
+    source_name: str | None,
+    select_all: bool,
+    yes: bool,
+    output_format: str,
+) -> None:
+    """Requeue failed or skipped items, so the next ingest runs them again.
+
+    Without --yes this is a dry run: it lists what would be requeued and
+    writes nothing. --yes runs the selection again and requeues what it
+    lists, which can include failures written since an earlier preview.
+    With --yes it writes a 'queued' row for each item (the log is never
+    edited), records the request in receipt.retry_requests, and
+    resets each item's attempt count. A filter that would match every item
+    of the status is refused unless --all is given.
+
+    Exits 1 when an item couldn't be requeued (another process held it, or
+    its state changed since it was listed).
+    """
+    from receipt_index.db import get_connection
+    from receipt_index.repository import RetryFilter, select_retry_candidates
+    from receipt_index.requeue import apply_requeue, orphan_report
+    from receipt_index.store import open_store
+
+    if transient:
+        if error_class not in (None, "transient"):
+            raise click.UsageError("--transient conflicts with --class")
+        error_class = "transient"
+    spec = RetryFilter(
+        status=status,  # type: ignore[arg-type]
+        source_ids=tuple(dict.fromkeys((*source_ids, *more_ids))),
+        error_like=error_like or None,
+        error_class=error_class,
+        since=_aware(since),
+        source_name=source_name,
+    )
+    if not spec.narrows() and not select_all:
+        raise click.UsageError(
+            f"This would requeue every {status} item"
+            + (f" of source {source_name}" if source_name else "")
+            + ". Narrow it with source IDs, --error-like, --class/--transient "
+            "or --since, or pass --all."
+        )
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    store = open_store(config.store)
+
+    with get_connection(config.database.url) as conn:
+        candidates = select_retry_candidates(conn, spec)
+        report = orphan_report(conn, store, candidates)
+        outcome = apply_requeue(conn, spec, candidates) if yes and candidates else None
+
+    _print_retry(candidates, report, outcome, dry_run=not yes, fmt=output_format)
+    if outcome is not None and outcome.not_requeued:
+        sys.exit(1)
 
 
 @cli.command()
@@ -615,9 +966,9 @@ def reextract(
 
     from receipt_index.db import get_connection
     from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+    from receipt_index.fetching import SourcePool
     from receipt_index.reextract import (
         ReceiptOutcome,
-        SourcePool,
         Status,
         planned_input,
         run_reextract,

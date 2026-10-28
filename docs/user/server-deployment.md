@@ -747,11 +747,20 @@ docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
         ORDER BY created_at DESC;"'
 ```
 
-Read the senders and subjects. A genuine non-receipt is fine. A real receipt in that list means the extraction threshold or prompt needs work — and recovering it requires deleting its `ingest_log` row (see [section 8.2](#82-dlq-recovery)).
+Read the senders and subjects. A genuine non-receipt is fine. A real receipt in that list means the extraction threshold or prompt needs work, and it is recovered with `receipt-index retry` (see [section 8.2](#82-dlq-recovery)).
 
-Swap `'skipped'` for `'failed'` for the failure side, where `error_message` is populated.
+Swap `'skipped'` for `'failed'` for the failure side, where `error_message` is populated. The counts are of records, not items: an item that failed and was retried has a record for each attempt.
 
-*Future work:* a `receipt-index failures --status skipped` flag, so this stops being a raw SQL step.
+The same lists, one line per item, come from the CLI:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec scheduler \
+    receipt-index failures --status skipped --since <date a week ago>
+docker compose -f deploy/docker-compose.yml exec scheduler \
+    receipt-index failures --status terminal
+```
+
+`--status retrying` lists failures still waiting for an automatic retry. Those clear themselves; `terminal` ones don't.
 
 ### 7.2 Log scan
 
@@ -820,45 +829,44 @@ After an upgrade that touched the renderer, the Dockerfile, or the config, re-ru
 
 ### 8.2 DLQ recovery
 
-Dead-lettering is permanent by design: a `source_id` present in `ingest_log` is never looked at again, whatever its status. Recovery is deleting the log row so the item becomes unknown again.
+A failed item is retried automatically: a transient failure (the LLM overloaded or rate-limited, a network error) after 30 seconds to 15 minutes without using up an attempt, a content failure after 5 and then 30 minutes. The third content failure is **terminal**, and a skipped item (judged not a receipt) is never retried automatically. See [Retries](cli-reference.md#retries) in the CLI reference. Terminal and skipped items stay where they are until they are requeued by hand with `receipt-index retry`. Nothing in `ingest_log` is ever deleted: a requeue adds a `queued` record, and the next `ingest` runs the item again.
 
-Only worth doing for **environmental** causes — a rendering gap, a permissions problem, a network blip, a corrupted credential. Content failures (the LLM genuinely cannot read the document) will simply fail again, and re-running them costs Anthropic spend for nothing.
+Two things happen on their own after the upgrade that adds retries. Items whose processing started but never finished (the run stopped mid-item; the old `ingest` logged a warning about them) are picked up by the next `ingest`: each is recorded as a failure that uses up an attempt, then retried, up to three paid attempts. Failures recorded before the upgrade are not retried until you requeue them. When a retry succeeds over a failure that had already stored a PDF, the old file is left behind and logged; `receipt-index failures --orphans` lists such files.
+
+Only requeue for **environmental** causes: a rendering gap, a permissions problem, a corrupted credential, a bug since fixed. Content failures (the LLM genuinely cannot read the document) will simply fail again, and re-running them costs Anthropic spend for nothing.
 
 1. **Fix the cause first.** Re-run the relevant gate to prove it.
 
-2. **Check for an orphaned PDF for that `source_id`.** A failure between rendering and the database write leaves a file with no row; leaving it behind means a duplicate PDF after the retry succeeds:
+2. **Preview.** `retry` writes nothing without `--yes`. Narrow it by error text, class, date, source or source ID; it refuses a selection that would match every failure unless `--all` is given:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec scheduler \
+       receipt-index retry --since 2026-08-01 --error-like "<the environmental error substring>"
+   ```
+
+   The preview lists each matching item, its error class and attempt. It also lists any **orphaned PDF** for those items, a file stored before a failed database write, which would leave a duplicate PDF once the retry succeeds. Remove an orphan by hand if it's listed; `retry` never deletes files. For failures recorded before files were tracked, it says how many it couldn't check. For those, look for a plausibly-matching file under the receipt's year and month (receipts stored before the `renditions/` layout are under `data/receipts/<YYYY>/<MM>/`):
+
+   ```bash
+   ls -l data/receipts/renditions/<YYYY>/<MM>/
+   ```
+
+3. **Requeue exactly those.** Run the same command with `--yes`. It lists what it requeued and records the request in `receipt.retry_requests`:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec scheduler \
+       receipt-index retry --since 2026-08-01 --error-like "<the environmental error substring>" --yes
+   ```
+
+   After an LLM outage, `--transient` selects every failure classed as transient. Use `--status skipped` for skipped items that should have been recognized as receipts.
+
+4. **The next scheduled cycle runs them.** Run `receipt-index ingest` by hand to run them at once. Watch it, then re-check with `receipt-index failures --status queued` (should be empty) and the per-status breakdown. Each requeue is on record:
 
    ```bash
    docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
        psql "$DATABASE_URL" -c "
-           SELECT source_id, email_subject, error_message, created_at
-           FROM receipt.ingest_log WHERE status = '\''failed'\''
-           ORDER BY created_at DESC;"'
-   # then look for a plausibly-matching file under the receipt's year and month
-   # (receipts stored before the renditions/ layout are under data/receipts/<YYYY>/<MM>/):
-   ls -l data/receipts/renditions/<YYYY>/<MM>/
+           SELECT requested_at, requested_by, filters, matched, requeued
+           FROM receipt.retry_requests ORDER BY requested_at DESC LIMIT 10;"'
    ```
-
-3. **Delete the log rows to force a retry.** Scope it — never `DELETE FROM receipt.ingest_log WHERE status = 'failed'` wholesale, which would also resurrect genuine content failures:
-
-   ```sql
-   -- Preview first
-   SELECT source_id, email_subject, error_message
-   FROM receipt.ingest_log
-   WHERE status = 'failed'
-     AND created_at >= TIMESTAMPTZ '2026-08-01 00:00:00+00'
-     AND error_message LIKE '%<the environmental error substring>%';
-
-   -- Then delete exactly those
-   DELETE FROM receipt.ingest_log
-   WHERE status = 'failed'
-     AND created_at >= TIMESTAMPTZ '2026-08-01 00:00:00+00'
-     AND error_message LIKE '%<the environmental error substring>%';
-   ```
-
-   The same applies to `status = 'skipped'` rows for receipts that should have been recognized.
-
-4. The next scheduled cycle picks them up. Watch it, then re-check the per-status breakdown.
 
 ### 8.3 Disaster recovery from Dropbox
 

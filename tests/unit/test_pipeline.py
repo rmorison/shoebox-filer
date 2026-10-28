@@ -10,13 +10,19 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
+from pydantic_ai.exceptions import (
+    ContentFilterError,
+    ModelAuthenticationError,
+    ModelOverloadedError,
+    UnexpectedModelBehavior,
+)
 
 from receipt_index import pipeline
 from receipt_index.adapters.base import SourceUnavailableError
@@ -31,7 +37,7 @@ from receipt_index.models import (
     SourceRead,
     SyncState,
 )
-from receipt_index.pipeline import IngestResult, run_ingest, warn_stale_started
+from receipt_index.pipeline import IngestResult, run_ingest
 from receipt_index.store import StoredFile
 
 if TYPE_CHECKING:
@@ -682,29 +688,6 @@ class TestSourceErrors:
         assert adapter.closed
 
 
-class TestStaleStarted:
-    def test_logs_stale_started_items(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        monkeypatch.setattr(
-            pipeline,
-            "get_stale_started",
-            MagicMock(return_value=[{"source_id": "<a@example.com>"}]),
-        )
-        with caplog.at_level(logging.WARNING):
-            ids = warn_stale_started(MagicMock())
-        assert ids == ["<a@example.com>"]
-        assert "<a@example.com>" in caplog.text
-
-    def test_quiet_when_none(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        monkeypatch.setattr(pipeline, "get_stale_started", MagicMock(return_value=[]))
-        with caplog.at_level(logging.WARNING):
-            assert warn_stale_started(MagicMock()) == []
-        assert caplog.text == ""
-
-
 class TestIngestResult:
     def test_defaults(self) -> None:
         result = IngestResult()
@@ -858,3 +841,407 @@ class TestIngestRecordsItsExtraction:
                 source_name="personal-email",
                 source_type="imap",
             )
+
+
+# ---------------------------------------------------------------------------
+# Failure classes and the retry scheduler
+# ---------------------------------------------------------------------------
+
+
+_M = "claude-test"
+
+
+def _failed_rows(repo: FakeRepo) -> list[dict[str, Any]]:
+    return [k for k in repo.row_kwargs if k["status"] == "failed"]
+
+
+class TestFailureClasses:
+    def test_content_failure_uses_an_attempt(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.side_effect = UnexpectedModelBehavior("output validation failed")
+        result = _run(FakeAdapter(_imap_read([1, 2])))
+
+        assert result.failed == 2
+        assert result.source_error is None
+        row = _failed_rows(repo)[0]
+        assert row["error_class"] == "content"
+        assert (row["attempt"], row["counts_attempt"]) == (1, True)
+        assert row["next_retry_at"] is not None
+
+    def test_refusal_is_a_content_failure(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.side_effect = ContentFilterError("refusal")
+        result = _run(FakeAdapter(_imap_read([1, 2])))
+        assert result.failed == 2
+        assert {r["error_class"] for r in _failed_rows(repo)} == {"content"}
+
+    @pytest.mark.parametrize(
+        ("exc", "cls"),
+        [
+            (ModelOverloadedError(_M, "overloaded"), "transient"),
+            (ModelAuthenticationError(_M, "invalid x-api-key"), "config"),
+        ],
+    )
+    def test_transient_or_config_failure_stops_the_source(
+        self, repo: FakeRepo, extract: MagicMock, exc: Exception, cls: str
+    ) -> None:
+        extract.side_effect = exc
+        adapter = FakeAdapter(_imap_read([1, 2, 3]))
+        result = _run(adapter)
+
+        assert result.failed == 1
+        assert adapter.fetched == ["<msg-1@example.com>"]
+        assert result.source_error is not None
+        assert cls in result.source_error
+        (row,) = _failed_rows(repo)
+        assert row["error_class"] == cls
+        assert row["counts_attempt"] is False
+        assert row["next_retry_at"] is not None
+        # The failed item has its rows, so the cursor passes it; no further.
+        assert repo.imap_saves[-1] == (7, 1, False)
+
+    def test_failure_after_the_store_write_records_the_file(
+        self, repo: FakeRepo, extract: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            pipeline, "insert_receipt", MagicMock(side_effect=RuntimeError("db"))
+        )
+        _run(FakeAdapter(_imap_read([1])))
+        (row,) = _failed_rows(repo)
+        assert row["stored_ref"] == (
+            "local:renditions/2025/06/2025-06-15__amazon__42.99.pdf"
+        )
+
+    def test_failure_before_the_store_write_records_no_file(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.side_effect = RuntimeError("LLM error")
+        _run(FakeAdapter(_imap_read([1])))
+        assert _failed_rows(repo)[0]["stored_ref"] is None
+
+
+def _log(source_id: str, status: str, minutes_ago: int = 60, **kw: Any) -> Any:
+    from uuid import uuid4
+
+    from receipt_index.models import IngestLogEntry
+
+    return IngestLogEntry.model_validate(
+        {
+            "id": uuid4(),
+            "source_id": source_id,
+            "source_type": "imap",
+            "source_name": "personal-email",
+            "status": status,
+            "receipt_id": None,
+            "vendor": None,
+            "amount": None,
+            "email_subject": "Receipt",
+            "email_sender": "shop@example.com",
+            "email_date": None,
+            "error_message": "boom",
+            "created_at": datetime.now(tz=UTC) - timedelta(minutes=minutes_ago),
+            **kw,
+        }
+    )
+
+
+class FetchByIdAdapter(FakeAdapter):
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(_imap_read([]), **kw)
+
+    def fetch_by_id(self, source_id: str) -> RawReceipt | None:
+        uid = int(source_id.split("-")[1].split("@")[0])
+        return self.fetch(_imap_ref(uid))
+
+
+@pytest.fixture
+def history(monkeypatch: pytest.MonkeyPatch, repo: FakeRepo) -> dict[str, list[Any]]:
+    """Each item's ingest_log rows, newest first, for the scheduler."""
+    rows: dict[str, list[Any]] = {}
+    monkeypatch.setattr(
+        pipeline,
+        "get_item_history",
+        lambda conn, source_id, limit=100: rows.get(source_id, []),
+    )
+    monkeypatch.setattr(
+        pipeline, "has_receipt", lambda conn, source_id: source_id in repo.receipts
+    )
+    monkeypatch.setattr(pipeline, "orphaned_refs", lambda conn, ids: {})
+    return rows
+
+
+def _retry(
+    due: list[Any], adapter: FetchByIdAdapter, **kw: Any
+) -> pipeline.RetryResult:
+    from contextlib import ExitStack
+
+    from receipt_index.config import ImapSourceConfig
+    from receipt_index.fetching import SourcePool
+
+    config = ImapSourceConfig(
+        name="personal-email",
+        type="imap",
+        host="mail.example.com",
+        username="user@example.com",
+        password="x",  # pragma: allowlist secret
+        folder="INBOX",
+    )
+    with ExitStack() as stack:
+        pool = SourcePool([config], lambda _c: adapter, stack)  # type: ignore[arg-type,return-value]
+        return pipeline.run_due_retries(
+            MagicMock(),
+            due,
+            pool=pool,
+            store=_store(),
+            agents={"email": MagicMock(), "document": MagicMock()},
+            llm_model="test-model",
+            **kw,
+        )
+
+
+class TestRetryScheduler:
+    def test_due_failure_is_retried_as_the_next_attempt(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", attempt=1, next_retry_at=_past())]
+        result = _retry(history[sid][:1], FetchByIdAdapter())
+
+        assert result.processed == 1
+        assert repo.statuses(sid) == ["started", "success"]
+        assert [k["attempt"] for k in repo.row_kwargs] == [2, 2]
+
+    def test_queued_item_starts_again_at_one(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [
+            _log(sid, "queued", 1, attempt=0, counts_attempt=False),
+            _log(sid, "failed", 90, attempt=3),
+        ]
+        _retry(history[sid][:1], FetchByIdAdapter())
+        assert [k["attempt"] for k in repo.row_kwargs] == [1, 1]
+
+    def test_item_no_longer_due_is_left_alone(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        listed = _log(sid, "failed", next_retry_at=_past())
+        # Someone else finished it between selection and the lock.
+        history[sid] = [_log(sid, "success", 0), listed]
+        adapter = FetchByIdAdapter()
+        result = _retry([listed], adapter)
+        assert repo.rows == []
+        assert adapter.fetched == []
+        assert result.processed == result.failed == 0
+
+    def test_skipped_item_never_becomes_an_automatic_retry(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        listed = _log(sid, "failed", next_retry_at=_past())
+        history[sid] = [_log(sid, "skipped", 0), listed]
+        _retry([listed], FetchByIdAdapter())
+        assert repo.rows == []
+
+    def test_locked_item_is_skipped(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        repo.locked = {sid}
+        adapter = FetchByIdAdapter()
+        _retry(history[sid], adapter)
+        assert repo.rows == []
+        assert adapter.fetched == []
+
+    def test_dead_started_row_uses_up_an_attempt(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "started", attempt=2)]
+        adapter = FetchByIdAdapter()
+        result = _retry(history[sid], adapter)
+
+        assert adapter.fetched == []
+        assert result.failed == 1
+        (row,) = _failed_rows(repo)
+        assert (row["attempt"], row["counts_attempt"]) == (2, True)
+        assert row["next_retry_at"] is not None
+        assert "mid-item" in row["error_message"]
+
+    def test_unreachable_source_writes_nothing_and_stops(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        ids = ["<msg-1@example.com>", "<msg-2@example.com>"]
+        for sid in ids:
+            history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        adapter = FetchByIdAdapter(unavailable_from=ids[0])
+        result = _retry([history[s][0] for s in ids], adapter)
+
+        assert repo.rows == []  # no started row: no attempt used up
+        assert adapter.fetched == [ids[0]]
+        assert result.stopped is not None
+
+    def test_transient_failure_stops_the_pass(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        extract.side_effect = ModelOverloadedError(_M, "overloaded")
+        ids = ["<msg-1@example.com>", "<msg-2@example.com>"]
+        for sid in ids:
+            history[sid] = [_log(sid, "failed", attempt=1, next_retry_at=_past())]
+        adapter = FetchByIdAdapter()
+        result = _retry([history[s][0] for s in ids], adapter)
+
+        assert adapter.fetched == [ids[0]]
+        assert result.failed == 1
+        assert result.stopped is not None
+        (row,) = _failed_rows(repo)
+        assert (row["attempt"], row["counts_attempt"]) == (2, False)
+
+    def test_gone_item_is_a_counted_failure(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", attempt=2, next_retry_at=_past())]
+        _retry(history[sid], FetchByIdAdapter(gone={sid}))
+        (row,) = _failed_rows(repo)
+        assert (row["attempt"], row["counts_attempt"], row["error_class"]) == (
+            3,
+            True,
+            "content",
+        )
+        assert row["next_retry_at"] is None  # attempt 3 of 3: terminal
+
+
+class TestRetrySourceName:
+    """A row that names no source keeps NULL, so later passes still find it."""
+
+    def test_gone_legacy_item_keeps_no_source_name(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "queued", attempt=0, source_name=None)]
+        _retry(history[sid], FetchByIdAdapter(gone={sid}))
+        assert [k["source_name"] for k in repo.row_kwargs] == [None, None]
+
+    def test_dead_started_legacy_item_keeps_no_source_name(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "started", source_name=None)]
+        _retry(history[sid], FetchByIdAdapter())
+        assert [k["source_name"] for k in repo.row_kwargs] == [None]
+
+    def test_found_legacy_item_records_the_source_that_had_it(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "queued", attempt=0, source_name=None)]
+        _retry(history[sid], FetchByIdAdapter())
+        assert [k["source_name"] for k in repo.row_kwargs] == [
+            "personal-email",
+            "personal-email",
+        ]
+
+
+class TestRetryOtherSourceDown:
+    def test_another_source_down_skips_only_that_item(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        """Two IMAP sources: "scans" is down, the pass runs for "personal-email".
+
+        An item that names no source is looked for in "scans" first and left
+        for later; the next item, from the healthy own source, still runs.
+        """
+        from contextlib import ExitStack
+
+        from receipt_index.config import ImapSourceConfig
+        from receipt_index.fetching import SourcePool
+
+        legacy, own = "<msg-1@example.com>", "<msg-2@example.com>"
+        history[legacy] = [_log(legacy, "queued", attempt=0, source_name=None)]
+        history[own] = [_log(own, "failed", next_retry_at=_past())]
+        down = FetchByIdAdapter(unavailable_from=legacy)
+        healthy = FetchByIdAdapter()
+
+        def config(name: str) -> ImapSourceConfig:
+            return ImapSourceConfig(
+                name=name,
+                type="imap",
+                host="mail.example.com",
+                username="user@example.com",
+                password="x",  # pragma: allowlist secret
+                folder="INBOX",
+            )
+
+        adapters = {"scans": down, "personal-email": healthy}
+        with ExitStack() as stack:
+            pool = SourcePool(
+                [config("scans"), config("personal-email")],
+                lambda c: adapters[c.name],  # type: ignore[arg-type,return-value]
+                stack,
+            )
+            result = pipeline.run_due_retries(
+                MagicMock(),
+                [history[legacy][0], history[own][0]],
+                pool=pool,
+                store=_store(),
+                agents={"email": MagicMock(), "document": MagicMock()},
+                llm_model="test-model",
+                own_source="personal-email",
+            )
+
+        assert result.stopped is None
+        assert result.processed == 1
+        assert repo.statuses(legacy) == []  # left for a later run, no attempt used
+        assert repo.statuses(own) == ["started", "success"]
+        assert down.fetched == [legacy]
+
+    def test_own_source_down_stops_the_pass(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        adapter = FetchByIdAdapter(unavailable_from=sid)
+        result = _retry(history[sid], adapter, own_source="personal-email")
+        assert result.stopped is not None
+
+
+class TestRetryOrphans:
+    def test_success_over_an_orphan_is_logged(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        history: dict[str, list[Any]],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        old = "local:renditions/2025/06/2025-06-15__amazon__42.99.pdf"
+        monkeypatch.setattr(pipeline, "orphaned_refs", lambda conn, ids: {sid: [old]})
+        with caplog.at_level(logging.WARNING):
+            result = _retry(history[sid], FetchByIdAdapter())
+        assert result.processed == 1
+        assert old in caplog.text
+        assert "failures --orphans" in caplog.text
+
+    def test_no_warning_without_an_orphan(
+        self,
+        repo: FakeRepo,
+        extract: MagicMock,
+        history: dict[str, list[Any]],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        sid = "<msg-1@example.com>"
+        history[sid] = [_log(sid, "failed", next_retry_at=_past())]
+        with caplog.at_level(logging.WARNING):
+            _retry(history[sid], FetchByIdAdapter())
+        assert "orphans" not in caplog.text
+
+
+def _past() -> datetime:
+    return datetime.now(tz=UTC) - timedelta(minutes=1)

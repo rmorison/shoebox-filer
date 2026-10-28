@@ -30,13 +30,13 @@ from receipt_index.locks import SourceLock, SourceLockLostError, item_lock
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import run_ingest
 from receipt_index.repository import (
-    get_stale_started,
     get_sync_state,
     insert_ingest_log,
     is_source_id_known,
     record_poll,
     save_drive_cursor,
     save_imap_cursor,
+    select_due,
 )
 from receipt_index.store import LocalEvidenceStore
 
@@ -227,28 +227,85 @@ class TestSyncStateRepository:
         )
         assert is_source_id_known(pg_conn, "<x@example.com>")
 
-    def test_stale_started(self, pg_conn: Conn) -> None:
-        def row(source_id: str, status: str, age: str) -> None:
+    def test_select_due(self, pg_conn: Conn) -> None:
+        """The retry pass's pick-up rule over mixed histories.
+
+        A started row is picked up at any age: the pass then tries its item
+        lock, which a live process holds.
+        """
+
+        def row(
+            source_id: str,
+            status: str,
+            age: str,
+            retry_in: str | None = None,
+            source_name: str | None = "mail",
+            source_type: str = "imap",
+        ) -> None:
             pg_conn.execute(
-                "INSERT INTO receipt.ingest_log "
-                "(source_id, source_type, status, source_name, created_at) "
-                "VALUES (%s, 'imap', %s, 'mail', now() - %s::interval)",
-                (source_id, status, age),
+                "INSERT INTO receipt.ingest_log (source_id, source_type, status, "
+                "source_name, created_at, next_retry_at) VALUES "
+                "(%s, %s, %s, %s, now() - %s::interval, now() + %s::interval)",
+                (source_id, source_type, status, source_name, age, retry_in),
             )
 
         row("<dead@example.com>", "started", "2 hours")
-        row("<recent@example.com>", "started", "5 minutes")
+        row("<due@example.com>", "failed", "3 hours", retry_in="-1 minute")
+        row("<later@example.com>", "failed", "3 hours", retry_in="1 hour")
+        row("<terminal@example.com>", "failed", "3 hours")
+        row("<queued@example.com>", "failed", "5 hours")
+        row("<queued@example.com>", "queued", "4 hours")
         row("<finished@example.com>", "started", "3 hours")
         row("<finished@example.com>", "success", "2 hours")
-        row("<retried@example.com>", "failed", "4 hours")
-        row("<retried@example.com>", "started", "3 hours")
+        row("<skipped@example.com>", "skipped", "1 hour")
+        row("<legacy@example.com>", "queued", "6 hours", source_name=None)
+        row(
+            "<drive@example.com>",
+            "queued",
+            "6 hours",
+            source_type="gdrive",
+            source_name=None,
+        )
+        row("<other@example.com>", "queued", "6 hours", source_name="other")
         pg_conn.commit()
 
-        stale = get_stale_started(pg_conn, older_than_seconds=3600)
-        assert [r["source_id"] for r in stale] == [
-            "<retried@example.com>",
+        due = select_due(pg_conn, source_name="mail", source_type="imap")
+        assert [r.source_id for r in due] == [
+            "<legacy@example.com>",
+            "<queued@example.com>",
+            "<due@example.com>",
             "<dead@example.com>",
         ]
+        assert [
+            r.source_id
+            for r in select_due(
+                pg_conn, source_name="mail", source_type="imap", limit=1
+            )
+        ] == ["<legacy@example.com>"]
+
+        # A source renamed in the config: its rows belong to the sources of
+        # its type, like rows that name no source.
+        renamed = select_due(
+            pg_conn,
+            source_name="mail",
+            source_type="imap",
+            configured=["mail", "drive-scans"],
+        )
+        assert [r.source_id for r in renamed] == [
+            "<legacy@example.com>",
+            "<other@example.com>",
+            "<queued@example.com>",
+            "<due@example.com>",
+            "<dead@example.com>",
+        ]
+        # ...but never a configured source's rows.
+        still_configured = select_due(
+            pg_conn,
+            source_name="mail",
+            source_type="imap",
+            configured=["mail", "other"],
+        )
+        assert "<other@example.com>" not in [r.source_id for r in still_configured]
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, Discriminator, Field, Tag, ValidationError
+from pydantic import (
+    BaseModel,
+    Discriminator,
+    Field,
+    Tag,
+    ValidationError,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +151,31 @@ class IngestConfig(BaseModel):
     # A Drive change younger than this is left for the next run, because
     # scanner apps can create a file and upload its content in a second step.
     drive_settle_seconds: int = Field(default=60, ge=0)
+
+    # Retries (design section 6). A content failure uses up an attempt and is
+    # due again after the backoff for its attempt number; the failure that
+    # reaches retry_max_attempts is terminal. Transient and config failures
+    # don't use up an attempt, until an item has spent
+    # transient_item_max_seconds failing that way.
+    retry_max_attempts: int = Field(default=3, ge=1)
+    retry_backoff_seconds: list[int] = Field(
+        default_factory=lambda: [300, 1800, 7200, 43200]
+    )
+    transient_item_max_seconds: int = Field(default=21600, ge=0)
+
+    @model_validator(mode="after")
+    def _check_backoff(self) -> IngestConfig:
+        needed = self.retry_max_attempts - 1
+        if len(self.retry_backoff_seconds) < needed:
+            msg = (
+                f"retry_backoff_seconds has {len(self.retry_backoff_seconds)} "
+                f"entries; retry_max_attempts {self.retry_max_attempts} needs "
+                f"at least {needed}"
+            )
+            raise ValueError(msg)
+        if any(seconds < 0 for seconds in self.retry_backoff_seconds):
+            raise ValueError("retry_backoff_seconds entries must be 0 or more")
+        return self
 
 
 class AppConfig(BaseModel):

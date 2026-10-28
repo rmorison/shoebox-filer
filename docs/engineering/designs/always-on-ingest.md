@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS receipt.sync_state (
 - **One item can't hold the queue for ever.** If the same item keeps raising service hiccups for longer than `transient_item_max_seconds` (default 21600, six hours) in total, the next one is recorded as an item error, and the worker moves on to the next item. That covers an item that fails the same "transient" way every time, such as a fetch that times out on a huge message. Source-wide refusals don't count towards this limit, since they aren't the item's fault.
 - **Item errors use up an attempt.** These are a parse error, a render failure, an extraction that fails validation, a store write that the store reports as permanent (the store can also mark an error terminal, such as a native Doc over Drive's 10 MB export cap; that item turns terminal on its first attempt and moves to `needs-attention` with the reason), and an item that exceeds `item_timeout_seconds` ([§ 1](#1-process-model)). The item is written to `ingest_log` as `failed` with `attempt = n` and `next_retry_at = now() + backoff[n]`.
 
-**Backoff and limits:** `retry_backoff_seconds` defaults to `[300, 1800, 7200, 43200]`: 5 minutes, 30 minutes, 2 hours, 12 hours. `retry_max_attempts` defaults to 5. The fifth failure is **terminal**: `next_retry_at` stays NULL, the item moves to `needs-attention` if the source archives, and it shows in `failures`, in `status` and on the dead-man's ping ([§ 9](#9-health)).
+**Backoff and limits:** `retry_backoff_seconds` defaults to `[300, 1800, 7200, 43200]`: 5 minutes, 30 minutes, 2 hours, 12 hours. `retry_max_attempts` defaults to 3 (the operator lowered it from 5 at ticket 2's sign-off, to avoid paying repeatedly to fail the same item). The third failure is **terminal**: `next_retry_at` stays NULL, the item moves to `needs-attention` if the source archives, and it shows in `failures`, in `status` and on the dead-man's ping ([§ 9](#9-health)).
 
 **Schema:** `ingest_log` stays append-only, and the latest row for a `source_id` gives the item's state. Each attempt writes a `started` row when it begins, committed before any work so a crash leaves a trace, and then a row with its outcome. Two migrations add a status value and four columns: ticket 1 adds `started` and `source_name`, which the cursor rule needs, and ticket 2 adds `attempt`, `counts_attempt` and `next_retry_at` (see [Implementation Plan](#implementation-plan)). Together:
 
@@ -242,12 +242,12 @@ CREATE INDEX IF NOT EXISTS idx_ingest_log_next_retry_at
 
 Once the evidence store keeps originals, a retry whose original is already stored reads it from the store instead.
 
-**Existing failed rows** have no `next_retry_at` after the migration, so they start out terminal. They aren't retried automatically, because doing so at cutover would spend LLM calls without the operator's say. The cutover runbook runs `receipt-index retry --status failed` once, by hand.
+**Existing failed rows** have no `next_retry_at` after the migration, so they start out terminal. They aren't retried automatically, because doing so at cutover would spend LLM calls without the operator's say. The cutover runbook runs `receipt-index retry --status failed --all --yes` once, by hand.
 
 **Skipped items** (confidence below 0.5) aren't retried automatically. Re-asking the same model with the same prompt mostly returns the same answer, and costs a call. Some may still be real receipts, and completeness matters, so they're surfaced:
 
 - `receipt-index failures --status failed|skipped|retrying|terminal [--since DATE] [--source NAME]` lists them with subject, sender, date and reason, and `--output json` is for the consumer agent. The default stays `failed`, so today's behaviour holds.
-- `receipt-index retry SOURCE_ID…` or `receipt-index retry --status skipped|failed [--since DATE] [--source NAME] [--dry-run]` re-runs items by hand. It takes item locks, and resets the attempt count. When the data-model design's re-extraction changes the prompt, `retry --status skipped` is how the skipped back catalogue gets a second look.
+- `receipt-index retry SOURCE_ID…` or `receipt-index retry --status skipped|failed [--error-like TEXT] [--class transient|content|config] [--since DATE] [--source NAME] [--all] [--yes]` requeues items by hand. It writes a `queued` row per item (status `queued`, `attempt = 0`), which the next retry pass runs as attempt 1, and records each request in `receipt.retry_requests`. It previews unless `--yes` is given, refuses a selection with nothing narrower than `--status` unless `--all` is given, takes item locks, and reports renditions orphaned by the matched failures (`ingest_log.stored_ref`). Each failed row also records its class (`transient`, `content` or `config`), so `retry --transient` requeues what an outage failed. (Settled at ticket 2's sign-off: the design first had `retry` run the items itself.) When the data-model design's re-extraction changes the prompt, `retry --status skipped` is how the skipped back catalogue gets a second look.
 
 ### 7. Dropoff archive
 
@@ -372,7 +372,7 @@ ingest:
   drive_settle_seconds: 60
   item_timeout_seconds: 600
   transient_item_max_seconds: 21600
-  retry_max_attempts: 5
+  retry_max_attempts: 3
   retry_backoff_seconds: [300, 1800, 7200, 43200]
   health:
     heartbeat_stale_seconds: 120
@@ -432,13 +432,13 @@ All new commands support `--output json` (RD-03).
 **Rollout, in order:**
 
 1. Ship tickets 1 and 2 (sync state and retries) into the one-shot `ingest`, still on cron. Each 15-minute run then reads only new items and runs due retries. Watch a few days of runs.
-2. Run `receipt-index retry --status failed` once by hand to work through the historical failures.
+2. Run `receipt-index retry --status failed --all --yes` once by hand to work through the historical failures.
 3. Deploy `serve` with every source on `archive: false`, and remove the cron ingest line in the same change. Even if the cron line is left by mistake, the source lock makes it exit 3 rather than race.
 4. Set up the external monitor, add `HEALTH_PING_URL` to the server `.env`, then uncomment `ping_url` in the config. Confirm that one deliberate stop (`docker compose stop ingest`) raises an alert.
 5. After a week with `status --check` clean and `backfill --dry-run --since <cutover - 7 days>` reporting zero unseen items, set `archive: true` on IMAP sources. From then on, the sweep files new outcomes. Filing the back catalogue is a separate, deliberate step: `backfill --archive --dry-run` first, then `backfill --archive`.
 6. After the evidence store's Drive backend and scope change land, set `archive: true` on Drive sources and run `backfill --originals-only` to drain the dropoff into `originals/`.
 
-**Rollback**, at any step after 3: revert the cutover change in `deploy/` (git revert of ticket 7's commit), which removes the `ingest` service and restores the cron line. Then run `docker compose -f deploy/docker-compose.yml up -d --remove-orphans`, which removes the `ingest` container and restarts the scheduler with the old crontab. A plain `docker compose stop ingest` isn't enough, because the next `up -d` would start it again. The schema changes are additive, so the one-shot `ingest` keeps working against them. Messages and files that were already moved stay where they are. They were processed, so nothing is lost, and `backfill` searches the archive folders if anything needs re-reading. Rolling back step 1 brings back today's full rescan. Before running the down migrations for `sync_state` and the `ingest_log` changes, drain pending retries with `retry --status failed`: the old code counts any `ingest_log` row as processed, so an item still waiting for its retry would never be tried again. The down migration deletes `started` rows, so the old status constraint can be restored.
+**Rollback**, at any step after 3: revert the cutover change in `deploy/` (git revert of ticket 7's commit), which removes the `ingest` service and restores the cron line. Then run `docker compose -f deploy/docker-compose.yml up -d --remove-orphans`, which removes the `ingest` container and restarts the scheduler with the old crontab. A plain `docker compose stop ingest` isn't enough, because the next `up -d` would start it again. The schema changes are additive, so the one-shot `ingest` keeps working against them. Messages and files that were already moved stay where they are. They were processed, so nothing is lost, and `backfill` searches the archive folders if anything needs re-reading. Rolling back step 1 brings back today's full rescan. Before running the down migrations for `sync_state` and the `ingest_log` changes, drain pending retries (`failures --status retrying` and `--status queued` empty, after an `ingest`): the old code counts any `ingest_log` row as processed, so an item still waiting for its retry would never be tried again. The down migration deletes `started` rows, so the old status constraint can be restored.
 
 ---
 
