@@ -448,6 +448,9 @@ class TestLinkOnly:
 
         assert text.exit_code == 0, text.output
         assert get.call_args.kwargs["status"] == "link-only"
+        # The text output names the host only: the path can carry a token.
+        assert "receipts.example.com" in text.output
+        assert "/r/abc123" not in text.output
         assert "1 link-only item(s)." in text.output
         data = json.loads(as_json.output)
         assert data[0]["receipt_link"] == "https://receipts.example.com/r/abc123"

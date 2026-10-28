@@ -152,7 +152,7 @@ Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
 
 Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all.
 
-A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are and points to `failures --status link-only`. The JSON output stays a list of receipts.
+A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are in all (the search's filters don't apply to them) and points to `failures --status link-only`. The JSON output stays a list of receipts.
 
 ### Examples
 

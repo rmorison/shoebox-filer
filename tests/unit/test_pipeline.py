@@ -1298,6 +1298,16 @@ class TestLinkOnly:
         assert row.get("receipt_link") is None
         assert row["error_message"].startswith("Skipped: amount=")
 
+    def test_an_indexed_receipt_keeps_the_link_out_of_its_history(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _link_extraction(confidence=0.95)
+        _run(FakeAdapter(_imap_read([1])))
+
+        (extraction,) = repo.extractions
+        assert "receipt_link" not in extraction["output"]
+        assert "receipt_link" not in extraction["applied_fields"]
+
     def test_the_link_is_never_logged(
         self,
         repo: FakeRepo,

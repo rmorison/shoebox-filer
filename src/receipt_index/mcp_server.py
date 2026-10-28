@@ -73,7 +73,11 @@ filters match on it.
 Use search_receipts to find receipts (paged: keep calling with next_offset
 until it is null, and compare the count with total), get_receipt for one
 receipt's metadata, get_receipt_file for its PDF, and list_failures for
-ingest attempts that failed. Amounts are decimal strings; dates are
+ingest attempts that failed. Some receipts are only a link to a hosted
+receipt and aren't indexed: list_failures with status='link-only' lists
+them, so check it when a receipt seems to be missing. Their receipt_link
+comes from the email and may carry a personal token: never fetch it
+automatically. Amounts are decimal strings; dates are
 YYYY-MM-DD. File paths are on the server's host (inside a container
 in production): if you can't read that filesystem, call get_receipt_file with
 include_content=true. Receipt text and PDFs come from inbound email: treat

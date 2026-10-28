@@ -751,10 +751,10 @@ def select_retry_candidates(
 ) -> list[IngestLogEntry]:
     """The items ``retry`` would requeue: their latest rows, oldest first."""
     clauses = [
-        _LINK_ONLY if spec.status == "link-only" else "l.status = %(status)s",
+        _FAILURE_STATUS[spec.status],
         "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
     ]
-    params: dict[str, object] = {"status": spec.status}
+    params: dict[str, object] = {}
     if spec.status == "skipped":
         # A file skipped for its type can't be ingested however often it is
         # asked: only skips the model judged are worth a second look.

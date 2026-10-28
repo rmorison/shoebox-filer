@@ -386,8 +386,9 @@ def search(
         _print_receipts(results)
         if link_only:
             click.echo(
-                f"\n{link_only} item(s) are link-only receipts and aren't "
-                "indexed: see `receipt-index failures --status link-only`."
+                f"\n{link_only} link-only item(s) in all (not filtered by this "
+                "search): receipts that are only a link aren't indexed. See "
+                "`receipt-index failures --status link-only`."
             )
 
 
@@ -499,6 +500,7 @@ def failures(
     failed attempts left behind instead; nothing is deleted.
     """
     from receipt_index.db import get_connection
+    from receipt_index.models import link_host
     from receipt_index.repository import get_ingest_failures
 
     config = _load_config_or_exit(ctx)
@@ -540,7 +542,11 @@ def failures(
             )
             sender = (r.email_sender or "\u2014")[:29]
             subject = (r.email_subject or r.source_id or "\u2014")[:39]
-            error = (r.error_message or "\u2014")[:29]
+            if r.receipt_link is not None:
+                # The host alone: the path and query can carry a token.
+                error = f"link: {link_host(r.receipt_link)}"[:29]
+            else:
+                error = (r.error_message or "\u2014")[:29]
             klass = r.error_class or "\u2014"
             if r.status == "failed" and r.next_retry_at is None:
                 next_retry = "terminal"

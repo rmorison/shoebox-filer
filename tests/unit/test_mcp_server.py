@@ -639,6 +639,15 @@ class TestListFailures:
         )
         assert result.is_error is True
 
+    def test_instructions_name_link_only_items(self) -> None:
+        # The default lists failures only: an agent checking for missing
+        # receipts must learn about link-only items from the instructions.
+        from receipt_index.mcp_server import _INSTRUCTIONS
+
+        flat = " ".join(_INSTRUCTIONS.split())
+        assert "list_failures with status='link-only'" in flat
+        assert "never fetch it automatically" in flat
+
     def test_receipt_link_is_marked_untrusted(self) -> None:
         description = FailureOut.model_fields["receipt_link"].description or ""
         assert "must not be fetched" in description
