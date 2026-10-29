@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
     import psycopg
 
+pytestmark = pytest.mark.integration
+
 _VENDORS = ("Acme Parking (U.S.), LLC", "Example Hardware")
 
 
