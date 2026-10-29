@@ -103,7 +103,9 @@ def test_pages_cover_the_unpaged_order(
 
 
 @pytest.mark.usefixtures("seeded")
-def test_text_footer_reports_the_page_against_the_total(config_file: Path) -> None:
+def test_text_footer_reports_the_page_against_the_total(
+    config_file: Path, pg_conn: psycopg.Connection[dict[str, Any]]
+) -> None:
     base = ["--config", str(config_file), "search"]
     page = CliRunner().invoke(cli, [*base, "--limit", "5", "--offset", "10"])
     assert page.exit_code == 0, page.output
@@ -111,3 +113,15 @@ def test_text_footer_reports_the_page_against_the_total(config_file: Path) -> No
 
     past = CliRunner().invoke(cli, [*base, "--offset", "12"])
     assert "No receipts on this page (12 match)." in past.output
+
+    # A paid amount takes three receipts off the review list: the total
+    # counts the same --needs-review filter as the page.
+    pg_conn.execute(
+        "UPDATE receipt.receipts SET paid_amount = amount "
+        "WHERE source_id IN (%s, %s, %s)",
+        ("<paging-0@example.com>", "<paging-1@example.com>", "<paging-2@example.com>"),
+    )
+    pg_conn.commit()
+    review = CliRunner().invoke(cli, [*base, "--needs-review", "--limit", "4"])
+    assert review.exit_code == 0, review.output
+    assert "4 receipt(s) shown (1-4 of 9)." in review.output

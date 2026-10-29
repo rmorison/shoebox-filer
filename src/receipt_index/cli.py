@@ -468,9 +468,10 @@ def search(
     total: int | None = None
 
     with get_connection(config.database.url) as conn:
-        if paged:
-            # One read-only snapshot, as the MCP tool takes, so the total and
-            # the page agree.
+        if paged and output_format == "text":
+            # The text footer places the page among all matches: count them in
+            # one read-only snapshot, as the MCP tool does, so the total and
+            # the page agree. JSON stays a list of the page, with no total.
             conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             conn.read_only = True
             total = count_receipts(conn, **filters)

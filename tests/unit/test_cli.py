@@ -1009,6 +1009,8 @@ class TestSearchPaging:
         data = json.loads(result.output)
         assert isinstance(data, list)
         assert len(data) == 2
+        # No total in JSON, so nothing counts it.
+        mock_count.assert_not_called()
 
     @patch("receipt_index.repository.count_ingest_failures", return_value=2)
     @patch("receipt_index.repository.count_receipts", return_value=37)
