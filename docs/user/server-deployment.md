@@ -836,7 +836,7 @@ A dead-man's-snitch (healthchecks.io-style) ping as a fourth crontab line after 
 
 ### 8.1 Upgrade
 
-The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once.
+The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says.
 
 ```bash
 cd ~/receipt-index
@@ -867,7 +867,7 @@ docker compose -f deploy/docker-compose.yml logs -f scheduler
 
 Rebuild the image on **every** `playwright` version bump — the browser build is pinned per Playwright release, and a mismatch between the pip package and the baked browser breaks HTML rendering (and therefore dead-letters receipts).
 
-After an upgrade that touched the renderer, the Dockerfile, or the config, re-run Gates A–D before walking away.
+After an upgrade that touched the renderer, the Dockerfile, or the config, re-run Gates A–D before walking away. After an upgrade that changed the MCP tools, restart each MCP client ([section 10](#10-read-only-mcp-server)).
 
 ### 8.2 DLQ recovery
 
@@ -972,7 +972,7 @@ Because the application doesn't own the tables, the migrations' column-level gra
 
 **Every new table needs a `SELECT` grant to `receipt_index_dev_read`.** The nightly backup runs as the read login, and `pg_dump` stops at the first table it can't read. A missing grant shows only as a failed backup in the scheduler's log.
 
-A server provisioned with this version of `db-init` ([4.2](#42-start-only-the-database)) has these logins from first boot. A server provisioned earlier, where the application still logs in as `receipt_index`, switches once with the steps below. Nothing in the repository changes this by itself. Each step can run while the scheduler runs, apart from step 6, which recreates it between ingest cycles.
+A server provisioned with this version of `db-init` ([4.2](#42-start-only-the-database)) has these logins from first boot. A server provisioned earlier, where the application still logs in as `receipt_index`, switches once with the steps below. Nothing in the repository changes this by itself. Each step can run while the scheduler runs, apart from step 6, which recreates it between ingest cycles. If the scheduler is stopped and the schedule must stay off, change steps 6 and 7 as [8.6](#86-with-the-scheduler-stopped) says.
 
 **1. Check who owns the migration version tables.** Migration 000014 grants on them, and only their owner can:
 
@@ -1040,6 +1040,14 @@ SELECT r.rolname, r.rolsuper, array_agg(g.rolname) AS member_of
 test -e .env.db && echo split || echo "one file"
 ```
 
+First keep a copy of `.env`, for rollback: it holds the current `DATABASE_URL` line. No service reads `.env.pre-logins`, and `.env.*` is git-ignored. `cp -p` keeps the file's mode, and `-n` never overwrites an earlier copy:
+
+```bash
+test ! -e .env.pre-logins && cp -pn .env .env.pre-logins && echo copied
+```
+
+**Pass:** `copied`. If `.env.pre-logins` already exists, an earlier run made it before editing `.env`. Keep it.
+
 The two password lines:
 
 ```bash
@@ -1055,8 +1063,10 @@ RECEIPT_INDEX_READ_DATABASE_URL=postgresql://receipt_index_read:<read password>@
 RECEIPT_INDEX_MCP_DATABASE_URL=postgresql://receipt_index_read:<read password>@db:5432/receipt_index  # pragma: allowlist secret
 ```
 
-- **`one file`**, the usual case, since 8.5 runs after this section: all five lines go in `.env`. Keep the current `DATABASE_URL` line there as a comment, for rollback. Leave `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` in `.env` as they are: migrations still run as the owner. 8.5 later moves the owner's lines and the two passwords into `.env.db`, and has you delete the comment.
-- **`split`**: the two password lines go in `.env.db`, and the three URL lines in `.env`. Keep the current `DATABASE_URL` line as a comment in `.env.db`, for rollback, not in `.env`: `.env` holds no owner credential, not even in a comment. `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` stay in `.env.db`.
+- **`one file`**, the usual case, since 8.5 runs after this section: all five lines go in `.env`, and the new `DATABASE_URL` replaces the current one. Leave `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` in `.env` as they are: migrations still run as the owner. 8.5 later moves the owner's lines and the two passwords into `.env.db`.
+- **`split`**: the two password lines go in `.env.db`, and the three URL lines in `.env`, where the new `DATABASE_URL` replaces the current one. `RECEIPT_INDEX_PASSWORD` and `MIGRATION_DATABASE_URL` stay in `.env.db`.
+
+In either case, don't keep the old `DATABASE_URL` as a comment: the copy holds it, and 8.5 step 3 checks that `.env` has no owner URL, in a comment or not.
 
 Use your `POSTGRES_DB` as the database name if it isn't `receipt_index`. The service doesn't read the two password variables; `db-init` does, on a disaster-recovery rebuild ([8.3](#83-disaster-recovery-from-dropbox)). Then check for expansion warnings, as in [3.3](#33-the--in-secrets-hazard--read-before-pasting-a-password):
 
@@ -1117,13 +1127,28 @@ DROP OWNED BY receipt_index_mcp;
 DROP ROLE receipt_index_mcp;
 ```
 
-**Rollback.** Put the old `DATABASE_URL` line back in `.env` (the application logs in as `receipt_index` again, so an owner credential is back in the scheduler's environment, and the check in [8.5](#85-split-the-owner-credentials-out-of-env) step 6 names `DATABASE_URL` until you switch again), recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it. On a server that has split, the old line is the comment you kept in `.env.db`: move it into `.env`. Uncommenting it in `.env.db` changes nothing the scheduler reads.
+**9. Delete the copy** once every check in step 7 passes: `rm .env.pre-logins`.
+
+**Rollback.** Put the old `DATABASE_URL` line back in `.env`, replacing the new one: copy it from `.env.pre-logins` in an editor. If the copy is gone, write it again as `DATABASE_URL=postgresql://receipt_index:<RECEIPT_INDEX_PASSWORD>@db:5432/receipt_index`, taking the password from `.env`, or from `.env.db` on a server that has split. The application logs in as `receipt_index` again, so an owner credential is back in the scheduler's environment, and the check in [8.5](#85-split-the-owner-credentials-out-of-env) step 6 names `DATABASE_URL` until you switch again. Recreate the scheduler as in step 6, and re-run Gate C's search check. Leave `RECEIPT_INDEX_READ_DATABASE_URL` set: backups as the read login don't depend on the application's login. To undo that too, remove the line and recreate the scheduler again, and backups go back to `DATABASE_URL`. `RECEIPT_INDEX_MCP_DATABASE_URL` stays on the read login: the MCP server never used the application's login. The logins and migration 000014 can stay. To remove `receipt_index_write` after a rollback, run `DROP OWNED BY` and `DROP ROLE` for it, as in step 8. Keep `receipt_index_read` while the backup or the MCP server uses it.
 
 ### 8.5 Split the owner credentials out of `.env`
 
 A server provisioned with this version of [3.2](#32-create-env-and-envdb-at-the-clone-root) has two env files from the start. A server provisioned earlier keeps every variable in one `.env`, which both containers read, so the scheduler holds the owner's and the superuser's credentials. It moves over once, with the steps below. From this release, `deploy/docker-compose.yml` needs `.env.db`: without it, `docker compose config` and `up` fail with `env file ... not found` before touching a container.
 
 **Precondition: [8.4](#84-separate-database-logins) is done,** so `DATABASE_URL` logs in as `receipt_index_write`. Otherwise `DATABASE_URL` is itself an owner credential and this split protects nothing. On a server still on the owner login, run 8.4 on the current checkout first, **before** `git pull` brings in this release: 8.4 step 6 recreates the scheduler, which needs `.env.db` once the new compose file is in place.
+
+If the checkout predates 8.4 as well, it has neither 8.4's steps nor its migration. Go first to the last commit whose compose file doesn't need `.env.db`, which has both, and run 8.4 there. The `^1` is that commit, the parent of the merge that first required `.env.db`:
+
+```bash
+cd ~/receipt-index
+git fetch
+git checkout "$(git log --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
+docker compose -f deploy/docker-compose.yml build
+```
+
+Then run 8.4 as this guide gives it, go back with `git checkout main`, and go on with step 1 below. Step 4's `git pull` brings in this release.
+
+If the scheduler is stopped and the schedule must stay off, change steps 5 and 6 and the rollback as [8.6](#86-with-the-scheduler-stopped) says.
 
 Steps 1 and 2 run once. If `.env.pre-split` or `.env.db` already exists, an earlier run got that far: don't run them again, since a second split of the already-split `.env` would replace both files with ones that hold no owner lines. Go on from step 3, or start over: `mv .env.pre-split .env && rm -f .env.db .env.new`, then step 1 again. The commands below refuse to overwrite either file, or a `.env.new` left by an interrupted run.
 
@@ -1155,7 +1180,7 @@ grep -cE '://(receipt_index|postgres)[:@]' .env                   # must print 0
 stat -c '%a %n' .env .env.db                                      # both 600
 ```
 
-The fourth count reads comment lines too. If it isn't 0, `.env` still holds an owner URL: most likely the old `DATABASE_URL` that [8.4](#84-separate-database-logins) step 5 kept as a comment for rollback. Delete that line in an editor; `.env.pre-split` keeps a copy until step 7, and after that 8.4's rollback can write the line again from `RECEIPT_INDEX_PASSWORD` in `.env.db`. Compose ignores comments, so it never reached the container, but `.env` should hold no owner password at all.
+The fourth count reads comment lines too. If it isn't 0, `.env` still holds an owner URL, perhaps in a comment: delete that line in an editor. Compose ignores comments, so a comment never reached the container, but `.env` should hold no owner password at all. [8.4](#84-separate-database-logins) keeps its rollback copy in `.env.pre-logins`, not in a comment, so a server that followed 8.4 prints 0 here.
 
 If `.env.db` holds fewer than 7 lines, `.env` lacked one of them: a server provisioned before 8.4 may lack the two login passwords; add them to `.env.db` from 1Password, as 8.3 step 2 says. Store `.env.db` in 1Password next to `.env`.
 
@@ -1204,6 +1229,34 @@ docker compose -f deploy/docker-compose.yml up -d scheduler
 
 The scheduler then holds the owner credentials again, as before this section, and `db` keeps reading `.env.db`. To also go back to the previous release, check out its commit and run `up -d`: its compose file reads the restored `.env` for both services, and `.env.db` is ignored.
 
+### 8.6 With the scheduler stopped
+
+Sometimes the schedule has to stay off, for example until a backfill finishes, so the scheduler isn't running. `up -d` and `up -d scheduler` would start supercronic, and the schedule with it, and `exec` needs a running container. To run [8.1](#81-upgrade), [8.4](#84-separate-database-logins) or [8.5](#85-split-the-owner-credentials-out-of-env) and leave the schedule off, change their commands like this:
+
+- **Skip the idle check and `stop scheduler`.** No cycle is running.
+- **Each `exec` becomes a one-off `run`.** The program goes in `--entrypoint` and its arguments after `scheduler`. A one-off container reads `.env` when it starts, so it sees an edit straight away, with no recreate:
+
+  ```bash
+  # exec scheduler receipt-index ingest
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint receipt-index scheduler ingest
+  # exec scheduler sh -c '...'     (8.4 step 7a and 7f, 8.5 step 6a)
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint sh scheduler -c '...'
+  # exec scheduler /app/backup.sh  (8.4 step 7d)
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint /app/backup.sh scheduler
+  ```
+
+  [10.1](#101-one-time-setup) step 4 gives the same form for the MCP check.
+- **`up -d` and `up -d scheduler` become `up -d db`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), and leaves the scheduler stopped. Skip `logs -f scheduler`.
+- **Copy a backup made by hand off the host yourself.** The sync cron lines don't run, so the dump from 8.4 step 7d stays in `data/backups` until the schedule starts. To copy it now:
+
+  ```bash
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint rclone scheduler \
+      copy /app/data/backups dropbox:receipt-index/backups --exclude "*.tmp" \
+      --config /app/.rclone/rclone.conf -v
+  ```
+
+When the schedule should start, `up -d` starts it, as in [Gate G](#gate-g--supervised-cycle-then-the-schedule) step 2.
+
 ---
 
 ## 9. Searching from the laptop
@@ -1248,6 +1301,8 @@ ssh receipt-server docker compose -p receipt-index exec -T scheduler receipt-ind
 ```
 
 The server refuses to start unless its database role is read-only. It logs in as the read login, `receipt_index_read`, a member of `receipt_index_dev_read` only, which `db-init` creates on a new server and [8.4](#84-separate-database-logins) creates on an older one. The application's logins, `receipt_index` and `receipt_index_write`, can write, so the server refuses them.
+
+**Restart MCP clients after an upgrade that changes the tools.** A client loads the tool list and each tool's input schema when it connects, and keeps them until it restarts. Results can carry the new fields at once, but the client won't offer a new tool or filter until it restarts or reconnects to the server.
 
 ### 10.1 One-time setup
 
