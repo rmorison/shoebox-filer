@@ -972,7 +972,7 @@ Because the application doesn't own the tables, the migrations' column-level gra
 
 **Every new table needs a `SELECT` grant to `receipt_index_dev_read`.** The nightly backup runs as the read login, and `pg_dump` stops at the first table it can't read. A missing grant shows only as a failed backup in the scheduler's log.
 
-A server provisioned with this version of `db-init` ([4.2](#42-start-only-the-database)) has these logins from first boot. A server provisioned earlier, where the application still logs in as `receipt_index`, switches once with the steps below. Nothing in the repository changes this by itself. Each step can run while the scheduler runs, apart from step 6, which recreates it between ingest cycles. If the scheduler is stopped and the schedule must stay off, change steps 6 and 7 as [8.6](#86-with-the-scheduler-stopped) says.
+A server provisioned with this version of `db-init` ([4.2](#42-start-only-the-database)) has these logins from first boot. A server provisioned earlier, where the application still logs in as `receipt_index`, switches once with the steps below. Nothing in the repository changes this by itself. Each step can run while the scheduler runs, apart from step 6, which recreates it between ingest cycles. If the scheduler is stopped and the schedule must stay off, change steps 6 and 7 and the rollback as [8.6](#86-with-the-scheduler-stopped) says.
 
 **1. Check who owns the migration version tables.** Migration 000014 grants on them, and only their owner can:
 
@@ -1146,7 +1146,7 @@ git checkout "$(git log --first-parent --format=%H -S'../.env.db' origin/main --
 docker compose -f deploy/docker-compose.yml build
 ```
 
-Then run 8.4 as this guide gives it, go back with `git checkout main`, and go on with step 1 below. Step 4's `git pull` brings in this release.
+Then run 8.4 from this guide as main has it, not from the copy in the older checkout: that copy's 8.4 step 5 keeps the old `DATABASE_URL` as a comment, which fails step 3 below, and it has no 8.6. Read main's copy on GitHub, or with `git show origin/main:docs/user/server-deployment.md | less`. Then go back with `git checkout main` and go on with step 1 below. Step 4's `git pull` brings in this release.
 
 If the scheduler is stopped and the schedule must stay off, change steps 5 and 6 and the rollback as [8.6](#86-with-the-scheduler-stopped) says.
 

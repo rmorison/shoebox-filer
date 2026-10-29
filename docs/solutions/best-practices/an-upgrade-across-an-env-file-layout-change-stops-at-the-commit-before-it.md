@@ -55,7 +55,7 @@ git show "$c":deploy/docker-compose.yml | grep -c 'env.db'               # 0
 git show "$c":docs/user/server-deployment.md | grep -c '^### 8.4'        # 1
 ```
 
-**Write the one-time step so it runs at the stop.** Its commands can't assume the new layout, because the stop's compose file reads only the old one. Tell the reader to follow the step as the current guide gives it, then return to the default branch (`git checkout main`) before the `git pull` that brings in the next release. A detached HEAD can't pull.
+**Write the one-time step so it runs at the stop.** Its commands can't assume the new layout, because the stop's compose file reads only the old one. Tell the reader to follow the step from the default branch's copy of the guide, not the copy in the older checkout, which predates any fix to the step. Then return to the default branch (`git checkout main`) before the `git pull` that brings in the next release. A detached HEAD can't pull.
 
 ## Why This Matters
 
@@ -77,7 +77,7 @@ After, the same paragraph, followed by:
 
 > If the checkout predates 8.4 as well, it has neither 8.4's steps nor its migration. Go first to the last commit whose compose file doesn't need `.env.db`, which has both, and run 8.4 there.
 
-Then the checkout command above, a `build`, "run 8.4 as this guide gives it", and `git checkout main` before going on with the split.
+Then the checkout command above, a `build`, "run 8.4 from this guide as main has it, not from the copy in the older checkout", and `git checkout main` before going on with the split.
 
 ## Related
 
