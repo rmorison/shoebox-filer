@@ -38,10 +38,11 @@ The first production upgrade across both releases came from a checkout older tha
 
 ```bash
 git fetch
-git checkout "$(git log --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
+git checkout "$(git log -m --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
 ```
 
 - `-S'<string>'` (git's pickaxe) lists commits that change how many times the string appears in the file. `tail -1` keeps the oldest, the one that brought the string in.
+- `-m` makes `-S` look at merge commits, comparing each with its first parent. Recent git does this for `--first-parent` by default, but with merge diffs off, `-S` matches no merge on main, the result is empty, and `git checkout "^1"` fails. Chain the next step with `&&` so it never runs on the old tree.
 - `--first-parent` keeps the walk on main's own commits, so the result is a merge on main and `^1` is main as it was just before that merge. Without it, the result can be a commit inside the feature branch, and its `^1` is wherever that branch started. In this repository's history both forms happen to land on the same commit, because the split's branch started from the logins merge. A branch started earlier would not.
 - A hash pasted into the guide is just as exact, but the repository's docs don't cite commits, and a hash hides how it was found.
 
@@ -50,7 +51,7 @@ To check whether a server has already passed the stop, run `git merge-base --is-
 **Check the command against history before publishing it.** At the commit it finds, the file must not name the new layout yet, and the one-time step's section must exist:
 
 ```bash
-c="$(git log --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
+c="$(git log -m --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
 git show "$c":deploy/docker-compose.yml | grep -c 'env.db'               # 0
 git show "$c":docs/user/server-deployment.md | grep -c '^### 8.4'        # 1
 ```

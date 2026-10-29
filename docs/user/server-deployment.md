@@ -1135,18 +1135,18 @@ DROP ROLE receipt_index_mcp;
 
 A server provisioned with this version of [3.2](#32-create-env-and-envdb-at-the-clone-root) has two env files from the start. A server provisioned earlier keeps every variable in one `.env`, which both containers read, so the scheduler holds the owner's and the superuser's credentials. It moves over once, with the steps below. From this release, `deploy/docker-compose.yml` needs `.env.db`: without it, `docker compose config` and `up` fail with `env file ... not found` before touching a container.
 
-**Precondition: [8.4](#84-separate-database-logins) is done,** so `DATABASE_URL` logs in as `receipt_index_write`. Otherwise `DATABASE_URL` is itself an owner credential and this split protects nothing. On a server still on the owner login, run 8.4 on the current checkout first, **before** `git pull` brings in this release: 8.4 step 6 recreates the scheduler, which needs `.env.db` once the new compose file is in place.
+**Precondition: [8.4](#84-separate-database-logins) is done,** so `DATABASE_URL` logs in as `receipt_index_write`. Otherwise `DATABASE_URL` is itself an owner credential and this split protects nothing. On a server still on the owner login, run 8.4 on the current checkout first, **before** `git pull` brings in this release: 8.4 step 6 recreates the scheduler, which needs `.env.db` once the new compose file is in place. Follow 8.4 from this guide as main has it, not from the copy in the server's checkout: an older copy's 8.4 step 5 keeps the old `DATABASE_URL` as a comment, which fails step 3 below, and has no 8.6. Read main's copy on GitHub, or with `git fetch && git show origin/main:docs/user/server-deployment.md | less`.
 
-If the checkout predates 8.4 as well, it has neither 8.4's steps nor its migration. Go first to the last commit whose compose file doesn't need `.env.db`, which has both, and run 8.4 there. The `^1` is that commit, the parent of the merge that first required `.env.db`:
+If the checkout predates 8.4 as well, it has neither 8.4's steps nor its migration. Go first to the last commit whose compose file doesn't need `.env.db`, which has both, and run 8.4 there. The `^1` is that commit, the parent of the merge that first required `.env.db`. `-m` makes `-S` compare each merge with its first parent:
 
 ```bash
 cd ~/receipt-index
 git fetch
-git checkout "$(git log --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1"
-docker compose -f deploy/docker-compose.yml build
+git checkout "$(git log -m --first-parent --format=%H -S'../.env.db' origin/main -- deploy/docker-compose.yml | tail -1)^1" &&
+    docker compose -f deploy/docker-compose.yml build
 ```
 
-Then run 8.4 from this guide as main has it, not from the copy in the older checkout: that copy's 8.4 step 5 keeps the old `DATABASE_URL` as a comment, which fails step 3 below, and it has no 8.6. Read main's copy on GitHub, or with `git show origin/main:docs/user/server-deployment.md | less`. Then go back with `git checkout main` and go on with step 1 below. Step 4's `git pull` brings in this release.
+Then run 8.4, go back with `git checkout main`, and go on with step 1 below. Step 4's `git pull` brings in this release.
 
 If the scheduler is stopped and the schedule must stay off, change steps 5 and 6 and the rollback as [8.6](#86-with-the-scheduler-stopped) says.
 
