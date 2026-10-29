@@ -635,9 +635,15 @@ class TestSearchCommand:
         assert "failures --status link-only" in result.output
         assert mock_count.call_args.kwargs["status"] == "link-only"
 
-        # JSON stays a plain list of receipts.
+        # JSON is the MCP envelope, with no link-only count in it.
         as_json = runner.invoke(cli, [*args, "--output", "json"])
-        assert isinstance(json.loads(as_json.output), list)
+        assert set(json.loads(as_json.output)) == {
+            "receipts",
+            "total",
+            "limit",
+            "offset",
+            "next_offset",
+        }
 
     @patch("receipt_index.repository.count_ingest_failures", return_value=1)
     @patch("receipt_index.repository.search_receipts", return_value=[])
@@ -742,8 +748,7 @@ class TestSearchCommand:
             cli, ["--config", str(config_file), "search", "--output", "json"]
         )
         assert result.exit_code == 0, result.output
-        data = json.loads(result.output)
-        assert isinstance(data, list)
+        data = json.loads(result.output)["receipts"]
         assert len(data) == 1
         assert data[0]["vendor"] == "Amazon"
 
@@ -988,7 +993,7 @@ class TestSearchPaging:
     @patch("receipt_index.repository.search_receipts")
     @patch("receipt_index.db.get_connection")
     @patch("receipt_index.cli.load_config")
-    def test_json_stays_a_list_of_the_page(
+    def test_json_is_the_page_envelope(
         self,
         mock_load_config: MagicMock,
         mock_conn: MagicMock,
@@ -1007,10 +1012,8 @@ class TestSearchPaging:
         )
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert isinstance(data, list)
-        assert len(data) == 2
-        # No total in JSON, so nothing counts it.
-        mock_count.assert_not_called()
+        assert len(data["receipts"]) == 2
+        assert (data["total"], data["limit"], data["next_offset"]) == (37, 2, 2)
 
     @patch("receipt_index.repository.count_ingest_failures", return_value=2)
     @patch("receipt_index.repository.count_receipts", return_value=37)
@@ -1088,8 +1091,7 @@ class TestFailuresCommand:
             cli, ["--config", str(config_file), "failures", "--output", "json"]
         )
         assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert isinstance(data, list)
+        data = json.loads(result.output)["failures"]
         assert len(data) == 1
         assert data[0]["status"] == "failed"
         assert data[0]["error_message"] == "amount > 0 validation failed"
@@ -1534,7 +1536,7 @@ class TestPaidAmountOutput:
         mock_load_config.return_value = _make_config()
         result = _invoke(config_file, "search", "--output", "json")
         assert result.exit_code == 0, result.output
-        (item,) = json.loads(result.output)
+        (item,) = json.loads(result.output)["receipts"]
         assert item["amount"] == "50.00"
         assert item["paid_amount"] == "30.00"
         assert item["effective_amount"] == "30.00"

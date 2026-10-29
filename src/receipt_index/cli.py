@@ -8,7 +8,7 @@ import re
 import sys
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import UUID
 
 import click
@@ -17,6 +17,7 @@ from psycopg.errors import DeadlockDetected
 
 from receipt_index.config import AppConfig, ConfigError, load_config
 from receipt_index.models import KINDS
+from receipt_index.paging import page_envelope
 
 # Load .env before any config interpolation
 load_dotenv()
@@ -415,7 +416,9 @@ def search(
     statement not at all). A purchase also gives refunded and net_paid.
 
     --limit and --offset page the same order the MCP search_receipts tool
-    does; JSON output stays a list of the receipts on the page.
+    does. JSON output is the same page envelope as that tool's: {receipts,
+    total, limit, offset, next_offset}, with limit and next_offset null
+    without --limit.
     """
     from decimal import Decimal, InvalidOperation
 
@@ -468,16 +471,16 @@ def search(
     total: int | None = None
 
     with get_connection(config.database.url) as conn:
-        if paged and output_format == "text":
-            # The text footer places the page among all matches: count them in
-            # one read-only snapshot, as the MCP tool does, so the total and
-            # the page agree. JSON stays a list of the page, with no total.
+        if paged or output_format == "json":
+            # The JSON envelope and the paged text footer place the page among
+            # all matches: count them in one read-only snapshot, as the MCP
+            # tool does, so the total and the page agree.
             conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             conn.read_only = True
             total = count_receipts(conn, **filters)
         results = search_receipts(conn, **filters, limit=limit, offset=offset)
         # Items with no receipt to search: counted for the text output only,
-        # so the JSON stays a list of receipts.
+        # so the JSON matches the MCP envelope.
         link_only = (
             count_ingest_failures(conn, status="link-only", source_name=source_name)
             if needs_review and output_format == "text"
@@ -485,7 +488,13 @@ def search(
         )
 
     if output_format == "json":
-        data = [r.model_dump(mode="json") for r in results]
+        data = page_envelope(
+            "receipts",
+            [r.model_dump(mode="json") for r in results],
+            total=cast("int", total),
+            limit=limit,
+            offset=offset or 0,
+        )
         click.echo(json.dumps(data, indent=2, default=str))
     else:
         _print_receipts(results, total=total, offset=offset or 0)
@@ -622,6 +631,18 @@ def _aware(value: datetime | None) -> datetime | None:
     ),
 )
 @click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Print at most N items. Default: every match.",
+)
+@click.option(
+    "--offset",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Skip the first N matches. Default: 0.",
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -635,44 +656,76 @@ def failures(
     since: datetime | None,
     source_name: str | None,
     orphans: bool,
+    limit: int | None,
+    offset: int | None,
     output_format: str,
 ) -> None:
     """List items whose latest ingest attempt failed (or was skipped).
 
-    One line per item, newest first. With --orphans, list the PDFs that
-    failed attempts left behind instead; nothing is deleted.
+    One line per item, newest first. --limit and --offset page that order.
+    JSON output is the same page envelope as the MCP list_failures tool's:
+    {failures, total, limit, offset, next_offset}. With --orphans, list the
+    PDFs that failed attempts left behind instead; nothing is deleted.
     """
+    import psycopg
+
     from receipt_index.db import get_connection
     from receipt_index.models import link_host
-    from receipt_index.repository import get_ingest_failures
+    from receipt_index.repository import count_ingest_failures, get_ingest_failures
 
     config = _load_config_or_exit(ctx)
 
     _configure_logging(config)
 
     if orphans:
-        if since is not None or source_name is not None or status != "failed":
+        if (
+            since is not None
+            or source_name is not None
+            or status != "failed"
+            or limit is not None
+            or offset is not None
+        ):
             raise click.UsageError(
                 "--orphans lists every orphaned file; it takes no --status, "
-                "--since or --source"
+                "--since, --source, --limit or --offset"
             )
         _print_orphans(config, output_format)
         return
 
+    filters: dict[str, Any] = {
+        "status": status,
+        "since": _aware(since),
+        "source_name": source_name,
+    }
+    paged = limit is not None or offset is not None
+    total: int | None = None
+
     with get_connection(config.database.url) as conn:
-        results = get_ingest_failures(
-            conn,
-            status=status,  # type: ignore[arg-type]
-            since=_aware(since),
-            source_name=source_name,
-        )
+        if paged or output_format == "json":
+            # The total and the page from one read-only snapshot, as in
+            # `search` and the MCP tool.
+            conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            conn.read_only = True
+            total = count_ingest_failures(conn, **filters)
+        results = get_ingest_failures(conn, **filters, limit=limit, offset=offset)
 
     if output_format == "json":
-        data = [r.model_dump(mode="json") for r in results]
+        data = page_envelope(
+            "failures",
+            [r.model_dump(mode="json") for r in results],
+            total=cast("int", total),
+            limit=limit,
+            offset=offset or 0,
+        )
         click.echo(json.dumps(data, indent=2, default=str))
     else:
         if not results:
-            click.echo("No failed ingests." if status == "failed" else "None found.")
+            if total:
+                click.echo(f"None on this page ({total} match).")
+            else:
+                click.echo(
+                    "No failed ingests." if status == "failed" else "None found."
+                )
             return
         click.echo(
             f"{'Date':<22} {'Sender':<30} {'Subject':<40} {'Error':<30} "
@@ -702,7 +755,14 @@ def failures(
                 f"{klass:<10} {next_retry:<16}"
             )
         noun = "failed ingest(s)" if status == "failed" else f"{status} item(s)"
-        click.echo(f"\n{len(results)} {noun}.")
+        if total is None:
+            click.echo(f"\n{len(results)} {noun}.")
+        else:
+            start = (offset or 0) + 1
+            click.echo(
+                f"\n{len(results)} {noun} shown "
+                f"({start}-{start + len(results) - 1} of {total})."
+            )
 
 
 def _print_retry(

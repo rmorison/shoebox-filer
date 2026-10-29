@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field
 from receipt_index import repository
 from receipt_index.db import get_connection
 from receipt_index.models import Kind  # noqa: TC001 (pydantic resolves it)
+from receipt_index.paging import next_offset
 from receipt_index.store import InvalidRefError, LocalEvidenceStore, rendition_ref
 
 if TYPE_CHECKING:
@@ -540,11 +541,6 @@ def _decimal_str(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
-def _next_offset(offset: int, page_len: int, total: int) -> int | None:
-    end = offset + page_len
-    return end if page_len and end < total else None
-
-
 def _client_info(ctx: Context) -> dict[str, str | None]:
     """Return the MCP client's name and version, or nulls if not sent."""
     try:
@@ -693,7 +689,7 @@ def build_server(
             total=total,
             limit=limit,
             offset=offset,
-            next_offset=_next_offset(offset, len(page), total),
+            next_offset=next_offset(offset, len(page), total),
         )
 
     @server.tool(annotations=_READ_ONLY_TOOL)
@@ -871,7 +867,7 @@ def build_server(
             total=total,
             limit=limit,
             offset=offset,
-            next_offset=_next_offset(offset, len(page), total),
+            next_offset=next_offset(offset, len(page), total),
         )
 
     return server
