@@ -189,9 +189,9 @@ Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
 
 Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all. Ties are broken by ID, so the order is the same on every run.
 
-**Paging.** `--limit` and `--offset` take a page of that order, as the MCP `search_receipts` tool does: `--limit 5` gives the first five, and `--limit 5 --offset 5` the next five. Without either option, `search` prints every match, so existing scripts see no change; unlike the MCP tool, which defaults to 50 and allows at most 200, `--limit` has no default and no upper bound. With either, the text output's footer places the page among all matches, for example `5 receipt(s) shown (6-10 of 37).`, and an offset past the last match prints `No receipts on this page (37 match).` The JSON output stays a list of the receipts on the page, with no total. If an ingest commits between two runs, receipts can shift between pages; see the MCP [paging note](#mcp) for that. The same goes for `--needs-review` while you work through it: a receipt you fix with [`edit`](#edit) or [`reextract`](#reextract) can leave, join or move in the list, so run it again from offset 0 (or with `--limit` alone) rather than moving on to the next offset.
+**Paging.** `--limit` and `--offset` take a page of that order, as the MCP `search_receipts` tool does: `--limit 5` gives the first five, and `--limit 5 --offset 5` the next five. Without either option, `search` prints every match; unlike the MCP tool, which defaults to 50 and allows at most 200, `--limit` has no default and no upper bound. With either, the text output's footer places the page among all matches, for example `5 receipt(s) shown (6-10 of 37).`, and an offset past the last match prints `No receipts on this page (37 match).` The JSON output is the same envelope in either case (see [JSON Output](#json-output)). If an ingest commits between two runs, receipts can shift between pages; see the MCP [paging note](#mcp) for that. The same goes for `--needs-review` while you work through it: a receipt you fix with [`edit`](#edit) or [`reextract`](#reextract) can leave, join or move in the list, so run it again from offset 0 (or with `--limit` alone) rather than moving on to the next offset.
 
-A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are (only `--source` narrows that count; vendor, amount and date filters don't apply to them) and points to `failures --status link-only`. The JSON output stays a list of receipts.
+A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are (only `--source` narrows that count; vendor, amount and date filters don't apply to them) and points to `failures --status link-only`. The JSON output doesn't count them.
 
 ### Examples
 
@@ -244,34 +244,50 @@ ID                                     Date         Vendor               Order  
 
 ### JSON Output
 
-Use `--output json` for machine-readable output:
+Use `--output json` for machine-readable output. It is the same page envelope as the MCP [`search_receipts`](#mcp) tool's, with the same field names and meanings:
+
+- `receipts`: the receipts on the page, in the order above.
+- `total`: how many receipts match the filters, on every page.
+- `limit`: the `--limit` given, or `null` without one.
+- `offset`: the `--offset` given, or `0`.
+- `next_offset`: the `--offset` for the next page, or `null` when this page is the last. It is always `null` without `--limit`, since the page then runs to the end.
+
+The total and the page are read from one snapshot, so they agree. Each receipt carries the same fields as an MCP receipt, except `file` (the PDF's path on the server and whether it exists), which only the MCP tool gives.
+
+To read every page, start at `--offset 0` and pass `next_offset` as the next `--offset` until it is `null`.
 
 ```json
-[
-  {
-    "id": "01942a3b-...",
-    "vendor": "Amazon",
-    "amount": "47.99",
-    "paid_amount": "47.99",
-    "effective_amount": "47.99",
-    "kind": "purchase",
-    "signed_amount": "47.99",
-    "refund_of": null,
-    "refunded": "12.00",
-    "net_paid": "35.99",
-    "currency": "USD",
-    "receipt_date": "2026-01-15",
-    "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97,
-                         "order_number": 0.95, "payment": 0.9},
-    "manual_fields": [],
-    "order_number": "123-4567890",
-    "payment_method": "card",
-    "payment_last4": "1234",
-    "payer": "Jane Doe",
-    "pdf_path": "2026/01/2026-01-15__amazon__47.99.pdf",
-    ...
-  }
-]
+{
+  "receipts": [
+    {
+      "id": "01942a3b-...",
+      "vendor": "Amazon",
+      "amount": "47.99",
+      "paid_amount": "47.99",
+      "effective_amount": "47.99",
+      "kind": "purchase",
+      "signed_amount": "47.99",
+      "refund_of": null,
+      "refunded": "12.00",
+      "net_paid": "35.99",
+      "currency": "USD",
+      "receipt_date": "2026-01-15",
+      "field_confidence": {"vendor": 0.98, "amount": 0.95, "paid_amount": 0.9, "date": 0.97,
+                           "order_number": 0.95, "payment": 0.9},
+      "manual_fields": [],
+      "order_number": "123-4567890",
+      "payment_method": "card",
+      "payment_last4": "1234",
+      "payer": "Jane Doe",
+      "pdf_path": "2026/01/2026-01-15__amazon__47.99.pdf",
+      ...
+    }
+  ],
+  "total": 3,
+  "limit": null,
+  "offset": 0,
+  "next_offset": null
+}
 ```
 
 ---
@@ -444,10 +460,14 @@ uv run receipt-index failures [OPTIONS]
 | `--status STATUS` | `failed` (the default: `retrying` and `terminal` together), `retrying` (due again later), `terminal` (not retried automatically), `skipped` (judged not a receipt), `queued` (requeued with `retry`, waiting for the next ingest) or `link-only` (skipped because the receipt is only a link to a hosted receipt, which ingest doesn't follow; `skipped` lists these too) |
 | `--since YYYY-MM-DD` | Only items whose latest record is from this date on |
 | `--source NAME` | Only items from this source |
-| `--orphans` | Instead, list stored PDFs that a failed attempt left behind and no receipt references, whatever the item's state now (for example after a retry succeeded and stored a new one). Nothing is deleted |
+| `--limit N` | Print at most N items (1 or more). Default: every match |
+| `--offset N` | Skip the first N matches (0 or more). Default: 0 |
+| `--orphans` | Instead, list stored PDFs that a failed attempt left behind and no receipt references, whatever the item's state now (for example after a retry succeeded and stored a new one). Nothing is deleted. Takes none of the options above |
 | `--output text\|json` | Output format (default: `text`) |
 
-The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class`, `stored_ref` and, for a link-only receipt, `receipt_link`. The link comes from the email and may carry a personal token: the text output shows only its host, and logs never show more than that.
+Items are ordered newest first, with ties broken by ID, and `--limit` and `--offset` page that order as they do for [`search`](#search). With either, the text output's footer places the page among all matches, for example `5 failed ingest(s) shown (6-10 of 37).`, and an offset past the last match prints `None on this page (37 match).`
+
+The text output shows the sender, subject, error, error class and next retry time (`terminal` when there is none). The JSON output is the same page envelope as the MCP [`list_failures`](#mcp) tool's, `{"failures": [...], "total": N, "limit": L, "offset": O, "next_offset": X}`, with the fields meaning what they mean for [`search`](#json-output): `limit` and `next_offset` are `null` without `--limit`. Each entry in `failures` is the item's latest `ingest_log` record, including `attempt`, `counts_attempt`, `next_retry_at`, `error_class`, `stored_ref` and, for a link-only receipt, `receipt_link`. With `--orphans`, the JSON output is a list of `{source_id, stored_ref, exists}`, with no envelope. The link comes from the email and may carry a personal token: the text output shows only its host, and logs never show more than that.
 
 ---
 
@@ -693,7 +713,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 | `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring), `kind` (a list of kinds; default every kind) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields, and `kind`, `signed_amount`, `refund_of`, `refunded` and `net_paid` ([Kinds and totals](#kinds-and-totals)). |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
-| `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`: the entries `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |
+| `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`, as `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |
 
 Each receipt is the `show --output json` record plus `file: {path, exists}`. `path` is the PDF's absolute path on the host running the server. The `source` filter is an exact match on `source_name`. Results carry no file content; only `get_receipt_file` returns content.
 
@@ -801,10 +821,10 @@ Pipe JSON output to other tools:
 uv run receipt-index search --vendor amazon --output json > amazon-receipts.json
 
 # Count receipts per vendor with jq
-uv run receipt-index search --date-from 2026-01-01 --output json | jq 'group_by(.vendor) | map({vendor: .[0].vendor, count: length})'
+uv run receipt-index search --date-from 2026-01-01 --output json | jq '.receipts | group_by(.vendor) | map({vendor: .[0].vendor, count: length})'
 
 # Sum the amounts paid with jq (effective_amount: paid when known, else the total)
-uv run receipt-index search --vendor amazon --output json | jq '[.[].effective_amount | tonumber] | add'
+uv run receipt-index search --vendor amazon --output json | jq '[.receipts[].effective_amount | tonumber] | add'
 ```
 
 ### Weekly Ingestion
