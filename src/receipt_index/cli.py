@@ -371,6 +371,18 @@ def _last4_filter(
     ),
 )
 @click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Print at most N receipts. Default: every match.",
+)
+@click.option(
+    "--offset",
+    type=click.IntRange(min=0),
+    default=None,
+    help="Skip the first N matches. Default: 0.",
+)
+@click.option(
     "--output",
     "output_format",
     type=click.Choice(["text", "json"]),
@@ -392,6 +404,8 @@ def search(
     last4: str | None,
     payer: str | None,
     kinds: tuple[str, ...],
+    limit: int | None,
+    offset: int | None,
     output_format: str,
 ) -> None:
     """Search indexed receipts.
@@ -399,11 +413,20 @@ def search(
     JSON output gives each receipt's kind and signed_amount: a sum of
     signed_amount is the net spend (a refund or credit counts against it, a
     statement not at all). A purchase also gives refunded and net_paid.
+
+    --limit and --offset page the same order the MCP search_receipts tool
+    does; JSON output stays a list of the receipts on the page.
     """
     from decimal import Decimal, InvalidOperation
 
+    import psycopg
+
     from receipt_index.db import get_connection
-    from receipt_index.repository import count_ingest_failures, search_receipts
+    from receipt_index.repository import (
+        count_ingest_failures,
+        count_receipts,
+        search_receipts,
+    )
 
     config = _load_config_or_exit(ctx)
 
@@ -427,22 +450,31 @@ def search(
     amount_min_d = _to_decimal(amount_min, "--amount-min")
     amount_max_d = _to_decimal(amount_max, "--amount-max")
 
+    filters: dict[str, Any] = {
+        "vendor": vendor,
+        "amount": amount_d,
+        "amount_min": amount_min_d,
+        "amount_max": amount_max_d,
+        "date_from": date_from.date() if date_from else None,
+        "date_to": date_to.date() if date_to else None,
+        "source_name": source_name,
+        "needs_review": needs_review,
+        "order_number": order_number,
+        "last4": last4,
+        "payer": payer,
+        "kinds": list(kinds) or None,
+    }
+    paged = limit is not None or offset is not None
+    total: int | None = None
+
     with get_connection(config.database.url) as conn:
-        results = search_receipts(
-            conn,
-            vendor=vendor,
-            amount=amount_d,
-            amount_min=amount_min_d,
-            amount_max=amount_max_d,
-            date_from=date_from.date() if date_from else None,
-            date_to=date_to.date() if date_to else None,
-            source_name=source_name,
-            needs_review=needs_review,
-            order_number=order_number,
-            last4=last4,
-            payer=payer,
-            kinds=list(kinds) or None,
-        )
+        if paged:
+            # One read-only snapshot, as the MCP tool takes, so the total and
+            # the page agree.
+            conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            conn.read_only = True
+            total = count_receipts(conn, **filters)
+        results = search_receipts(conn, **filters, limit=limit, offset=offset)
         # Items with no receipt to search: counted for the text output only,
         # so the JSON stays a list of receipts.
         link_only = (
@@ -455,7 +487,7 @@ def search(
         data = [r.model_dump(mode="json") for r in results]
         click.echo(json.dumps(data, indent=2, default=str))
     else:
-        _print_receipts(results)
+        _print_receipts(results, total=total, offset=offset or 0)
         if link_only:
             click.echo(
                 f"\n{link_only} link-only item(s) (not filtered by vendor, "
@@ -481,10 +513,19 @@ def _payment_line(receipt: Receipt) -> str | None:
     return " ".join(parts) or None
 
 
-def _print_receipts(results: list[Receipt]) -> None:
-    """The `search` text table."""
+def _print_receipts(
+    results: list[Receipt], *, total: int | None = None, offset: int = 0
+) -> None:
+    """The `search` text table.
+
+    ``total`` is the unpaged match count, given only when the results are a
+    page (``--limit`` or ``--offset``); the footer then places the page in it.
+    """
     if not results:
-        click.echo("No receipts found.")
+        if total:
+            click.echo(f"No receipts on this page ({total} match).")
+        else:
+            click.echo("No receipts found.")
         return
     # Amount is the effective amount (paid when known, else the total),
     # unsigned; Kind says which way it counts.
@@ -504,7 +545,13 @@ def _print_receipts(results: list[Receipt]) -> None:
             f"{r.effective_amount!s:>10} "
             f"{r.amount!s:>10}"
         )
-    click.echo(f"\n{len(results)} receipt(s) found.")
+    if total is None:
+        click.echo(f"\n{len(results)} receipt(s) found.")
+    else:
+        click.echo(
+            f"\n{len(results)} receipt(s) shown "
+            f"({offset + 1}-{offset + len(results)} of {total})."
+        )
 
 
 def _print_orphans(config: AppConfig, output_format: str) -> None:

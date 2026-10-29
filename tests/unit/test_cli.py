@@ -879,6 +879,170 @@ class TestSearchCommand:
         assert "--amount cannot be combined" in result.output
 
 
+class TestSearchPaging:
+    """`search --limit` and `--offset`: a page of the same stable order."""
+
+    @patch("receipt_index.repository.count_receipts", return_value=37)
+    @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_limit_and_offset_reach_the_repository(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = CliRunner().invoke(
+            cli,
+            [
+                *("--config", str(config_file), "search", "--vendor", "amazon"),
+                *("--limit", "5", "--offset", "5"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        kwargs = mock_search.call_args.kwargs
+        assert (kwargs["limit"], kwargs["offset"]) == (5, 5)
+        # The total counts the same filters, unpaged.
+        assert mock_count.call_args.kwargs["vendor"] == "amazon"
+        assert "limit" not in mock_count.call_args.kwargs
+
+    @patch("receipt_index.repository.count_receipts", return_value=37)
+    @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_default_is_every_match(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "search"])
+        assert result.exit_code == 0, result.output
+        kwargs = mock_search.call_args.kwargs
+        assert (kwargs["limit"], kwargs["offset"]) == (None, None)
+        mock_count.assert_not_called()
+        assert "1 receipt(s) found." in result.output
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["--limit", "0"],
+            ["--limit", "-1"],
+            ["--offset", "-1"],
+            ["--limit", "five"],
+        ],
+    )
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_out_of_range_is_a_usage_error(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        config_file: Path,
+        args: list[str],
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = CliRunner().invoke(
+            cli, ["--config", str(config_file), "search", *args]
+        )
+        assert result.exit_code == 2, result.output
+        assert f"Invalid value for '{args[0]}'" in result.output
+        mock_conn.assert_not_called()
+
+    @patch("receipt_index.repository.count_receipts", return_value=37)
+    @patch("receipt_index.repository.search_receipts")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_text_footer_shows_the_page(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        mock_search.return_value = [_SAMPLE_RECEIPT] * 5
+        runner = CliRunner()
+        base = ["--config", str(config_file), "search"]
+        page = runner.invoke(cli, [*base, "--limit", "5", "--offset", "5"])
+        assert "5 receipt(s) shown (6-10 of 37)." in page.output
+        assert "found." not in page.output
+
+        mock_search.return_value = []
+        past = runner.invoke(cli, [*base, "--offset", "40"])
+        assert "No receipts on this page (37 match)." in past.output
+        assert "No receipts found." not in past.output
+
+        mock_count.return_value = 0
+        none = runner.invoke(cli, [*base, "--limit", "5"])
+        assert "No receipts found." in none.output
+
+    @patch("receipt_index.repository.count_receipts", return_value=37)
+    @patch("receipt_index.repository.search_receipts")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_json_stays_a_list_of_the_page(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        mock_search.return_value = [_SAMPLE_RECEIPT] * 2
+        result = CliRunner().invoke(
+            cli,
+            [
+                *("--config", str(config_file), "search", "--limit", "2"),
+                *("--output", "json"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        assert len(data) == 2
+
+    @patch("receipt_index.repository.count_ingest_failures", return_value=2)
+    @patch("receipt_index.repository.count_receipts", return_value=37)
+    @patch("receipt_index.repository.search_receipts", return_value=[_SAMPLE_RECEIPT])
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_needs_review_link_only_count_unaffected(
+        self,
+        mock_load_config: MagicMock,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        mock_count: MagicMock,
+        mock_failures: MagicMock,
+        config_file: Path,
+    ) -> None:
+        mock_load_config.return_value = _make_config()
+        result = CliRunner().invoke(
+            cli,
+            [
+                *("--config", str(config_file), "search", "--needs-review"),
+                *("--limit", "1", "--offset", "3"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_search.call_args.kwargs["needs_review"] is True
+        assert mock_count.call_args.kwargs["needs_review"] is True
+        assert "1 receipt(s) shown (4-4 of 37)." in result.output
+        assert "2 link-only item(s)" in result.output
+        assert mock_failures.call_args.kwargs == {
+            "status": "link-only",
+            "source_name": None,
+        }
+
+
 class TestFailuresCommand:
     """Tests for the failures CLI command."""
 

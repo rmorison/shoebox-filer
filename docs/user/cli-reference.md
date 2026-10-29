@@ -181,11 +181,15 @@ uv run receipt-index search [OPTIONS]
 | `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
 | `--payer TEXT` | Filter by payer name (case-insensitive substring match) |
 | `--kind KIND` | Only receipts of this [kind](#kinds-and-totals): `purchase`, `refund`, `credit` or `statement`. Repeatable. Default: every kind |
+| `--limit N` | Print at most N receipts (1 or more). Default: every match |
+| `--offset N` | Skip the first N matches (0 or more). Default: 0 |
 | `--output text\|json` | Output format (default: `text`) |
 
 Note: `--amount` cannot be combined with `--amount-min`/`--amount-max`.
 
-Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all.
+Results are ordered by date (newest first), then vendor name. With `--needs-review` they are ordered by paid-amount confidence, lowest first, with receipts that have none first of all. Ties are broken by ID, so the order is the same on every run.
+
+**Paging.** `--limit` and `--offset` take a page of that order, as the MCP `search_receipts` tool does: `--limit 5` gives the first five, and `--limit 5 --offset 5` the next five. Without either option, `search` prints every match, so existing scripts see no change; unlike the MCP tool, which defaults to 50 and allows at most 200, `--limit` has no default and no upper bound. With either, the text output's footer places the page among all matches, for example `5 receipt(s) shown (6-10 of 37).`, and an offset past the last match prints `No receipts on this page (37 match).` The JSON output stays a list of the receipts on the page, with no total. If an ingest commits between two runs, receipts can shift between pages; see the MCP [paging note](#mcp) for that.
 
 A link-only receipt isn't indexed, so `search` can't list it. With `--needs-review`, the text output ends with how many there are (only `--source` narrows that count; vendor, amount and date filters don't apply to them) and points to `failures --status link-only`. The JSON output stays a list of receipts.
 
@@ -215,6 +219,10 @@ uv run receipt-index search --order-number 123-4567890
 
 # Purchases only: leave out refunds, credits and statements
 uv run receipt-index search --kind purchase --date-from 2026-01-01
+
+# The five newest receipts, then the next five
+uv run receipt-index search --limit 5
+uv run receipt-index search --limit 5 --offset 5
 
 # Output as JSON for scripting
 uv run receipt-index search --vendor amazon --output json
