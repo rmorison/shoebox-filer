@@ -82,7 +82,34 @@ def _ids(config_file: Path, *args: str) -> list[str]:
         cli, ["--config", str(config_file), "search", "--output", "json", *args]
     )
     assert result.exit_code == 0, result.output
-    return [r["id"] for r in json.loads(result.output)]
+    return [r["id"] for r in json.loads(result.output)["receipts"]]
+
+
+def _walk(config_file: Path, command: str, key: str, *args: str) -> list[str]:
+    """Follow ``next_offset`` from 0 to null; return the ids seen, in order.
+
+    Every page reports the same total, and the walk ends exactly at it.
+    """
+    seen: list[str] = []
+    offset: int | None = 0
+    totals = set()
+    while offset is not None:
+        result = CliRunner().invoke(
+            cli,
+            [
+                *("--config", str(config_file), command, *args),
+                *("--limit", "5", "--offset", str(offset), "--output", "json"),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        page = json.loads(result.output)
+        assert (page["limit"], page["offset"]) == (5, offset)
+        totals.add(page["total"])
+        seen += [item["id"] for item in page[key]]
+        offset = page["next_offset"]
+    (total,) = totals
+    assert len(seen) == total
+    return seen
 
 
 @pytest.mark.usefixtures("seeded")
@@ -102,6 +129,28 @@ def test_pages_cover_the_unpaged_order(
     assert pages[0] + pages[1] + pages[2] == everything
     # An offset alone skips that many and prints the rest.
     assert _ids(config_file, *filters, "--offset", "7") == everything[7:]
+
+
+@pytest.mark.usefixtures("seeded")
+@pytest.mark.parametrize("filters", [(), ("--needs-review",)])
+def test_next_offset_walks_every_page(
+    config_file: Path, filters: tuple[str, ...]
+) -> None:
+    seen = _walk(config_file, "search", "receipts", *filters)
+    # No repeats and no gaps: the walk is the unpaged order.
+    assert len(set(seen)) == len(seen) == 12
+    assert seen == _ids(config_file, *filters)
+
+
+@pytest.mark.usefixtures("seeded")
+def test_unpaged_json_envelope(config_file: Path) -> None:
+    result = CliRunner().invoke(
+        cli, ["--config", str(config_file), "search", "--output", "json"]
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert len(data["receipts"]) == data["total"] == 12
+    assert (data["limit"], data["offset"], data["next_offset"]) == (None, 0, None)
 
 
 @pytest.mark.usefixtures("seeded")

@@ -252,7 +252,7 @@ class TestFailures:
 
     def test_json_carries_the_retry_fields(self, failures_env: dict[str, Any]) -> None:
         result = self._invoke(failures_env, "--output", "json")
-        data = json.loads(result.output)
+        data = json.loads(result.output)["failures"]
         assert data[0]["error_class"] == "transient"
         assert data[1]["next_retry_at"].startswith("2026-10-27")
 
@@ -395,7 +395,9 @@ class TestOrphans:
                 cli, ["--config", str(path), "failures", "--orphans", *args]
             )
         assert result.exit_code == 2
-        assert "takes no --status, --since or --source" in result.output
+        assert (
+            "takes no --status, --since, --source, --limit or --offset" in result.output
+        )
         found.assert_not_called()
 
     def test_a_store_error_is_logged(
@@ -452,7 +454,7 @@ class TestLinkOnly:
         assert "receipts.example.com" in text.output
         assert "/r/abc123" not in text.output
         assert "1 link-only item(s)." in text.output
-        data = json.loads(as_json.output)
+        data = json.loads(as_json.output)["failures"]
         assert data[0]["receipt_link"] == "https://receipts.example.com/r/abc123"
 
     def test_retry_link_only_is_status_wide(self, env: dict[str, Any]) -> None:

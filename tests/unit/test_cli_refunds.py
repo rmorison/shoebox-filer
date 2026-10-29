@@ -100,7 +100,7 @@ class TestSearch:
     ) -> None:
         result = _invoke(config_file, "search", "--output", "json")
         assert result.exit_code == 0, result.output
-        purchase, refund = json.loads(result.output)
+        purchase, refund = json.loads(result.output)["receipts"]
         assert (purchase["kind"], purchase["signed_amount"]) == ("purchase", "30.00")
         assert (purchase["refunded"], purchase["net_paid"]) == ("10.00", "20.00")
         assert (refund["kind"], refund["signed_amount"]) == ("refund", "-10.00")

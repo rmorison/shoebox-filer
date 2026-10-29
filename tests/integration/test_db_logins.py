@@ -462,7 +462,8 @@ def test_write_paths_run_as_the_write_login(
     assert result.exit_code == 0, result.output
     result = _invoke(config, "search", "--kind", "purchase", "--output", "json")
     assert result.exit_code == 0, result.output
-    (shown,) = [r for r in json.loads(result.output) if r["id"] == str(purchase["id"])]
+    receipts = json.loads(result.output)["receipts"]
+    (shown,) = [r for r in receipts if r["id"] == str(purchase["id"])]
     assert shown["net_paid"] == "2.50"
     events = pg_conn.execute(
         "SELECT event_type, actor_kind FROM receipt.receipt_events "

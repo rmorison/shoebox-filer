@@ -193,7 +193,7 @@ class TestSearchOutput:
         self, mock_conn: MagicMock, mock_search: MagicMock, config_file: Path
     ) -> None:
         result = _invoke(config_file, "search", "--output", "json")
-        (row,) = json.loads(result.output)
+        (row,) = json.loads(result.output)["receipts"]
         assert row["order_number"] == "A-100"
         assert row["payment_method"] == "card"
         assert row["payment_last4"] == "1234"
