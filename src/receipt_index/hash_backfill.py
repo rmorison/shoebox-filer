@@ -73,10 +73,12 @@ def backfill_rendition_hashes(
             report.missing.append((receipt_id, f"{ref}: {type(exc).__name__}"))
             continue
         digest = hashlib.sha256(data).digest()
-        known = digest in seen or _is_stored(conn, digest)
-        seen.add(digest)
+        # Recorded bytes: committed rows, and in a dry run the bytes this
+        # run would have recorded. A rolled-back conflict records nothing.
+        known = _is_stored(conn, digest) or (dry_run and digest in seen)
         if dry_run:
             conn.rollback()
+            seen.add(digest)
             report.shared += known
             report.hashed += 1
             continue

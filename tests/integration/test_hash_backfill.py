@@ -201,3 +201,19 @@ def test_a_receipt_without_a_path_or_with_a_taken_path_is_reported(
     assert rendition[no_path] is None
     assert rendition[first] is not None
     assert rendition[last] is not None
+
+
+def test_a_rolled_back_conflict_does_not_count_as_shared(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    _receipt(pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-a")
+    backfill_rendition_hashes(pg_conn, store)
+    (tmp_path / "2026" / "01" / "a.pdf").write_bytes(b"%PDF-new")
+    # Taken path with new bytes: its stored_files row is rolled back.
+    _receipt(pg_conn, tmp_path, "<t@example.com>", "2026/01/a.pdf", None)
+    _receipt(pg_conn, tmp_path, "<b@example.com>", "2026/01/b.pdf", b"%PDF-new")
+
+    report = backfill_rendition_hashes(pg_conn, store)
+
+    assert (report.hashed, report.shared, len(report.missing)) == (1, 0, 1)
