@@ -350,9 +350,8 @@ class TestServeDrive:
             assert _until(lambda: _statuses("file-1")[-1:] == ["success"])
             with _FakeDrive.lock:
                 drive_folder.append("file-2")
-            assert _until(
-                lambda: _statuses("file-2")[-1:] == ["success"]
-            ), "a file added while serve ran wasn't indexed"
+            indexed = _until(lambda: _statuses("file-2")[-1:] == ["success"])
+            assert indexed, "a file added while serve ran wasn't indexed"
         token = _rows(
             "SELECT drive_page_token FROM receipt.sync_state WHERE source_name = %s",
             "drive-serve",

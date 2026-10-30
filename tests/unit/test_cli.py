@@ -1614,3 +1614,127 @@ class TestPaidAmountOutput:
         result = CliRunner().invoke(cli, ["search", "--help"])
         assert result.exit_code == 0
         assert "effective amount" in " ".join(result.output.split())
+
+
+class TestIngestStatementTimeout:
+    @patch("receipt_index.pipeline.run_ingest")
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.store.open_store")
+    @patch("receipt_index.extraction.create_extraction_agent")
+    @patch("receipt_index.adapters.imap.ImapAdapter")
+    @patch("receipt_index.cli.load_config")
+    def test_ingest_connection_has_a_statement_timeout(
+        self,
+        mock_load_config: MagicMock,
+        mock_adapter_cls: MagicMock,
+        mock_create_agent: MagicMock,
+        mock_store_cls: MagicMock,
+        mock_get_conn: MagicMock,
+        mock_run: MagicMock,
+        config_file: Path,
+    ) -> None:
+        from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS
+
+        mock_load_config.return_value = _two_source_config()
+        mock_run.return_value = IngestResult()
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "ingest"])
+        assert result.exit_code == 0, result.output
+        kwargs = mock_get_conn.call_args.kwargs
+        assert kwargs["statement_timeout_seconds"] == INGEST_STATEMENT_TIMEOUT_SECONDS
+
+
+class FakeService:
+    """Stands in for receipt_index.service.Service: returns at once."""
+
+    instances: ClassVar[list[FakeService]] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+        self.calls: list[str] = []
+        FakeService.instances.append(self)
+
+    def start(self) -> None:
+        self.calls.append("start")
+
+    def wait(self) -> None:
+        self.calls.append("wait")
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+
+    def shutdown(self) -> bool:
+        self.calls.append("shutdown")
+        return True
+
+
+@pytest.fixture
+def fake_service() -> Iterator[type[FakeService]]:
+    FakeService.instances = []
+    with (
+        patch("receipt_index.service.Service", FakeService),
+        patch("receipt_index.store.open_store"),
+        patch("receipt_index.extraction.create_extraction_agent"),
+        patch("signal.signal"),
+    ):
+        yield FakeService
+
+
+class TestServe:
+    @patch("receipt_index.cli.load_config")
+    def test_watches_the_sources_it_can_lock(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_source_lock: type[FakeSourceLock],
+        fake_service: type[FakeService],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_source_lock.held = {"test-email"}
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+
+        assert result.exit_code == 0, result.output
+        assert "source test-email is being watched by a running serve" in result.output
+        (service,) = fake_service.instances
+        assert [s.name for s in service.kwargs["sources"]] == ["other-email"]
+        assert [s.name for s in service.kwargs["all_sources"]] == [
+            "test-email",
+            "other-email",
+        ]
+        assert set(service.kwargs["locks"]) == {"other-email"}
+        assert service.calls == ["start", "wait", "shutdown"]
+
+    @patch("receipt_index.cli.load_config")
+    def test_every_source_held_exits_3(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_source_lock: type[FakeSourceLock],
+        fake_service: type[FakeService],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_source_lock.held = {"test-email", "other-email"}
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+
+        assert result.exit_code == 3, result.output
+        assert fake_service.instances == []
+
+    @patch("receipt_index.cli.load_config")
+    def test_source_option_limits_and_checks_names(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_service: type[FakeService],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        result = CliRunner().invoke(
+            cli, ["--config", str(config_file), "serve", "--source", "other-email"]
+        )
+        assert result.exit_code == 0, result.output
+        (service,) = fake_service.instances
+        assert [s.name for s in service.kwargs["sources"]] == ["other-email"]
+
+        result = CliRunner().invoke(
+            cli, ["--config", str(config_file), "serve", "--source", "nope"]
+        )
+        assert result.exit_code == 1
+        assert "nope" in result.output
