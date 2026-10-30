@@ -154,8 +154,11 @@ def store_email_original(
     """Store an email's ``message.eml`` and its attachments; record nothing.
 
     The folder is ``originals/YYYY/MM/{received-date}__{source}__{hash}``,
-    from the ``.eml``'s sha256. ``conn`` is only read, to find bytes the store
-    already holds. Raises ``ValueError`` without ``raw.raw_bytes``.
+    from the ``.eml``'s sha256 and ``received_at``. An email with no Date
+    header is dated when it was fetched, so a retry on a later day writes a
+    second folder and leaves the first for ``verify --orphans``. ``conn`` is
+    only read, to find bytes the store already holds. Raises ``ValueError``
+    without ``raw.raw_bytes``.
     """
     if raw.raw_bytes is None:
         msg = f"no raw bytes for {raw.source_id}"

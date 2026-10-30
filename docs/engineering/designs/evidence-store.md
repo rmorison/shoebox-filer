@@ -466,7 +466,7 @@ def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor:
 
 | Crash or failure after | State left | Recovery |
 |------------------------|-----------|----------|
-| An IMAP original was stored (step 1) | Files under `originals/` with no rows: the rows are recorded in step 5's transaction | The retry derives the same folder and names from the same bytes, so nothing is written again, and records them. `verify --orphans` reports any left for good |
+| An IMAP original was stored (step 1) | Files under `originals/` with no rows: the rows are recorded in step 5's transaction | The retry derives the same folder and names from the same bytes, so nothing is written again, and records them. An email with no Date header is dated at fetch, so a retry on a later day writes a second folder. `verify --orphans` reports any left for good |
 | A rendition was uploaded (step 3) | A Drive rendition file with no location row | The retry uploads a fresh one (the receipt ID is new each attempt). `verify --orphans` reports the unrecorded file |
 | A Drive adopt (step 4) | The file in `originals/` (or, under the copy fallback, copied, with the dropoff file in `processed/`), no receipt | The changes feed can't be relied on, since the file's parents no longer include the dropoff folder. The ingest design's retry scheduler requeues the item from its started record, finds the file by its ID, and the idempotent adopt returns the existing record before the commit |
 | Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's [retry policy](always-on-ingest.md#6-retries) |
