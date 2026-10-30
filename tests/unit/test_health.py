@@ -291,6 +291,27 @@ class TestChecks:
         )
         assert lines == ["source mail stale 3600s", "source scans never succeeded"]
 
+    def test_the_grace_ends_at_the_first_read_after_start(self) -> None:
+        # A serve that keeps restarting: its catch-up read failed, so the
+        # old success shows as stale at once.
+        config = _config()
+        started = _NOW - timedelta(seconds=60)
+        statuses = _statuses(config, {"mail": 3600, "scans": 10})
+        mail = statuses[0]
+        assert mail.row is not None
+        mail.row = mail.row.model_copy(
+            update={"last_poll_at": _NOW - timedelta(seconds=30)}
+        )
+        problems = evaluate(
+            sources=statuses,
+            heartbeat=_fresh(started_at=started),
+            database_ok=True,
+            ingest=config.ingest,
+            pause_after=pause_threshold(config.sources, config.ingest),
+            now=_NOW,
+        )
+        assert [p.line for p in problems] == ["source mail stale 3600s"]
+
     def test_a_busy_worker_holds_back_the_pause_lines(self) -> None:
         pause = Pause(since=_NOW - timedelta(seconds=900), reason="x")
         lines = _lines(
@@ -432,6 +453,26 @@ class TestPingLines:
     def test_terminal_alerts_off(self) -> None:
         report = _collect(_config(), MagicMock(), terminal=2)
         assert ping_lines(report, 0) == []
+
+    def test_retrying_never_goes_negative(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from receipt_index import repository
+
+        # An item cleared between the pending and retrying queries.
+        monkeypatch.setattr(repository, "list_sync_state", lambda _c: [])
+        monkeypatch.setattr(repository, "count_due_retries", lambda _c: 3)
+        monkeypatch.setattr(
+            repository, "count_ingest_failures", lambda _c, *, status, since=None: 2
+        )
+        report = collect(
+            _config(),
+            lambda: cast("Any", nullcontext(MagicMock())),
+            heartbeat_path=tmp_path / "none",
+            now=_NOW,
+        )
+        assert report.retries is not None
+        assert report.retries["retrying"] == 0
 
     def test_lines_carry_no_error_text_or_pause_reason(self, tmp_path: Path) -> None:
         rows = [

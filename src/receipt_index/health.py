@@ -257,6 +257,18 @@ def _secs(seconds: float) -> str:
     return f"{int(seconds)}s"
 
 
+def _polled_since(status: SourceStatus, started: datetime) -> bool:
+    """Whether the source was read (successfully or not) since ``started``.
+
+    The start-up grace ends at the first read, so a serve that restarts
+    again and again can't keep a failing source inside it.
+    """
+    row = status.row
+    return (
+        row is not None and row.last_poll_at is not None and row.last_poll_at >= started
+    )
+
+
 def evaluate(
     *,
     sources: list[SourceStatus],
@@ -300,10 +312,12 @@ def evaluate(
             since_start = None if started is None else (now - started).total_seconds()
             if (
                 since_start is not None
+                and started is not None
                 and (age is None or since_start < age)
                 and since_start <= status.stale_after_seconds
+                and not _polled_since(status, started)
             ):
-                continue
+                continue  # this serve hasn't read it yet: catching up
             if age is None:
                 problems.append(Problem("source", "never succeeded", status.name))
             elif age > status.stale_after_seconds:
@@ -370,8 +384,10 @@ def collect(
                 report.retries = {
                     "pending": pending,
                     # Due later: `failures --status retrying` counts both.
-                    "retrying": count_ingest_failures(conn, status="retrying")
-                    - pending,
+                    # Two statements: an item can clear between them.
+                    "retrying": max(
+                        0, count_ingest_failures(conn, status="retrying") - pending
+                    ),
                     "queued": count_ingest_failures(conn, status="queued"),
                     "terminal": count_ingest_failures(conn, status="terminal"),
                     "skipped_7d": count_ingest_failures(
