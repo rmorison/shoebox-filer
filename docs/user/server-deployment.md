@@ -154,6 +154,8 @@ git clone https://github.com/rmorison/shoebox-filer.git ~/receipt-index
 cd ~/receipt-index
 ```
 
+The rest of this guide writes `~/receipt-index` for the clone root. If you cloned somewhere else, use your own path wherever a command names it.
+
 ### 3.2 Create `.env` and `.env.db` at the clone root
 
 ```bash
@@ -407,7 +409,19 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint receipt-index 
     search --vendor zzz-no-such-vendor --output json
 ```
 
-**Pass:** exit 0 and, on a pre-cutover (empty) database, an empty page: `"receipts": []` and `"total": 0`. This is the check that catches an ownership/grant lockout — the failure mode where the schema is perfect and the app still cannot read it.
+**Pass:** exit 0 and an empty page. No vendor contains `zzz-no-such-vendor`, so the page is empty whether or not the database holds receipts yet, and you can rerun this check after go-live, for example after an upgrade:
+
+```json
+{
+  "receipts": [],
+  "total": 0,
+  "limit": null,
+  "offset": 0,
+  "next_offset": null
+}
+```
+
+This is the check that catches an ownership/grant lockout — the failure mode where the schema is perfect and the app still cannot read it.
 
 ### Gate D — environment and credentials, with zero writes
 
