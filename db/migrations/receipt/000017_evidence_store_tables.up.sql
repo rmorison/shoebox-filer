@@ -170,24 +170,23 @@ ALTER TABLE receipt.extractions
 GRANT ALL PRIVILEGES ON receipt.stored_files, receipt.file_locations,
     receipt.provenance, receipt.provenance_files TO receipt_index_dev_all;
 
--- _write: read, and insert the columns ingest and the hash backfill write.
--- UPDATE grants come with the tickets that update these tables.
+-- _write: read, and insert only the columns ingest and the hash backfill
+-- write. Nothing writes provenance_files, content_kind, owner or
+-- source_sha256 yet; the tickets that write them, and any that update these
+-- tables, add their grants.
 GRANT SELECT ON receipt.stored_files, receipt.file_locations,
     receipt.provenance, receipt.provenance_files TO receipt_index_dev_write;
-GRANT INSERT (content_kind, sha256, byte_size, media_type)
+GRANT INSERT (sha256, byte_size, media_type)
     ON receipt.stored_files TO receipt_index_dev_write;
-GRANT INSERT (file_id, backend, locator, purpose, receipt_id, owner, display_path)
+GRANT INSERT (file_id, backend, locator, purpose, receipt_id, display_path)
     ON receipt.file_locations TO receipt_index_dev_write;
 GRANT INSERT (receipt_id, is_primary, source_type, source_name, source_id,
               received_at, email_subject, email_sender, email_date, file_name,
-              source_sha256, home_receipt_id, original_status, match_method)
+              home_receipt_id, original_status, match_method)
     ON receipt.provenance TO receipt_index_dev_write;
-GRANT INSERT (provenance_id, position, file_id, role, file_name)
-    ON receipt.provenance_files TO receipt_index_dev_write;
-GRANT INSERT (rendition_file_id), UPDATE (rendition_file_id)
-    ON receipt.receipts TO receipt_index_dev_write;
+GRANT UPDATE (rendition_file_id) ON receipt.receipts TO receipt_index_dev_write;
 
--- _read: SELECT only (the nightly backup reads every table)
+-- _read: SELECT only (the nightly backup reads every table). It already
+-- reads every column of receipts (000002).
 GRANT SELECT ON receipt.stored_files, receipt.file_locations,
     receipt.provenance, receipt.provenance_files TO receipt_index_dev_read;
-GRANT SELECT (rendition_file_id) ON receipt.receipts TO receipt_index_dev_read;

@@ -515,6 +515,37 @@ def test_write_paths_run_as_the_write_login(
     pg_conn.commit()
 
 
+# Write grants on the evidence-store tables (000017) reach only the columns
+# the code writes: (table, column or None for the whole table).
+_UNWRITTEN = [
+    ("provenance_files", None),
+    ("stored_files", "content_kind"),
+    ("stored_files", "pdf_status"),
+    ("file_locations", "owner"),
+    ("file_locations", "last_verified_at"),
+    ("provenance", "source_sha256"),
+    ("provenance", "original_file_id"),
+    ("receipts", "rendition_file_id"),
+]
+
+
+@pytest.mark.parametrize(("table", "column"), _UNWRITTEN)
+def test_write_login_cannot_insert_columns_nothing_writes(
+    write_conn: Conn, table: str, column: str | None
+) -> None:
+    name = f"receipt.{table}"
+    if column is None:
+        row = write_conn.execute(
+            "SELECT has_any_column_privilege(%s, 'INSERT') AS ok", (name,)
+        ).fetchone()
+    else:
+        row = write_conn.execute(
+            "SELECT has_column_privilege(%s, %s, 'INSERT') AS ok", (name, column)
+        ).fetchone()
+    write_conn.rollback()
+    assert row == {"ok": False}
+
+
 @pytest.mark.parametrize(
     "statement",
     [

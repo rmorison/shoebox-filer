@@ -217,3 +217,19 @@ def test_a_rolled_back_conflict_does_not_count_as_shared(
     report = backfill_rendition_hashes(pg_conn, store)
 
     assert (report.hashed, report.shared, len(report.missing)) == (1, 0, 1)
+
+
+def test_dry_run_reports_a_taken_path_as_the_real_run_does(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    _receipt(pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-a")
+    backfill_rendition_hashes(pg_conn, store)
+    taken = _receipt(pg_conn, tmp_path, "<t@example.com>", "2026/01/a.pdf", None)
+
+    dry = backfill_rendition_hashes(pg_conn, store, dry_run=True)
+    real = backfill_rendition_hashes(pg_conn, store)
+
+    assert [rid for rid, _ in dry.missing] == [rid for rid, _ in real.missing]
+    assert [rid for rid, _ in dry.missing] == [taken]
+    assert dry.hashed == real.hashed == 0

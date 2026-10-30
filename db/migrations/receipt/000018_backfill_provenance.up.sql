@@ -1,6 +1,9 @@
 -- One provenance row per existing receipt (evidence-store design, §6,
 -- migration step 2). Its original is pending until the originals backfill.
--- A re-run adds nothing.
+-- A re-run adds nothing, so running this file again repairs a receipt that
+-- the previous release ingested after it ran.
+-- received_at: the email's date, else (Drive) when the receipt was created.
+-- New Drive ingests record the file's modified time, which receipts never kept.
 INSERT INTO receipt.provenance (
     receipt_id, is_primary, source_type, source_name, source_id, received_at,
     email_subject, email_sender, email_date, file_name, home_receipt_id,

@@ -1597,6 +1597,21 @@ def record_rendition(
     return file_id
 
 
+def location_holder(conn: psycopg.Connection[dict[str, Any]], ref: str) -> UUID | None:
+    """The receipt whose location is at this reference, if one is recorded."""
+    backend, locator = split_ref(ref)
+    row = conn.execute(
+        "SELECT receipt_id FROM receipt.file_locations"
+        " WHERE backend = %(backend)s AND locator = %(locator)s",
+        {"backend": backend, "locator": locator},
+    ).fetchone()
+    return (
+        None
+        if row is None or row["receipt_id"] is None
+        else UUID(str(row["receipt_id"]))
+    )
+
+
 def insert_provenance(
     conn: psycopg.Connection[dict[str, Any]],
     *,

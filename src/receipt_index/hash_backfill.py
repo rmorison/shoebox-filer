@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from receipt_index.repository import (
     RenditionConflictError,
+    location_holder,
     receipts_without_rendition,
     record_rendition,
 )
@@ -77,7 +78,15 @@ def backfill_rendition_hashes(
         # run would have recorded. A rolled-back conflict records nothing.
         known = _is_stored(conn, digest) or (dry_run and digest in seen)
         if dry_run:
+            # The real run's conflict, predicted: another receipt's location
+            # already holds this path.
+            holder = location_holder(conn, ref)
             conn.rollback()
+            if holder is not None and holder != receipt_id:
+                report.missing.append(
+                    (receipt_id, f"{ref} is already recorded for another receipt")
+                )
+                continue
             seen.add(digest)
             report.shared += known
             report.hashed += 1

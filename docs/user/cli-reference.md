@@ -696,8 +696,9 @@ Ingest records the sha256 of each rendition it stores, and where the file lives.
 
 - **Run it once after upgrading** to the release that brings the provenance schema, as the application's login. The later move of the store to Google Drive reads these records.
 - **It is safe to run again.** It reads only receipts with no record yet, so a second run finds nothing to do and changes nothing. A run cut short carries on from where it stopped.
-- **A missing or unreadable file** is named by receipt ID and left unrecorded, and the command exits 1. Restore the file and run it again.
-- `--dry-run` reads and hashes the files and writes nothing.
+- **A missing or unreadable file** is named by receipt ID and left unrecorded, and the command exits 1. Restore the file and run it again. So is a receipt whose file path another receipt's record already holds, which a re-run can't fix: it needs a look by hand.
+- `--dry-run` reads and hashes the files and writes nothing. It reports the same unrecorded receipts the real run would.
+- **Each receipt's `updated_at` changes once**, when its record is written: the receipt row gains the link to its file.
 
 It prints how many renditions it recorded, and how many share bytes with another receipt. A catalogue of a few thousand receipts takes well under a minute.
 
