@@ -34,11 +34,7 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
-from receipt_index.originals import (
-    record_email_original,
-    select_receipt_document,
-    store_email_original,
-)
+from receipt_index.originals import record_email_evidence, store_email_original
 from receipt_index.refunds import link_by_rule
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
@@ -70,7 +66,6 @@ from receipt_index.store import pdf_path_for, store_rendition
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from contextlib import AbstractContextManager
-    from uuid import UUID
 
     import psycopg
     from pydantic_ai import Agent
@@ -90,7 +85,6 @@ if TYPE_CHECKING:
         SyncState,
     )
     from receipt_index.originals import StoredEmail
-    from receipt_index.repository import DocumentCertainty, ProvenanceFileRole
     from receipt_index.store import EvidenceStore, StoredFile
 
 logger = logging.getLogger(__name__)
@@ -240,21 +234,13 @@ def record_ingest_evidence(
     source_sha256 = (
         hashlib.sha256(raw.raw_bytes).digest() if raw.raw_bytes is not None else None
     )
-    original_id: UUID | None = None
-    document_id: UUID | None = None
-    certainty: DocumentCertainty | None = None
-    files: list[tuple[UUID, ProvenanceFileRole, str | None]] = []
-    if email is not None:
-        email = record_email_original(conn, email)
-        assert email.message.id is not None
-        original_id = email.message.id
-        files.append((email.message.id, "message", None))
-        for att in email.attachments:
-            assert att.file.id is not None
-            files.append((att.file.id, "attachment", att.file_name))
-        index, certainty = select_receipt_document(receipt_document, raw.attachments)
-        if index is not None:
-            document_id = email.attachments[index].file.id
+    evidence = (
+        record_email_evidence(
+            conn, email, receipt_document=receipt_document, attachments=raw.attachments
+        )
+        if email is not None
+        else None
+    )
     provenance = insert_provenance(
         conn,
         receipt_id=receipt.id,
@@ -267,12 +253,12 @@ def record_ingest_evidence(
         email_date=_email_date(raw.source_type, raw),
         file_name=raw.file_name,
         source_sha256=source_sha256,
-        original_file_id=original_id,
-        receipt_document_file_id=document_id,
-        document_certainty=certainty,
+        original_file_id=evidence.original_id if evidence else None,
+        receipt_document_file_id=evidence.document_id if evidence else None,
+        document_certainty=evidence.certainty if evidence else None,
     )
-    if files:
-        insert_provenance_files(conn, provenance.id, files)
+    if evidence is not None:
+        insert_provenance_files(conn, provenance.id, evidence.files)
     if rendition.sha256 is None or rendition.byte_size is None:
         msg = f"rendition {rendition.ref} has no hash"
         raise ValueError(msg)

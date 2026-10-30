@@ -235,6 +235,8 @@ class TestStoreEmailOriginal:
     ) -> None:
         terms = b"%PDF-1.4 terms and conditions"
         held[hashlib.sha256(terms).digest()] = "local:originals/elsewhere/01__t.pdf"
+        (tmp_path / "originals" / "elsewhere").mkdir(parents=True)
+        (tmp_path / "originals" / "elsewhere" / "01__t.pdf").write_bytes(terms)
         store = LocalEvidenceStore(tmp_path)
         email = store_email_original(
             MagicMock(),
@@ -246,7 +248,39 @@ class TestStoreEmailOriginal:
         (att,) = email.attachments
         assert att.file.ref == "local:originals/elsewhere/01__t.pdf"
         assert att.file.sha256 == hashlib.sha256(terms).digest()
-        assert not [f for f in _files(tmp_path) if f.endswith(".pdf")]
+        assert [f for f in _files(tmp_path) if f.endswith(".pdf")] == [
+            "originals/elsewhere/01__t.pdf"
+        ]
+
+    def test_a_recorded_original_missing_from_the_store_is_written_again(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        terms = b"%PDF-1.4 terms and conditions"
+        held[hashlib.sha256(terms).digest()] = "local:originals/gone/01__t.pdf"
+        email = store_email_original(
+            MagicMock(),
+            LocalEvidenceStore(tmp_path),
+            _raw([_att("terms.pdf", data=terms)]),
+            source_name="mail",
+            received_at=_RECEIVED,
+        )
+        (att,) = email.attachments
+        assert att.file.ref.endswith("/01__terms.pdf")
+        assert (tmp_path / att.file.ref.removeprefix("local:")).read_bytes() == terms
+
+    def test_another_backends_original_isnt_reused_here(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        terms = b"%PDF-1.4 terms and conditions"
+        held[hashlib.sha256(terms).digest()] = "drive:file-id"
+        email = store_email_original(
+            MagicMock(),
+            LocalEvidenceStore(tmp_path),
+            _raw([_att("terms.pdf", data=terms)]),
+            source_name="mail",
+            received_at=_RECEIVED,
+        )
+        assert email.attachments[0].file.ref.startswith("local:originals/")
 
     def test_hostile_names_stay_inside_the_root(
         self, tmp_path: Path, held: dict[bytes, str]
@@ -357,7 +391,7 @@ class _Evidence:
                 ],
             )
 
-        monkeypatch.setattr(pipeline, "record_email_original", record)
+        monkeypatch.setattr(originals, "record_email_original", record)
 
     def _provenance(self, conn: Any, **kwargs: Any) -> Any:
         self.provenance = kwargs
@@ -406,6 +440,30 @@ class TestRecordIngestEvidence:
             ),
             (ev.provenance_id, receipt_id, "attachment", "receipt.pdf"),
         ]
+
+    def test_a_nul_in_a_raw_name_is_recorded_as_a_replacement_character(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ev = _Evidence(monkeypatch)
+        name = "receipt\x00.pdf"
+        raw = _raw([_att(name)])
+        email = StoredEmail(
+            message=_stored("message.eml"),
+            attachments=[StoredAttachment(file=_stored("01__r.pdf"), file_name=name)],
+        )
+        pipeline.record_ingest_evidence(
+            MagicMock(),
+            _RECEIPT,
+            raw,
+            _RENDITION,
+            source_name="mail",
+            source_type="imap",
+            email=email,
+            receipt_document=name,
+        )
+        assert ev.files[1][3] == "receipt\ufffd.pdf"
+        # Matching still uses the name as sent.
+        assert ev.provenance["document_certainty"] == "certain"
 
     def test_a_drive_item_is_pending_with_its_hash(
         self, monkeypatch: pytest.MonkeyPatch

@@ -1703,7 +1703,7 @@ def store_original_ref(
     return f"{row['backend']}:{row['locator']}"
 
 
-class OriginalConflictError(Exception):
+class OriginalLocationConflictError(Exception):
     """An original's location is already recorded for other bytes."""
 
 
@@ -1720,7 +1720,7 @@ def record_original(
     Doesn't commit. A location already recorded for the same file is kept,
     so recording an original again (a retry, or bytes another item stored)
     changes nothing. One recorded for other bytes raises
-    :class:`OriginalConflictError`.
+    :class:`OriginalLocationConflictError`.
     """
     file_id = record_stored_file(
         conn, sha256=sha256, byte_size=byte_size, media_type=media_type
@@ -1742,7 +1742,7 @@ def record_original(
     ).fetchone()
     if held is None or held["file_id"] != file_id or held["purpose"] != "original":
         msg = f"{ref} is already recorded for other bytes"
-        raise OriginalConflictError(msg)
+        raise OriginalLocationConflictError(msg)
     return file_id
 
 

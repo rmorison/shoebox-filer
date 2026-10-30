@@ -21,16 +21,17 @@ from typing import TYPE_CHECKING, Any
 from slugify import slugify
 
 from receipt_index.repository import record_original, store_original_ref
-from receipt_index.store import StoredFile, StoreFolder
+from receipt_index.store import StoredFile, StoreError, StoreFolder
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
+    from uuid import UUID
 
     import psycopg
 
     from receipt_index.models import Attachment, RawReceipt
-    from receipt_index.repository import DocumentCertainty
+    from receipt_index.repository import DocumentCertainty, ProvenanceFileRole
     from receipt_index.store import EvidenceStore
 
 MESSAGE_NAME = "message.eml"
@@ -122,6 +123,18 @@ def select_receipt_document(
     return None, None
 
 
+def _present(store: EvidenceStore, ref: str) -> bool:
+    """Whether a recorded original is still in this store.
+
+    A database restored out of step with the files, or a file removed by
+    hand, mustn't leave a new item linked to a file that isn't there.
+    """
+    try:
+        return store.exists(ref)
+    except StoreError:  # another backend's reference
+        return False
+
+
 def _put_original(
     conn: psycopg.Connection[dict[str, Any]],
     store: EvidenceStore,
@@ -134,7 +147,7 @@ def _put_original(
     """Store one original, or reuse the store's copy of the same bytes."""
     digest = hashlib.sha256(data).digest()
     existing = store_original_ref(conn, digest)
-    if existing is not None:
+    if existing is not None and _present(store, existing):
         return StoredFile(
             sha256=digest, byte_size=len(data), media_type=media_type, ref=existing
         )
@@ -219,4 +232,59 @@ def record_email_original(
             StoredAttachment(file=_record(conn, att.file), file_name=att.file_name)
             for att in email.attachments
         ],
+    )
+
+
+def _recordable_name(name: str | None) -> str | None:
+    """A raw MIME file name as ``provenance_files.file_name`` can hold it.
+
+    PostgreSQL text can't hold NUL, which an RFC 2231 name can encode; it
+    becomes U+FFFD. Every other character is kept as sent.
+    """
+    return None if name is None else name.replace("\x00", "\ufffd")
+
+
+@dataclass(frozen=True)
+class EmailEvidence:
+    """What a provenance row records about an email's stored original."""
+
+    original_id: UUID
+    document_id: UUID | None
+    certainty: DocumentCertainty | None
+    # (stored file ID, role, raw file name), message first: provenance_files.
+    files: list[tuple[UUID, ProvenanceFileRole, str | None]]
+
+
+def record_email_evidence(
+    conn: psycopg.Connection[dict[str, Any]],
+    email: StoredEmail,
+    *,
+    receipt_document: str | None,
+    attachments: Sequence[Attachment],
+) -> EmailEvidence:
+    """Record an email's stored files and pick its receipt document.
+
+    Doesn't commit. ``attachments`` are the parsed attachments the email was
+    stored from, in the same order; ``receipt_document`` is the extraction's.
+    """
+    recorded = record_email_original(conn, email)
+    message_id = recorded.message.id
+    attachment_ids = [att.file.id for att in recorded.attachments]
+    if message_id is None or None in attachment_ids:
+        msg = "record_email_original left a file unrecorded"
+        raise AssertionError(msg)
+    ids = [i for i in attachment_ids if i is not None]
+    files: list[tuple[UUID, ProvenanceFileRole, str | None]] = [
+        (message_id, "message", None),
+        *(
+            (file_id, "attachment", _recordable_name(att.file_name))
+            for file_id, att in zip(ids, recorded.attachments, strict=True)
+        ),
+    ]
+    index, certainty = select_receipt_document(receipt_document, attachments)
+    return EmailEvidence(
+        original_id=message_id,
+        document_id=None if index is None else ids[index],
+        certainty=certainty,
+        files=files,
     )

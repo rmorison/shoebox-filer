@@ -27,6 +27,7 @@ from receipt_index.adapters.gdrive import GdriveAdapter
 from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import process_item, run_ingest
+from receipt_index.repository import OriginalLocationConflictError, record_original
 from receipt_index.store import LocalEvidenceStore
 from tests.unit.test_gdrive_adapter import (
     FakeDrive,
@@ -395,3 +396,102 @@ def test_a_drive_item_on_the_local_backend_is_pending(
     assert prov["document_certainty"] is None
     assert _linked_files(pg_conn, prov["id"]) == []
     assert not (tmp_path / "originals").exists()
+
+
+def test_one_email_carrying_the_same_bytes_twice(
+    greenmail_available: bool, pg_conn: Conn, tmp_path: Path
+) -> None:
+    """Two attachments with identical bytes: one stored file, two locations."""
+    user = _unique_user("orig-twice")
+    message_id = f"<{uuid.uuid4().hex}@example.com>"
+    pdf = _pdf("twice")
+    seed_email(
+        to_addr=user,
+        subject="Your parking receipt",
+        text_body="Total: 12.00",
+        message_id=message_id,
+        attachments=[
+            ("receipt.pdf", "application/pdf", pdf),
+            ("copy.pdf", "application/pdf", pdf),
+        ],
+    )
+
+    store = LocalEvidenceStore(tmp_path)
+    assert _ingest(pg_conn, user, store, "mail-twice", "receipt.pdf").processed == 1
+
+    prov = _provenance(pg_conn, message_id)
+    files = [f for f in _linked_files(pg_conn, prov["id"]) if f["position"] > 0]
+    assert {f["file_id"] for f in files} == {files[0]["file_id"]}
+    assert {(f["position"], f["locator"].rsplit("/", 1)[1]) for f in files} == {
+        (1, "01__receipt.pdf"),
+        (1, "02__copy.pdf"),
+        (2, "01__receipt.pdf"),
+        (2, "02__copy.pdf"),
+    }
+    assert _rows_for(pg_conn, pdf) == 1
+    assert prov["receipt_document_file_id"] == files[0]["file_id"]
+    assert prov["document_certainty"] == "certain"
+
+
+@pytest.mark.parametrize("held_by", ["other bytes", "a rendition"])
+def test_record_original_refuses_a_locator_held_for_something_else(
+    pg_conn: Conn, held_by: str
+) -> None:
+    held, wanted = _pdf("held"), _pdf("wanted")
+    locator = f"originals/test/{uuid.uuid4().hex}.pdf"
+    file_id = pg_conn.execute(
+        "INSERT INTO receipt.stored_files (sha256, byte_size, media_type)"
+        " VALUES (%s, %s, 'application/pdf') RETURNING id",
+        (hashlib.sha256(held if held_by == "other bytes" else wanted).digest(), 1),
+    ).fetchone()
+    assert file_id is not None
+    if held_by == "other bytes":
+        pg_conn.execute(
+            "INSERT INTO receipt.file_locations"
+            " (file_id, backend, locator, purpose, display_path)"
+            " VALUES (%s, 'local', %s, 'original', %s)",
+            (file_id["id"], locator, locator),
+        )
+    else:
+        receipt = pg_conn.execute(
+            "SELECT id FROM receipt.receipts LIMIT 1"
+        ).fetchone() or _seed_receipt(pg_conn)
+        pg_conn.execute(
+            "INSERT INTO receipt.file_locations"
+            " (file_id, backend, locator, purpose, receipt_id, display_path)"
+            " VALUES (%s, 'local', %s, 'rendition', %s, %s)",
+            (file_id["id"], locator, receipt["id"], locator),
+        )
+
+    with pytest.raises(OriginalLocationConflictError):
+        record_original(
+            pg_conn,
+            ref=f"local:{locator}",
+            sha256=hashlib.sha256(wanted).digest(),
+            byte_size=len(wanted),
+            media_type="application/pdf",
+        )
+    pg_conn.rollback()
+
+
+def _seed_receipt(conn: Conn) -> dict[str, Any]:
+    from receipt_index.repository import insert_receipt
+
+    receipt = insert_receipt(
+        conn,
+        source_id=f"seed-{uuid.uuid4().hex}",
+        source_type="imap",
+        source_name="seed",
+        vendor="Acme Parking (U.S.), LLC",
+        amount=Decimal("12.00"),
+        currency="USD",
+        receipt_date=date(2026, 10, 14),
+        description=None,
+        confidence=0.9,
+        pdf_path=f"2026/10/{uuid.uuid4().hex}.pdf",
+        email_subject=None,
+        email_sender=None,
+        email_date=None,
+        commit=False,
+    )
+    return {"id": receipt.id}
