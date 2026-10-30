@@ -829,7 +829,7 @@ From any device, no SSH: check the newest file under `receipt-index/receipts` in
 
 Read it correctly: a fresh file **confirms** delivery. The *absence* of new files is not a health signal, because it is the normal state during a quiet week. Only chase it when you know receipts arrived in the window.
 
-Also glance at `receipt-index/backups`: seven nightly files with day-of-week names (`receipt_index-<1..7>.dump`), the newest dated last night, and up to twelve monthly ones (`receipt_index-month-<01..12>.dump`), the newest dated the 1st of this month. supercronic doesn't retry a missed run, so if the scheduler was stopped or the dump failed on the 1st, that month's file is old or missing until next year: take one by hand, as in [8.6](#86-with-the-scheduler-stopped), with `exec scheduler /app/backup.sh monthly` while the scheduler runs, but not between 03:17 and the end of the 03:47 dump on the 1st, when a scheduled run may be writing the same file.
+Also glance at `receipt-index/backups`: seven nightly files with day-of-week names (`receipt_index-<1..7>.dump`), the newest dated last night, and up to twelve monthly ones (`receipt_index-month-<01..12>.dump`), the newest dated the 1st of this month. supercronic doesn't retry a missed run, so if the scheduler was stopped or the dump failed on the 1st, that month's file is old or missing until next year: take one by hand with `docker compose -f deploy/docker-compose.yml exec scheduler /app/backup.sh monthly` while the scheduler runs (with it stopped, use the form in [8.6](#86-with-the-scheduler-stopped)). Don't start one from 03:47 UTC on the 1st until the scheduled monthly dump finishes: both would write the same file.
 
 ### 7.4 Disk
 
@@ -970,7 +970,7 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
 
 5. Run the checks in [8.4](#84-separate-database-logins) step 7 and Gate B step 5: each URL connects as its login, the scheduler holds no owner credential, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
-6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. Expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
+6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. After a nightly restore, expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
 
 ### 8.4 Separate database logins
 
