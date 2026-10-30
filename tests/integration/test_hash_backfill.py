@@ -158,3 +158,46 @@ def test_dry_run_writes_nothing(pg_conn: Conn, tmp_path: Path) -> None:
 
     assert report.hashed == 1
     assert _state(pg_conn) == before
+
+
+def test_dry_run_counts_bytes_already_recorded_as_shared(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    _receipt(pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-x")
+    backfill_rendition_hashes(pg_conn, store)
+    _receipt(pg_conn, tmp_path, "<b@example.com>", "2026/01/b.pdf", b"%PDF-x")
+
+    report = backfill_rendition_hashes(pg_conn, store, dry_run=True)
+
+    assert (report.hashed, report.shared) == (1, 1)
+
+
+def test_a_receipt_without_a_path_or_with_a_taken_path_is_reported(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    """Neither stops the run: the receipts after them are still recorded."""
+    store = LocalEvidenceStore(tmp_path)
+    first = _receipt(pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-a")
+    backfill_rendition_hashes(pg_conn, store)
+    no_path = _receipt(pg_conn, tmp_path, "<n@example.com>", "2026/01/n.pdf", None)
+    pg_conn.execute(
+        "UPDATE receipt.receipts SET pdf_path = NULL WHERE id = %s", (no_path,)
+    )
+    pg_conn.commit()
+    # A second receipt naming a file another receipt's location already holds.
+    taken = _receipt(pg_conn, tmp_path, "<t@example.com>", "2026/01/a.pdf", None)
+    last = _receipt(pg_conn, tmp_path, "<z@example.com>", "2026/01/z.pdf", b"%PDF-z")
+
+    report = backfill_rendition_hashes(pg_conn, store)
+
+    reasons = dict(report.missing)
+    assert set(reasons) == {no_path, taken}
+    assert reasons[no_path] == "no pdf_path"
+    assert "already recorded" in reasons[taken]
+    assert report.hashed == 1
+    rendition = {r["id"]: r["rendition_file_id"] for r in _state(pg_conn)["receipts"]}
+    assert rendition[taken] is None
+    assert rendition[no_path] is None
+    assert rendition[first] is not None
+    assert rendition[last] is not None

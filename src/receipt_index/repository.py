@@ -18,7 +18,7 @@ from receipt_index.models import (
     ReceiptEvent,
     SyncState,
 )
-from receipt_index.store import LOCAL_SCHEME
+from receipt_index.store import LOCAL_SCHEME, split_ref
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1516,14 +1516,6 @@ class RenditionConflictError(Exception):
     """Another receipt already has a location at this rendition's locator."""
 
 
-def _split_ref(ref: str) -> tuple[str, str]:
-    """A store reference as its backend and locator."""
-    if ref.startswith(LOCAL_SCHEME):
-        return "local", ref[len(LOCAL_SCHEME) :]
-    msg = f"no backend for store reference: {ref!r}"
-    raise ValueError(msg)
-
-
 def record_stored_file(
     conn: psycopg.Connection[dict[str, Any]],
     *,
@@ -1573,7 +1565,7 @@ def record_rendition(
     file_id = record_stored_file(
         conn, sha256=sha256, byte_size=byte_size, media_type=media_type
     )
-    backend, locator = _split_ref(ref)
+    backend, locator = split_ref(ref)
     conn.execute(
         """\
         INSERT INTO receipt.file_locations

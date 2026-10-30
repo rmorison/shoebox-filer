@@ -20,7 +20,7 @@ from receipt_index.repository import (
     receipts_without_rendition,
     record_rendition,
 )
-from receipt_index.store import InvalidRefError, rendition_ref
+from receipt_index.store import PDF_MEDIA_TYPE, InvalidRefError, rendition_ref
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -30,8 +30,6 @@ if TYPE_CHECKING:
     from receipt_index.store import EvidenceStore
 
 logger = logging.getLogger(__name__)
-
-_PDF_MEDIA_TYPE = "application/pdf"
 
 
 @dataclass
@@ -55,10 +53,10 @@ def backfill_rendition_hashes(
 ) -> BackfillReport:
     """Hash and record every receipt's rendition that isn't recorded yet.
 
-    A receipt whose file is missing, unreadable or already recorded for
-    another receipt is reported in ``missing`` with the reason and left
-    alone, so a later run picks it up. With ``dry_run`` the files are read
-    and hashed, and nothing is written.
+    A receipt with no ``pdf_path``, or whose file is missing, unreadable or
+    already recorded for another receipt, is reported in ``missing`` with
+    the reason and left alone, so a later run picks it up once it is fixed.
+    With ``dry_run`` the files are read and hashed, and nothing is written.
     """
     report = BackfillReport()
     seen: set[bytes] = set()
@@ -75,15 +73,13 @@ def backfill_rendition_hashes(
             report.missing.append((receipt_id, f"{ref}: {type(exc).__name__}"))
             continue
         digest = hashlib.sha256(data).digest()
+        known = digest in seen or _is_stored(conn, digest)
+        seen.add(digest)
         if dry_run:
-            report.shared += digest in seen
-            seen.add(digest)
+            conn.rollback()
+            report.shared += known
             report.hashed += 1
             continue
-        known = conn.execute(
-            "SELECT 1 FROM receipt.stored_files WHERE sha256 = %(sha256)s",
-            {"sha256": digest},
-        ).fetchone()
         try:
             record_rendition(
                 conn,
@@ -91,7 +87,7 @@ def backfill_rendition_hashes(
                 ref=ref,
                 sha256=digest,
                 byte_size=len(data),
-                media_type=_PDF_MEDIA_TYPE,
+                media_type=PDF_MEDIA_TYPE,
             )
         except RenditionConflictError as exc:
             conn.rollback()
@@ -99,6 +95,15 @@ def backfill_rendition_hashes(
             continue
         conn.commit()
         report.hashed += 1
-        report.shared += known is not None
+        report.shared += known
     conn.rollback()
     return report
+
+
+def _is_stored(conn: psycopg.Connection[dict[str, Any]], digest: bytes) -> bool:
+    """Whether ``stored_files`` already holds these bytes."""
+    row = conn.execute(
+        "SELECT 1 FROM receipt.stored_files WHERE sha256 = %(sha256)s",
+        {"sha256": digest},
+    ).fetchone()
+    return row is not None

@@ -1952,7 +1952,7 @@ def store_backfill_hashes(ctx: click.Context, dry_run: bool) -> None:
     if not report.ok:
         click.echo(
             f"{len(report.missing)} receipt(s) not recorded;"
-            " restore their files and run again.",
+            " restore their files, or resolve the conflict named, and run again.",
             err=True,
         )
         sys.exit(1)
