@@ -292,3 +292,109 @@ class TestServeKeys:
 
         config = IngestConfig(imap_poll_seconds=3600, drive_poll_seconds=3600)
         assert (config.imap_poll_seconds, config.drive_poll_seconds) == (3600, 3600)
+
+
+_PING_MARKER = "CAPABILITY-MARKER-7f3a"
+
+
+def _health_config(health: dict[str, object], **ingest: object) -> dict[str, object]:
+    return {
+        "sources": [
+            {
+                "name": "mail",
+                "type": "imap",
+                "host": "mail.example.com",
+                "username": "user@example.com",
+                "password": "secret",  # pragma: allowlist secret
+            }
+        ],
+        "database": {"url": "postgresql://localhost/test"},
+        "llm": {"api_key": "test-key"},  # pragma: allowlist secret
+        "ingest": {**ingest, "health": health},
+    }
+
+
+class TestHealthKeys:
+    def test_defaults(self) -> None:
+        health = AppConfig.model_validate(_health_config({})).ingest.health
+        assert health.heartbeat_stale_seconds == 120
+        assert health.source_stale_seconds is None
+        assert health.terminal_alert_seconds == 86400
+        assert health.ping_url is None
+        assert health.ping_interval_seconds == 300
+
+    def test_ping_url_is_kept_secret(self) -> None:
+        url = f"https://hc-ping.example.com/{_PING_MARKER}/"
+        config = AppConfig.model_validate(_health_config({"ping_url": url}))
+        assert config.ingest.health.ping_url is not None
+        assert config.ingest.health.ping_url.get_secret_value() == url.rstrip("/")
+        assert _PING_MARKER not in repr(config)
+        assert _PING_MARKER not in str(config.model_dump())
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"ftp://hc-ping.example.com/{_PING_MARKER}",
+            f"https://hc-ping.example.com/{_PING_MARKER}?x=1",
+            f"https://hc-ping.example.com/{_PING_MARKER}\n/x",
+            f"https://hc-ping.example.com/{_PING_MARKER} x",
+            12345,
+        ],
+    )
+    def test_a_bad_ping_url_is_refused_without_its_value(self, url: object) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            AppConfig.model_validate(_health_config({"ping_url": url}))
+        assert "ping_url" in str(excinfo.value)
+        assert _PING_MARKER not in str(excinfo.value)
+        assert "12345" not in str(excinfo.value)
+
+    def test_another_ingest_error_hides_the_ping_url(self, tmp_path: Path) -> None:
+        # A parent model's error would print the whole ingest dict.
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            textwrap.dedent(f"""\
+                sources:
+                  - name: mail
+                    type: imap
+                    host: mail.example.com
+                    username: user@example.com
+                    password: secret
+                database:
+                  url: postgresql://localhost/test
+                llm:
+                  api_key: test-key
+                ingest:
+                  retry_max_attempts: 9
+                  health:
+                    ping_url: https://hc-ping.example.com/{_PING_MARKER}
+            """)
+        )
+        with pytest.raises(ConfigError) as excinfo:
+            load_config(str(path))
+        assert "retry_backoff_seconds" in str(excinfo.value)
+        assert _PING_MARKER not in str(excinfo.value)
+
+    def test_source_stale_below_a_poll_interval_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="imap_poll_seconds"):
+            AppConfig.model_validate(_health_config({"source_stale_seconds": 200}))
+
+    def test_source_stale_checks_only_the_source_types_present(self) -> None:
+        # 200 is below the IMAP poll (240), but the only source is Drive.
+        data = _health_config({"source_stale_seconds": 200})
+        data["sources"] = [
+            {"name": "scans", "type": "gdrive", "folder_id": "f", "token_json": "{}"}
+        ]
+        config = AppConfig.model_validate(data)
+        assert config.ingest.health.source_stale_seconds == 200
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("heartbeat_stale_seconds", 59),
+            ("terminal_alert_seconds", -1),
+            ("ping_interval_seconds", 29),
+        ],
+    )
+    def test_floors(self, key: str, value: int) -> None:
+        with pytest.raises(ValidationError, match=key):
+            AppConfig.model_validate(_health_config({key: value}))

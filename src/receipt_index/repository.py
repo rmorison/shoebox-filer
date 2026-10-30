@@ -219,6 +219,14 @@ def record_poll(
     conn.commit()
 
 
+def list_sync_state(conn: psycopg.Connection[dict[str, Any]]) -> list[SyncState]:
+    """Every source's stored read position, for ``status``."""
+    cur = conn.execute(
+        "SELECT * FROM receipt.sync_state ORDER BY source_name, folder, id"
+    )
+    return [SyncState.model_validate(row) for row in cur.fetchall()]
+
+
 def insert_receipt(
     conn: psycopg.Connection[dict[str, Any]],
     *,
@@ -689,6 +697,17 @@ def count_ingest_failures(
     """Count what ``get_ingest_failures`` would return unpaged."""
     where, params = _failure_filters(status, since, source_name)
     cur = conn.execute(f"SELECT COUNT(*) AS n FROM ({_LATEST}) l WHERE {where}", params)
+    row = cur.fetchone()
+    return int(row["n"]) if row else 0
+
+
+def count_due_retries(conn: psycopg.Connection[dict[str, Any]]) -> int:
+    """Items whose latest row is a failure whose retry is due now (``status``)."""
+    cur = conn.execute(
+        f"SELECT COUNT(*) AS n FROM ({_LATEST}) l "
+        "WHERE l.status = 'failed' AND l.next_retry_at <= now() "
+        f"AND {_NO_PROVENANCE}"
+    )
     row = cur.fetchone()
     return int(row["n"]) if row else 0
 
