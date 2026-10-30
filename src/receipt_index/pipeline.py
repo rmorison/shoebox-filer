@@ -16,6 +16,7 @@ most likely fail the same way.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -33,6 +34,11 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
+from receipt_index.originals import (
+    record_email_original,
+    select_receipt_document,
+    store_email_original,
+)
 from receipt_index.refunds import link_by_rule
 from receipt_index.renderer import render_pdf
 from receipt_index.repository import (
@@ -43,6 +49,7 @@ from receipt_index.repository import (
     insert_extraction,
     insert_ingest_log,
     insert_provenance,
+    insert_provenance_files,
     insert_receipt,
     is_due,
     is_source_id_known,
@@ -63,6 +70,7 @@ from receipt_index.store import pdf_path_for, store_rendition
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from contextlib import AbstractContextManager
+    from uuid import UUID
 
     import psycopg
     from pydantic_ai import Agent
@@ -81,6 +89,8 @@ if TYPE_CHECKING:
         SourceRead,
         SyncState,
     )
+    from receipt_index.originals import StoredEmail
+    from receipt_index.repository import DocumentCertainty, ProvenanceFileRole
     from receipt_index.store import EvidenceStore, StoredFile
 
 logger = logging.getLogger(__name__)
@@ -216,9 +226,36 @@ def record_ingest_evidence(
     *,
     source_name: str,
     source_type: str,
+    email: StoredEmail | None = None,
+    receipt_document: str | None = None,
 ) -> None:
-    """Write a new receipt's provenance row and its rendition's records."""
-    insert_provenance(
+    """Write a new receipt's provenance, its original's and rendition's records.
+
+    ``email`` is the item's stored original, if it was stored: its files are
+    recorded, linked through ``provenance_files``, and its receipt document
+    picked from the extraction's ``receipt_document``. Without one, the
+    original is ``pending``. ``source_sha256`` is the whole original's hash
+    whenever its bytes are in hand, stored or not.
+    """
+    source_sha256 = (
+        hashlib.sha256(raw.raw_bytes).digest() if raw.raw_bytes is not None else None
+    )
+    original_id: UUID | None = None
+    document_id: UUID | None = None
+    certainty: DocumentCertainty | None = None
+    files: list[tuple[UUID, ProvenanceFileRole, str | None]] = []
+    if email is not None:
+        email = record_email_original(conn, email)
+        assert email.message.id is not None
+        original_id = email.message.id
+        files.append((email.message.id, "message", None))
+        for att in email.attachments:
+            assert att.file.id is not None
+            files.append((att.file.id, "attachment", att.file_name))
+        index, certainty = select_receipt_document(receipt_document, raw.attachments)
+        if index is not None:
+            document_id = email.attachments[index].file.id
+    provenance = insert_provenance(
         conn,
         receipt_id=receipt.id,
         source_type=source_type,
@@ -229,7 +266,13 @@ def record_ingest_evidence(
         email_sender=raw.sender,
         email_date=_email_date(raw.source_type, raw),
         file_name=raw.file_name,
+        source_sha256=source_sha256,
+        original_file_id=original_id,
+        receipt_document_file_id=document_id,
+        document_certainty=certainty,
     )
+    if files:
+        insert_provenance_files(conn, provenance.id, files)
     if rendition.sha256 is None or rendition.byte_size is None:
         msg = f"rendition {rendition.ref} has no hash"
         raise ValueError(msg)
@@ -320,6 +363,21 @@ def process_item(
             )
             return ItemOutcome("skipped")
 
+        # The original is kept only for an item that becomes a receipt: a
+        # skipped item stays at its source. Its files are written now and
+        # recorded in the receipt's transaction below (evidence-store design,
+        # section 7), so a crash leaves files the retry reuses, never rows.
+        email: StoredEmail | None = None
+        if source_type == "imap":
+            if raw.raw_bytes is None:
+                logger.warning(
+                    "No raw bytes for %s; its original stays pending", raw.source_id
+                )
+            else:
+                email = store_email_original(
+                    conn, store, raw, source_name=source_name, received_at=raw.date
+                )
+
         pdf_data = render_pdf(raw)
         stored = store_rendition(
             store,
@@ -359,7 +417,14 @@ def process_item(
         # Its source item and rendition are recorded in the same transaction
         # (evidence-store design, §7 step 5).
         record_ingest_evidence(
-            conn, receipt, raw, stored, source_name=source_name, source_type=source_type
+            conn,
+            receipt,
+            raw,
+            stored,
+            source_name=source_name,
+            source_type=source_type,
+            email=email,
+            receipt_document=metadata.receipt_document,
         )
         # A refund is linked to its purchase, or a purchase to its waiting
         # refunds, in the same transaction (receipt data-model design, §6).

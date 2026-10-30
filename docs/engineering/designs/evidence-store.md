@@ -90,7 +90,7 @@ class EvidenceStore(Protocol):
     def rename(self, ref: str, name: str) -> None: ... # renditions only
 ```
 
-- **`put` is content-addressed and idempotent for originals.** It hashes the bytes first. If `stored_files` already holds that sha256 with an `original` location **that the store account owns** (`file_locations.owner = 'store'`), it returns the existing row and writes nothing, so a retry after a crash never stores an original twice. A location the operator's account owns (an adopted dropoff file, under the move default) doesn't count, because the operator can delete it: an email attachment with the same bytes still gets its own store-owned copy.
+- **Storing an original is content-addressed and idempotent.** The bytes are hashed first. If `stored_files` already holds that sha256 with an `original` location **that the store account owns** (`file_locations.owner = 'store'`), the existing file is returned and nothing is written, so a retry after a crash never stores an original twice. `put` itself touches no database: the lookup sits in the helpers above it (`store_email_original`), and the rows are recorded in the item's own transaction (ticket 3). A location the operator's account owns (an adopted dropoff file, under the move default) doesn't count, because the operator can delete it: an email attachment with the same bytes still gets its own store-owned copy.
 - **Concurrent writers.** `serve` and `backfill` can store the same bytes at the same moment. `stored_files` rows are inserted with `INSERT ... ON CONFLICT (sha256) DO NOTHING`, followed by a `SELECT` by sha256, and `file_locations` rows with `ON CONFLICT (backend, locator) DO NOTHING`, so the loser of the race reuses the winner's row. A Drive upload that lost the race is trashed (it is the process's own unrecorded upload, which the guard allows).
 - **Each receipt has its own rendition location.** The `stored_files` row is shared when two receipts' renditions have the same bytes (a PDF passed through as the rendition, a scan dropped twice). But every receipt gets its own rendition file in `renditions/`, recorded as a `file_locations` row with that `receipt_id`. A rename then touches one receipt's file only. A retry finds the receipt's existing rendition location and writes nothing.
 - **There is no update or delete for originals.** `rename` refuses any location whose purpose is `original`. Only renditions get renamed, when re-extraction changes the vendor, date or amount in the name.
@@ -129,8 +129,8 @@ Higher-level helpers sit on top of `put` so that ingest never deals with attachm
 
 **The receipt document.** Each provenance record names the one file the receipt was read from: its *receipt document*. It is `certain` only when the source makes it so, or the extraction says so:
 
-- **Drive source:** the source file (for a native Doc, its export snapshot): `certain`.
-- **Email:** the attachment the extraction reports it read the receipt from. The receipt data-model design's extraction output reports this as `receipt_document`: an attachment file name, `"body"`, or null. The store maps a file name to the `provenance_files` row with that raw MIME file name. It is `certain` only when the name matches exactly one attachment. A name the extractor had to clean for its prompt (control characters, a run of three or more dashes, over 255 characters) matches none. A name shared by two attachments, a name that matches none, or null leaves it `ambiguous`; `"body"` means no receipt document. Until the extraction reports it, every email attachment is recorded `ambiguous`, *including a lone PDF*, because a vendor that puts the receipt in the body often attaches only its terms and conditions. Today the pipeline uses the first PDF in the message, which is exactly that case.
+- **Drive source:** the source file (for a native Doc, its export snapshot): `certain`, once it is adopted. Until then (`archive: false`, original `pending`) there is no stored file to name, so the receipt document and its certainty are NULL.
+- **Email:** the attachment the extraction reports it read the receipt from. The receipt data-model design's extraction output reports this as `receipt_document`: an attachment file name, `"body"`, or null. The store maps a file name to the `provenance_files` row with that raw MIME file name. It is `certain` only when the name matches exactly one attachment. A name the extractor had to clean for its prompt (control characters, a run of three or more dashes, over 255 characters) matches none. A part with no MIME file name (an inline image the adapter names by its Content-ID, or `unnamed`) has a NULL `file_name` and matches none. A name shared by two attachments (the first of them), a name that matches none, or null (the first PDF, which the renderer passes through) leaves it `ambiguous`; a null with no PDF, or `"body"`, means no receipt document. So a lone PDF the extraction doesn't name is `ambiguous`, because a vendor that puts the receipt in the body often attaches only its terms and conditions.
 - **Email whose receipt is the HTML or text body:** no receipt document.
 - **Image attachments** (logos, inline images, signatures) are the receipt document only when the extraction names one, as for a photographed or screenshot receipt.
 
@@ -445,7 +445,7 @@ def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor:
     # file_locations row, tied to receipt_id, is written in step 5's transaction.
 ```
 
-`RawReceipt` gains `raw_bytes`, the exact RFC 822 bytes the IMAP adapter fetched and parsed, so the stored original is byte for byte what extraction read.
+`RawReceipt` gains `raw_bytes`, the exact bytes of the whole original as fetched: the RFC 822 bytes the IMAP adapter parsed, so the stored original is byte for byte what extraction read, or a binary Drive file's bytes, whose sha256 is Drive's `sha256Checksum`. A native Google Doc has none (its download is an export).
 
 **`adopt_drive_original` is idempotent**, keyed on the Drive file ID:
 
@@ -455,7 +455,7 @@ def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor:
 
 **Order of one successful item:**
 
-1. Fetch. For IMAP, store the original with `store_email_original`. Record the whole-original hash as `provenance.source_sha256`: the `.eml`'s sha256, or the Drive file's `sha256Checksum` read from its metadata. Rule 1 needs only that hash, so it works whether or not the Drive file is ever adopted (the ingest design's `archive: false` default leaves Drive originals `pending`).
+1. Fetch. Hash the whole original for `provenance.source_sha256`: the `.eml`'s sha256, or the Drive file's `sha256Checksum` (the sha256 of its bytes). For IMAP, store the original with `store_email_original` once the item is known to be kept: after rule 1 links it, or after extraction decides it isn't skipped. A skipped item stays at its source, so storing at fetch would leave every non-receipt email as an orphan (the operator's decision, ticket 3). Rule 1 needs only that hash, so it works whether or not the Drive file is ever adopted (the ingest design's `archive: false` default leaves Drive originals `pending`).
 2. **Whole-original match before extraction.** If the whole original's hash links to an existing receipt under rule 1 ([section 8](#8-provenance-and-duplicates)), the item joins that receipt and the LLM call is skipped. Identical bytes mean an identical receipt, so the kind, vendor and amount are the same by construction. No other rule runs before extraction.
 3. Otherwise extract, then apply rules 2 to 4, which need the extracted kind, vendor, paid amount and receipt document. If the item joins an existing receipt, it stores no rendition. Otherwise render, validate the PDF ([section 9](#9-pdf-validation-at-ingest)), and store the new receipt's rendition.
 4. For a Drive source with `archive: true`, adopt the original. This is the same step as the ingest design's archive move. With `archive: false`, nothing moves and `original_status` stays `pending` until `backfill --originals-only` adopts it.
@@ -466,7 +466,7 @@ def store_rendition(pdf: bytes, *, receipt_id: UUID, receipt_date: date, vendor:
 
 | Crash or failure after | State left | Recovery |
 |------------------------|-----------|----------|
-| An IMAP original was stored (step 1) | Stored files with no provenance | The retry's `put` finds the hashes and reuses them. `verify --orphans` reports any left for good |
+| An IMAP original was stored (step 1) | Files under `originals/` with no rows: the rows are recorded in step 5's transaction | The retry derives the same folder and names from the same bytes, so nothing is written again, and records them. `verify --orphans` reports any left for good |
 | A rendition was uploaded (step 3) | A Drive rendition file with no location row | The retry uploads a fresh one (the receipt ID is new each attempt). `verify --orphans` reports the unrecorded file |
 | A Drive adopt (step 4) | The file in `originals/` (or, under the copy fallback, copied, with the dropoff file in `processed/`), no receipt | The changes feed can't be relied on, since the file's parents no longer include the dropoff folder. The ingest design's retry scheduler requeues the item from its started record, finds the file by its ID, and the idempotent adopt returns the existing record before the commit |
 | Upload checksum mismatch | Nothing recorded; the bad upload trashed | The item fails and is retried under the ingest design's [retry policy](always-on-ingest.md#6-retries) |
@@ -506,7 +506,7 @@ A receipt is one purchase (or one refund). A provenance record is one source ite
 
 **Why rule 3 checks the date and the items.** An order shipped in parts and charged once per shipment, in equal amounts, has one order number, one vendor and one amount, but two charges. A forward or a rescan of one charge has the same date and the same items. A split shipment almost always differs in one of them, so it is flagged for review, never linked. A null or zero paid amount (a receipt the extraction couldn't price, or a zero-amount receipt) never links by order number.
 
-**Only rule 1 runs before extraction.** Rules 2 to 4 need the kind, vendor, paid amount, order number and receipt document that extraction produces, so they run after it, in step 3 of the write path. Until the data-model design's extraction reports which attachment held the receipt, every email receipt document is `ambiguous`, so rule 2 applies only to Drive sources.
+**Only rule 1 runs before extraction.** Rules 2 to 4 need the kind, vendor, paid amount, order number and receipt document that extraction produces, so they run after it, in step 3 of the write path. The extraction reports which attachment held the receipt (`receipt_document`), so rule 2 applies to an email whose receipt document is `certain`, as well as to Drive sources.
 
 **Two real purchases stay two.** Two identical parking charges on one day match rule 4 and get flagged, not linked. They don't match rules 1 to 3, because they are two distinct emails, PDFs or order numbers.
 

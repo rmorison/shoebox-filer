@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 
     from receipt_index.models import ActorKind, EventType
 
+DocumentCertainty = Literal["certain", "ambiguous"]
+ProvenanceFileRole = Literal["message", "attachment", "drive_original", "drive_export"]
+
 # The manual_fields name of a field_confidence entry, where they differ.
 _MANUAL_NAME = {"date": "receipt_date"}
 
@@ -1628,26 +1631,38 @@ def insert_provenance(
     email_date: datetime | None,
     file_name: str | None,
     match_method: str = "first",
+    source_sha256: bytes | None = None,
+    original_file_id: UUID | None = None,
+    receipt_document_file_id: UUID | None = None,
+    document_certainty: DocumentCertainty | None = None,
 ) -> Provenance:
     """Record the source item that created a receipt. Doesn't commit.
 
     The first item for a receipt is its primary and its home. Its original
-    stays ``pending`` until the store keeps originals.
+    is ``stored`` when ``original_file_id`` is given, else ``pending``.
     """
     row = conn.execute(
         """\
         INSERT INTO receipt.provenance (
             receipt_id, is_primary, source_type, source_name, source_id,
             received_at, email_subject, email_sender, email_date, file_name,
-            home_receipt_id, original_status, match_method
+            home_receipt_id, original_status, match_method, source_sha256,
+            original_file_id, receipt_document_file_id, document_certainty
         ) VALUES (
             %(receipt_id)s, TRUE, %(source_type)s, %(source_name)s, %(source_id)s,
             %(received_at)s, %(email_subject)s, %(email_sender)s, %(email_date)s,
-            %(file_name)s, %(receipt_id)s, 'pending', %(match_method)s
+            %(file_name)s, %(receipt_id)s, %(original_status)s, %(match_method)s,
+            %(source_sha256)s, %(original_file_id)s,
+            %(receipt_document_file_id)s, %(document_certainty)s
         )
         RETURNING *
         """,
         {
+            "original_status": "pending" if original_file_id is None else "stored",
+            "source_sha256": source_sha256,
+            "original_file_id": original_file_id,
+            "receipt_document_file_id": receipt_document_file_id,
+            "document_certainty": document_certainty,
             "receipt_id": receipt_id,
             "source_type": source_type,
             "source_name": source_name,
@@ -1661,6 +1676,102 @@ def insert_provenance(
         },
     ).fetchone()
     return Provenance.model_validate(row)
+
+
+def store_original_ref(
+    conn: psycopg.Connection[dict[str, Any]], sha256: bytes
+) -> str | None:
+    """The reference of a stored original with these bytes, if the store owns one.
+
+    A location the operator's account owns (an adopted dropoff file) doesn't
+    count: the operator can delete it, so the same bytes get their own copy.
+    """
+    row = conn.execute(
+        """\
+        SELECT l.backend, l.locator
+          FROM receipt.stored_files f
+          JOIN receipt.file_locations l ON l.file_id = f.id
+         WHERE f.sha256 = %(sha256)s
+           AND l.purpose = 'original' AND l.owner = 'store'
+         ORDER BY l.created_at, l.id
+         LIMIT 1
+        """,
+        {"sha256": sha256},
+    ).fetchone()
+    if row is None:
+        return None
+    return f"{row['backend']}:{row['locator']}"
+
+
+class OriginalConflictError(Exception):
+    """An original's location is already recorded for other bytes."""
+
+
+def record_original(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    ref: str,
+    sha256: bytes,
+    byte_size: int,
+    media_type: str,
+) -> UUID:
+    """Record a stored original: its stored file and its location.
+
+    Doesn't commit. A location already recorded for the same file is kept,
+    so recording an original again (a retry, or bytes another item stored)
+    changes nothing. One recorded for other bytes raises
+    :class:`OriginalConflictError`.
+    """
+    file_id = record_stored_file(
+        conn, sha256=sha256, byte_size=byte_size, media_type=media_type
+    )
+    backend, locator = split_ref(ref)
+    conn.execute(
+        """\
+        INSERT INTO receipt.file_locations
+            (file_id, backend, locator, purpose, display_path)
+        VALUES (%(file_id)s, %(backend)s, %(locator)s, 'original', %(locator)s)
+        ON CONFLICT DO NOTHING
+        """,
+        {"file_id": file_id, "backend": backend, "locator": locator},
+    )
+    held = conn.execute(
+        "SELECT file_id, purpose FROM receipt.file_locations"
+        " WHERE backend = %(backend)s AND locator = %(locator)s",
+        {"backend": backend, "locator": locator},
+    ).fetchone()
+    if held is None or held["file_id"] != file_id or held["purpose"] != "original":
+        msg = f"{ref} is already recorded for other bytes"
+        raise OriginalConflictError(msg)
+    return file_id
+
+
+def insert_provenance_files(
+    conn: psycopg.Connection[dict[str, Any]],
+    provenance_id: UUID,
+    files: Sequence[tuple[UUID, ProvenanceFileRole, str | None]],
+) -> None:
+    """Record every file a source item brought, in order. Doesn't commit.
+
+    ``files`` holds (stored file ID, role, raw file name); position 0 is the
+    first (the message), 1.. the attachments in MIME order.
+    """
+    for position, (file_id, role, file_name) in enumerate(files):
+        conn.execute(
+            """\
+            INSERT INTO receipt.provenance_files
+                (provenance_id, position, file_id, role, file_name)
+            VALUES (%(provenance_id)s, %(position)s, %(file_id)s, %(role)s,
+                    %(file_name)s)
+            """,
+            {
+                "provenance_id": provenance_id,
+                "position": position,
+                "file_id": file_id,
+                "role": role,
+                "file_name": file_name,
+            },
+        )
 
 
 def receipts_without_rendition(

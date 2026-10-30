@@ -313,6 +313,23 @@ def test_write_paths_run_as_the_write_login(
         "SELECT id FROM receipt.receipts WHERE source_id = %s", (good_id,)
     ).fetchone()
     assert receipt is not None
+    # Its original: the message, recorded and linked (000019's grants).
+    original = pg_conn.execute(
+        "SELECT p.original_status, p.source_sha256 IS NOT NULL AS hashed,"
+        " pf.role, l.purpose FROM receipt.provenance p"
+        " JOIN receipt.provenance_files pf ON pf.provenance_id = p.id"
+        " JOIN receipt.file_locations l ON l.file_id = pf.file_id"
+        " WHERE p.source_id = %s",
+        (good_id,),
+    ).fetchall()
+    assert original == [
+        {
+            "original_status": "stored",
+            "hashed": True,
+            "role": "message",
+            "purpose": "original",
+        }
+    ]
     state = pg_conn.execute(
         "SELECT imap_last_uid, last_poll_at, last_success_at "
         "FROM receipt.sync_state WHERE source_name = %s",
@@ -515,16 +532,16 @@ def test_write_paths_run_as_the_write_login(
     pg_conn.commit()
 
 
-# Write grants on the evidence-store tables (000017) reach only the columns
-# the code writes: (table, column or None for the whole table).
+# Write grants on the evidence-store tables (000017, 000019) reach only the
+# columns the code writes: (table, column or None for the whole table).
 _UNWRITTEN = [
-    ("provenance_files", None),
     ("stored_files", "content_kind"),
     ("stored_files", "pdf_status"),
+    ("stored_files", "repaired_from_id"),
     ("file_locations", "owner"),
     ("file_locations", "last_verified_at"),
-    ("provenance", "source_sha256"),
-    ("provenance", "original_file_id"),
+    ("file_locations", "read_only_set"),
+    ("provenance", "original_unavailable_reason"),
     ("receipts", "rendition_file_id"),
 ]
 

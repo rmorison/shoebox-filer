@@ -79,7 +79,7 @@ def test_a_new_receipt_records_its_provenance_and_rendition(
     assert prov["home_receipt_id"] == receipt.id
     assert prov["is_primary"] is True
     assert prov["match_method"] == "first"
-    assert prov["original_status"] == "pending"
+    assert prov["original_status"] == "stored"
     assert (prov["source_type"], prov["source_name"]) == ("imap", "greenmail-test")
     assert prov["email_subject"] == "Your parking receipt"
     assert prov["received_at"] is not None
