@@ -1,6 +1,6 @@
 # Server Deployment
 
-Take a clean Ubuntu box to an unattended receipt-index service: Postgres in Docker, `receipt-index ingest` on a 15-minute schedule, receipts and nightly database dumps mirrored to Dropbox.
+Take a clean Ubuntu box to an unattended receipt-index service: Postgres in Docker, `receipt-index ingest` on a 15-minute schedule, receipts and nightly and monthly database dumps mirrored to Dropbox.
 
 This is the canonical operations document for the always-on deployment — provisioning, first-launch gates, the one-time cutover from the dev machine, weekly monitoring, upgrades, and disaster recovery.
 
@@ -28,7 +28,7 @@ One Docker Compose project, named `receipt-index` (set by `name:` at the top of 
 | Service | What it is |
 |---|---|
 | `db` | `postgres:18`, named volume `pgdata`, published on `127.0.0.1:15432` only |
-| `scheduler` | The app image with `supercronic /app/crontab` as its entrypoint — ingest every 15 min, two rclone mirror lines, one nightly `pg_dump` |
+| `scheduler` | The app image with `supercronic /app/crontab` as its entrypoint — ingest every 15 min, two rclone mirror lines, a nightly and a monthly `pg_dump` |
 
 **The git clone is the deployment unit.** There is no registry and no CI: the image is built on the server from the checkout, and deploying an update is `git pull` + rebuild. Everything the server needs beyond the clone is a handful of git-ignored files at the clone root.
 
@@ -42,13 +42,13 @@ Layout after provisioning:
 ├── .env.db                      <- the owner and superuser credentials (git-ignored, chmod 600)
 ├── data/
 │   ├── receipts/                <- rendered PDF tree      (uid 1000)
-│   ├── backups/                 <- nightly pg_dump files  (uid 1000)
+│   ├── backups/                 <- nightly and monthly pg_dump files  (uid 1000)
 │   └── mcp-logs/                <- MCP access log, never mirrored (uid 1000)
 ├── rclone-config/               <- Dropbox token          (uid 1000, chmod 700)
 └── deploy/
     ├── docker-compose.yml       <- the production compose file
     ├── crontab                  <- supercronic schedule
-    ├── backup.sh                <- nightly dump script
+    ├── backup.sh                <- nightly and monthly dump script
     ├── example.receipt-index.yaml  <- config template (copy + edit, see 3.2b)
     ├── receipt-index.yaml       <- your copy (git-ignored; no secrets, only ${VAR})
     ├── db-init/01-create-roles.sh
@@ -97,7 +97,7 @@ Laptop-side commands use **`receipt-server`** as the SSH target. Either define t
 
 - **`uv`** ([docs.astral.sh/uv](https://docs.astral.sh/uv/)) — only for Gate A, which runs the in-container render tests from the repo's test suite. Skip it if you accept the manual fallback in Gate A.
 
-- **Disk**: the pgdata volume, the receipt tree, seven database dumps, and capped container logs (10 MB × 7 per service). A few GB is plenty; check with `df -h` before starting.
+- **Disk**: the pgdata volume, the receipt tree, nineteen database dumps (seven nightly, twelve monthly), and capped container logs (10 MB × 7 per service). A few GB is plenty; check with `df -h` before starting.
 
 ### Rootless Docker
 
@@ -481,7 +481,7 @@ docker compose -f deploy/docker-compose.yml exec scheduler receipt-index ingest 
 **Pass:** exit 0, a PDF appears under `data/receipts`, the corresponding `receipts` row exists, and `receipt-index failures` shows nothing new.
 
 ```bash
-# 2. Enable the schedule — this starts supercronic and all four cron lines
+# 2. Enable the schedule — this starts supercronic and all five cron lines
 docker compose -f deploy/docker-compose.yml up -d
 
 # 3. Watch two automatic ticks (at :00/:15/:30/:45)
@@ -728,7 +728,7 @@ scripts/receipt-search show <one-of-those-ids>
 
 ### 6.7 Finish
 
-Proceed to Gate F (Dropbox bulk mirror, count-verified) and only then Gate G. Do not start the scheduler earlier: bringing it up activates *all four* cron lines at once — ingest, both mirrors, and the nightly backup. If you need the scheduler running with the mirror still off, comment out the two `rclone` lines in `deploy/crontab` locally (leave the edit uncommitted) and restore them after Gate F.
+Proceed to Gate F (Dropbox bulk mirror, count-verified) and only then Gate G. Do not start the scheduler earlier: bringing it up activates *all five* cron lines at once — ingest, both mirrors, and the nightly and monthly backups. If you need the scheduler running with the mirror still off, comment out the two `rclone` lines in `deploy/crontab` locally (leave the edit uncommitted) and restore them after Gate F.
 
 ### 6.8 Abort criterion
 
@@ -829,7 +829,7 @@ From any device, no SSH: check the newest file under `receipt-index/receipts` in
 
 Read it correctly: a fresh file **confirms** delivery. The *absence* of new files is not a health signal, because it is the normal state during a quiet week. Only chase it when you know receipts arrived in the window.
 
-Also glance at `receipt-index/backups`: seven files, day-of-week names, the newest dated last night.
+Also glance at `receipt-index/backups`: seven nightly files with day-of-week names (`receipt_index-<1..7>.dump`), the newest dated last night, and up to twelve monthly ones (`receipt_index-month-<01..12>.dump`), the newest dated the 1st of this month.
 
 ### 7.4 Disk
 
@@ -838,7 +838,7 @@ df -h /
 du -sh ~/receipt-index/data/*
 ```
 
-Container logs are capped (10 MB × 7 files per service) and the backup directory is bounded at seven dumps by day-of-week rotation, so growth should be dominated by the receipt tree and pgdata.
+Container logs are capped (10 MB × 7 files per service) and the backup directory is bounded at nineteen dumps (seven by day of week, twelve by month), so growth should be dominated by the receipt tree and pgdata.
 
 ### 7.5 Future work
 
@@ -926,7 +926,7 @@ Only requeue for **environmental** causes: a rendering gap, a permissions proble
 
 ### 8.3 Disaster recovery from Dropbox
 
-The full-loss story: the server is gone and Dropbox holds everything — the nightly dumps under `receipt-index/backups` and the complete receipt tree under `receipt-index/receipts`.
+The full-loss story: the server is gone and Dropbox holds everything — the nightly and monthly dumps under `receipt-index/backups` and the complete receipt tree under `receipt-index/receipts`.
 
 1. Rebuild the host per [section 2](#2-server-prerequisites), then provision per [section 3](#3-provisioning) (clone, `.env` and `.env.db` from 1Password, directories with uid 1000, rclone config). A single `.env` saved before [8.5](#85-split-the-owner-credentials-out-of-env) still holds the owner's lines: split it with 8.5 steps 2 and 3 first.
 
@@ -949,7 +949,7 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
        copy dropbox:receipt-index/receipts /app/data/receipts \
        --config /app/.rclone/rclone.conf -v
 
-   ls -l data/backups/          # pick the newest receipt_index-<dow>.dump
+   ls -l data/backups/          # pick the newest receipt_index-<dow>.dump (or a monthly one, below)
    chown -R 1000:1000 data      # sudo if not your uid
    ```
 
@@ -965,6 +965,8 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
            --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" /tmp/restore.dump'
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
+
+   **Restoring from a monthly dump.** Use one when no nightly dump will do: they are all damaged, or the problem you're recovering from was noticed more than seven days late, so every nightly dump already holds it. The steps are the same, with `data/backups/receipt_index-month-<MM>.dump` in the `cp` line. The monthly dump runs at 03:47 UTC on the 1st, and `<MM>` is the month it ran in, not the month it covers: `receipt_index-month-11.dump` holds the database as of 03:47 UTC on 1 November, so it covers October. Check the file's date with `ls -l` before restoring. Everything recorded after that dump is lost, not only one day: messages still in the mailbox are ingested again on the next cycles, as in step 6, but anything no longer there, and any edits made by hand since, have to be redone.
 
 5. Run the checks in [8.4](#84-separate-database-logins) step 7 and Gate B step 5: each URL connects as its login, the scheduler holds no owner credential, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
@@ -1261,7 +1263,14 @@ Sometimes the schedule has to stay off, for example until a backfill finishes, s
 
   [10.1](#101-one-time-setup) step 4 gives the same form for the MCP check.
 - **`up -d` and `up -d scheduler` become `up -d db`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), and leaves the scheduler stopped. Skip `logs -f scheduler`.
-- **Copy a backup made by hand off the host yourself.** The sync cron lines don't run, so the dump from 8.4 step 7d stays in `data/backups` until the schedule starts. To copy it now:
+- **No backup runs, nightly or monthly.** Both dumps are cron lines, so they stop with the scheduler. To take one by hand, as the read login like the scheduled ones, run the script in a one-off container. With no argument it writes today's day-of-week name; with `monthly` it writes this month's `receipt_index-month-<MM>.dump`, replacing the one already there:
+
+  ```bash
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint /app/backup.sh scheduler
+  docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint /app/backup.sh scheduler monthly
+  ```
+
+- **Copy a backup made by hand off the host yourself.** The sync cron lines don't run, so a dump made by hand, such as the one from 8.4 step 7d, stays in `data/backups` until the schedule starts. To copy it now:
 
   ```bash
   docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint rclone scheduler \
