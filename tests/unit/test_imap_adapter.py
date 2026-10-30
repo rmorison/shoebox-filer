@@ -849,6 +849,7 @@ class TestRefusedMessages:
             pipeline, "extract_metadata", MagicMock(return_value=_extraction())
         )
         monkeypatch.setattr(pipeline, "render_pdf", MagicMock(return_value=b"%PDF"))
+        monkeypatch.setattr(pipeline, "record_ingest_evidence", MagicMock())
         store = MagicMock()
         store.put.return_value = StoredFile(
             sha256=None, byte_size=4, media_type="application/pdf", ref="local:x.pdf"

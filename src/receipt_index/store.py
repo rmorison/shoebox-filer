@@ -139,8 +139,9 @@ class StoreFolder:
 class StoredFile:
     """One stored file, as ``put`` records it.
 
-    ``id`` is the ``receipt.stored_files`` row, which arrives with the schema
-    ticket; until then it is None.
+    ``id`` is the ``receipt.stored_files`` row. ``put`` writes no database
+    row, so it leaves ``id`` None; the repository records the row
+    (``record_rendition``) in the caller's transaction.
     """
 
     sha256: bytes | None

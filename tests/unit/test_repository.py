@@ -77,7 +77,7 @@ class TestGetProcessedSourceIds:
         conn = _mock_conn([])
         get_processed_source_ids(conn)
         conn.execute.assert_called_once_with(
-            "SELECT source_id FROM receipt.receipts "
+            "SELECT source_id FROM receipt.provenance "
             "UNION "
             "SELECT source_id FROM receipt.ingest_log"
         )

@@ -111,6 +111,8 @@ class FakeRepo:
     known_after_listing: set[str] = field(default_factory=set)
     fail_on_started: set[str] = field(default_factory=set)
     extractions: list[dict[str, Any]] = field(default_factory=list)
+    provenance: list[dict[str, Any]] = field(default_factory=list)
+    renditions: list[dict[str, Any]] = field(default_factory=list)
     # Every write in order, to check what commits with what.
     writes: list[str] = field(default_factory=list)
     # Receipts the refund linking rule ran on.
@@ -147,6 +149,14 @@ class FakeRepo:
         self.writes.append("receipt")
         self.receipt_kwargs.append({"source_id": source_id, **kwargs})
         return Receipt.model_validate({**_RECEIPT_ROW, "source_id": source_id})
+
+    def insert_provenance(self, conn: Any, *, source_id: str, **kwargs: Any) -> None:
+        self.writes.append("provenance")
+        self.provenance.append({"source_id": source_id, **kwargs})
+
+    def record_rendition(self, conn: Any, **kwargs: Any) -> None:
+        self.writes.append("rendition")
+        self.renditions.append(kwargs)
 
     def link_by_rule(self, conn: Any, receipt: Receipt) -> list[Any]:
         self.writes.append("link_rule")
@@ -325,6 +335,8 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
         "is_source_id_known",
         "insert_ingest_log",
         "insert_receipt",
+        "insert_provenance",
+        "record_rendition",
         "insert_extraction",
         "link_by_rule",
         "save_imap_cursor",
@@ -868,9 +880,9 @@ class TestIngestRecordsItsExtraction:
         _run(FakeAdapter(_imap_read([1])))
         linked = [r.source_id for r in repo.linked]
         assert linked == [repo.receipt_kwargs[0]["source_id"]]
-        receipt_at = repo.writes.index("receipt")
-        assert repo.writes[receipt_at + 1] == "link_rule"
-        assert repo.writes.index("ingest_log:success") > receipt_at + 1
+        link_at = repo.writes.index("link_rule")
+        assert link_at > repo.writes.index("receipt")
+        assert repo.writes.index("ingest_log:success") > link_at
 
     def test_receipt_and_extraction_commit_with_the_success_row(
         self, repo: FakeRepo, extract: MagicMock
@@ -879,12 +891,48 @@ class TestIngestRecordsItsExtraction:
         assert repo.writes == [
             "ingest_log:started",
             "receipt",
+            "provenance",
+            "rendition",
             "link_rule",
             "extraction",
             "ingest_log:success",
         ]
         # insert_receipt leaves the commit to insert_ingest_log.
         assert repo.receipt_kwargs[0]["commit"] is False
+
+    def test_success_records_provenance_and_rendition(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        _run(FakeAdapter(_imap_read([1])))
+        (prov,) = repo.provenance
+        receipt_id = _RECEIPT_ROW["id"]
+        assert prov["source_id"] == repo.receipt_kwargs[0]["source_id"]
+        assert prov["receipt_id"] == receipt_id
+        assert prov["source_name"] == repo.row_kwargs[0]["source_name"]
+        assert prov["received_at"] is not None
+        (rendition,) = repo.renditions
+        assert rendition["receipt_id"] == receipt_id
+        assert rendition["ref"].startswith("local:")
+        assert len(rendition["sha256"]) == 32
+        assert rendition["media_type"] == "application/pdf"
+
+    def test_skip_records_no_provenance(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        extract.return_value = _extraction(confidence=0.2)
+        _run(FakeAdapter(_imap_read([1])))
+        assert repo.provenance == []
+        assert repo.renditions == []
+
+    def test_a_failed_evidence_write_fails_the_item(
+        self, repo: FakeRepo, extract: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            pipeline, "record_rendition", MagicMock(side_effect=RuntimeError("db"))
+        )
+        _run(FakeAdapter(_imap_read([1])))
+        assert "ingest_log:success" not in repo.writes
+        assert repo.writes[-1] == "ingest_log:failed"
 
     def test_skip_writes_no_extraction(
         self, repo: FakeRepo, extract: MagicMock

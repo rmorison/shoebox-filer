@@ -98,8 +98,9 @@ def scratch() -> Iterator[tuple[psycopg.Connection[dict[str, Any]], str]]:
 
 def _receipt(conn: psycopg.Connection[Any], source_id: str) -> Any:
     row = conn.execute(
-        "INSERT INTO receipt.receipts (source_id, source_name, vendor, amount,"
-        " receipt_date, confidence, pdf_path) VALUES (%s, 'personal-email',"
+        "INSERT INTO receipt.receipts (source_id, source_type, source_name, vendor,"
+        " amount, receipt_date, confidence, pdf_path) VALUES (%s, 'imap',"
+        " 'personal-email',"
         " 'Acme Parking (U.S.), LLC', 12.00, '2026-01-15', 0.9, '2026/01/x.pdf')"
         " RETURNING id",
         (source_id,),

@@ -41,11 +41,13 @@ from receipt_index.repository import (
     has_receipt,
     insert_extraction,
     insert_ingest_log,
+    insert_provenance,
     insert_receipt,
     is_due,
     is_source_id_known,
     orphaned_refs,
     record_poll,
+    record_rendition,
     save_drive_cursor,
     save_imap_cursor,
 )
@@ -77,7 +79,7 @@ if TYPE_CHECKING:
         SourceRead,
         SyncState,
     )
-    from receipt_index.store import EvidenceStore
+    from receipt_index.store import EvidenceStore, StoredFile
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +185,41 @@ def _record_failure(
     except Exception:
         logger.warning("Failed to write ingest log for %s", source_id, exc_info=True)
     return cls
+
+
+def record_ingest_evidence(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt: Receipt,
+    raw: RawReceipt,
+    rendition: StoredFile,
+    *,
+    source_name: str,
+    source_type: str,
+) -> None:
+    """Write a new receipt's provenance row and its rendition's records."""
+    insert_provenance(
+        conn,
+        receipt_id=receipt.id,
+        source_type=source_type,
+        source_name=source_name,
+        source_id=raw.source_id,
+        received_at=raw.date,
+        email_subject=raw.subject,
+        email_sender=raw.sender,
+        email_date=_email_date(raw.source_type, raw),
+        file_name=raw.file_name,
+    )
+    if rendition.sha256 is None or rendition.byte_size is None:
+        msg = f"rendition {rendition.ref} has no hash"
+        raise ValueError(msg)
+    record_rendition(
+        conn,
+        receipt_id=receipt.id,
+        ref=rendition.ref,
+        sha256=rendition.sha256,
+        byte_size=rendition.byte_size,
+        media_type=rendition.media_type,
+    )
 
 
 def process_item(
@@ -297,6 +334,11 @@ def process_item(
             email_date=_email_date(raw.source_type, raw),
             file_name=raw.file_name,
             commit=False,
+        )
+        # Its source item and rendition are recorded in the same transaction
+        # (evidence-store design, §7 step 5).
+        record_ingest_evidence(
+            conn, receipt, raw, stored, source_name=source_name, source_type=source_type
         )
         # A refund is linked to its purchase, or a purchase to its waiting
         # refunds, in the same transaction (receipt data-model design, §6).
