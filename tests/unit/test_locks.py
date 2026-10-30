@@ -91,7 +91,7 @@ class TestSourceLock:
         lock = SourceLock("postgresql://db", "personal-email")
 
         assert lock.acquire() is True
-        assert connect.call_args.kwargs == {"autocommit": True}
+        assert connect.call_args.kwargs["autocommit"] is True
         lock.release()
         connect.return_value.close.assert_called_once()
 
@@ -116,3 +116,35 @@ class TestSourceLock:
         conn.execute.side_effect = psycopg.OperationalError("terminated")
         with pytest.raises(SourceLockLostError, match="terminated"):
             lock.check()
+
+
+class TestAcquireConnection:
+    def test_connects_with_a_timeout_and_keepalives(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from receipt_index.locks import SourceLock
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (True,)
+        with patch("receipt_index.locks.psycopg.connect", return_value=conn) as connect:
+            assert SourceLock("postgresql://x", "mail").acquire()
+        kwargs = connect.call_args.kwargs
+        assert kwargs["connect_timeout"] == 10
+        assert kwargs["keepalives"] == 1
+        assert kwargs["tcp_user_timeout"] == 30000
+
+    def test_a_failed_lock_query_closes_the_connection(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        import psycopg
+
+        from receipt_index.locks import SourceLock
+
+        conn = MagicMock()
+        conn.execute.side_effect = psycopg.OperationalError("server closed")
+        with (
+            patch("receipt_index.locks.psycopg.connect", return_value=conn),
+            pytest.raises(psycopg.OperationalError),
+        ):
+            SourceLock("postgresql://x", "mail").acquire()
+        conn.close.assert_called_once()

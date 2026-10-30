@@ -15,6 +15,10 @@ DEFAULT_MODEL = "claude-haiku-5-5"
 # Going lower should wait until it is measured on real receipts.
 EXTRACTION_EFFORT: Final[Literal["medium"]] = "medium"
 
+# A deadline on each model request, below `item_timeout_seconds`, so a hung
+# call raises ModelRequestTimeout (transient) instead of holding the item.
+LLM_REQUEST_TIMEOUT_SECONDS: Final = 180.0
+
 
 def anthropic_model(
     *, api_key: str, model: str
@@ -26,7 +30,7 @@ def anthropic_model(
     No sampling parameters are set; Haiku 5.5 rejects non-default ones.
     """
     llm = AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
-    settings = AnthropicModelSettings()
+    settings = AnthropicModelSettings(request_timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     if llm.profile.get("anthropic_supports_effort", False):
         settings["anthropic_effort"] = EXTRACTION_EFFORT
     return llm, settings

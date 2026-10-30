@@ -114,7 +114,7 @@ def ingest(
 
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
-    from receipt_index.db import get_connection
+    from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
     from receipt_index.extraction import create_extraction_agent
     from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
@@ -192,7 +192,10 @@ def ingest(
                 locked_sources.append(source_config.name)
                 continue
 
-            with get_connection(config.database.url) as conn:
+            with get_connection(
+                config.database.url,
+                statement_timeout_seconds=INGEST_STATEMENT_TIMEOUT_SECONDS,
+            ) as conn:
                 result = run_ingest(
                     conn=conn,
                     adapter=adapter,
@@ -281,6 +284,128 @@ def ingest(
     if locked_sources:
         sys.exit(3)
     if totals.failed > 0 or failed_sources:
+        sys.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--source",
+    "source_names",
+    multiple=True,
+    help="Watch only this source (repeatable). Default: every source.",
+)
+@click.pass_context
+def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
+    """Watch the sources and ingest new items as they arrive, until stopped.
+
+    IMAP sources are watched with IDLE (plus a safety poll), Drive sources
+    are polled, and items due for a retry are run every minute. SIGTERM or
+    Ctrl-C stops it after the item in hand. A source that another process
+    holds is left out; if every source is held, the exit code is 3.
+    """
+    import signal
+
+    from receipt_index.db import (
+        INGEST_CONNECT_TIMEOUT_SECONDS,
+        INGEST_STATEMENT_TIMEOUT_SECONDS,
+        get_connection,
+    )
+    from receipt_index.extraction import (
+        DOCUMENT_SYSTEM_PROMPT,
+        create_extraction_agent,
+    )
+    from receipt_index.locks import SourceLock
+    from receipt_index.retries import RetryPolicy
+    from receipt_index.service import ServeTimings, Service
+    from receipt_index.store import open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+
+    sources = list(config.sources)
+    if source_names:
+        known = {s.name for s in config.sources}
+        unknown = [n for n in source_names if n not in known]
+        if unknown:
+            available = ", ".join(sorted(known))
+            click.echo(
+                f"Error: source(s) not found in config: {', '.join(unknown)}. "
+                f"Available sources: {available}",
+                err=True,
+            )
+            sys.exit(1)
+        sources = [s for s in sources if s.name in source_names]
+
+    locks: dict[str, SourceLock] = {}
+    finished = True
+    held: list[SourceConfig] = []
+    try:
+        for source_config in sources:
+            lock = SourceLock(config.database.url, source_config.name)
+            if lock.acquire():
+                locks[source_config.name] = lock
+                held.append(source_config)
+            else:
+                click.echo(
+                    f"source {source_config.name} is being watched by a running "
+                    "serve; see `receipt-index status`",
+                    err=True,
+                )
+        if not held:
+            sys.exit(3)
+
+        agents = {
+            "email": create_extraction_agent(
+                api_key=config.llm.api_key, model=config.llm.model
+            ),
+            "document": create_extraction_agent(
+                api_key=config.llm.api_key,
+                model=config.llm.model,
+                system_prompt=DOCUMENT_SYSTEM_PROMPT,
+            ),
+        }
+        ingest_config = config.ingest
+        service = Service(
+            sources=held,
+            all_sources=config.sources,
+            locks=locks,
+            timings=ServeTimings(
+                idle_reissue_seconds=ingest_config.idle_reissue_seconds,
+                imap_poll_seconds=ingest_config.imap_poll_seconds,
+                drive_poll_seconds=ingest_config.drive_poll_seconds,
+                item_timeout_seconds=ingest_config.item_timeout_seconds,
+            ),
+            open_conn=lambda: get_connection(
+                config.database.url,
+                statement_timeout_seconds=INGEST_STATEMENT_TIMEOUT_SECONDS,
+                connect_timeout_seconds=INGEST_CONNECT_TIMEOUT_SECONDS,
+            ),
+            adapter_factory=_source_adapter(config),
+            agents=agents,
+            store=open_store(config.store),
+            llm_model=config.llm.model,
+            policy=RetryPolicy.from_config(ingest_config),
+        )
+
+        def _on_signal(signum: int, _frame: object) -> None:
+            # Only a flag: logging or Event.set here could deadlock on a lock
+            # the interrupted main thread holds.
+            service.request_stop()
+
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGINT, _on_signal)
+        logger.info("serve: watching %s", ", ".join(s.name for s in held))
+        service.start()
+        service.wait()
+        finished = service.shutdown()
+        logger.info("serve: stopped")
+    finally:
+        # A worker still running may be using its lock connection: leave the
+        # locks to process exit, which drops them with their connections.
+        if finished:
+            for lock in locks.values():
+                lock.release()
+    if not finished:
         sys.exit(1)
 
 

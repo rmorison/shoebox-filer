@@ -97,6 +97,52 @@ def _header_bytes(data: dict[bytes, Any]) -> bytes | None:
     return None
 
 
+def connect_imap(config: ImapSourceConfig) -> IMAPClient:
+    """Establish an IMAP connection and authenticate.
+
+    Shared by the adapter and ``serve``'s IDLE watcher. TLS is verified: the
+    default context checks the certificate and the host name. Retries up to 3
+    times with exponential backoff on connection errors; authentication and
+    protocol errors aren't retried.
+    """
+    last_err: Exception | None = None
+    for attempt in range(_MAX_CONNECT_RETRIES):
+        try:
+            if config.use_ssl:
+                client = IMAPClient(
+                    config.host,
+                    port=config.port,
+                    ssl=True,
+                    ssl_context=ssl.create_default_context(),
+                    timeout=_IMAP_TIMEOUT_SECONDS,
+                )
+            else:
+                client = IMAPClient(
+                    config.host,
+                    port=config.port,
+                    ssl=False,
+                    timeout=_IMAP_TIMEOUT_SECONDS,
+                )
+            client.login(config.username, config.password)
+            return client
+        except IMAPClientError:
+            raise  # auth/protocol errors are not transient
+        except OSError as exc:
+            last_err = exc
+            if attempt < _MAX_CONNECT_RETRIES - 1:
+                delay = 2**attempt
+                logger.warning(
+                    "IMAP connection attempt %d failed, retrying in %ds: %s",
+                    attempt + 1,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+    raise ConnectionError(
+        f"Failed to connect to IMAP after {_MAX_CONNECT_RETRIES} attempts"
+    ) from last_err
+
+
 class ImapAdapter:
     """Read new receipts from an IMAP folder."""
 
@@ -147,48 +193,7 @@ class ImapAdapter:
         return self._client
 
     def _connect(self) -> IMAPClient:
-        """Establish an IMAP connection and authenticate.
-
-        TLS is verified: the default context checks the certificate and the
-        host name. Retries up to 3 times with exponential backoff on
-        connection errors; authentication and protocol errors aren't retried.
-        """
-        last_err: Exception | None = None
-        for attempt in range(_MAX_CONNECT_RETRIES):
-            try:
-                if self.config.use_ssl:
-                    client = IMAPClient(
-                        self.config.host,
-                        port=self.config.port,
-                        ssl=True,
-                        ssl_context=ssl.create_default_context(),
-                        timeout=_IMAP_TIMEOUT_SECONDS,
-                    )
-                else:
-                    client = IMAPClient(
-                        self.config.host,
-                        port=self.config.port,
-                        ssl=False,
-                        timeout=_IMAP_TIMEOUT_SECONDS,
-                    )
-                client.login(self.config.username, self.config.password)
-                return client
-            except IMAPClientError:
-                raise  # auth/protocol errors are not transient
-            except OSError as exc:
-                last_err = exc
-                if attempt < _MAX_CONNECT_RETRIES - 1:
-                    delay = 2**attempt
-                    logger.warning(
-                        "IMAP connection attempt %d failed, retrying in %ds: %s",
-                        attempt + 1,
-                        delay,
-                        exc,
-                    )
-                    time.sleep(delay)
-        raise ConnectionError(
-            f"Failed to connect to IMAP after {_MAX_CONNECT_RETRIES} attempts"
-        ) from last_err
+        return connect_imap(self.config)
 
     # -- reading ---------------------------------------------------------
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import errno
+import os
+
 import pytest
 from pydantic_ai.exceptions import (
     ContentFilterError,
@@ -152,3 +155,35 @@ class TestChains:
                 raise RuntimeError("while handling")  # noqa: B904
         except RuntimeError as exc:
             assert classify(exc) == "transient"
+
+
+class TestEnvironmentFailures:
+    """A local failure that would hit every item is transient, not content."""
+
+    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+    def test_disk_full_is_transient(self, code: int) -> None:
+        assert classify(OSError(code, os.strerror(code))) == "transient"
+
+    def test_disk_full_under_a_wrapper_is_transient(self) -> None:
+        try:
+            try:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            except OSError as inner:
+                raise RuntimeError("store write failed") from inner
+        except RuntimeError as outer:
+            assert classify(outer) == "transient"
+
+    def test_other_os_errors_stay_content(self) -> None:
+        assert classify(OSError(errno.EACCES, "Permission denied")) == "content"
+
+    def test_statement_timeout_is_transient(self) -> None:
+        from psycopg import errors as pg_errors
+
+        exc = pg_errors.QueryCanceled("canceling statement due to statement timeout")
+        assert classify(exc) == "transient"
+
+
+def test_a_full_database_disk_is_transient() -> None:
+    from psycopg import errors as pg_errors
+
+    assert classify(pg_errors.DiskFull("could not extend file")) == "transient"

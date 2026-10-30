@@ -145,13 +145,35 @@ class LoggingConfig(BaseModel):
 class IngestConfig(BaseModel):
     """Ingest timing (the ``ingest:`` block).
 
-    Only the keys the current ingest uses are defined; later keys arrive
-    with the features that read them. Every key has a default.
+    Only the keys the current ingest and ``serve`` use are defined; later
+    keys (``health:``) arrive with the features that read them. Every key has
+    a default, so a config without the block loads unchanged.
     """
 
     # A Drive change younger than this is left for the next run, because
     # scanner apps can create a file and upload its content in a second step.
     drive_settle_seconds: int = Field(default=60, ge=0)
+
+    # `serve` (design sections 1, 2 and 4). IDLE is re-issued this often even
+    # when nothing happened; RFC 2177 lets a server drop an idle client after
+    # 29 minutes, and routers often drop idle flows sooner.
+    idle_reissue_seconds: int = Field(default=600, ge=60)
+    # The IMAP safety poll, which runs whether or not IDLE fired (and is the
+    # only poll on a server without IDLE), and the Drive poll interval.
+    imap_poll_seconds: int = Field(default=240, ge=30)
+    drive_poll_seconds: int = Field(default=120, ge=30)
+    # How long one step (an item, or a source's listing) may run before
+    # `serve`'s watchdog exits the process. A slow but healthy item must never
+    # reach it, because the restart charges the item a content attempt. The
+    # floor is the sum of the deadlines one item can meet without failing:
+    #   a retry's re-fetch reconnecting to IMAP (3 tries x 120 s + 3 s) 363
+    #   the body fetch (IMAP socket timeout)                              120
+    #   two model requests (one output retry; 180 s covers SDK retries)   360
+    #   Playwright: launch, content and PDF, 60 s each                    180
+    #   one database statement (statement_timeout)                         60
+    #   weasyprint after a Playwright timeout (no deadline of its own)    117
+    #                                                                    1200
+    item_timeout_seconds: int = Field(default=1200, ge=1200)
 
     # Retries (design section 6). A content failure uses up an attempt and is
     # due again after the backoff for its attempt number; the failure that

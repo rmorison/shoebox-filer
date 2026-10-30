@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A deadline on launching Chromium and on each page step (content, PDF), so a
+# hung browser raises; the render then falls back to weasyprint.
+PLAYWRIGHT_TIMEOUT_SECONDS = 60
+_PLAYWRIGHT_TIMEOUT_MS = PLAYWRIGHT_TIMEOUT_SECONDS * 1000
+
 #: URL schemes whose payload travels with the document — fetching them causes
 #: no network or filesystem I/O. Everything else (http, https, file, ftp,
 #: protocol-relative and relative references) counts as remote.
@@ -282,7 +287,7 @@ def _html_to_pdf_playwright(html_content: str) -> bytes:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = ".playwright"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(timeout=_PLAYWRIGHT_TIMEOUT_MS)
         try:
             # JS off: email HTML never legitimately needs scripts (mail clients
             # do not run them), and route() cannot intercept WebSockets that
@@ -290,6 +295,7 @@ def _html_to_pdf_playwright(html_content: str) -> bytes:
             context = browser.new_context(java_script_enabled=False)
             context.route("**/*", _block_remote_requests)
             page = context.new_page()
+            page.set_default_timeout(_PLAYWRIGHT_TIMEOUT_MS)
             page.set_content(html_content, wait_until="domcontentloaded")
             pdf_bytes: bytes = page.pdf(format="Letter")
             return pdf_bytes

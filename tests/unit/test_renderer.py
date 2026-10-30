@@ -644,3 +644,40 @@ class TestPlaywrightEgressBlocking:
         assert REMOTE_IMAGE_URL in seen, "request never reached the route handler"
         # Blocked != timeout: aborts are immediate, so the render stays fast.
         assert elapsed < 30
+
+
+class TestPlaywrightTimeouts:
+    """Every Playwright step has a deadline, so a hung Chromium raises."""
+
+    def test_launch_and_page_steps_have_timeouts(self) -> None:
+        from receipt_index import renderer
+
+        pw = MagicMock()
+        page = pw.chromium.launch.return_value.new_context.return_value.new_page
+        page.return_value.pdf.return_value = b"%PDF"
+        manager = MagicMock()
+        manager.__enter__.return_value = pw
+        with patch("playwright.sync_api.sync_playwright", return_value=manager):
+            assert _html_to_pdf_playwright("<p>hi</p>") == b"%PDF"
+
+        ms = renderer.PLAYWRIGHT_TIMEOUT_SECONDS * 1000
+        pw.chromium.launch.assert_called_once_with(timeout=ms)
+        page.return_value.set_default_timeout.assert_called_once_with(ms)
+
+    def test_a_playwright_timeout_falls_back_to_weasyprint(self) -> None:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+        from receipt_index.renderer import _html_to_pdf_bytes
+
+        with (
+            patch(
+                "receipt_index.renderer._html_to_pdf_playwright",
+                side_effect=PlaywrightTimeout("Timeout 60000ms exceeded"),
+            ),
+            patch(
+                "receipt_index.renderer._html_to_pdf_weasyprint",
+                return_value=b"%PDF-wp",
+            ) as weasy,
+        ):
+            assert _html_to_pdf_bytes("<p>hi</p>") == b"%PDF-wp"
+        weasy.assert_called_once()

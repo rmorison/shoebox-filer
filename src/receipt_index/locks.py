@@ -59,9 +59,30 @@ class SourceLock:
         self._conn: psycopg.Connection[Any] | None = None
 
     def acquire(self) -> bool:
-        """Try to take the lock without waiting. Return whether it was taken."""
-        conn = psycopg.connect(self.database_url, autocommit=True)
-        row = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()
+        """Try to take the lock without waiting. Return whether it was taken.
+
+        The connection has a connect timeout and TCP keepalives, so a database
+        host that stops answering makes ``check`` fail instead of hanging.
+        """
+        conn = psycopg.connect(
+            self.database_url,
+            autocommit=True,
+            # Give up connecting after 10 s. Notice a dead peer in about 90 s
+            # when idle (keepalives), or 30 s after a query goes unanswered.
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=6,
+            tcp_user_timeout=30000,
+        )
+        try:
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock(%s)", (self.key,)
+            ).fetchone()
+        except Exception:
+            conn.close()
+            raise
         if row is None or not row[0]:
             conn.close()
             return False

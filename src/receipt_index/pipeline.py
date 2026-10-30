@@ -17,9 +17,10 @@ most likely fail the same way.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.errors import classify
@@ -61,6 +62,7 @@ from receipt_index.store import pdf_path_for, store_rendition
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from contextlib import AbstractContextManager
 
     import psycopg
     from pydantic_ai import Agent
@@ -89,6 +91,25 @@ _MIN_CONFIDENCE = MIN_RECEIPT_CONFIDENCE
 _DIED_MID_ITEM = "the process stopped mid-item (found by the retry scheduler)"
 
 ItemStatus = Literal["success", "skipped", "failed", "known", "locked"]
+
+
+class RunControl(Protocol):
+    """How a long-running caller (``serve``) steers the item loops.
+
+    ``should_stop`` is asked before each item: the loops stop between items,
+    so no item is left half-done and the cursor rule holds. ``running`` wraps
+    each item, so a watchdog can time it.
+    """
+
+    def should_stop(self) -> bool: ...
+
+    def running(self, source_id: str) -> AbstractContextManager[object]: ...
+
+
+def _running(
+    control: RunControl | None, source_id: str
+) -> AbstractContextManager[object]:
+    return nullcontext() if control is None else control.running(source_id)
 
 
 @dataclass
@@ -643,12 +664,14 @@ def run_ingest(
     limit: int | None = None,
     source_lock: SourceLock | None = None,
     policy: RetryPolicy | None = None,
+    control: RunControl | None = None,
 ) -> IngestResult:
     """Read what is new in one source and process it, one item at a time.
 
     The caller holds ``source_lock`` (the CLI does); it is checked before
     every cursor write. ``dry_run`` reads the new range but writes nothing:
     no rows, no locks, no cursor. ``limit`` caps the unseen items handled.
+    ``control`` (``serve``'s) can stop the loop between items.
     """
     result = IngestResult()
     with adapter:
@@ -704,6 +727,9 @@ def run_ingest(
                     continue
                 if limit is not None and attempted >= limit:
                     break
+                if control is not None and control.should_stop():
+                    logger.info("Source %s: stopping between items", source_name)
+                    break
                 attempted += 1
 
                 if dry_run:
@@ -711,17 +737,18 @@ def run_ingest(
                     result.skipped += 1
                     continue
 
-                outcome = handle_item(
-                    conn,
-                    adapter,
-                    ref,
-                    store=store,
-                    source_name=source_name,
-                    source_type=source_type,
-                    agent=agent,
-                    llm_model=llm_model,
-                    policy=policy,
-                )
+                with _running(control, ref.source_id):
+                    outcome = handle_item(
+                        conn,
+                        adapter,
+                        ref,
+                        store=store,
+                        source_name=source_name,
+                        source_type=source_type,
+                        agent=agent,
+                        llm_model=llm_model,
+                        policy=policy,
+                    )
                 if outcome.status == "locked":
                     logger.info(
                         "Item %s is locked by another process; leaving it",
@@ -801,6 +828,7 @@ def run_due_retries(
     llm_model: str,
     policy: RetryPolicy | None = None,
     own_source: str | None = None,
+    control: RunControl | None = None,
 ) -> RetryResult:
     """Run the items that are due again, one at a time.
 
@@ -817,11 +845,18 @@ def run_due_retries(
     ends when ``own_source`` (the source it runs for) can't be reached, or
     on a transient or config failure. When another source of the type can't
     be reached, only the item being looked for there is left for later.
+    ``control`` (``serve``'s) can stop the pass between items.
     """
     policy = policy or RetryPolicy()
     result = RetryResult()
     for entry in due:
-        with item_lock(conn, entry.source_id) as locked:
+        if control is not None and control.should_stop():
+            logger.info("Retries: stopping between items")
+            break
+        with (
+            _running(control, entry.source_id),
+            item_lock(conn, entry.source_id) as locked,
+        ):
             if not locked:
                 logger.info("Item %s is locked; leaving it", entry.source_id)
                 continue
