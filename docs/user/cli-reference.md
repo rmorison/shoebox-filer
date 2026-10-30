@@ -121,7 +121,7 @@ A failed item is retried by a later run. Each failure is recorded with a class:
 
 | Class | Examples | Uses up an attempt | Retried after |
 |---|---|---|---|
-| `transient` | The LLM is overloaded or rate-limited, a server error, a dropped connection or timeout, a source that can't be reached, a full disk or quota, a database statement that ran past its timeout | No | 30 seconds, doubling with each such failure in a row, up to 15 minutes |
+| `transient` | The LLM is overloaded or rate-limited, a server error, a dropped connection or timeout, a source that can't be reached, a full disk or quota (local or the database's), a database statement that ran past its timeout | No | 30 seconds, doubling with each such failure in a row, up to 15 minutes |
 | `config` | The LLM API key is rejected, the account's credits ran out, or the configured model doesn't exist (a retired or mistyped `llm.model`) | No | The same as `transient` |
 | `content` | The message can't be parsed or rendered, the extraction fails validation, the model declines the request | Yes | `ingest.retry_backoff_seconds` for that attempt (5 minutes, then 30 minutes) |
 
@@ -181,17 +181,17 @@ uv run receipt-index serve [--source NAME]...
 - **IMAP sources** are watched with IDLE on a connection of their own. When the server reports new mail, the source is read at once. IDLE is re-issued every `ingest.idle_reissue_seconds` (default 600), since servers and home routers drop idle connections. A **safety poll** reads each IMAP source every `ingest.imap_poll_seconds` (default 240) whether or not IDLE fired. On a server without IDLE, the safety poll is the only poll.
 - **Google Drive sources** are read every `ingest.drive_poll_seconds` (default 120).
 - **Retries** due for each source run every minute.
-- One worker processes items one at a time. A source that stops on a `transient` or `config` failure is left alone for 30 seconds, doubling with each stop in a row up to 15 minutes. Its failed item comes back through the retry pass when it is due.
+- One worker processes items one at a time. A source that stops on a `transient` or `config` failure is left alone for 30 seconds, doubling with each stop in a row up to 15 minutes. Its failed item comes back through the retry pass when it is due. A poll or retry that falls in a pause is dropped, not saved for later: the source's next scheduled poll or retry picks it up, so mail that arrives during a pause waits for the next safety poll.
 - A source that another process holds (a running `ingest`, or another `serve`) is left out at start-up. A one-shot `ingest` started while `serve` runs exits with code 3 for the sources `serve` holds.
-- **Stopping**: SIGTERM or Ctrl-C stops the watchers at once. The worker finishes the item in hand, then stops, so no item is left half-done. Items still queued are read again on the next start.
-- **Watchdog**: if one item, or one read of a source, runs longer than `ingest.item_timeout_seconds` (default 600), `serve` logs it and exits with code 4, so that a container restart policy brings it back. The item's unfinished attempt is then recorded as a failure that uses up an attempt.
+- **Stopping**: SIGTERM or Ctrl-C stops the watchers at once. The worker finishes the item in hand, then stops, so no item is left half-done. Items still queued are read again on the next start. A stop takes up to `ingest.item_timeout_seconds` plus 30 seconds, so a container's stop grace period must be longer than that.
+- **Watchdog**: if one item, or one read of a source, runs longer than `ingest.item_timeout_seconds` (default 1200), `serve` logs it and exits with code 4, so that a container restart policy brings it back. The item's unfinished attempt is then recorded as a failure that uses up an attempt.
 
 ```yaml
 ingest:
   idle_reissue_seconds: 600   # at least 60
   imap_poll_seconds: 240      # at least 30
   drive_poll_seconds: 120     # at least 30
-  item_timeout_seconds: 600   # at least 600, the sum of an item's per-call timeouts
+  item_timeout_seconds: 1200  # at least 1200, the sum of the deadlines one item can meet
 ```
 
 **Exit codes**:

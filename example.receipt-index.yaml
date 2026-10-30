@@ -71,7 +71,7 @@ ingest:
   idle_reissue_seconds: 600            # re-issue IMAP IDLE this often (at least 60)
   imap_poll_seconds: 240               # IMAP safety poll, IDLE or not (at least 30)
   drive_poll_seconds: 120              # Drive poll interval (at least 30)
-  item_timeout_seconds: 600            # the watchdog exits serve past this (at least 600)
+  item_timeout_seconds: 1200           # the watchdog exits serve past this (at least 1200)
 
 # ---------------------------------------------------------------------------
 # Annotations — changes made after extraction (optional block)

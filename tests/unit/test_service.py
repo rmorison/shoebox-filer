@@ -820,3 +820,226 @@ class TestNormalStop:
         svc.stop()
         assert svc.shutdown() is True
         assert svc.worker_failed is False
+
+
+# ---------------------------------------------------------------------------
+# Lead review: a server that says BYE and closes, re-issue EXISTS, signals
+# ---------------------------------------------------------------------------
+
+
+class ByeServer:
+    """A tiny IMAP server: greets, logs in, EXAMINEs, IDLEs, then says BYE.
+
+    After IDLE starts it sends ``* BYE`` and closes the connection, which is
+    what a server going down for maintenance does.
+    """
+
+    def __init__(self) -> None:
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.sock.settimeout(_WAIT)
+        self.port = self.sock.getsockname()[1]
+        self.connections = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self._session, args=(conn,), daemon=True).start()
+
+    def _session(self, conn: socket.socket) -> None:
+        conn.settimeout(_WAIT)
+        f = conn.makefile("rwb")
+
+        def say(line: str) -> None:
+            f.write(line.encode() + b"\r\n")
+            f.flush()
+
+        try:
+            say("* OK [CAPABILITY IMAP4rev1 IDLE] ready")
+            while True:
+                raw = f.readline()
+                if not raw:
+                    return
+                tag, cmd = raw.decode().split(" ", 2)[:2]
+                cmd = cmd.strip().upper()
+                if cmd == "CAPABILITY":
+                    say("* CAPABILITY IMAP4rev1 IDLE")
+                    say(f"{tag} OK done")
+                elif cmd in ("EXAMINE", "SELECT"):
+                    say("* 0 EXISTS")
+                    say("* OK [UIDVALIDITY 1] ok")
+                    say(f"{tag} OK [READ-ONLY] done")
+                elif cmd == "IDLE":
+                    say("+ idling")
+                    time.sleep(0.1)
+                    say("* BYE server shutting down")
+                    conn.shutdown(socket.SHUT_RDWR)
+                    return
+                else:
+                    say(f"{tag} OK done")
+        except OSError:
+            return
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        self.sock.close()
+
+
+class TestByeAndClose:
+    def test_a_server_that_says_bye_and_closes_is_reconnected_at_once(self) -> None:
+        from imapclient import IMAPClient
+
+        server = ByeServer()
+        counted = {"checks": 0}
+
+        def connect(config: ImapSourceConfig) -> Any:
+            client = IMAPClient("127.0.0.1", port=server.port, ssl=False, timeout=5)
+            client.login("user", "pw")
+            original = client.idle_check
+
+            def counting(timeout: float | None = None) -> Any:
+                counted["checks"] += 1
+                return original(timeout=timeout)
+
+            client.idle_check = counting  # type: ignore[method-assign]
+            return client
+
+        queue, stop = RecordingQueue(), threading.Event()
+        watcher = IdleWatcher(
+            _imap(),
+            queue,  # type: ignore[arg-type]
+            stop,
+            reissue_seconds=600,
+            connect=connect,
+            check_slice=1.0,
+            backoff_first=0.05,
+            backoff_max=0.05,
+        )
+        try:
+            with _watching(watcher, stop):
+                # A spinning watcher stays on the dead connection until its
+                # re-issue time; a correct one reconnects within the slice.
+                reconnected = _until(lambda: server.connections >= 2, timeout=3.0)
+                assert reconnected, "the watcher never left the closed connection"
+        finally:
+            server.close()
+        # Each connection gets a handful of checks, not thousands.
+        assert counted["checks"] < 50 * server.connections
+
+    def test_a_bye_response_drops_the_session(self) -> None:
+        dropped = FakeIMAP([[(b"BYE", b"server shutting down")]])
+        fresh = FakeIMAP()
+        connect = Connector([dropped, fresh])
+        queue, stop = RecordingQueue(), threading.Event()
+        with _watching(_watcher(connect, queue, stop), stop):
+            assert _until(lambda: fresh.count("idle") >= 1)
+        assert connect.calls == 2
+
+
+class TestExistsAtReissue:
+    def test_exists_reported_while_leaving_idle_queues_a_poll(self) -> None:
+        class ExistsOnDone(FakeIMAP):
+            def idle_done(self) -> tuple[Any, list[Any]]:
+                super().idle_done()
+                return (b"OK", [(4, b"EXISTS")])
+
+        client = ExistsOnDone()
+        queue, stop = RecordingQueue(), threading.Event()
+        watcher = _watcher(Connector([client]), queue, stop, reissue_seconds=0.05)
+        with _watching(watcher, stop):
+            assert _until(lambda: queue.count(_POLL) >= 2)
+
+
+class TestKeepaliveTimings:
+    def test_the_idle_socket_detects_a_dead_peer_within_minutes(self) -> None:
+        client = FakeIMAP()
+        queue, stop = RecordingQueue(), threading.Event()
+        with _watching(_watcher(Connector([client]), queue, stop), stop):
+            assert _until(lambda: client.count("idle") >= 1)
+        calls = {c.args[:2]: c.args[2] for c in client.sock.setsockopt.call_args_list}
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            idle = calls[(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE)]
+            intvl = calls[(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL)]
+            count = calls[(socket.IPPROTO_TCP, socket.TCP_KEEPCNT)]
+            assert idle + intvl * count <= 180
+
+
+class TestSignalSafeStop:
+    def _service(self) -> service.Service:
+        sources = [_drive("scans")]
+        return service.Service(
+            sources=sources,
+            all_sources=sources,
+            locks={"scans": MagicMock()},
+            timings=service.ServeTimings(
+                idle_reissue_seconds=60,
+                imap_poll_seconds=3600,
+                drive_poll_seconds=3600,
+                item_timeout_seconds=1200,
+                join_seconds=5,
+            ),
+            open_conn=lambda: MagicMock(closed=False, broken=False),
+            adapter_factory=MagicMock(),
+            agents={"email": MagicMock(), "document": MagicMock()},
+            store=MagicMock(),
+            llm_model="test-model",
+            policy=MagicMock(),
+            exit_fn=MagicMock(),
+        )
+
+    def test_the_signal_path_takes_no_lock(self) -> None:
+        svc = self._service()
+
+        class NoSetEvent(threading.Event):
+            def set(self) -> None:
+                raise AssertionError("a signal handler must not call Event.set")
+
+        svc.stop_event = NoSetEvent()
+        svc.request_stop()  # what the SIGTERM handler calls
+
+    def test_wait_returns_after_a_requested_stop_and_then_stops(
+        self, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        svc = self._service()
+        svc.start()
+        timer = threading.Timer(0.1, svc.request_stop)
+        timer.start()
+        start = time.monotonic()
+        svc.wait(poll_seconds=0.05)
+        assert time.monotonic() - start < 2.0
+        assert svc.stop_event.is_set()
+        assert svc.shutdown() is True
+
+
+class TestWatchdogExitsWithoutLoggingShutdown:
+    def test_the_exit_doesnt_wait_on_logging_locks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging
+
+        def hang() -> None:
+            raise AssertionError("logging.shutdown can block on a held lock")
+
+        monkeypatch.setattr(logging, "shutdown", hang)
+        now, exits = Clock(), []
+        clock = ItemClock(now=now)
+        loop = HealthLoop(
+            clock,
+            stop=threading.Event(),
+            worker_done=threading.Event(),
+            item_timeout_seconds=600,
+            exit_fn=exits.append,
+            now=now,
+        )
+        with clock.job(Job("poll", "mail")):
+            now.now += 601
+            loop.check()
+        assert exits == [service.WATCHDOG_EXIT_CODE]

@@ -267,7 +267,7 @@ class TestServeKeys:
         assert config.idle_reissue_seconds == 600
         assert config.imap_poll_seconds == 240
         assert config.drive_poll_seconds == 120
-        assert config.item_timeout_seconds == 600
+        assert config.item_timeout_seconds == 1200
 
     @pytest.mark.parametrize(
         ("key", "floor"),
@@ -275,7 +275,7 @@ class TestServeKeys:
             ("idle_reissue_seconds", 60),
             ("imap_poll_seconds", 30),
             ("drive_poll_seconds", 30),
-            ("item_timeout_seconds", 600),
+            ("item_timeout_seconds", 1200),
         ],
     )
     def test_floors(self, key: str, floor: int) -> None:

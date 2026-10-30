@@ -1662,6 +1662,9 @@ class FakeService:
     def stop(self) -> None:
         self.calls.append("stop")
 
+    def request_stop(self) -> None:
+        self.calls.append("request_stop")
+
     finished: ClassVar[bool] = True
 
     def shutdown(self) -> bool:
@@ -1793,7 +1796,7 @@ class TestServeWiring:
 
     @pytest.mark.parametrize(("finished", "code"), [(True, 0), (False, 1)])
     @patch("receipt_index.cli.load_config")
-    def test_exit_code_follows_shutdown_and_locks_are_released(
+    def test_exit_code_follows_shutdown(
         self,
         mock_load_config: MagicMock,
         config_file: Path,
@@ -1807,4 +1810,44 @@ class TestServeWiring:
         with patch("receipt_index.locks.SourceLock", ReleaseRecordingLock):
             result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
         assert result.exit_code == code, result.output
-        assert sorted(ReleaseRecordingLock.released) == ["other-email", "test-email"]
+        # Released on a clean stop; left to process exit when the worker is
+        # still running (TestServeLockRelease).
+        expected = ["other-email", "test-email"] if finished else []
+        assert sorted(ReleaseRecordingLock.released) == expected
+
+
+class TestServeLockRelease:
+    @patch("receipt_index.cli.load_config")
+    def test_locks_are_left_to_process_exit_when_the_worker_is_still_running(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_service: type[FakeService],
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_service.finished = False
+        ReleaseRecordingLock.released = []
+        with patch("receipt_index.locks.SourceLock", ReleaseRecordingLock):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+        assert result.exit_code == 1, result.output
+        assert ReleaseRecordingLock.released == []
+
+    @patch("receipt_index.cli.load_config")
+    def test_the_signal_handler_only_requests_a_stop(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_service: type[FakeService],
+    ) -> None:
+        import signal as signal_module
+
+        mock_load_config.return_value = _two_source_config()
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+        assert result.exit_code == 0, result.output
+        handlers = {
+            c.args[0]: c.args[1]
+            for c in signal_module.signal.call_args_list  # type: ignore[attr-defined]
+        }
+        (service,) = fake_service.instances
+        handlers[signal_module.SIGTERM](signal_module.SIGTERM, None)
+        assert service.calls[-1] == "request_stop"

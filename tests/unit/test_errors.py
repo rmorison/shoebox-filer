@@ -181,3 +181,9 @@ class TestEnvironmentFailures:
 
         exc = pg_errors.QueryCanceled("canceling statement due to statement timeout")
         assert classify(exc) == "transient"
+
+
+def test_a_full_database_disk_is_transient() -> None:
+    from psycopg import errors as pg_errors
+
+    assert classify(pg_errors.DiskFull("could not extend file")) == "transient"

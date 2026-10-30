@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 # Server-side default for every transaction on the session: any INSERT,
@@ -41,12 +42,17 @@ def get_connection(
     connect_timeout_seconds:
         When set, connecting gives up after this long.
 
-    Either option replaces any ``options`` parameter given in the URL.
+    Either option is added to any ``options`` parameter given in the URL.
     """
     extra: dict[str, object] = {}
     if connect_timeout_seconds is not None:
         extra["connect_timeout"] = connect_timeout_seconds
     options: list[str] = []
+    if read_only or statement_timeout_seconds is not None:
+        # Keep any options the URL already sets (a search_path, say).
+        url_options = conninfo_to_dict(database_url).get("options")
+        if url_options:
+            options.append(str(url_options))
     if read_only:
         options.append(_READ_ONLY_OPTIONS)
     if statement_timeout_seconds is not None:

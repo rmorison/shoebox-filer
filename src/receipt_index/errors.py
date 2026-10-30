@@ -37,7 +37,7 @@ class TransientError(Exception):
 
 
 def _transient_types() -> tuple[type[BaseException], ...]:
-    from psycopg.errors import QueryCanceled
+    from psycopg.errors import DiskFull, QueryCanceled
     from pydantic_ai.exceptions import (
         ModelConnectionError,
         ModelRateLimitError,
@@ -51,6 +51,7 @@ def _transient_types() -> tuple[type[BaseException], ...]:
     return (
         TransientError,
         QueryCanceled,  # a statement_timeout
+        DiskFull,  # the database's disk, like ENOSPC on ours
         SourceUnavailableError,
         ModelRateLimitError,
         ModelUnavailableError,  # ModelOverloadedError is a subclass

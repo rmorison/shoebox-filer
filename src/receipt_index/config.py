@@ -162,10 +162,18 @@ class IngestConfig(BaseModel):
     # only poll on a server without IDLE), and the Drive poll interval.
     imap_poll_seconds: int = Field(default=240, ge=30)
     drive_poll_seconds: int = Field(default=120, ge=30)
-    # How long one item may run before `serve`'s watchdog exits the process.
-    # The floor is the sum of the per-call deadlines an item can meet: two
-    # model requests (180 s each), Playwright (180 s) and an IMAP fetch (120 s).
-    item_timeout_seconds: int = Field(default=600, ge=600)
+    # How long one step (an item, or a source's listing) may run before
+    # `serve`'s watchdog exits the process. A slow but healthy item must never
+    # reach it, because the restart charges the item a content attempt. The
+    # floor is the sum of the deadlines one item can meet without failing:
+    #   a retry's re-fetch reconnecting to IMAP (3 tries x 120 s + 3 s) 363
+    #   the body fetch (IMAP socket timeout)                              120
+    #   two model requests (one output retry; 180 s covers SDK retries)   360
+    #   Playwright: launch, content and PDF, 60 s each                    180
+    #   one database statement (statement_timeout)                         60
+    #   weasyprint after a Playwright timeout (no deadline of its own)    117
+    #                                                                    1200
+    item_timeout_seconds: int = Field(default=1200, ge=1200)
 
     # Retries (design section 6). A content failure uses up an attempt and is
     # due again after the backoff for its attempt number; the failure that

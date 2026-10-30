@@ -83,6 +83,13 @@ IDLE_CHECK_SLICE_SECONDS = 1.0  # how soon a watcher sees a stop
 RECONNECT_FIRST_SECONDS = 5.0
 RECONNECT_MAX_SECONDS = 300.0
 AUTH_RETRY_SECONDS = 900.0
+# Instant empty IDLE checks in a row that mean the connection has closed.
+_FAST_EMPTY_LIMIT = 3
+# TCP keepalive on the IDLE socket: a peer that vanished (a NAT that dropped
+# the flow) is noticed after about 2 minutes, not Linux's default 2 hours.
+_KEEPALIVE_IDLE_SECONDS = 60
+_KEEPALIVE_INTERVAL_SECONDS = 15
+_KEEPALIVE_COUNT = 4
 
 JobKind = Literal["poll", "retry"]
 
@@ -266,8 +273,7 @@ class IdleWatcher:
     def _open(self) -> IMAPClient:
         client = self._connect(self.config)
         try:
-            sock = client.socket()
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            _set_keepalive(client.socket())
             client.select_folder(self.config.folder, readonly=True)  # EXAMINE
         except Exception:
             _logout(client)
@@ -283,26 +289,63 @@ class IdleWatcher:
         self._healthy = False
         client.idle()
         started = time.monotonic()
+        fast_empty = 0
         while not self.stop.is_set():
+            checked = time.monotonic()
             responses = client.idle_check(timeout=self.check_slice)
+            if any(_is_bye(r) for r in responses):
+                raise ConnectionError("the IMAP server ended the session (BYE)")
+            # imapclient returns at once with nothing when the socket reads
+            # EOF: a closed connection looks like a burst of instant empty
+            # checks, not like a quiet server.
+            if not responses and time.monotonic() - checked < self.check_slice / 2:
+                fast_empty += 1
+                if fast_empty >= _FAST_EMPTY_LIMIT:
+                    raise ConnectionError("the IMAP server closed the connection")
+                continue
+            fast_empty = 0
             if any(_is_exists(r) for r in responses):
-                client.idle_done()
+                self._leave_idle(client)
                 self.queue.put(self._poll)
                 client.idle()
                 started = time.monotonic()
                 self._healthy = True
             elif time.monotonic() - started >= self.reissue_seconds:
-                client.idle_done()
+                if self._leave_idle(client):
+                    self.queue.put(self._poll)
                 client.idle()
                 started = time.monotonic()
                 self._healthy = True
-        client.idle_done()
+        if self._leave_idle(client):
+            self.queue.put(self._poll)
+
+    @staticmethod
+    def _leave_idle(client: IMAPClient) -> bool:
+        """End IDLE. Return whether the server reported new mail meanwhile."""
+        done = client.idle_done()
+        responses = done[1] if isinstance(done, tuple) and len(done) > 1 else []
+        return any(_is_exists(r) for r in responses or [])
+
+
+def _is_bye(response: Any) -> bool:
+    return isinstance(response, tuple) and len(response) > 0 and response[0] == b"BYE"
 
 
 def _is_exists(response: Any) -> bool:
     return (
         isinstance(response, tuple) and len(response) > 1 and response[1] == b"EXISTS"
     )
+
+
+def _set_keepalive(sock: Any) -> None:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for option, value in (
+        ("TCP_KEEPIDLE", _KEEPALIVE_IDLE_SECONDS),
+        ("TCP_KEEPINTVL", _KEEPALIVE_INTERVAL_SECONDS),
+        ("TCP_KEEPCNT", _KEEPALIVE_COUNT),
+    ):
+        if hasattr(socket, option):  # Linux; other platforms keep defaults
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, option), value)
 
 
 def _logout(client: Any) -> None:
@@ -355,7 +398,13 @@ class Timer:
 
 
 class Worker:
-    """Runs jobs one at a time through the existing ingest and retry paths."""
+    """Runs jobs one at a time through the existing ingest and retry paths.
+
+    A job for a paused source is dropped, not deferred: the timer queues the
+    source's next poll or retry job at its interval, and that one runs once
+    the pause has passed. A wake-up from IDLE during a pause is therefore
+    picked up by the next safety poll.
+    """
 
     def __init__(
         self,
@@ -611,7 +660,8 @@ class HealthLoop:
                 running,
                 self.item_timeout_seconds,
             )
-            logging.shutdown()
+            # No logging.shutdown(): the stuck thread may hold a handler's
+            # lock. The stream handler has already written the line.
             self._exit(WATCHDOG_EXIT_CODE)
 
 
@@ -700,6 +750,7 @@ class Service:
         self._threads: list[threading.Thread] = []
         self._worker_thread: threading.Thread | None = None
         self.worker_failed = False
+        self._stop_requested = False
 
     def start(self) -> None:
         def work() -> None:
@@ -729,13 +780,25 @@ class Service:
         return thread
 
     def stop(self) -> None:
-        """Ask every thread to stop. Safe to call from a signal handler."""
+        """Ask every thread to stop. Not for a signal handler: use ``request_stop``."""
         self.stop_event.set()
 
+    def request_stop(self) -> None:
+        """Ask for a stop from a signal handler.
+
+        It only sets a flag: ``Event.set`` takes a lock the interrupted main
+        thread may already hold inside ``Event.wait``. ``wait`` turns the
+        flag into a ``stop()``.
+        """
+        self._stop_requested = True
+
     def wait(self, poll_seconds: float = 1.0) -> None:
-        """Block until ``stop()``, waking often so signals are handled."""
-        while not self.stop_event.wait(poll_seconds):
+        """Block until a stop is asked for, waking often to see the flag."""
+        while not self._stop_requested and not self.stop_event.wait(poll_seconds):
             pass
+        if self._stop_requested:
+            logger.info("serve: stop requested; stopping")
+        self.stop()
 
     def shutdown(self) -> bool:
         """Stop and join the threads. Return whether the worker finished cleanly.

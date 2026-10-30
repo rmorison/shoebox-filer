@@ -388,8 +388,9 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         )
 
         def _on_signal(signum: int, _frame: object) -> None:
-            logger.info("serve: %s received; stopping", signal.Signals(signum).name)
-            service.stop()
+            # Only a flag: logging or Event.set here could deadlock on a lock
+            # the interrupted main thread holds.
+            service.request_stop()
 
         signal.signal(signal.SIGTERM, _on_signal)
         signal.signal(signal.SIGINT, _on_signal)
@@ -399,8 +400,11 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         finished = service.shutdown()
         logger.info("serve: stopped")
     finally:
-        for lock in locks.values():
-            lock.release()
+        # A worker still running may be using its lock connection: leave the
+        # locks to process exit, which drops them with their connections.
+        if finished:
+            for lock in locks.values():
+                lock.release()
     if not finished:
         sys.exit(1)
 
