@@ -4,7 +4,8 @@ Every failed ``ingest_log`` row carries one of three classes:
 
 - ``transient``: the service, not the item, failed (an overloaded or
   rate-limited LLM, a 5xx, a dropped connection or a timeout, a source that
-  can't be reached). Retrying later should work, so it uses up no attempt.
+  can't be reached, a full disk, a statement timeout). Retrying later should
+  work, so it uses up no attempt.
 - ``config``: a source-wide refusal that the operator fixes once (an LLM key
   that is rejected, credits that ran out). Every item would fail the same
   way, so it uses up no attempt either.
@@ -18,6 +19,7 @@ chain, so the boundaries that raise them stay unchanged.
 
 from __future__ import annotations
 
+import errno
 from typing import Literal
 
 ErrorClass = Literal["transient", "content", "config"]
@@ -25,12 +27,17 @@ ErrorClass = Literal["transient", "content", "config"]
 # How far down a cause chain to look; chains are short in practice.
 _MAX_CHAIN = 10
 
+# A full disk or an exhausted quota fails every item the same way until the
+# operator frees space, so it uses up no attempt.
+_DISK_FULL = frozenset({errno.ENOSPC, errno.EDQUOT})
+
 
 class TransientError(Exception):
     """Raised by a boundary to say that a failure is the service's, not the item's."""
 
 
 def _transient_types() -> tuple[type[BaseException], ...]:
+    from psycopg.errors import QueryCanceled
     from pydantic_ai.exceptions import (
         ModelConnectionError,
         ModelRateLimitError,
@@ -43,6 +50,7 @@ def _transient_types() -> tuple[type[BaseException], ...]:
 
     return (
         TransientError,
+        QueryCanceled,  # a statement_timeout
         SourceUnavailableError,
         ModelRateLimitError,
         ModelUnavailableError,  # ModelOverloadedError is a subclass
@@ -105,7 +113,9 @@ def classify(exc: BaseException) -> ErrorClass:
     if any(isinstance(e, config) or _http_status(e) in (401, 403, 404) for e in chain):
         return "config"
     transient = _transient_types()
-    if any(isinstance(e, transient) or _http_transient(e) for e in chain):
+    if any(
+        isinstance(e, transient) or _http_transient(e) or _disk_full(e) for e in chain
+    ):
         return "transient"
     return "content"
 
@@ -115,6 +125,10 @@ def _http_status(exc: BaseException) -> int | None:
     from pydantic_ai.exceptions import ModelHTTPError
 
     return exc.status_code if isinstance(exc, ModelHTTPError) else None
+
+
+def _disk_full(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in _DISK_FULL
 
 
 def _http_transient(exc: BaseException) -> bool:

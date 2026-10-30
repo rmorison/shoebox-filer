@@ -1455,3 +1455,78 @@ class TestLinkOnly:
         assert "receipts.example.com" in caplog.text
         assert "/r/abc123" not in caplog.text
         assert "s3cr3t-t0ken" not in caplog.text
+
+
+class TestDiskFull:
+    def test_disk_full_while_storing_stops_the_source_without_an_attempt(
+        self, repo: FakeRepo, extract: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import errno
+
+        monkeypatch.setattr(
+            pipeline,
+            "store_rendition",
+            MagicMock(side_effect=OSError(errno.ENOSPC, "No space left on device")),
+        )
+        adapter = FakeAdapter(_imap_read([1, 2, 3]))
+        result = _run(adapter)
+
+        assert result.source_error is not None
+        assert adapter.fetched == ["<msg-1@example.com>"]
+        (row,) = _failed_rows(repo)
+        assert row["error_class"] == "transient"
+        assert row["counts_attempt"] is False
+
+
+class StopAfter:
+    """A RunControl that asks to stop once ``n`` items have run."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.ran: list[str] = []
+
+    def should_stop(self) -> bool:
+        return len(self.ran) >= self.n
+
+    @contextmanager
+    def running(self, source_id: str) -> Iterator[None]:
+        yield
+        self.ran.append(source_id)
+
+
+class TestRunControl:
+    def test_a_stop_ends_the_loop_between_items(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        control = StopAfter(1)
+        adapter = FakeAdapter(_imap_read([1, 2, 3]))
+        result = _run(adapter, control=control)
+
+        assert control.ran == ["<msg-1@example.com>"]
+        assert adapter.fetched == ["<msg-1@example.com>"]
+        assert result.processed == 1
+        # Every item that started has its outcome; the cursor stops there.
+        assert repo.statuses("<msg-1@example.com>") == ["started", "success"]
+        assert repo.statuses("<msg-2@example.com>") == []
+        assert repo.imap_saves[-1] == (7, 1, False)
+
+    def test_without_a_control_every_item_runs(
+        self, repo: FakeRepo, extract: MagicMock
+    ) -> None:
+        result = _run(FakeAdapter(_imap_read([1, 2, 3])))
+        assert result.processed == 3
+
+    def test_a_stop_ends_the_retry_pass_between_items(
+        self, repo: FakeRepo, extract: MagicMock, history: dict[str, list[Any]]
+    ) -> None:
+        due = []
+        for n in (1, 2):
+            sid = f"<msg-{n}@example.com>"
+            history[sid] = [_log(sid, "failed", attempt=1, next_retry_at=_past())]
+            due.append(history[sid][0])
+        control = StopAfter(1)
+        result = _retry(due, FetchByIdAdapter(), control=control)
+
+        assert control.ran == ["<msg-1@example.com>"]
+        assert result.processed == 1
+        assert repo.statuses("<msg-2@example.com>") == []

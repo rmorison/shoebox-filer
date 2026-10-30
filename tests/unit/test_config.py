@@ -255,3 +255,40 @@ class TestStoreBackend:
     def test_anything_else_is_rejected(self, backend: str) -> None:
         with pytest.raises(ValidationError, match="backend"):
             StoreConfig.model_validate({"backend": backend})
+
+
+class TestServeKeys:
+    """The ``serve`` keys of the ``ingest:`` block."""
+
+    def test_defaults(self) -> None:
+        from receipt_index.config import IngestConfig
+
+        config = IngestConfig()
+        assert config.idle_reissue_seconds == 600
+        assert config.imap_poll_seconds == 240
+        assert config.drive_poll_seconds == 120
+        assert config.item_timeout_seconds == 600
+
+    @pytest.mark.parametrize(
+        ("key", "floor"),
+        [
+            ("idle_reissue_seconds", 60),
+            ("imap_poll_seconds", 30),
+            ("drive_poll_seconds", 30),
+            ("item_timeout_seconds", 600),
+        ],
+    )
+    def test_floors(self, key: str, floor: int) -> None:
+        from pydantic import ValidationError
+
+        from receipt_index.config import IngestConfig
+
+        assert getattr(IngestConfig(**{key: floor}), key) == floor
+        with pytest.raises(ValidationError, match=key):
+            IngestConfig(**{key: floor - 1})
+
+    def test_hourly_polling_is_allowed(self) -> None:
+        from receipt_index.config import IngestConfig
+
+        config = IngestConfig(imap_poll_seconds=3600, drive_poll_seconds=3600)
+        assert (config.imap_poll_seconds, config.drive_poll_seconds) == (3600, 3600)
