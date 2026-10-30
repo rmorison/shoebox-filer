@@ -829,7 +829,7 @@ From any device, no SSH: check the newest file under `receipt-index/receipts` in
 
 Read it correctly: a fresh file **confirms** delivery. The *absence* of new files is not a health signal, because it is the normal state during a quiet week. Only chase it when you know receipts arrived in the window.
 
-Also glance at `receipt-index/backups`: seven nightly files with day-of-week names (`receipt_index-<1..7>.dump`), the newest dated last night, and up to twelve monthly ones (`receipt_index-month-<01..12>.dump`), the newest dated the 1st of this month.
+Also glance at `receipt-index/backups`: seven nightly files with day-of-week names (`receipt_index-<1..7>.dump`), the newest dated last night, and up to twelve monthly ones (`receipt_index-month-<01..12>.dump`), the newest dated the 1st of this month. supercronic doesn't retry a missed run, so if the scheduler was stopped or the dump failed on the 1st, that month's file is old or missing until next year: take one by hand, as in [8.6](#86-with-the-scheduler-stopped), with `exec scheduler /app/backup.sh monthly` while the scheduler runs, but not between 03:17 and the end of the 03:47 dump on the 1st, when a scheduled run may be writing the same file.
 
 ### 7.4 Disk
 
@@ -966,7 +966,7 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
    make migrate-up      # no-op, or applies a delta newer than the dump
    ```
 
-   **Restoring from a monthly dump.** Use one when no nightly dump will do: they are all damaged, or the problem you're recovering from was noticed more than seven days late, so every nightly dump already holds it. The steps are the same, with `data/backups/receipt_index-month-<MM>.dump` in the `cp` line. The monthly dump runs at 03:47 UTC on the 1st, and `<MM>` is the month it ran in, not the month it covers: `receipt_index-month-11.dump` holds the database as of 03:47 UTC on 1 November, so it covers October. Check the file's date with `ls -l` before restoring. Everything recorded after that dump is lost, not only one day: messages still in the mailbox are ingested again on the next cycles, as in step 6, but anything no longer there, and any edits made by hand since, have to be redone.
+   **Restoring from a monthly dump.** Use one when no nightly dump will do: they are all damaged, or the problem you're recovering from was noticed more than seven days late, so every nightly dump already holds it. The steps are the same, with `data/backups/receipt_index-month-<MM>.dump` in the `cp` line. The monthly dump runs at 03:47 UTC on the 1st, and `<MM>` is the month it ran in, not the month it covers: a scheduled `receipt_index-month-11.dump` holds the database as of 03:47 UTC on 1 November, so it covers October. A monthly run by hand later in the month replaces it ([8.6](#86-with-the-scheduler-stopped)), so check the file's date with `ls -l` before restoring. Everything recorded after that dump is lost, not only one day: messages still in the mailbox are ingested again on the next cycles, as in step 6, but anything no longer there, and any edits made by hand since, have to be redone.
 
 5. Run the checks in [8.4](#84-separate-database-logins) step 7 and Gate B step 5: each URL connects as its login, the scheduler holds no owner credential, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
@@ -1263,7 +1263,7 @@ Sometimes the schedule has to stay off, for example until a backfill finishes, s
 
   [10.1](#101-one-time-setup) step 4 gives the same form for the MCP check.
 - **`up -d` and `up -d scheduler` become `up -d db`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), and leaves the scheduler stopped. Skip `logs -f scheduler`.
-- **No backup runs, nightly or monthly.** Both dumps are cron lines, so they stop with the scheduler. To take one by hand, as the read login like the scheduled ones, run the script in a one-off container. With no argument it writes today's day-of-week name; with `monthly` it writes this month's `receipt_index-month-<MM>.dump`, replacing the one already there:
+- **No backup runs, nightly or monthly.** Both dumps are cron lines, so they stop with the scheduler, and supercronic doesn't run a missed one when it starts again. To take one by hand, as the read login like the scheduled ones, run the script in a one-off container. With no argument it writes today's day-of-week name; with `monthly` it writes this month's `receipt_index-month-<MM>.dump`, replacing the one already there:
 
   ```bash
   docker compose -f deploy/docker-compose.yml run --rm -T --entrypoint /app/backup.sh scheduler
