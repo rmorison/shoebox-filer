@@ -23,14 +23,38 @@ pytestmark = pytest.mark.integration
 Conn = psycopg.Connection[dict[str, Any]]
 
 
-def _exists(conn: Conn, query: str, *params: str) -> bool:
-    row = conn.execute(query, params).fetchone()
+def _table_exists(conn: Conn, schema: str, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM pg_tables WHERE schemaname = %s AND tablename = %s",
+        (schema, table),
+    ).fetchone()
     return row is not None
 
 
+def _outside_objects(conn: Conn) -> dict[str, int | None]:
+    """OIDs of what must survive. The bootstrap recreates the function and the
+    extension when they are missing, so only an unchanged OID shows that the
+    schema drop didn't take them with it."""
+    oids: dict[str, int | None] = {}
+    for name, query in (
+        ("set_updated_at", "SELECT 'public.set_updated_at()'::regprocedure::oid"),
+        ("pg_trgm", "SELECT oid FROM pg_extension WHERE extname = 'pg_trgm'"),
+    ):
+        row = conn.execute(query).fetchone()
+        oids[name] = None if row is None else row["oid"]
+    for table in _VERSION_TABLES:
+        row = conn.execute(
+            "SELECT to_regclass(%s)::oid", (f"public.{table}",)
+        ).fetchone()
+        oids[table] = None if row is None else row["to_regclass"]
+    return oids
+
+
 def test_bootstrap_drops_a_table_it_does_not_know(pg_conn: Conn) -> None:
-    # The version tables live in public; make sure they are there to survive.
+    # Creates the version tables in public, so there is something to survive.
     apply_migration_grants(pg_conn)
+    before = _outside_objects(pg_conn)
+    assert all(before.values()), before
     pg_conn.execute(
         "CREATE TABLE receipt.stray (id int,"
         " receipt_id uuid REFERENCES receipt.receipts (id))"
@@ -39,29 +63,9 @@ def test_bootstrap_drops_a_table_it_does_not_know(pg_conn: Conn) -> None:
     try:
         _run_migrations(pg_conn)
 
-        assert not _exists(
-            pg_conn,
-            "SELECT 1 FROM pg_tables WHERE schemaname = 'receipt'"
-            " AND tablename = 'stray'",
-        )
-        assert _exists(
-            pg_conn,
-            "SELECT 1 FROM pg_tables WHERE schemaname = 'receipt'"
-            " AND tablename = 'receipts'",
-        )
-        assert _exists(
-            pg_conn,
-            "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
-            " WHERE n.nspname = 'public' AND p.proname = 'set_updated_at'",
-        )
-        assert _exists(pg_conn, "SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
-        for table in _VERSION_TABLES:
-            assert _exists(
-                pg_conn,
-                "SELECT 1 FROM pg_tables WHERE schemaname = 'public'"
-                " AND tablename = %s",
-                table,
-            )
+        assert not _table_exists(pg_conn, "receipt", "stray")
+        assert _table_exists(pg_conn, "receipt", "receipts")
+        assert _outside_objects(pg_conn) == before
     finally:
         # Leave the shared database clean even when the bootstrap didn't.
         pg_conn.rollback()
