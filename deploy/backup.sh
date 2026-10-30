@@ -1,11 +1,16 @@
 #!/bin/sh
 #
-# Nightly database backup, run from deploy/crontab inside the scheduler
-# container. Writes a pg_dump custom-format archive into the bind-mounted
-# /app/data/backups directory using day-of-week rotation, so the directory
-# holds at most 7 files and the rclone mirror of it stays bounded too
-# (`rclone copy` never deletes at the destination, but it does overwrite
-# changed files — a fixed 7-name set is what keeps Dropbox from growing).
+# Database backup, run from deploy/crontab inside the scheduler container.
+# Writes a pg_dump custom-format archive into the bind-mounted
+# /app/data/backups directory under a fixed set of names, so the directory
+# and the rclone mirror of it stay bounded (`rclone copy` never deletes at
+# the destination, but it does overwrite changed files — a fixed name set is
+# what keeps Dropbox from growing):
+#
+#   backup.sh [nightly]   receipt_index-<1..7>.dump, day of week (7 names)
+#   backup.sh monthly     receipt_index-month-<01..12>.dump, month (12 names)
+#
+# A second run on the same day, or in the same month, replaces that file.
 #
 # Why a script instead of an inline crontab command:
 #   * supercronic hands the whole command line to `$SHELL -c` and does NOT
@@ -22,6 +27,16 @@
 # tick can never mirror a half-written dump.
 
 set -eu
+
+# Check the argument before connecting, so a bad crontab line fails fast.
+kind="${1:-nightly}"
+case "${kind}" in
+    nightly | monthly) ;;
+    *)
+        echo "usage: backup.sh [nightly|monthly]" >&2
+        exit 2
+        ;;
+esac
 
 # Dump as the read login when RECEIPT_INDEX_READ_DATABASE_URL is set: it can
 # read every table, golang-migrate's version tables included (migration
@@ -42,9 +57,13 @@ BACKUP_DIR="${BACKUP_DIR:-/app/data/backups}"
 
 mkdir -p "${BACKUP_DIR}"
 
-# 1..7, Monday..Sunday
-dow="$(date +%u)"
-target="${BACKUP_DIR}/receipt_index-${dow}.dump"
+if [ "${kind}" = monthly ]; then
+    # 01..12, the month the dump is taken in
+    target="${BACKUP_DIR}/receipt_index-month-$(date +%m).dump"
+else
+    # 1..7, Monday..Sunday
+    target="${BACKUP_DIR}/receipt_index-$(date +%u).dump"
+fi
 tmp="${target}.tmp"
 
 # A failed dump must not strand a partial .tmp: the mirror is additive-only,
@@ -52,7 +71,7 @@ tmp="${target}.tmp"
 # suspenders (--exclude "*.tmp" on the crontab mirror line).
 trap 'rm -f "${tmp}"' EXIT
 
-echo "backup: dumping as ${dump_user} to ${target}"
+echo "backup: ${kind} dump as ${dump_user} to ${target}"
 
 pg_dump --format=custom --no-password --file="${tmp}" "${DUMP_URL}"
 mv -f "${tmp}" "${target}"
