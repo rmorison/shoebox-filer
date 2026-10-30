@@ -213,6 +213,7 @@ class IdleWatcher:
     def run(self) -> None:
         delay = self.backoff_first
         while not self.stop.is_set():
+            self._healthy = False  # earned again by each session
             try:
                 client = self._open()
             except LoginError as exc:
@@ -441,9 +442,12 @@ class Worker:
         if error is None:
             self._pauses.pop(job.source, None)
             return
-        if self._lock_lost(job.source):
-            return
-        self._pause(job.source, error)
+        # The lock check and re-take reach the database too, so the watchdog
+        # times them as well.
+        with self.clock.job(Job(job.kind, job.source)):
+            lost = self._lock_lost(job.source)
+        if not lost:
+            self._pause(job.source, error)
 
     def _poll(
         self, conn: psycopg.Connection[dict[str, Any]], source: SourceConfig

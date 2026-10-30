@@ -742,3 +742,81 @@ class TestIdleBackoffResets:
         with _watching(watcher, stop):
             assert _until(lambda: connect.calls >= 4)
         assert waits[:3] == [1.0, 1.0, 1.0]
+
+
+class TestRelockIsTimed:
+    def test_the_lock_check_and_retake_run_under_the_clock(
+        self, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        lock = MagicMock()
+        worker = _worker([_imap("mail")], locks={"mail": lock})
+        seen: list[Any] = []
+
+        def check() -> None:
+            seen.append(worker.clock.busy_since())
+            raise SourceLockLostError("gone")
+
+        lock.check.side_effect = check
+        lock.acquire.return_value = True
+        pipeline_calls["run_ingest"].return_value = IngestResult(source_error="x")
+        worker.run_job(Job("poll", "mail"))
+        assert seen and seen[0] is not None
+        assert seen[0][1] == "poll mail"
+        assert worker.clock.busy_since() is None
+
+
+class TestHealthIsPerSession:
+    def test_a_failure_before_idle_after_a_healthy_session_still_backs_off(
+        self,
+    ) -> None:
+        class NoCaps(FakeIMAP):
+            def has_capability(self, cap: str) -> bool:
+                raise OSError("connection reset")
+
+        healthy = FakeIMAP([[(1, b"EXISTS")], OSError("reset")])
+        connect = Connector([healthy, NoCaps(), NoCaps(), NoCaps(), FakeIMAP()])
+        queue, stop = RecordingQueue(), threading.Event()
+        waits: list[float] = []
+        real_wait = stop.wait
+
+        def recording_wait(timeout: float | None = None) -> bool:
+            if timeout is not None and timeout >= 0.5:
+                waits.append(timeout)
+            return real_wait(0.001)
+
+        stop.wait = recording_wait  # type: ignore[method-assign]
+        watcher = _watcher(connect, queue, stop, backoff_first=1.0, backoff_max=8.0)
+        with _watching(watcher, stop):
+            assert _until(lambda: connect.calls >= 5)
+        assert waits[:4] == [1.0, 2.0, 4.0, 8.0]
+
+
+class TestNormalStop:
+    def test_a_stopped_service_reports_a_clean_shutdown(
+        self, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        sources = [_drive("scans")]
+        svc = service.Service(
+            sources=sources,
+            all_sources=sources,
+            locks={"scans": MagicMock()},
+            timings=service.ServeTimings(
+                idle_reissue_seconds=60,
+                imap_poll_seconds=3600,
+                drive_poll_seconds=3600,
+                item_timeout_seconds=600,
+                join_seconds=5,
+            ),
+            open_conn=lambda: MagicMock(closed=False, broken=False),
+            adapter_factory=MagicMock(),
+            agents={"email": MagicMock(), "document": MagicMock()},
+            store=MagicMock(),
+            llm_model="test-model",
+            policy=MagicMock(),
+            exit_fn=MagicMock(),
+        )
+        svc.start()
+        assert _until(lambda: pipeline_calls["run_ingest"].called)
+        svc.stop()
+        assert svc.shutdown() is True
+        assert svc.worker_failed is False
