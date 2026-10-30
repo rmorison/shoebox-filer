@@ -27,6 +27,7 @@ from receipt_index.renderer import (
     _render_text_to_pdf,
     render_pdf,
 )
+from tests.images import make_two_frame_mpo
 
 if TYPE_CHECKING:
     from playwright.sync_api import Route
@@ -381,6 +382,18 @@ class TestRenderDriveFile:
         result = _render_drive_file(raw)
         assert result == b"%PDF-from-png"
         mock_convert.assert_called_once_with(image_data)
+
+    def test_mpo_photo_as_image_jpeg_converted(self) -> None:
+        raw = RawReceipt(
+            source_id="drive-mpo",
+            source_name="test-source",
+            source_type="gdrive",
+            date=datetime(2025, 1, 1, tzinfo=UTC),
+            file_content=make_two_frame_mpo(),
+            file_content_type="image/jpeg",
+        )
+        result = _render_drive_file(raw)
+        assert result[:5] == b"%PDF-"
 
     def test_raises_without_file_content(self) -> None:
         raw = RawReceipt(
