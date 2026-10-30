@@ -1303,7 +1303,17 @@ docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -
         WHERE NOT EXISTS (SELECT 1 FROM receipt.provenance p WHERE p.receipt_id = r.id)"'
 ```
 
-**Rolling back.** `make migrate-down` undoes one migration in each directory. Taking the receipt directory back past this release takes two. 000018's down removes only the provenance records it made. 000017's down drops the new tables, including the records ingest wrote after the upgrade. That loses nothing, because ingest still writes the same facts to `receipts` in this release.
+**Rolling back.** Take the receipt directory back to version 16 with golang-migrate directly, from the clone root, on the release you are leaving:
+
+```bash
+MURL=$(grep '^MIGRATION_DATABASE_URL=' .env.db | cut -d= -f2-)
+.bin/migrate -path db/migrations/receipt -database "${MURL}&x-migrations-table=schema_migrations_receipt" goto 16
+unset MURL
+```
+
+**Don't use `make migrate-down` for this.** It also steps back the public directory, whose only migration creates `set_updated_at()`, the function every `updated_at` trigger runs.
+
+000018's down removes only the provenance records it made. 000017's down drops the new tables, including the records ingest wrote after the upgrade. That loses nothing, because ingest still writes the same facts to `receipts` in this release. Then check out the previous release and `up -d` it.
 
 ---
 
