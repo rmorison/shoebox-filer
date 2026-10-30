@@ -8,6 +8,7 @@
 - [`uv run receipt-index show`](#show) — View full details for a receipt
 - [`uv run receipt-index edit`](#edit) — Correct a receipt's fields by hand
 - [`uv run receipt-index history`](#history) — List the changes made to a receipt after extraction
+- [`uv run receipt-index status`](#status) — Show each source's health, the heartbeat and retry counts; `--check` for a healthcheck
 - [`uv run receipt-index failures`](#failures) — List items that failed or were skipped
 - [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
@@ -184,6 +185,7 @@ uv run receipt-index serve [--source NAME]...
 - One worker processes items one at a time. A source that stops on a `transient` or `config` failure is left alone for 30 seconds, doubling with each stop in a row up to 15 minutes. Its failed item comes back through the retry pass when it is due. A poll or retry that falls in a pause is dropped, not saved for later: the source's next scheduled poll or retry picks it up, so mail that arrives during a pause waits for the next safety poll.
 - A source that another process holds (a running `ingest`, or another `serve`) is left out at start-up. A one-shot `ingest` started while `serve` runs exits with code 3 for the sources `serve` holds.
 - **Stopping**: SIGTERM or Ctrl-C stops the watchers at once. The worker finishes the item in hand, then stops, so no item is left half-done. Items still queued are read again on the next start. A stop takes up to `ingest.item_timeout_seconds` plus 30 seconds, so a container's stop grace period must be longer than that.
+- **Health**: while the worker is alive, `serve` rewrites a heartbeat file (`/tmp/receipt-index-serve.heartbeat`) every 30 seconds, and [`status --check`](#status) reads it. With `ingest.health.ping_url` set, it also pings an external monitor ([the dead-man ping](#the-dead-man-ping)).
 - **Watchdog**: if one item, or one read of a source, runs longer than `ingest.item_timeout_seconds` (default 1200), `serve` logs it and exits with code 4, so that a container restart policy brings it back. The item's unfinished attempt is then recorded as a failure that uses up an attempt.
 
 ```yaml
@@ -491,6 +493,73 @@ One line per change: the time (UTC), the event type, who made it (and whether a 
 `—` stands for an empty value. With `--output json` each event has its `event_type`, `payload` (for an edit: `field`, `old`, `new` and the removed `old_confidence`; for a cleared field: `field` and its `value`), `actor`, `actor_kind`, `reason` and `created_at`.
 
 The history is append-only: nothing in the application can change or delete an event. Deleting a receipt by hand in SQL deletes its history with it.
+
+---
+
+## status
+
+Show each source's read position and health, `serve`'s heartbeat, and the retry counts. It works with or without `serve` running: it reads the database, and `serve`'s heartbeat file if there is one.
+
+```bash
+uv run receipt-index status [--check] [--output text|json]
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--check` | Print one line per problem, or `ok`, and exit 1 if there is any problem. This is `serve`'s container healthcheck |
+| `--output text\|json` | Output format (default: `text`). With `--check`, JSON prints the full report and the exit code still follows the problems |
+
+### What it shows
+
+- **Each configured source**: its cursor (IMAP UIDVALIDITY and last UID, or the Drive page token), the last poll, the last successful read and its age, the stale threshold, the last error (marked `cleared since` when a successful read came after it), the reset count and the archive state.
+- **Orphaned sync state**: rows for a source name or folder no longer in the config, for example after a rename.
+- **Worker**: the heartbeat's age, `serve`'s process ID, the sources it watches, how long it has been on its current step, the sources paused after errors (for how long, and why) and the sources it stopped watching after losing their lock.
+- **Retries**: pending (failed, due now), retrying (failed, due later), queued, terminal, and skipped in the last 7 days.
+- **Problems**: the `--check` lines.
+
+### The checks
+
+`--check` reports each of these as one line:
+
+| Line | When |
+|---|---|
+| `heartbeat missing` | There's no heartbeat file: `serve` isn't running here |
+| `heartbeat stale 340s` | The heartbeat is older than `ingest.health.heartbeat_stale_seconds` (default 120). `serve` rewrites it every 30 seconds while its worker is alive and no step has run past `ingest.item_timeout_seconds` |
+| `source NAME stale 1200s` | The source's last successful read is older than its stale threshold: `ingest.health.source_stale_seconds` when set, otherwise three times its poll interval (720 seconds for IMAP and 360 for Drive at the defaults) |
+| `source NAME never succeeded` | The source has never been read successfully |
+| `source NAME lock lost` | `serve` lost the source's lock to another process and stopped watching it |
+| `source NAME paused 900s` | `serve` has kept the source paused after errors for longer than `source_stale_seconds`, or by default the largest of the sources' stale thresholds |
+| `database unreachable` | The database didn't answer within 5 seconds |
+
+With a fresh heartbeat, only the sources that `serve` watches are checked for staleness. They aren't checked at all while its worker is busy on a job, because one worker takes the sources in turn and a long job holds the others back. A stuck job is caught by the heartbeat instead. A stale heartbeat's content is ignored, because the process that wrote it may be gone. Terminal failures never fail the check: they are content problems, reported by the ping below and by [`failures`](#failures).
+
+### The dead-man ping
+
+When `ingest.health.ping_url` is set, `serve` pings an external monitor (for example healthchecks.io) from a thread of its own. It pings once at start and then every `ping_interval_seconds` (default 300):
+
+- If the checks above pass and no item has turned terminal within `terminal_alert_seconds` (default 86400), it sends a GET to `ping_url`.
+- Otherwise it sends a POST to `ping_url` + `/fail` with the problem lines, plus for example `terminal 2 in 24h`. The body never includes error text or receipt details.
+
+The monitor alerts when the pings stop or a failure ping arrives. The ping has a 10-second timeout, and a monitor that is down or unreachable is logged but never stops `serve`. The URL is a capability: keep it in the environment (`ping_url: ${HEALTH_PING_URL}`). It is never logged or shown in a config error, and its key stays commented out until the variable is set, since a `${VAR}` whose variable is unset stops every command.
+
+```yaml
+ingest:
+  health:
+    heartbeat_stale_seconds: 120   # at least 60
+    # source_stale_seconds: 900    # optional; at least each poll interval it applies to
+    terminal_alert_seconds: 86400  # 0 turns terminal alerts off
+    # ping_url: ${HEALTH_PING_URL} # http or https, with no query string
+    ping_interval_seconds: 300     # at least 30
+```
+
+**Exit codes**:
+
+| Code | Meaning |
+|---|---|
+| 0 | Healthy, or no `--check` and the database was read |
+| 1 | `--check` found a problem, or the database couldn't be reached |
 
 ---
 

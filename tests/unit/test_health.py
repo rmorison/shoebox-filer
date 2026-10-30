@@ -671,7 +671,11 @@ class TestPing:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         # urllib quotes the URL in its own errors for these.
-        for url in (f"nope://{_MARKER}", f"http://127.0.0.1:1/{_MARKER}\n"):
+        for url in (
+            f"nope://{_MARKER}",
+            f"{_MARKER}/no-scheme",
+            f"http://127.0.0.1:1/{_MARKER}\n/x",
+        ):
             with caplog.at_level(logging.DEBUG):
                 assert _ping(url, []).ping_once() is False
         assert _MARKER not in caplog.text
