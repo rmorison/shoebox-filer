@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import io
 
+import pdfplumber
 import pytest
 from PIL import Image
 
 from receipt_index.image_converter import image_to_pdf
+from tests.images import MPO_FIRST_FRAME_SIZE, make_two_frame_mpo
 
 
 def _make_image(
@@ -44,6 +46,18 @@ class TestImageToPdf:
         la_data = _make_image("PNG", mode="LA")
         result = image_to_pdf(la_data)
         assert result[:5] == b"%PDF-"
+
+    def test_mpo_converts_first_frame_to_one_page(self) -> None:
+        mpo_data = make_two_frame_mpo()
+        assert Image.open(io.BytesIO(mpo_data)).format == "MPO"
+
+        result = image_to_pdf(mpo_data)
+
+        assert result[:5] == b"%PDF-"
+        with pdfplumber.open(io.BytesIO(result)) as pdf:
+            assert len(pdf.pages) == 1
+            page = pdf.pages[0]
+            assert (page.width, page.height) == MPO_FIRST_FRAME_SIZE
 
     def test_unsupported_format_raises_value_error(self) -> None:
         bmp_data = _make_image("BMP")

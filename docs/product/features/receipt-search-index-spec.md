@@ -153,7 +153,7 @@ Designed in the [receipt data-model design](../../engineering/designs/receipt-da
 | RD-07 | **Idempotency and duplicates:** Track processed items by unique ID (e.g., IMAP message ID, Drive file ID) to skip on re-runs. A receipt has one or more provenance records, one per source item. A new item joins an existing receipt automatically only on an exact match: the hash of its whole original, the hash of its receipt document (never any other attachment), or the same order number, vendor and paid amount, always between receipts of the same kind. Metadata-only matches are flagged for review, not linked. Every link can be undone and is recorded. Amended by [ADR-0010](../../engineering/adr/0010-provenance-records-and-duplicate-detection.md). |
 | RD-08 | **Config file:** YAML configuration for source definitions. Secrets stay in environment variables. Supports `${ENV_VAR}` interpolation for non-secret config values. |
 | RD-09 | **Google Drive auth:** OAuth2 with offline refresh token stored as environment variable. Service accounts require folder sharing, which is less natural for personal Drive usage. |
-| RD-10 | **Drive file handling:** PDFs copied directly to file store. Images (JPG, PNG) converted to PDF via Pillow. Google Docs exported as PDF via Drive API. |
+| RD-10 | **Drive file handling:** PDFs copied directly to file store. Images (JPG, PNG) converted to PDF via Pillow; a phone photo saved as MPO (a JPEG holding more than one frame) is converted from its first frame. Google Docs exported as PDF via Drive API. |
 
 ## Open Questions
 
