@@ -199,7 +199,7 @@ ingest:
 | Code | Meaning |
 |---|---|
 | 0 | Stopped by SIGTERM or Ctrl-C |
-| 1 | The worker didn't stop in time after a stop, or a configured source name was not found |
+| 1 | The worker crashed (`serve` then stops, so a restart policy brings it back), the worker didn't stop in time after a stop, or a `--source` name was not found |
 | 3 | Every selected source is held by another process |
 | 4 | The watchdog stopped a step that ran past `ingest.item_timeout_seconds` |
 

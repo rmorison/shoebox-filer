@@ -645,3 +645,100 @@ class TestWatchdog:
         done.set()
         thread.join(timeout=_WAIT)
         assert not thread.is_alive()
+
+
+class TestWorkerSurvivesADatabaseOutage:
+    def test_a_failed_lock_retake_pauses_the_source_and_keeps_the_worker(
+        self, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        import psycopg
+
+        lock = MagicMock()
+        lock.check.side_effect = SourceLockLostError("gone")
+        lock.acquire.side_effect = psycopg.OperationalError("connection refused")
+        worker = _worker([_imap("mail")], locks={"mail": lock})
+        pipeline_calls["run_ingest"].side_effect = psycopg.OperationalError("down")
+
+        worker.run_job(Job("poll", "mail"))  # must not raise
+
+        assert "mail" not in worker.dropped
+        assert worker.paused_until("mail") is not None
+
+    def test_an_unexpected_error_in_a_job_never_ends_the_worker(
+        self, pipeline_calls: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = _worker()
+        calls: list[Job] = []
+
+        def boom(job: Job) -> None:
+            calls.append(job)
+            raise RuntimeError("a bug")
+
+        monkeypatch.setattr(worker, "run_job", boom)
+        worker.queue.put(Job("poll", "mail"))
+        worker.queue.put(Job("poll", "scans"))
+        thread = threading.Thread(target=worker.run, daemon=True)
+        thread.start()
+        try:
+            assert _until(lambda: len(calls) == 2)
+            assert thread.is_alive()
+        finally:
+            worker.stop.set()
+            thread.join(timeout=_WAIT)
+        assert not thread.is_alive()
+
+
+class TestDeadWorkerIsFatal:
+    def test_a_worker_that_ends_on_its_own_stops_the_service(self) -> None:
+        sources = [_drive("scans")]
+        svc = service.Service(
+            sources=sources,
+            all_sources=sources,
+            locks={"scans": MagicMock()},
+            timings=service.ServeTimings(
+                idle_reissue_seconds=60,
+                imap_poll_seconds=3600,
+                drive_poll_seconds=3600,
+                item_timeout_seconds=600,
+                join_seconds=1,
+            ),
+            open_conn=MagicMock(),
+            adapter_factory=MagicMock(),
+            agents={"email": MagicMock(), "document": MagicMock()},
+            store=MagicMock(),
+            llm_model="test-model",
+            policy=MagicMock(),
+            exit_fn=MagicMock(),
+        )
+
+        def crash() -> None:
+            raise RuntimeError("worker crashed")
+
+        svc.worker.run = crash  # type: ignore[method-assign]
+        svc.start()
+        assert svc.stop_event.wait(_WAIT), "a dead worker must stop the service"
+        assert svc.shutdown() is False  # reported as a failed run (exit 1)
+
+
+class TestIdleBackoffResets:
+    def test_a_healthy_session_resets_the_reconnect_delay(self) -> None:
+        # Two drops after healthy sessions: each reconnect waits the first
+        # delay, not a doubled one.
+        healthy_then_drop = [
+            FakeIMAP([[(1, b"EXISTS")], OSError("reset")]) for _ in range(3)
+        ]
+        connect = Connector([*healthy_then_drop, FakeIMAP()])
+        queue, stop = RecordingQueue(), threading.Event()
+        waits: list[float] = []
+        real_wait = stop.wait
+
+        def recording_wait(timeout: float | None = None) -> bool:
+            if timeout is not None and timeout >= 0.5:
+                waits.append(timeout)
+            return real_wait(0.001)
+
+        stop.wait = recording_wait  # type: ignore[method-assign]
+        watcher = _watcher(connect, queue, stop, backoff_first=1.0, backoff_max=8.0)
+        with _watching(watcher, stop):
+            assert _until(lambda: connect.calls >= 4)
+        assert waits[:3] == [1.0, 1.0, 1.0]

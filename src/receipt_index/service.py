@@ -208,6 +208,7 @@ class IdleWatcher:
         self.backoff_max = backoff_max
         self.auth_retry_seconds = auth_retry_seconds
         self._poll = Job("poll", config.name)
+        self._healthy = False
 
     def run(self) -> None:
         delay = self.backoff_first
@@ -245,9 +246,11 @@ class IdleWatcher:
                         self.config.name,
                     )
                     return
-                if self._idle(client):
-                    delay = self.backoff_first
+                self._idle(client)
             except Exception as exc:
+                if self._healthy:
+                    # The session worked before it dropped: start over.
+                    delay = self.backoff_first
                 logger.warning(
                     "IMAP source %s: IDLE dropped (%s); reconnecting in %.0fs",
                     self.config.name,
@@ -270,9 +273,13 @@ class IdleWatcher:
             raise
         return client
 
-    def _idle(self, client: IMAPClient) -> bool:
-        """Sit in IDLE until stopped. Return whether a full cycle completed."""
-        healthy = False
+    def _idle(self, client: IMAPClient) -> None:
+        """Sit in IDLE until stopped.
+
+        Sets ``_healthy`` once the session has reported mail or completed a
+        re-issue, so a later drop reconnects after the first delay again.
+        """
+        self._healthy = False
         client.idle()
         started = time.monotonic()
         while not self.stop.is_set():
@@ -282,13 +289,13 @@ class IdleWatcher:
                 self.queue.put(self._poll)
                 client.idle()
                 started = time.monotonic()
+                self._healthy = True
             elif time.monotonic() - started >= self.reissue_seconds:
                 client.idle_done()
                 client.idle()
                 started = time.monotonic()
-                healthy = True
+                self._healthy = True
         client.idle_done()
-        return healthy
 
 
 def _is_exists(response: Any) -> bool:
@@ -392,7 +399,11 @@ class Worker:
                 job = self.queue.get(timeout=0.5)
                 if job is None or self.stop.is_set():
                     continue
-                self.run_job(job)
+                try:
+                    self.run_job(job)
+                except Exception:
+                    # Nothing a job does may end the only worker.
+                    logger.exception("Worker: %s %s failed", job.kind, job.source)
         finally:
             self._close_conn()
 
@@ -411,13 +422,15 @@ class Worker:
 
         error: str | None
         try:
-            conn = self._connection()
+            # Connecting and committing are timed too, so a database that
+            # hangs there still trips the watchdog.
             with self.clock.job(job):
+                conn = self._connection()
                 if job.kind == "poll":
                     error = self._poll(conn, source)
                 else:
                     error = self._retries(conn, source)
-            conn.commit()
+                conn.commit()
         except Exception as exc:
             # One bad job (a cancelled statement, a dropped connection) must
             # not end the only worker.
@@ -497,7 +510,16 @@ class Worker:
         except SourceLockLostError:
             pass
         lock.release()
-        if lock.acquire():
+        try:
+            taken = lock.acquire()
+        except Exception as exc:
+            # The database is down: the next job after the pause tries again.
+            logger.warning(
+                "Source %s: can't re-take its source lock yet (%s)", name, exc
+            )
+            self._pause(name, "source lock lost; database unreachable")
+            return True
+        if taken:
             logger.warning("Source %s: re-took its lost source lock", name)
         else:
             logger.error(
@@ -673,13 +695,22 @@ class Service:
         )
         self._threads: list[threading.Thread] = []
         self._worker_thread: threading.Thread | None = None
+        self.worker_failed = False
 
     def start(self) -> None:
         def work() -> None:
             try:
                 self.worker.run()
+            except BaseException:
+                logger.critical("serve: the worker crashed", exc_info=True)
             finally:
                 self.worker_done.set()
+                if not self.stop_event.is_set():
+                    # A serve with no worker ingests nothing: stop, so the
+                    # process exits non-zero and its supervisor restarts it.
+                    logger.critical("serve: the worker ended; stopping")
+                    self.worker_failed = True
+                    self.stop()
 
         self._worker_thread = self._spawn(work, "worker")
         self._spawn(self.health.run, "health")
@@ -703,7 +734,7 @@ class Service:
             pass
 
     def shutdown(self) -> bool:
-        """Stop and join the threads. Return whether the worker finished.
+        """Stop and join the threads. Return whether the worker finished cleanly.
 
         The worker gets until the item in hand is done: at most
         ``item_timeout_seconds``, after which the watchdog exits the process.
@@ -719,4 +750,4 @@ class Service:
         finished = worker is None or not worker.is_alive()
         if not finished:
             logger.error("serve: the worker didn't stop in time")
-        return finished
+        return finished and not self.worker_failed

@@ -14,6 +14,9 @@ _READ_ONLY_OPTIONS = "-c default_transaction_read_only=on"
 # hung query raises QueryCanceled (transient) instead of holding the item and
 # its source lock (always-on ingest design, section 1).
 INGEST_STATEMENT_TIMEOUT_SECONDS = 60
+# How long the ingest connections wait to connect, so a database host that
+# drops packets fails the job instead of hanging the worker.
+INGEST_CONNECT_TIMEOUT_SECONDS = 10
 
 
 def get_connection(
@@ -21,6 +24,7 @@ def get_connection(
     *,
     read_only: bool = False,
     statement_timeout_seconds: float | None = None,
+    connect_timeout_seconds: int | None = None,
 ) -> psycopg.Connection[dict[str, object]]:
     """Create and return a new database connection.
 
@@ -34,9 +38,14 @@ def get_connection(
     statement_timeout_seconds:
         When set, every statement on the session is cancelled after this
         long (``statement_timeout``).
+    connect_timeout_seconds:
+        When set, connecting gives up after this long.
 
     Either option replaces any ``options`` parameter given in the URL.
     """
+    extra: dict[str, object] = {}
+    if connect_timeout_seconds is not None:
+        extra["connect_timeout"] = connect_timeout_seconds
     options: list[str] = []
     if read_only:
         options.append(_READ_ONLY_OPTIONS)
@@ -44,7 +53,5 @@ def get_connection(
         millis = int(statement_timeout_seconds * 1000)
         options.append(f"-c statement_timeout={millis}")
     if options:
-        return psycopg.connect(
-            database_url, row_factory=dict_row, options=" ".join(options)
-        )
-    return psycopg.connect(database_url, row_factory=dict_row)
+        extra["options"] = " ".join(options)
+    return psycopg.connect(database_url, row_factory=dict_row, **extra)  # type: ignore[arg-type]

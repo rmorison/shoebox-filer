@@ -1662,14 +1662,17 @@ class FakeService:
     def stop(self) -> None:
         self.calls.append("stop")
 
+    finished: ClassVar[bool] = True
+
     def shutdown(self) -> bool:
         self.calls.append("shutdown")
-        return True
+        return FakeService.finished
 
 
 @pytest.fixture
 def fake_service() -> Iterator[type[FakeService]]:
     FakeService.instances = []
+    FakeService.finished = True
     with (
         patch("receipt_index.service.Service", FakeService),
         patch("receipt_index.store.open_store"),
@@ -1738,3 +1741,70 @@ class TestServe:
         )
         assert result.exit_code == 1
         assert "nope" in result.output
+
+
+class ReleaseRecordingLock(FakeSourceLock):
+    released: ClassVar[list[str]] = []
+
+    def release(self) -> None:
+        ReleaseRecordingLock.released.append(self.source_name)
+
+
+class TestServeWiring:
+    @patch("receipt_index.db.get_connection")
+    @patch("receipt_index.cli.load_config")
+    def test_connections_and_timings_come_from_the_config(
+        self,
+        mock_load_config: MagicMock,
+        mock_get_conn: MagicMock,
+        config_file: Path,
+        fake_service: type[FakeService],
+    ) -> None:
+        from receipt_index.db import (
+            INGEST_CONNECT_TIMEOUT_SECONDS,
+            INGEST_STATEMENT_TIMEOUT_SECONDS,
+        )
+
+        config = _two_source_config()
+        ingest = config.ingest.model_copy(
+            update={
+                "idle_reissue_seconds": 300,
+                "imap_poll_seconds": 90,
+                "drive_poll_seconds": 45,
+                "item_timeout_seconds": 900,
+            }
+        )
+        mock_load_config.return_value = config.model_copy(update={"ingest": ingest})
+        result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+        assert result.exit_code == 0, result.output
+
+        (service,) = fake_service.instances
+        timings = service.kwargs["timings"]
+        assert (
+            timings.idle_reissue_seconds,
+            timings.imap_poll_seconds,
+            timings.drive_poll_seconds,
+            timings.item_timeout_seconds,
+        ) == (300, 90, 45, 900)
+        service.kwargs["open_conn"]()
+        kwargs = mock_get_conn.call_args.kwargs
+        assert kwargs["statement_timeout_seconds"] == INGEST_STATEMENT_TIMEOUT_SECONDS
+        assert kwargs["connect_timeout_seconds"] == INGEST_CONNECT_TIMEOUT_SECONDS
+
+    @pytest.mark.parametrize(("finished", "code"), [(True, 0), (False, 1)])
+    @patch("receipt_index.cli.load_config")
+    def test_exit_code_follows_shutdown_and_locks_are_released(
+        self,
+        mock_load_config: MagicMock,
+        config_file: Path,
+        fake_service: type[FakeService],
+        finished: bool,
+        code: int,
+    ) -> None:
+        mock_load_config.return_value = _two_source_config()
+        fake_service.finished = finished
+        ReleaseRecordingLock.released = []
+        with patch("receipt_index.locks.SourceLock", ReleaseRecordingLock):
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "serve"])
+        assert result.exit_code == code, result.output
+        assert sorted(ReleaseRecordingLock.released) == ["other-email", "test-email"]

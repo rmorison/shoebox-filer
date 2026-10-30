@@ -305,7 +305,11 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
     """
     import signal
 
-    from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
+    from receipt_index.db import (
+        INGEST_CONNECT_TIMEOUT_SECONDS,
+        INGEST_STATEMENT_TIMEOUT_SECONDS,
+        get_connection,
+    )
     from receipt_index.extraction import (
         DOCUMENT_SYSTEM_PROMPT,
         create_extraction_agent,
@@ -374,6 +378,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             open_conn=lambda: get_connection(
                 config.database.url,
                 statement_timeout_seconds=INGEST_STATEMENT_TIMEOUT_SECONDS,
+                connect_timeout_seconds=INGEST_CONNECT_TIMEOUT_SECONDS,
             ),
             adapter_factory=_source_adapter(config),
             agents=agents,
