@@ -40,7 +40,7 @@ Purpose = Literal["original", "rendition"]
 LOCAL_SCHEME = "local:"
 
 _TOP_FOLDER: dict[str, str] = {"original": "originals", "rendition": "renditions"}
-_PDF_MEDIA_TYPE = "application/pdf"
+PDF_MEDIA_TYPE = "application/pdf"
 # A filesystem name is at most 255 bytes; leave room for a "_NN" suffix.
 _MAX_SEGMENT_BYTES = 240
 _VENDOR_SLUG_MAX = 50
@@ -139,8 +139,9 @@ class StoreFolder:
 class StoredFile:
     """One stored file, as ``put`` records it.
 
-    ``id`` is the ``receipt.stored_files`` row, which arrives with the schema
-    ticket; until then it is None.
+    ``id`` is the ``receipt.stored_files`` row. ``put`` writes no database
+    row, so it leaves ``id`` None; the repository records the row
+    (``record_rendition``) in the caller's transaction.
     """
 
     sha256: bytes | None
@@ -444,7 +445,7 @@ def store_rendition(
     """Store a receipt's rendered PDF under ``renditions/YYYY/MM/``."""
     return store.put(
         pdf,
-        media_type=_PDF_MEDIA_TYPE,
+        media_type=PDF_MEDIA_TYPE,
         purpose="rendition",
         folder=StoreFolder.for_rendition(receipt_date),
         name=rendition_name(receipt_date, vendor, amount),
@@ -454,6 +455,17 @@ def store_rendition(
 def rendition_ref(pdf_path: str) -> str:
     """The reference for a receipt's ``pdf_path``. Validates nothing."""
     return f"{LOCAL_SCHEME}{pdf_path}"
+
+
+def split_ref(ref: str) -> tuple[str, str]:
+    """A reference as its backend and locator: ``("local", <relative path>)``.
+
+    These are the ``file_locations`` row's ``backend`` and ``locator``.
+    """
+    if ref.startswith(LOCAL_SCHEME):
+        return "local", ref[len(LOCAL_SCHEME) :]
+    msg = f"no backend for store reference: {ref!r}"
+    raise InvalidRefError(msg)
 
 
 def pdf_path_for(ref: str) -> str:

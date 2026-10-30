@@ -13,11 +13,12 @@ from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
     IngestLogEntry,
+    Provenance,
     Receipt,
     ReceiptEvent,
     SyncState,
 )
-from receipt_index.store import LOCAL_SCHEME
+from receipt_index.store import LOCAL_SCHEME, split_ref
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -44,17 +45,24 @@ _WITH_NET = (
     " LEFT JOIN receipt.v_receipt_net n ON n.receipt_id = receipts.id"
 )
 
+# An ingest_log row (aliased l) whose item has no receipt: no provenance row.
+_NO_PROVENANCE = (
+    "NOT EXISTS (SELECT 1 FROM receipt.provenance p WHERE p.source_id = l.source_id)"
+)
+
 
 def get_processed_source_ids(
     conn: psycopg.Connection[dict[str, Any]],
 ) -> set[str]:
-    """Return source_ids already in receipts or ingest_log (skipped/failed).
+    """Return source_ids already in provenance or ingest_log.
 
-    This provides full idempotency — we won't re-process messages that were
-    previously ingested, skipped (not a receipt), or failed.
+    This provides full idempotency — we won't re-process items that were
+    previously ingested, skipped (not a receipt), or failed. A source item
+    that evidences a receipt has a provenance row (evidence-store design, §6
+    step 3), whether or not ``receipts`` still names it.
     """
     cur = conn.execute(
-        "SELECT source_id FROM receipt.receipts "
+        "SELECT source_id FROM receipt.provenance "
         "UNION "
         "SELECT source_id FROM receipt.ingest_log"
     )
@@ -64,13 +72,13 @@ def get_processed_source_ids(
 def is_source_id_known(
     conn: psycopg.Connection[dict[str, Any]], source_id: str
 ) -> bool:
-    """Return whether a source ID has a receipt or any ingest_log row.
+    """Return whether a source ID has a provenance row or any ingest_log row.
 
     The same rule as ``get_processed_source_ids``, for one ID: the re-check
     made after taking an item lock.
     """
     cur = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM receipt.receipts WHERE source_id = %(id)s) "
+        "SELECT EXISTS (SELECT 1 FROM receipt.provenance WHERE source_id = %(id)s) "
         "OR EXISTS (SELECT 1 FROM receipt.ingest_log WHERE source_id = %(id)s) "
         "AS known",
         {"id": source_id},
@@ -637,7 +645,7 @@ def _failure_filters(
 ) -> tuple[str, dict[str, object]]:
     clauses = [
         _FAILURE_STATUS[status],
-        "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
+        _NO_PROVENANCE,
     ]
     params: dict[str, object] = {}
     if since is not None:
@@ -706,9 +714,10 @@ def get_item_history(
 
 
 def has_receipt(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
-    """Whether a receipt exists for this source ID."""
+    """Whether a receipt exists for this source ID (it has a provenance row)."""
     cur = conn.execute(
-        "SELECT 1 FROM receipt.receipts WHERE source_id = %(id)s", {"id": source_id}
+        "SELECT 1 FROM receipt.provenance WHERE source_id = %(id)s",
+        {"id": source_id},
     )
     return cur.fetchone() is not None
 
@@ -762,8 +771,7 @@ def select_due(
         " OR (%(configured)s::text[] IS NOT NULL"
         " AND l.source_name <> ALL(%(configured)s::text[])))"
         " AND l.source_type = %(type)s)) "
-        "AND NOT EXISTS (SELECT 1 FROM receipt.receipts r"
-        " WHERE r.source_id = l.source_id) "
+        f"AND {_NO_PROVENANCE} "
         "ORDER BY created_at ASC, id ASC"
     )
     if limit is not None:
@@ -820,7 +828,7 @@ def select_retry_candidates(
     """The items ``retry`` would requeue: their latest rows, oldest first."""
     clauses = [
         _FAILURE_STATUS[spec.status],
-        "NOT EXISTS (SELECT 1 FROM receipt.receipts r WHERE r.source_id = l.source_id)",
+        _NO_PROVENANCE,
     ]
     params: dict[str, object] = {}
     if spec.status == "skipped":
@@ -1497,3 +1505,170 @@ def list_refunds(
         f"{_WITH_NET} WHERE {where} ORDER BY receipt_date DESC, vendor ASC, id ASC"
     )
     return [Receipt.model_validate(row) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Evidence store: stored files, their locations and provenance
+# ---------------------------------------------------------------------------
+
+
+class RenditionConflictError(Exception):
+    """Another receipt already has a location at this rendition's locator."""
+
+
+def record_stored_file(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    sha256: bytes,
+    byte_size: int,
+    media_type: str,
+) -> UUID:
+    """The ``stored_files`` row for these bytes, inserted if it is new.
+
+    Two writers storing the same bytes at once end with one row: the loser's
+    insert does nothing, and it reads the winner's row.
+    """
+    row = conn.execute(
+        """\
+        INSERT INTO receipt.stored_files (sha256, byte_size, media_type)
+        VALUES (%(sha256)s, %(size)s, %(media_type)s)
+        ON CONFLICT (sha256) DO NOTHING
+        RETURNING id
+        """,
+        {"sha256": sha256, "size": byte_size, "media_type": media_type},
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT id FROM receipt.stored_files WHERE sha256 = %(sha256)s",
+            {"sha256": sha256},
+        ).fetchone()
+    assert row is not None
+    return UUID(str(row["id"]))
+
+
+def record_rendition(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    ref: str,
+    sha256: bytes,
+    byte_size: int,
+    media_type: str,
+) -> UUID:
+    """Record a receipt's rendition: its stored file, location and file ID.
+
+    Writes the ``stored_files`` row (shared by receipts with the same bytes),
+    the receipt's own rendition location, and ``receipts.rendition_file_id``.
+    Doesn't commit. A location already recorded for this receipt is kept;
+    one held by another receipt raises :class:`RenditionConflictError`.
+    """
+    file_id = record_stored_file(
+        conn, sha256=sha256, byte_size=byte_size, media_type=media_type
+    )
+    backend, locator = split_ref(ref)
+    conn.execute(
+        """\
+        INSERT INTO receipt.file_locations
+            (file_id, backend, locator, purpose, receipt_id, display_path)
+        VALUES (%(file_id)s, %(backend)s, %(locator)s, 'rendition',
+                %(receipt_id)s, %(locator)s)
+        ON CONFLICT DO NOTHING
+        """,
+        {
+            "file_id": file_id,
+            "backend": backend,
+            "locator": locator,
+            "receipt_id": receipt_id,
+        },
+    )
+    held = conn.execute(
+        "SELECT receipt_id, file_id FROM receipt.file_locations"
+        " WHERE backend = %(backend)s AND locator = %(locator)s",
+        {"backend": backend, "locator": locator},
+    ).fetchone()
+    if held is None or held["receipt_id"] != receipt_id or held["file_id"] != file_id:
+        msg = f"{ref} is already recorded for another receipt or other bytes"
+        raise RenditionConflictError(msg)
+    conn.execute(
+        "UPDATE receipt.receipts SET rendition_file_id = %(file_id)s"
+        " WHERE id = %(receipt_id)s",
+        {"file_id": file_id, "receipt_id": receipt_id},
+    )
+    return file_id
+
+
+def location_taken(
+    conn: psycopg.Connection[dict[str, Any]], ref: str, receipt_id: UUID
+) -> bool:
+    """Whether a location other than this receipt's is recorded at ``ref``.
+
+    The same test ``record_rendition`` applies, read only: a location of
+    another receipt, or of an original (no receipt), takes the path.
+    """
+    backend, locator = split_ref(ref)
+    row = conn.execute(
+        "SELECT 1 FROM receipt.file_locations"
+        " WHERE backend = %(backend)s AND locator = %(locator)s"
+        " AND receipt_id IS DISTINCT FROM %(receipt_id)s",
+        {"backend": backend, "locator": locator, "receipt_id": receipt_id},
+    ).fetchone()
+    return row is not None
+
+
+def insert_provenance(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    receipt_id: UUID,
+    source_type: str,
+    source_name: str,
+    source_id: str,
+    received_at: datetime,
+    email_subject: str | None,
+    email_sender: str | None,
+    email_date: datetime | None,
+    file_name: str | None,
+    match_method: str = "first",
+) -> Provenance:
+    """Record the source item that created a receipt. Doesn't commit.
+
+    The first item for a receipt is its primary and its home. Its original
+    stays ``pending`` until the store keeps originals.
+    """
+    row = conn.execute(
+        """\
+        INSERT INTO receipt.provenance (
+            receipt_id, is_primary, source_type, source_name, source_id,
+            received_at, email_subject, email_sender, email_date, file_name,
+            home_receipt_id, original_status, match_method
+        ) VALUES (
+            %(receipt_id)s, TRUE, %(source_type)s, %(source_name)s, %(source_id)s,
+            %(received_at)s, %(email_subject)s, %(email_sender)s, %(email_date)s,
+            %(file_name)s, %(receipt_id)s, 'pending', %(match_method)s
+        )
+        RETURNING *
+        """,
+        {
+            "receipt_id": receipt_id,
+            "source_type": source_type,
+            "source_name": source_name,
+            "source_id": source_id,
+            "received_at": received_at,
+            "email_subject": email_subject,
+            "email_sender": email_sender,
+            "email_date": email_date,
+            "file_name": file_name,
+            "match_method": match_method,
+        },
+    ).fetchone()
+    return Provenance.model_validate(row)
+
+
+def receipts_without_rendition(
+    conn: psycopg.Connection[dict[str, Any]],
+) -> list[tuple[UUID, str | None]]:
+    """Receipts whose rendition isn't recorded yet: ID and ``pdf_path``."""
+    rows = conn.execute(
+        "SELECT id, pdf_path FROM receipt.receipts"
+        " WHERE rendition_file_id IS NULL ORDER BY created_at, id"
+    ).fetchall()
+    return [(UUID(str(r["id"])), r["pdf_path"]) for r in rows]

@@ -445,9 +445,10 @@ def test_write_paths_run_as_the_write_login(
     # 4c. edit --kind and the refund commands: kind and refund_of (UPDATE),
     #     the v_receipt_net view and the rule's and a person's events.
     purchase = pg_conn.execute(
-        "INSERT INTO receipt.receipts (source_id, source_name, vendor, amount, "
-        "paid_amount, currency, receipt_date, confidence, pdf_path, order_number) "
-        "VALUES (%s, %s, 'Acme Parking (U.S.), LLC, Garage 2', 20.00, 20.00, "
+        "INSERT INTO receipt.receipts (source_id, source_type, source_name, "
+        "vendor, amount, paid_amount, currency, receipt_date, confidence, "
+        "pdf_path, order_number) VALUES (%s, 'imap', %s, "
+        "'Acme Parking (U.S.), LLC, Garage 2', 20.00, 20.00, "
         "'EUR', '2026-10-01', 0.9, 'p.pdf', 'A-101') RETURNING id",
         (f"<purchase-{source}@example.com>", source),
     ).fetchone()
@@ -495,6 +496,55 @@ def test_write_paths_run_as_the_write_login(
     assert resets == {"resets": 1}
     pg_conn.commit()
 
+    # 6. store backfill-hashes: stored_files, file_locations (INSERT) and
+    #    receipts.rendition_file_id (UPDATE). Ingest recorded its own
+    #    renditions; the purchase seeded in 4c has none until its file exists.
+    (tmp_path / "store" / "p.pdf").write_bytes(b"%PDF-purchase")
+    result = _invoke(config, "store", "backfill-hashes")
+    assert result.exit_code == 0, result.output
+    assert "Recorded 1 rendition(s)" in result.output
+    unrecorded = pg_conn.execute(
+        "SELECT count(*) AS n FROM receipt.receipts WHERE rendition_file_id IS NULL"
+    ).fetchone()
+    assert unrecorded == {"n": 0}
+    provenance = pg_conn.execute(
+        "SELECT count(*) AS n FROM receipt.provenance WHERE source_id = %s",
+        (good_id,),
+    ).fetchone()
+    assert provenance == {"n": 1}
+    pg_conn.commit()
+
+
+# Write grants on the evidence-store tables (000017) reach only the columns
+# the code writes: (table, column or None for the whole table).
+_UNWRITTEN = [
+    ("provenance_files", None),
+    ("stored_files", "content_kind"),
+    ("stored_files", "pdf_status"),
+    ("file_locations", "owner"),
+    ("file_locations", "last_verified_at"),
+    ("provenance", "source_sha256"),
+    ("provenance", "original_file_id"),
+    ("receipts", "rendition_file_id"),
+]
+
+
+@pytest.mark.parametrize(("table", "column"), _UNWRITTEN)
+def test_write_login_cannot_insert_columns_nothing_writes(
+    write_conn: Conn, table: str, column: str | None
+) -> None:
+    name = f"receipt.{table}"
+    if column is None:
+        row = write_conn.execute(
+            "SELECT has_any_column_privilege(%s, 'INSERT') AS ok", (name,)
+        ).fetchone()
+    else:
+        row = write_conn.execute(
+            "SELECT has_column_privilege(%s, %s, 'INSERT') AS ok", (name, column)
+        ).fetchone()
+    write_conn.rollback()
+    assert row == {"ok": False}
+
 
 @pytest.mark.parametrize(
     "statement",
@@ -512,6 +562,10 @@ def test_write_paths_run_as_the_write_login(
         # ingest_log is append-only; 000014 takes back 000007's UPDATE grant.
         "UPDATE receipt.ingest_log SET llm_model = 'changed'",
         "CREATE TABLE receipt.not_allowed (id INTEGER)",
+        # The evidence-store tables: no UPDATE or DELETE grants yet.
+        "UPDATE receipt.provenance SET source_name = 'changed'",
+        "DELETE FROM receipt.stored_files",
+        "UPDATE receipt.file_locations SET locator = 'changed'",
     ],
 )
 def test_write_login_cannot_change_history_or_schema(
@@ -541,6 +595,8 @@ def test_read_login_can_read_every_table_pg_dump_reads(read_conn: Conn) -> None:
     names = [t["name"] for t in tables]
     assert "public.schema_migrations_public" in names
     assert "receipt.receipts" in names
+    for table in ("stored_files", "file_locations", "provenance", "provenance_files"):
+        assert f"receipt.{table}" in names
     for name in names:
         read_conn.execute(
             sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(sql.SQL(name))
@@ -574,9 +630,9 @@ def test_forensic_commands_run_as_the_read_login(
         tmp_path, login=_READ_LOGIN, user="nobody@localhost", source=source
     )
     pg_conn.execute(
-        "INSERT INTO receipt.receipts (source_id, source_name, vendor, amount, "
-        "receipt_date, confidence, pdf_path) VALUES "
-        "('<read@example.com>', %s, 'Acme Parking (U.S.), LLC', 1.00, "
+        "INSERT INTO receipt.receipts (source_id, source_type, source_name, "
+        "vendor, amount, receipt_date, confidence, pdf_path) VALUES "
+        "('<read@example.com>', 'imap', %s, 'Acme Parking (U.S.), LLC', 1.00, "
         "'2026-10-01', 0.9, 'x.pdf') RETURNING id",
         (source,),
     )

@@ -11,6 +11,7 @@
 - [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
 - [`uv run receipt-index refund`](#refund) — Link refunds to their purchases, unlink them, and list them
+- [`uv run receipt-index store`](#store) — Record the hash and location of each stored rendition
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
 All commands require a configured `.env` file (see [Getting Started](getting-started.md)).
@@ -678,6 +679,28 @@ uv run receipt-index refund link 01942a3d-1234-7def-8abc-567890abcdef 01942a3b-1
 # Undo a link the rule made
 uv run receipt-index refund unlink 01942a3d-1234-7def-8abc-567890abcdef --reason "refund for a different order"
 ```
+
+---
+
+## store
+
+Record what the evidence store holds for each receipt.
+
+```bash
+uv run receipt-index store backfill-hashes [--dry-run]
+```
+
+### backfill-hashes
+
+Ingest records the sha256 of each rendition it stores, and where the file lives. Receipts stored before that have no record. `store backfill-hashes` reads each of their rendition files, hashes it, and records three things: the stored file (one per distinct content, so two receipts with identical PDFs share it), the receipt's own local location, and the receipt's link to the file.
+
+- **Run it once after upgrading** to the release that brings the provenance schema, as the application's login. The later move of the store to Google Drive reads these records.
+- **It is safe to run again.** It reads only receipts with no record yet, so a second run finds nothing to do and changes nothing. A run cut short carries on from where it stopped.
+- **A missing or unreadable file** is named by receipt ID and left unrecorded, and the command exits 1. Restore the file and run it again. So is a receipt whose file path another receipt's record already holds, which a re-run can't fix: it needs a look by hand.
+- `--dry-run` reads and hashes the files and writes nothing. It reports the same unrecorded receipts the real run would.
+- **Each receipt's `updated_at` changes once**, when its record is written: the receipt row gains the link to its file.
+
+It prints how many renditions it recorded, and how many share bytes with another receipt. A catalogue of a few thousand receipts takes well under a minute.
 
 ---
 

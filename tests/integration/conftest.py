@@ -58,7 +58,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000016 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000018 (tables, indexes and
     constraints). receipt/000014 holds grants only. The grants are not applied
     here, since CI's Postgres has no application roles; apply_migration_grants
     applies them for the tests that need them.
@@ -84,6 +84,9 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # (receipt/000011, receipt/000015).
     conn.execute("DROP TABLE IF EXISTS receipt.extractions")
     conn.execute("DROP TABLE IF EXISTS receipt.receipt_events")
+    # The evidence-store tables (receipt/000017) reference receipts too.
+    for table in ("provenance_files", "provenance", "file_locations", "stored_files"):
+        conn.execute(f"DROP TABLE IF EXISTS receipt.{table} CASCADE")
     conn.execute("DROP TABLE IF EXISTS receipt.receipts CASCADE")
     conn.execute(
         """\
@@ -250,6 +253,14 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     # receipt/000016 — kind, refund_of, the generated signed_amount and the
     # v_receipt_net view. Run from the migration file, up to its grants.
     conn.execute(_schema_part("receipt", "000016"))
+
+    # receipt/000017 — stored_files, file_locations, provenance and
+    # provenance_files; receipts.rendition_file_id; the legacy source columns
+    # made nullable. Run from the migration file, up to its grants.
+    conn.execute(_schema_part("receipt", "000017"))
+
+    # receipt/000018 — one provenance row per receipt (none at bootstrap).
+    conn.execute(_schema_part("receipt", "000018"))
     conn.commit()
 
 
@@ -353,14 +364,14 @@ def pg_conn() -> Iterator[psycopg.Connection[dict[str, Any]]]:
 
 @pytest.fixture(autouse=True)
 def _truncate_receipts(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
-    """Clear the receipts, ingest_log, sync_state and retry_requests tables."""
+    """Clear the receipts, ingest_log, sync_state, retry_requests and stored files."""
     pg_conn.rollback()  # clear any dangling transaction from a prior test failure
     # The cascade reaches receipt.extractions, whose guard refuses TRUNCATE.
     # Replica mode skips ordinary triggers for this test-only statement.
     pg_conn.execute("SET LOCAL session_replication_role = replica")
     pg_conn.execute(
         "TRUNCATE receipt.ingest_log, receipt.receipts, receipt.sync_state, "
-        "receipt.retry_requests CASCADE"
+        "receipt.retry_requests, receipt.stored_files CASCADE"
     )
     pg_conn.commit()
 

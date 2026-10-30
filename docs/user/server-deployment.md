@@ -850,7 +850,7 @@ A dead-man's-snitch (healthchecks.io-style) ping as a fourth crontab line after 
 
 ### 8.1 Upgrade
 
-The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says.
+The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says.
 
 ```bash
 cd ~/receipt-index
@@ -1270,6 +1270,50 @@ Sometimes the schedule has to stay off, for example until a backfill finishes, s
   ```
 
 When the schedule should start, `up -d` starts it, as in [Gate G](#gate-g--supervised-cycle-then-the-schedule) step 2.
+
+### 8.7 Recording renditions after the provenance schema
+
+Receipt migration 000017 adds the tables that record each stored file, its sha256 and where it lives, and 000018 gives every existing receipt a provenance record (its source item). New ingests write both themselves. The receipts stored before the upgrade still need their renditions recorded, once:
+
+1. **Upgrade as in [8.1](#81-upgrade), with the scheduler stopped before `make migrate-up`.** 000018 runs once and records only the receipts that exist when it runs. A receipt the previous image ingests after it gets no provenance record, so `failures` and `retry` treat it as having none (it is never ingested twice: its `ingest_log` row prevents that).
+2. **After `up -d`, try a dry run, then record:**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index store backfill-hashes --dry-run
+   docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index store backfill-hashes
+   ```
+
+   With the scheduler stopped, use the `run --rm -T --entrypoint receipt-index scheduler store backfill-hashes` form from [8.6](#86-with-the-scheduler-stopped). It runs as the application's login and reads the store under `data/receipts`. A catalogue of a few thousand receipts takes well under a minute. It prints how many renditions it recorded. A second run prints `Recorded 0 rendition(s)` and changes nothing.
+3. **Exit 1** lists each receipt it couldn't record, by ID: a missing or unreadable file (restore it from the Dropbox mirror and run again), or a file path another receipt's record already holds (look at both receipts by hand). Every other receipt is recorded.
+4. **Each existing receipt's `updated_at` changes once**, when its rendition is recorded. MCP clients that read `updated_at` see every receipt as changed on the upgrade day.
+
+**If the previous image ingested after 000018 ran** (step 1 was missed), run 000018 again. It adds a record only for receipts that have none:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec -T db sh -c \
+    'psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+    < db/migrations/receipt/000018_backfill_provenance.up.sql
+```
+
+This check prints 0 when every receipt has one:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm --entrypoint sh scheduler -c '
+    psql "$RECEIPT_INDEX_READ_DATABASE_URL" -At -c "SELECT count(*) FROM receipt.receipts r
+        WHERE NOT EXISTS (SELECT 1 FROM receipt.provenance p WHERE p.receipt_id = r.id)"'
+```
+
+**Rolling back.** Take the receipt directory back to version 16 with golang-migrate directly, from the clone root, on the release you are leaving:
+
+```bash
+MURL=$(grep '^MIGRATION_DATABASE_URL=' .env.db | cut -d= -f2-)
+.bin/migrate -path db/migrations/receipt -database "${MURL}&x-migrations-table=schema_migrations_receipt" goto 16
+unset MURL
+```
+
+**Don't use `make migrate-down` for this.** It also steps back the public directory, whose only migration creates `set_updated_at()`, the function every `updated_at` trigger runs.
+
+000018's down removes only the provenance records it made. 000017's down drops the new tables, including the records ingest wrote after the upgrade. That loses nothing, because ingest still writes the same facts to `receipts` in this release. Then check out the previous release and `up -d` it.
 
 ---
 

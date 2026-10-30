@@ -694,6 +694,42 @@ class ReceiptEvent(BaseModel):
     created_at: datetime
 
 
+MatchMethod = Literal[
+    "first", "original_hash", "document_hash", "order_number", "manual", "migrated"
+]
+OriginalStatus = Literal["stored", "pending", "unavailable"]
+
+
+class Provenance(BaseModel):
+    """One source item that evidences a receipt (``receipt.provenance``).
+
+    An email, a forward or a Drive file. ``source_id`` is unique across every
+    source, so an item already recorded here is never ingested again.
+    """
+
+    id: UUID
+    receipt_id: UUID
+    is_primary: bool
+    source_type: str
+    source_name: str
+    source_id: str
+    received_at: datetime
+    email_subject: str | None = None
+    email_sender: str | None = None
+    email_date: datetime | None = None
+    file_name: str | None = None
+    source_sha256: bytes | None = None
+    home_receipt_id: UUID | None = None
+    original_file_id: UUID | None = None
+    receipt_document_file_id: UUID | None = None
+    document_certainty: Literal["certain", "ambiguous"] | None = None
+    original_status: OriginalStatus
+    original_unavailable_reason: str | None = None
+    match_method: MatchMethod
+    created_at: datetime
+    updated_at: datetime
+
+
 class IngestLogEntry(BaseModel):
     """A record of an ingest attempt (success, failure, or skip)."""
 

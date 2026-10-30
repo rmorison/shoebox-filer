@@ -1914,6 +1914,51 @@ def mcp_command(
 
 
 @cli.group()
+def store() -> None:
+    """Manage the evidence store's records."""
+
+
+@store.command("backfill-hashes")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Read and hash the renditions, and write nothing.",
+)
+@click.pass_context
+def store_backfill_hashes(ctx: click.Context, dry_run: bool) -> None:
+    """Record the hash and location of every rendition not yet recorded.
+
+    For each receipt with no recorded rendition, reads its local file, and
+    records its stored file, its local location and its rendition file ID.
+    Run once after upgrading; a second run finds nothing to do. Exits 1 if
+    any receipt's file is missing or unreadable.
+    """
+    from receipt_index.db import get_connection
+    from receipt_index.hash_backfill import backfill_rendition_hashes
+    from receipt_index.store import open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    evidence = open_store(config.store)
+    with get_connection(config.database.url) as conn:
+        report = backfill_rendition_hashes(conn, evidence, dry_run=dry_run)
+    verb = "Would record" if dry_run else "Recorded"
+    click.echo(
+        f"{verb} {report.hashed} rendition(s);"
+        f" {report.shared} share bytes with another receipt."
+    )
+    for receipt_id, why in report.missing:
+        click.echo(f"Not recorded: {receipt_id}: {why}", err=True)
+    if not report.ok:
+        click.echo(
+            f"{len(report.missing)} receipt(s) not recorded;"
+            " restore their files, or resolve the conflict named, and run again.",
+            err=True,
+        )
+        sys.exit(1)
+
+
+@cli.group()
 def auth() -> None:
     """Manage authentication for external services."""
 
