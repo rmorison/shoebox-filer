@@ -1597,19 +1597,22 @@ def record_rendition(
     return file_id
 
 
-def location_holder(conn: psycopg.Connection[dict[str, Any]], ref: str) -> UUID | None:
-    """The receipt whose location is at this reference, if one is recorded."""
+def location_taken(
+    conn: psycopg.Connection[dict[str, Any]], ref: str, receipt_id: UUID
+) -> bool:
+    """Whether a location other than this receipt's is recorded at ``ref``.
+
+    The same test ``record_rendition`` applies, read only: a location of
+    another receipt, or of an original (no receipt), takes the path.
+    """
     backend, locator = split_ref(ref)
     row = conn.execute(
-        "SELECT receipt_id FROM receipt.file_locations"
-        " WHERE backend = %(backend)s AND locator = %(locator)s",
-        {"backend": backend, "locator": locator},
+        "SELECT 1 FROM receipt.file_locations"
+        " WHERE backend = %(backend)s AND locator = %(locator)s"
+        " AND receipt_id IS DISTINCT FROM %(receipt_id)s",
+        {"backend": backend, "locator": locator, "receipt_id": receipt_id},
     ).fetchone()
-    return (
-        None
-        if row is None or row["receipt_id"] is None
-        else UUID(str(row["receipt_id"]))
-    )
+    return row is not None
 
 
 def insert_provenance(

@@ -233,3 +233,45 @@ def test_dry_run_reports_a_taken_path_as_the_real_run_does(
     assert [rid for rid, _ in dry.missing] == [rid for rid, _ in real.missing]
     assert [rid for rid, _ in dry.missing] == [taken]
     assert dry.hashed == real.hashed == 0
+
+
+def test_dry_run_sees_two_unrecorded_receipts_on_one_path(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    _receipt(pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-a")
+    second = _receipt(pg_conn, tmp_path, "<b@example.com>", "2026/01/a.pdf", None)
+
+    dry = backfill_rendition_hashes(pg_conn, store, dry_run=True)
+    real = backfill_rendition_hashes(pg_conn, store)
+
+    assert [rid for rid, _ in dry.missing] == [rid for rid, _ in real.missing]
+    assert [rid for rid, _ in dry.missing] == [second]
+    assert dry.hashed == real.hashed == 1
+
+
+def test_dry_run_treats_an_original_at_the_path_as_taken(
+    pg_conn: Conn, tmp_path: Path
+) -> None:
+    store = LocalEvidenceStore(tmp_path)
+    receipt_id = _receipt(
+        pg_conn, tmp_path, "<a@example.com>", "2026/01/a.pdf", b"%PDF-a"
+    )
+    file_id = pg_conn.execute(
+        "INSERT INTO receipt.stored_files (sha256, byte_size, media_type)"
+        " VALUES (%s, 1, 'application/pdf') RETURNING id",
+        (hashlib.sha256(b"other").digest(),),
+    ).fetchone()
+    assert file_id is not None
+    pg_conn.execute(
+        "INSERT INTO receipt.file_locations (file_id, backend, locator, purpose,"
+        " display_path) VALUES (%s, 'local', '2026/01/a.pdf', 'original', 'x')",
+        (file_id["id"],),
+    )
+    pg_conn.commit()
+
+    dry = backfill_rendition_hashes(pg_conn, store, dry_run=True)
+    real = backfill_rendition_hashes(pg_conn, store)
+
+    assert [rid for rid, _ in dry.missing] == [receipt_id]
+    assert [rid for rid, _ in real.missing] == [receipt_id]

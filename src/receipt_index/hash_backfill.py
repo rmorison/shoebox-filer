@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from receipt_index.repository import (
     RenditionConflictError,
-    location_holder,
+    location_taken,
     receipts_without_rendition,
     record_rendition,
 )
@@ -61,6 +61,7 @@ def backfill_rendition_hashes(
     """
     report = BackfillReport()
     seen: set[bytes] = set()
+    claimed: dict[str, UUID] = {}  # dry run: paths this run would record
     for receipt_id, pdf_path in receipts_without_rendition(conn):
         conn.rollback()  # end the read's transaction; one per receipt below
         if pdf_path is None:
@@ -79,14 +80,15 @@ def backfill_rendition_hashes(
         known = _is_stored(conn, digest) or (dry_run and digest in seen)
         if dry_run:
             # The real run's conflict, predicted: another receipt's location
-            # already holds this path.
-            holder = location_holder(conn, ref)
+            # holds this path already, or would by now in this run.
+            taken = location_taken(conn, ref, receipt_id)
             conn.rollback()
-            if holder is not None and holder != receipt_id:
+            if taken or claimed.get(ref, receipt_id) != receipt_id:
                 report.missing.append(
                     (receipt_id, f"{ref} is already recorded for another receipt")
                 )
                 continue
+            claimed[ref] = receipt_id
             seen.add(digest)
             report.shared += known
             report.hashed += 1
