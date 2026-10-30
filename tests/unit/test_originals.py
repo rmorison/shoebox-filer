@@ -252,6 +252,56 @@ class TestStoreEmailOriginal:
             "originals/elsewhere/01__t.pdf"
         ]
 
+    def test_it_never_commits_the_callers_transaction(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        conn = MagicMock()
+        store_email_original(
+            conn,
+            LocalEvidenceStore(tmp_path),
+            _raw([_att("receipt.pdf")]),
+            source_name="mail",
+            received_at=_RECEIVED,
+        )
+        conn.commit.assert_not_called()
+
+    def test_the_same_bytes_twice_in_one_email_are_written_once(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        pdf = b"%PDF-1.4 the receipt"
+        email = store_email_original(
+            MagicMock(),
+            LocalEvidenceStore(tmp_path),
+            _raw([_att("receipt.pdf", data=pdf), _att("copy.pdf", data=pdf)]),
+            source_name="mail",
+            received_at=_RECEIVED,
+        )
+        first, second = email.attachments
+        assert first.file == second.file
+        assert first.file.ref.endswith("/01__receipt.pdf")
+        assert [a.file_name for a in email.attachments] == ["receipt.pdf", "copy.pdf"]
+        assert [f for f in _files(tmp_path) if f.endswith(".pdf")] == [
+            first.file.ref.removeprefix("local:")
+        ]
+
+    def test_a_recorded_original_of_another_size_is_written_again(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        terms = b"%PDF-1.4 terms and conditions"
+        held[hashlib.sha256(terms).digest()] = "local:originals/cut/01__t.pdf"
+        (tmp_path / "originals" / "cut").mkdir(parents=True)
+        (tmp_path / "originals" / "cut" / "01__t.pdf").write_bytes(terms[:10])
+        email = store_email_original(
+            MagicMock(),
+            LocalEvidenceStore(tmp_path),
+            _raw([_att("terms.pdf", data=terms)]),
+            source_name="mail",
+            received_at=_RECEIVED,
+        )
+        (att,) = email.attachments
+        assert att.file.ref.endswith("/01__terms.pdf")
+        assert (tmp_path / att.file.ref.removeprefix("local:")).read_bytes() == terms
+
     def test_a_recorded_original_missing_from_the_store_is_written_again(
         self, tmp_path: Path, held: dict[bytes, str]
     ) -> None:
@@ -563,6 +613,22 @@ class TestProcessItem:
         evidence = stub["record_ingest_evidence"].call_args.kwargs
         assert evidence["email"] is stub["store_email_original"].return_value
         assert evidence["receipt_document"] == "body"
+
+    def test_the_read_ends_before_rendering(self, stub: dict[str, MagicMock]) -> None:
+        conn = MagicMock()
+        order: list[str] = []
+        stub["store_email_original"].side_effect = lambda *a, **k: order.append("store")
+        conn.commit.side_effect = lambda: order.append("commit")
+        stub["render_pdf"].side_effect = lambda raw: order.append("render") or b"%PDF"
+        pipeline.process_item(
+            conn,
+            _raw([_att("receipt.pdf")]),
+            store=MagicMock(),
+            source_name="mail",
+            source_type="imap",
+            llm_model="m",
+        )
+        assert order[:3] == ["store", "commit", "render"]
 
     def test_a_skipped_item_stores_no_original(
         self, stub: dict[str, MagicMock]

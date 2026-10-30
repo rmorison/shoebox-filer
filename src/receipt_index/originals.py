@@ -123,14 +123,16 @@ def select_receipt_document(
     return None, None
 
 
-def _present(store: EvidenceStore, ref: str) -> bool:
-    """Whether a recorded original is still in this store.
+def _present(store: EvidenceStore, ref: str, size: int) -> bool:
+    """Whether a recorded original is still in this store, at its size.
 
-    A database restored out of step with the files, or a file removed by
-    hand, mustn't leave a new item linked to a file that isn't there.
+    A database restored out of step with the files, or a file removed,
+    truncated or edited by hand, mustn't leave a new item linked to a file
+    that isn't what was recorded. (``verify --deep`` re-hashes; this is the
+    cheap check.)
     """
     try:
-        return store.exists(ref)
+        return store.exists(ref) and store.stat(ref).size == size
     except StoreError:  # another backend's reference
         return False
 
@@ -147,7 +149,7 @@ def _put_original(
     """Store one original, or reuse the store's copy of the same bytes."""
     digest = hashlib.sha256(data).digest()
     existing = store_original_ref(conn, digest)
-    if existing is not None and _present(store, existing):
+    if existing is not None and _present(store, existing, len(data)):
         return StoredFile(
             sha256=digest, byte_size=len(data), media_type=media_type, ref=existing
         )
@@ -169,39 +171,41 @@ def store_email_original(
     The folder is ``originals/YYYY/MM/{received-date}__{source}__{hash}``,
     from the ``.eml``'s sha256 and ``received_at``. An email with no Date
     header is dated when it was fetched, so a retry on a later day writes a
-    second folder and leaves the first for ``verify --orphans``. ``conn`` is
-    only read, to find bytes the store already holds. Raises ``ValueError``
-    without ``raw.raw_bytes``.
+    second folder and leaves the first for ``verify --orphans``. Bytes that
+    occur twice in the email are written once.
+
+    ``conn`` is only read, to find bytes the store already holds; the caller
+    owns its transaction. Raises ``ValueError`` without ``raw.raw_bytes``.
     """
     if raw.raw_bytes is None:
         msg = f"no raw bytes for {raw.source_id}"
         raise ValueError(msg)
     sha256 = hashlib.sha256(raw.raw_bytes).digest()
     folder = StoreFolder.for_original(received_at, source_name, sha256)
-    message = _put_original(
-        conn,
-        store,
-        raw.raw_bytes,
-        media_type=MESSAGE_MEDIA_TYPE,
-        folder=folder,
-        name=MESSAGE_NAME,
-    )
+    # Within one email, the same bytes are stored once: nothing is recorded
+    # until the item's transaction, so the database can't dedupe them yet.
+    stored: dict[bytes, StoredFile] = {}
+
+    def put(data: bytes, media_type: str, name: str) -> StoredFile:
+        digest = hashlib.sha256(data).digest()
+        if digest not in stored:
+            stored[digest] = _put_original(
+                conn, store, data, media_type=media_type, folder=folder, name=name
+            )
+        return stored[digest]
+
+    message = put(raw.raw_bytes, MESSAGE_MEDIA_TYPE, MESSAGE_NAME)
     attachments = [
         StoredAttachment(
-            file=_put_original(
-                conn,
-                store,
+            file=put(
                 att.data,
-                media_type=base_media_type(att.content_type),
-                folder=folder,
-                name=attachment_name(position, att),
+                base_media_type(att.content_type),
+                attachment_name(position, att),
             ),
             file_name=att.mime_filename,
         )
         for position, att in enumerate(raw.attachments, start=1)
     ]
-    # End the lookups' read transaction before the item goes on to render.
-    conn.commit()
     return StoredEmail(message=message, attachments=attachments)
 
 

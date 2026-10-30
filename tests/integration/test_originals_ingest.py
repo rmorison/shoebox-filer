@@ -401,7 +401,7 @@ def test_a_drive_item_on_the_local_backend_is_pending(
 def test_one_email_carrying_the_same_bytes_twice(
     greenmail_available: bool, pg_conn: Conn, tmp_path: Path
 ) -> None:
-    """Two attachments with identical bytes: one stored file, two locations."""
+    """Two attachments with identical bytes: one file, one location."""
     user = _unique_user("orig-twice")
     message_id = f"<{uuid.uuid4().hex}@example.com>"
     pdf = _pdf("twice")
@@ -422,12 +422,13 @@ def test_one_email_carrying_the_same_bytes_twice(
     prov = _provenance(pg_conn, message_id)
     files = [f for f in _linked_files(pg_conn, prov["id"]) if f["position"] > 0]
     assert {f["file_id"] for f in files} == {files[0]["file_id"]}
-    assert {(f["position"], f["locator"].rsplit("/", 1)[1]) for f in files} == {
+    # Written once, under the first name: one location serves both positions.
+    assert [(f["position"], f["locator"].rsplit("/", 1)[1]) for f in files] == [
         (1, "01__receipt.pdf"),
-        (1, "02__copy.pdf"),
         (2, "01__receipt.pdf"),
-        (2, "02__copy.pdf"),
-    }
+    ]
+    assert [f["file_name"] for f in files] == ["receipt.pdf", "copy.pdf"]
+    assert not [p for p in _files(tmp_path) if p.endswith("__copy.pdf")]
     assert _rows_for(pg_conn, pdf) == 1
     assert prov["receipt_document_file_id"] == files[0]["file_id"]
     assert prov["document_certainty"] == "certain"

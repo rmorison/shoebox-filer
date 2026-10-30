@@ -349,10 +349,8 @@ def process_item(
             )
             return ItemOutcome("skipped")
 
-        # The original is kept only for an item that becomes a receipt: a
-        # skipped item stays at its source. Its files are written now and
-        # recorded in the receipt's transaction below (evidence-store design,
-        # section 7), so a crash leaves files the retry reuses, never rows.
+        # Only a receipt keeps its original. Files now, rows in the receipt's
+        # transaction (design §7): a crash leaves files to reuse, never rows.
         email: StoredEmail | None = None
         if source_type == "imap":
             if raw.raw_bytes is None:
@@ -363,6 +361,8 @@ def process_item(
                 email = store_email_original(
                     conn, store, raw, source_name=source_name, received_at=raw.date
                 )
+                # Nothing written yet: end the read so render isn't in a txn.
+                conn.commit()
 
         pdf_data = render_pdf(raw)
         stored = store_rendition(
