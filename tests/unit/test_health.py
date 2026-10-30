@@ -254,6 +254,50 @@ class TestChecks:
         lines = _lines(_config(), ages={"mail": 1200, "scans": 10}, heartbeat=None)
         assert lines == ["heartbeat missing", "source mail stale 1200s"]
 
+    def test_a_requested_source_serve_does_not_hold(self) -> None:
+        # Another process held its lock at start; serve never takes it later.
+        lines = _lines(
+            _config(),
+            ages={"mail": 10, "scans": 99999},
+            heartbeat=_fresh(watching=["mail"], requested=["mail", "scans"]),
+        )
+        assert lines == ["source scans not held"]
+
+    def test_a_lost_lock_is_not_also_not_held(self) -> None:
+        lines = _lines(
+            _config(),
+            heartbeat=_fresh(
+                watching=["mail"], requested=["mail", "scans"], lock_lost=["scans"]
+            ),
+        )
+        assert lines == ["source scans lock lost"]
+
+    def test_a_fresh_start_gets_one_threshold_to_catch_up(self) -> None:
+        # Down for an hour, restarted 60 s ago: not stale yet.
+        just_started = _NOW - timedelta(seconds=60)
+        lines = _lines(
+            _config(),
+            ages={"mail": 3600, "scans": None},
+            heartbeat=_fresh(started_at=just_started),
+        )
+        assert lines == []
+
+    def test_after_the_catch_up_threshold_it_is_stale_again(self) -> None:
+        started = _NOW - timedelta(seconds=800)
+        lines = _lines(
+            _config(),
+            ages={"mail": 3600, "scans": None},
+            heartbeat=_fresh(started_at=started),
+        )
+        assert lines == ["source mail stale 3600s", "source scans never succeeded"]
+
+    def test_a_busy_worker_holds_back_the_pause_lines(self) -> None:
+        pause = Pause(since=_NOW - timedelta(seconds=900), reason="x")
+        lines = _lines(
+            _config(), heartbeat=_fresh(paused={"mail": pause}, busy_seconds=5.0)
+        )
+        assert lines == []
+
     def test_terminal_failures_never_fail_the_check(self) -> None:
         conn = MagicMock()
         report = _collect(_config(), conn, terminal=5)
@@ -330,7 +374,7 @@ class TestCollect:
         assert [p.line for p in report.problems] == ["source scans never succeeded"]
         assert report.retries == {
             "pending": 1,
-            "retrying": 2,
+            "retrying": 1,
             "queued": 3,
             "terminal": 4,
             "skipped_7d": 5,
@@ -795,3 +839,22 @@ class TestServeHealth:
 def test_problem_line_shape() -> None:
     assert Problem("heartbeat", "missing").line == "heartbeat missing"
     assert Problem("source", "stale 9s", "mail").line == "source mail stale 9s"
+
+
+class TestWorkerStateAssembly:
+    def test_requested_started_and_a_dropped_source_leaving_watching(
+        self, tmp_path: Path, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        svc = _service(tmp_path, requested=["scans", "mail"])
+        svc.worker.dropped.add("scans")
+        state = svc.worker_state()
+        assert state.watching == []
+        assert state.lock_lost == ["scans"]
+        assert state.requested == ["scans", "mail"]
+        assert state.started_at is not None
+        assert state.pid == os.getpid()
+
+    def test_requested_defaults_to_the_held_sources(
+        self, tmp_path: Path, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        assert _service(tmp_path).worker_state().requested == ["scans"]

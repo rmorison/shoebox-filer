@@ -222,6 +222,12 @@ class IngestConfig(BaseModel):
 
     health: HealthConfig = HealthConfig()
 
+    def poll_seconds(self, source_type: str) -> int:
+        """The poll interval of a source type: the IMAP safety poll or Drive's."""
+        if source_type == "imap":
+            return self.imap_poll_seconds
+        return self.drive_poll_seconds
+
     @model_validator(mode="after")
     def _check_backoff(self) -> IngestConfig:
         needed = self.retry_max_attempts - 1
@@ -279,16 +285,13 @@ class AppConfig(BaseModel):
         stale = self.ingest.health.source_stale_seconds
         if stale is None:
             return self
-        polls = {
-            "imap": self.ingest.imap_poll_seconds,
-            "gdrive": self.ingest.drive_poll_seconds,
-        }
         for kind in sorted({s.type for s in self.sources}):
-            if stale < polls[kind]:
+            poll = self.ingest.poll_seconds(kind)
+            if stale < poll:
                 key = "imap_poll_seconds" if kind == "imap" else "drive_poll_seconds"
                 msg = (
                     f"ingest.health.source_stale_seconds ({stale}) is below "
-                    f"ingest.{key} ({polls[kind]}), so every {kind} source "
+                    f"ingest.{key} ({poll}), so every {kind} source "
                     "would be stale between polls"
                 )
                 raise ValueError(msg)

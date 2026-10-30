@@ -330,11 +330,11 @@ The file's content carries what lives only in `serve`'s memory, for `status` to 
 **`status --check`** exits non-zero, printing one line per problem, when any of these holds:
 - the heartbeat file is missing, or older than `heartbeat_stale_seconds` (default 120). A missing file fails the check, because `--check` is the `ingest` container's healthcheck and a container whose `serve` never started must not pass;
 - a source's `last_success_at` is older than its stale threshold. That's `source_stale_seconds` when set, and otherwise three times the source's poll interval: 720 seconds for IMAP and 360 for Drive at the defaults. A threshold that follows the interval keeps hourly polling from failing the check between polls;
-- a watcher has stopped after losing its source lock to another process ([§ 1](#1-process-model));
+- a watcher has stopped after losing its source lock to another process ([§ 1](#1-process-model)), or `serve` was asked to watch a source whose lock another process held when it started;
 - a source has been paused on errors for longer than `source_stale_seconds` when that's set, or otherwise the largest of the sources' stale thresholds (720 seconds at the defaults);
 - the database can't be reached.
 
-With a fresh heartbeat, only the sources `serve` watches are checked for staleness, and none while its worker is busy on a job. One worker takes the sources in turn, so a long job (a bulk drop, a retry pass) holds the others back without anything being wrong, and a wedged job is the heartbeat's to catch. A stale heartbeat's content is ignored: the process that wrote it may be gone.
+With a fresh heartbeat, only the sources `serve` watches are checked for staleness, and neither staleness nor pauses while its worker is busy on a job. A source's age counts from its last success or from `serve`'s start, whichever is later, so a restart after downtime gets one stale threshold to catch up before the first ping reports it. One worker takes the sources in turn, so a long job (a bulk drop, a retry pass) holds the others back without anything being wrong, and a wedged job is the heartbeat's to catch. A stale heartbeat's content is ignored: the process that wrote it may be gone.
 
 Terminal failures don't fail the check. They're content problems, not liveness problems, so they mustn't mark the container unhealthy. They still reach the operator through the dead-man's ping (below) as well as `status` and `failures`.
 

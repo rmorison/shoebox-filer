@@ -782,9 +782,13 @@ class Service:
         ping_url: str | None = None,
         ping_interval_seconds: float = 300.0,
         ping_probe: Callable[[], list[str]] | None = None,
+        requested: Sequence[str] | None = None,
     ) -> None:
         self.timings = timings
         self._watching = [s.name for s in sources]
+        # What serve was asked to watch, held or not (`status` flags the gap).
+        self._requested = list(requested) if requested is not None else self._watching
+        self._started_at = datetime.now(UTC)
         self.stop_event = threading.Event()
         self.worker_done = threading.Event()
         self.queue = JobQueue()
@@ -878,10 +882,12 @@ class Service:
         return WorkerState(
             pid=os.getpid(),
             written_at=datetime.now(UTC),
-            watching=list(self._watching),
+            watching=[n for n in self._watching if n not in lost],
             paused=paused,
             lock_lost=lost,
             busy_seconds=None if busy is None else time.monotonic() - busy[0],
+            requested=list(self._requested),
+            started_at=self._started_at,
         )
 
     def _spawn(self, target: Callable[[], None], name: str) -> threading.Thread:

@@ -508,7 +508,7 @@ uv run receipt-index status [--check] [--output text|json]
 
 | Option | Description |
 |---|---|
-| `--check` | Print one line per problem, or `ok`, and exit 1 if there is any problem. This is `serve`'s container healthcheck |
+| `--check` | Print one line per problem, or `ok`, and exit 1 if there is any problem. This is `serve`'s container healthcheck. In text it skips the retry counts, which it doesn't print |
 | `--output text\|json` | Output format (default: `text`). With `--check`, JSON prints the full report and the exit code still follows the problems |
 
 ### What it shows
@@ -516,7 +516,7 @@ uv run receipt-index status [--check] [--output text|json]
 - **Each configured source**: its cursor (IMAP UIDVALIDITY and last UID, or the Drive page token), the last poll, the last successful read and its age, the stale threshold, the last error (marked `cleared since` when a successful read came after it), the reset count and the archive state.
 - **Orphaned sync state**: rows for a source name or folder no longer in the config, for example after a rename.
 - **Worker**: the heartbeat's age, `serve`'s process ID, the sources it watches, how long it has been on its current step, the sources paused after errors (for how long, and why) and the sources it stopped watching after losing their lock.
-- **Retries**: pending (failed, due now), retrying (failed, due later), queued, terminal, and skipped in the last 7 days.
+- **Retries**: pending (failed, due now), retrying (failed, due later), queued, terminal, and skipped in the last 7 days. `failures --status retrying` lists pending and retrying together.
 - **Problems**: the `--check` lines.
 
 ### The checks
@@ -530,10 +530,11 @@ uv run receipt-index status [--check] [--output text|json]
 | `source NAME stale 1200s` | The source's last successful read is older than its stale threshold: `ingest.health.source_stale_seconds` when set, otherwise three times its poll interval (720 seconds for IMAP and 360 for Drive at the defaults) |
 | `source NAME never succeeded` | The source has never been read successfully |
 | `source NAME lock lost` | `serve` lost the source's lock to another process and stopped watching it |
+| `source NAME not held` | `serve` was asked to watch the source, but another process (a running `ingest`, say) held its lock when `serve` started. `serve` doesn't try again until it restarts |
 | `source NAME paused 900s` | `serve` has kept the source paused after errors for longer than `source_stale_seconds`, or by default the largest of the sources' stale thresholds |
 | `database unreachable` | The database didn't answer within 5 seconds |
 
-With a fresh heartbeat, only the sources that `serve` watches are checked for staleness. They aren't checked at all while its worker is busy on a job, because one worker takes the sources in turn and a long job holds the others back. A stuck job is caught by the heartbeat instead. A stale heartbeat's content is ignored, because the process that wrote it may be gone. Terminal failures never fail the check: they are content problems, reported by the ping below and by [`failures`](#failures).
+With a fresh heartbeat, only the sources that `serve` watches are checked for staleness. A source's age counts from its last successful read or from `serve`'s start, whichever is later, so a restart after downtime gets one stale threshold to catch up before the check or the ping reports it. Neither staleness nor pauses are checked while the worker is busy on a job, because one worker takes the sources in turn and a long job holds the others back. A stuck job is caught by the heartbeat instead. A stale heartbeat's content is ignored, because the process that wrote it may be gone. Terminal failures never fail the check: they are content problems, reported by the ping below and by [`failures`](#failures).
 
 ### The dead-man ping
 

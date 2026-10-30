@@ -391,6 +391,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             ping_url=(health.ping_url.get_secret_value() if health.ping_url else None),
             ping_interval_seconds=health.ping_interval_seconds,
             ping_probe=_ping_probe(config),
+            requested=[s.name for s in sources],
         )
 
         def _on_signal(signum: int, _frame: object) -> None:
@@ -472,7 +473,14 @@ def status(ctx: click.Context, output_format: str, check: bool) -> None:
 
     config = _load_config_or_exit(ctx)
     _configure_logging(config)
-    report = collect(config, _status_connection(config), heartbeat_path=HEARTBEAT_PATH)
+    report = collect(
+        config,
+        _status_connection(config),
+        heartbeat_path=HEARTBEAT_PATH,
+        # The healthcheck needs no retry counts: fewer queries under its
+        # timeout.
+        retries=not (check and output_format == "text"),
+    )
 
     if output_format == "json":
         click.echo(json.dumps(report_json(report), indent=2))

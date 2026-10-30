@@ -161,7 +161,7 @@ class TestReport:
         assert "(cleared since): read failed: timeout" in out
         assert "archive: off" in out
         assert "heartbeat: none (serve isn't running here)" in out
-        assert "pending 1, retrying 2, queued 2, terminal 2" in out
+        assert "pending 1, retrying 1, queued 2, terminal 2" in out
         assert out.rstrip().endswith("heartbeat missing")
 
     def test_text_with_serve_and_an_orphan(self, env: dict[str, Any]) -> None:
@@ -203,3 +203,39 @@ class TestReport:
         result = _run(env)
         assert result.exit_code == 1
         assert "unknown (database unreachable)" in result.output
+
+
+class TestServeWiring:
+    def test_the_ping_probe_reports_problems_and_new_terminals(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from receipt_index.config import load_config
+
+        config = load_config(str(env["config"]))
+        _beat(env["hb"])
+        assert cli_module._ping_probe(config)() == []
+        monkeypatch.setattr(
+            repository,
+            "count_ingest_failures",
+            lambda _c, *, status, since=None: (
+                2 if since and status == "terminal" else 0
+            ),
+        )
+        assert cli_module._ping_probe(config)() == ["terminal 2 in 24h"]
+
+    def test_text_check_skips_the_retry_counts(
+        self, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[bool] = []
+        real = health.collect
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs["retries"])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(health, "collect", spy)
+        _beat(env["hb"])
+        _run(env, "--check")
+        _run(env, "--check", "--output", "json")
+        _run(env)
+        assert seen == [False, True, True]

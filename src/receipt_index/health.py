@@ -85,6 +85,10 @@ class WorkerState:
     lock_lost: list[str] = field(default_factory=list)
     # How long the worker had been on its current step; None when idle.
     busy_seconds: float | None = None
+    # The sources this serve was asked to watch (every configured source, or
+    # the --source set), and when it started.
+    requested: list[str] = field(default_factory=list)
+    started_at: datetime | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -97,6 +101,10 @@ class WorkerState:
             },
             "lock_lost": list(self.lock_lost),
             "busy_seconds": self.busy_seconds,
+            "requested": list(self.requested),
+            "started_at": None
+            if self.started_at is None
+            else self.started_at.isoformat(),
         }
 
     @classmethod
@@ -117,6 +125,12 @@ class WorkerState:
                 None
                 if data.get("busy_seconds") is None
                 else float(data["busy_seconds"])
+            ),
+            requested=[str(n) for n in data.get("requested", [])],
+            started_at=(
+                None
+                if data.get("started_at") is None
+                else datetime.fromisoformat(data["started_at"])
             ),
         )
 
@@ -170,18 +184,12 @@ def source_folder(source: SourceConfig) -> str:
     return source.folder if isinstance(source, ImapSourceConfig) else source.folder_id
 
 
-def poll_seconds(source: SourceConfig, ingest: IngestConfig) -> int:
-    if isinstance(source, ImapSourceConfig):
-        return ingest.imap_poll_seconds
-    return ingest.drive_poll_seconds
-
-
 def stale_threshold(source: SourceConfig, ingest: IngestConfig) -> int:
     """How old a source's last successful read may be before it's stale."""
     explicit = ingest.health.source_stale_seconds
     if explicit is not None:
         return explicit
-    return STALE_POLLS * poll_seconds(source, ingest)
+    return STALE_POLLS * ingest.poll_seconds(source.type)
 
 
 def pause_threshold(sources: Sequence[SourceConfig], ingest: IngestConfig) -> int:
@@ -229,7 +237,11 @@ class SourceStatus:
 
 @dataclass
 class Report:
-    """Everything ``status`` shows. ``rows`` is None when the database was down."""
+    """Everything ``status`` shows.
+
+    When the database was down, ``database_ok`` is False, ``retries`` is
+    None and no source has a row.
+    """
 
     now: datetime
     sources: list[SourceStatus]
@@ -268,25 +280,45 @@ def evaluate(
     # A stale heartbeat's content belongs to a process that may be gone.
     state = heartbeat.state if fresh and heartbeat is not None else None
 
+    # While a live worker is busy on a long job (a bulk drop, a retry pass),
+    # the other sources wait their turn: that isn't staleness or a stuck
+    # pause, and a wedged step is the heartbeat's to catch.
+    busy = state is not None and state.busy_seconds is not None
+    # A serve that just started hasn't read its sources yet: each source's
+    # age counts from the later of its last success and the start, so a
+    # restart after downtime gets one stale threshold to catch up.
+    started = state.started_at if state is not None else None
+
     if not database_ok:
         problems.append(Problem("database", "unreachable"))
-    elif state is None or state.busy_seconds is None:
-        # While a live worker is busy on a long job (a bulk drop, a retry
-        # pass), the other sources wait their turn: that isn't staleness,
-        # and a wedged step is the heartbeat's to catch.
+    elif not busy:
         watched = set(state.watching) if state is not None else None
         for status in sources:
             if watched is not None and status.name not in watched:
                 continue  # left to whatever else reads it (`serve --source`)
             age = status.success_age(now)
+            since_start = None if started is None else (now - started).total_seconds()
+            if (
+                since_start is not None
+                and (age is None or since_start < age)
+                and since_start <= status.stale_after_seconds
+            ):
+                continue
             if age is None:
                 problems.append(Problem("source", "never succeeded", status.name))
             elif age > status.stale_after_seconds:
                 problems.append(Problem("source", f"stale {_secs(age)}", status.name))
 
     if state is not None:
-        for name in sorted(state.lock_lost):
+        lost = set(state.lock_lost)
+        for name in sorted(lost):
             problems.append(Problem("source", "lock lost", name))
+        held = set(state.watching)
+        for name in sorted(set(state.requested) - held - lost):
+            # Another process held its lock when serve started, and serve
+            # never takes it later: nothing watches this source.
+            problems.append(Problem("source", "not held", name))
+    if state is not None and not busy:
         for name, pause in sorted(state.paused.items()):
             paused_for = (now - pause.since).total_seconds()
             if paused_for > pause_after:
@@ -334,9 +366,12 @@ def collect(
         with open_conn() as conn:
             rows = list_sync_state(conn)
             if retries:
+                pending = count_due_retries(conn)
                 report.retries = {
-                    "pending": count_due_retries(conn),
-                    "retrying": count_ingest_failures(conn, status="retrying"),
+                    "pending": pending,
+                    # Due later: `failures --status retrying` counts both.
+                    "retrying": count_ingest_failures(conn, status="retrying")
+                    - pending,
                     "queued": count_ingest_failures(conn, status="queued"),
                     "terminal": count_ingest_failures(conn, status="terminal"),
                     "skipped_7d": count_ingest_failures(
