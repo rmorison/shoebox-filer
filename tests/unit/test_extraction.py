@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,7 +27,8 @@ from receipt_index.models import (
     RawReceipt,
     ReceiptMetadata,
 )
-from tests.pdfs import make_pdf
+from receipt_index.pdf_validate import PdfLimits
+from tests.pdfs import filter_chain_pdf, make_pdf
 
 _FIELD_CONFIDENCE = FieldConfidence(vendor=0.9, amount=0.9, paid_amount=0.9, date=0.9)
 
@@ -460,16 +463,16 @@ class TestReadPdfAttachments:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # It can be neither the text (that's found) nor a document (too long).
-        import pdfplumber.page
+        from receipt_index import pdf_reader
 
-        calls: list[int] = []
-        real = pdfplumber.page.Page.extract_text
+        limits: list[int | None] = []
+        real = pdf_reader.read_pdf
 
-        def counting(page: pdfplumber.page.Page, *args: object, **kw: object) -> str:
-            calls.append(page.page_number)
-            return real(page, *args, **kw)
+        def spy(data: bytes, *, text_up_to_pages: int | None = None) -> object:
+            limits.append(text_up_to_pages)
+            return real(data, text_up_to_pages=text_up_to_pages)
 
-        monkeypatch.setattr(pdfplumber.page.Page, "extract_text", counting)
+        monkeypatch.setattr(pdf_reader, "read_pdf", spy)
         pdfs = _read_pdf_attachments(
             [
                 _pdf("receipt.pdf", make_pdf(_RECEIPT_TEXT)),
@@ -477,18 +480,28 @@ class TestReadPdfAttachments:
             ]
         )
         assert pdfs.text_name == "receipt.pdf"
-        assert len(calls) == 1
+        assert limits == [None, 10]
 
-    def test_a_page_read_error_is_unreadable_not_scanned(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_a_hostile_pdf_is_left_out_within_the_bound(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        def boom(*_args: object, **_kwargs: object) -> str:
-            raise ValueError("bad page")
+        # About 700 bytes whose page content takes pdfplumber minutes of CPU.
+        from receipt_index import pdf_reader
 
-        monkeypatch.setattr("pdfplumber.page.Page.extract_text", boom)
-        pdfs = _read_pdf_attachments([_pdf("odd.pdf", make_pdf(_RECEIPT_TEXT))])
+        tight = PdfLimits(cpu_seconds=2, wall_seconds=20)
+        monkeypatch.setattr(
+            pdf_reader, "read_pdf", partial(pdf_reader.read_pdf, limits=tight)
+        )
+        receipt = _pdf("receipt.pdf", make_pdf(_RECEIPT_TEXT))
+        start = time.monotonic()
+        with caplog.at_level("INFO", logger="receipt_index.extraction"):
+            pdfs = _read_pdf_attachments(
+                [_pdf("bomb.pdf", filter_chain_pdf(64)), receipt]
+            )
+        assert time.monotonic() - start < tight.wall_seconds
+        assert pdfs.text_name == "receipt.pdf"
         assert pdfs.documents == []
-        assert pdfs.text is None
+        assert "bomb.pdf can't be read" in caplog.text
 
     def test_images_and_other_types_are_not_read(self) -> None:
         pdfs = _read_pdf_attachments(

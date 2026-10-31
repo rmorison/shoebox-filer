@@ -94,7 +94,7 @@ def test_bytes_that_cannot_be_repaired_are_unparseable(data: bytes) -> None:
 
 def test_a_pdf_that_needs_a_user_password_is_unparseable() -> None:
     with patch(
-        "receipt_index.pdf_validate.pikepdf.open",
+        "pikepdf.open",
         side_effect=pikepdf.PasswordError("password needed"),
     ):
         assert _judge(make_pdf("Locked")) == PdfCheck(status="unparseable")
@@ -111,7 +111,7 @@ def test_a_repair_that_still_fails_strict_mode_is_unparseable() -> None:
             raise pikepdf.PdfError("still damaged")
         return real_open(*args, **kwargs)  # type: ignore[arg-type]
 
-    with patch("receipt_index.pdf_validate.pikepdf.open", side_effect=open_):
+    with patch("pikepdf.open", side_effect=open_):
         assert _judge(truncated_pdf()) == PdfCheck(status="unparseable")
     # The strict open, the recovering open, and the strict check of the repair.
     assert calls == [True, False, True]
@@ -123,7 +123,7 @@ def test_a_repair_that_still_fails_strict_mode_is_unparseable() -> None:
 )
 def test_any_error_reading_a_pdf_makes_it_unparseable(error: Exception) -> None:
     # In the child, a MemoryError is its address-space limit: the file's doing.
-    with patch("receipt_index.pdf_validate.pikepdf.open", side_effect=error):
+    with patch("pikepdf.open", side_effect=error):
         assert _judge(make_pdf("Hostile")) == PdfCheck(status="unparseable")
 
 

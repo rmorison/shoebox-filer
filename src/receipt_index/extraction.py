@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import functools
-import io
 import json
 import logging
 import re
@@ -512,35 +511,6 @@ class _PdfAttachments:
     documents: list[Attachment] = field(default_factory=list)
 
 
-@dataclass
-class _PdfRead:
-    """What pdfplumber found in one PDF. ``text`` is None when not read."""
-
-    pages: int
-    text: str | None
-    encrypted: bool
-
-
-def _read_pdf(data: bytes, *, text_up_to_pages: int | None = None) -> _PdfRead | None:
-    """A PDF's page count, text and encryption, or None when it can't be read.
-
-    With ``text_up_to_pages``, a longer PDF's text isn't read. Any failure,
-    on opening or on a page, means unreadable, never a scan.
-    """
-    import pdfplumber
-
-    try:
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            pages = len(pdf.pages)
-            encrypted = pdf.doc.encryption is not None
-            if text_up_to_pages is not None and pages > text_up_to_pages:
-                return _PdfRead(pages, None, encrypted)
-            texts = [page.extract_text() or "" for page in pdf.pages]
-    except Exception:  # any failure means unreadable, never a scan
-        return None
-    return _PdfRead(pages, "\n\n".join(texts).strip(), encrypted)
-
-
 def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
     """Sort the PDF attachments into text, documents and left out.
 
@@ -549,7 +519,11 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
     goes as a document, within the caps above; image attachments, which
     are all sent, count toward the byte cap. A PDF that can't be read, or
     an encrypted scan, is left out: sent, it would fail the whole request.
+    pdfplumber runs in a bounded child, so a PDF that hits a limit there
+    can't be read either.
     """
+    from receipt_index import pdf_reader
+
     pdfs = _PdfAttachments()
     sent_bytes = sum(len(att.data) for att in _image_attachments(attachments))
     for att in attachments:
@@ -558,7 +532,7 @@ def _read_pdf_attachments(attachments: list[Attachment]) -> _PdfAttachments:
         # Once the text is found, a PDF too long to be a document isn't
         # read through: it can be neither.
         limit = _MAX_EMAIL_PDF_PAGES if pdfs.text is not None else None
-        read = _read_pdf(att.data, text_up_to_pages=limit)
+        read = pdf_reader.read_pdf(att.data, text_up_to_pages=limit)
         if read is None:
             logger.info(
                 "PDF attachment %s can't be read; left out", _label_name(att.filename)

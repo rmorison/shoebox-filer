@@ -22,7 +22,11 @@ memory and time are never at the file's mercy. A clean result is cached by
 content, so an item's attachment and its pass-through rendition, the same
 bytes, are checked once.
 
-pdfplumber stays for text extraction; this module only judges and repairs.
+pdfplumber stays for text extraction, and it decodes the same untrusted
+content, so it runs under the same bounds: :func:`run_bounded` is shared,
+and the child runs one of two jobs, ``check`` (here) or ``read``
+(:func:`receipt_index.pdf_reader.read_pdf`). Each has its own child, so a
+PDF too costly to read is still judged on its own bytes.
 """
 
 from __future__ import annotations
@@ -37,8 +41,6 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal
-
-import pikepdf
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,7 @@ class PdfCheck:
 
 @dataclass(frozen=True)
 class PdfLimits:
-    """Bounds on checking one PDF. All are far below ``item_timeout_seconds``.
+    """Bounds on checking or reading one PDF, far below ``item_timeout_seconds``.
 
     A receipt is kilobytes to a few megabytes; Drive's own export limit is
     10 MB. The memory limit is the child's whole address space.
@@ -83,6 +85,8 @@ _UNPARSEABLE = PdfCheck(status="unparseable")
 
 def _strict_ok(data: bytes) -> bool:
     """Whether qpdf reads ``data`` without recovery, saves it, and warns of nothing."""
+    import pikepdf  # in the child only: a read child doesn't pay for it
+
     try:
         with pikepdf.open(io.BytesIO(data), attempt_recovery=False) as pdf:
             pdf.save(io.BytesIO())
@@ -98,6 +102,8 @@ def _repair(data: bytes) -> bytes | None:
     The file ID is derived from the content, so the same damaged bytes always
     give the same repair: a retry stores what the first attempt would have.
     """
+    import pikepdf
+
     try:
         with pikepdf.open(io.BytesIO(data)) as pdf:
             out = io.BytesIO()
@@ -118,20 +124,33 @@ def _judge(data: bytes) -> PdfCheck:
     return _UNPARSEABLE
 
 
-def _child_main() -> None:
-    """Limit this process, judge the PDF on stdin, write the result to stdout.
+def _check_job(data: bytes) -> bytes:
+    """The status on one line, then (for ``repaired``) the repair."""
+    result = _judge(data)
+    return result.status.encode() + b"\n" + (result.repaired or b"")
 
-    Output is the status on one line, then (for ``repaired``) the repair.
+
+def _child_main() -> None:
+    """Limit this process, run the job on the PDF on stdin, write its output.
+
+    Arguments: the job (``check`` or ``read``), the memory and CPU limits,
+    then the job's own arguments.
     """
-    memory, cpu = (int(arg) for arg in sys.argv[1:3])
+    job = sys.argv[1]
+    memory, cpu = (int(arg) for arg in sys.argv[2:4])
     resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
-    result = _judge(sys.stdin.buffer.read())
-    out = sys.stdout.buffer
-    out.write(result.status.encode() + b"\n")
-    if result.repaired is not None:
-        out.write(result.repaired)
-    out.flush()
+    data = sys.stdin.buffer.read()
+    if job == "check":
+        output = _check_job(data)
+    elif job == "read":
+        from receipt_index.pdf_reader import read_job
+
+        output = read_job(data, sys.argv[4:])
+    else:
+        sys.exit(f"unknown job {job!r}")
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +161,20 @@ _cache: OrderedDict[bytes, PdfCheck] = OrderedDict()
 _cache_lock = threading.Lock()
 
 
-def _run_child(data: bytes, limits: PdfLimits) -> PdfCheck | None:
-    """The child's judgement of ``data``, or None if it didn't finish cleanly."""
+def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes | None:
+    """The output of ``job`` run on ``data`` in a bounded child process.
+
+    None, with the reason logged, when ``data`` is over the size cap or the
+    child times out, is killed (a hit limit) or fails.
+    """
+    if len(data) > limits.max_bytes:
+        logger.warning(
+            "PDF of %d bytes is over the %d-byte limit; not running the %s",
+            len(data),
+            limits.max_bytes,
+            job,
+        )
+        return None
     try:
         proc = subprocess.run(  # our own interpreter and module
             [
@@ -151,8 +182,10 @@ def _run_child(data: bytes, limits: PdfLimits) -> PdfCheck | None:
                 "-I",
                 "-m",
                 _MODULE,
+                job,
                 str(limits.memory_bytes),
                 str(limits.cpu_seconds),
+                *args,
             ],
             input=data,
             capture_output=True,
@@ -161,21 +194,33 @@ def _run_child(data: bytes, limits: PdfLimits) -> PdfCheck | None:
         )
     except subprocess.TimeoutExpired:
         logger.warning(
-            "PDF check timed out after %.0fs (%d bytes); treating it as unparseable",
+            "PDF %s timed out after %.0fs (%d bytes)",
+            job,
             limits.wall_seconds,
             len(data),
         )
         return None
-    status, _, repaired = proc.stdout.partition(b"\n")
-    if proc.returncode != 0 or status not in (b"ok", b"repaired", b"unparseable"):
+    if proc.returncode != 0:
         # A negative code is the signal: SIGXCPU for the CPU limit, SIGKILL...
         logger.warning(
-            "PDF check ended with exit code %d (%d bytes); treating it as "
-            "unparseable: %s",
+            "PDF %s ended with exit code %d (%d bytes): %s",
+            job,
             proc.returncode,
             len(data),
             proc.stderr.decode(errors="replace").strip()[-300:],
         )
+        return None
+    return proc.stdout
+
+
+def _run_check(data: bytes, limits: PdfLimits) -> PdfCheck | None:
+    """The child's judgement of ``data``, or None if it didn't finish cleanly."""
+    output = run_bounded("check", data, limits)
+    if output is None:
+        return None
+    status, _, repaired = output.partition(b"\n")
+    if status not in (b"ok", b"repaired", b"unparseable"):
+        logger.warning("PDF check gave no status (%d bytes)", len(data))
         return None
     if status == b"repaired":
         return PdfCheck(status="repaired", repaired=repaired)
@@ -187,21 +232,15 @@ def check_pdf(data: bytes, *, limits: PdfLimits = DEFAULT_LIMITS) -> PdfCheck:
 
     qpdf runs in a bounded child process; see the module docstring.
     """
-    if len(data) > limits.max_bytes:
-        logger.warning(
-            "PDF of %d bytes is over the %d-byte limit; treating it as unparseable",
-            len(data),
-            limits.max_bytes,
-        )
-        return _UNPARSEABLE
     key = hashlib.sha256(data).digest()
     with _cache_lock:
         if key in _cache:
             _cache.move_to_end(key)
             return _cache[key]
-    result = _run_child(data, limits)
+    result = _run_check(data, limits)
     if result is None:
         # Not cached: a timeout or a kill can be the host's load, not the file.
+        logger.info("Treating the PDF as unparseable (%d bytes)", len(data))
         return _UNPARSEABLE
     if result.status == "repaired":
         logger.info("Repaired a damaged PDF (%d bytes)", len(data))
