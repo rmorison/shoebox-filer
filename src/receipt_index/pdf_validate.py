@@ -61,19 +61,40 @@ class PdfCheck:
 
 @dataclass(frozen=True)
 class PdfLimits:
-    """Bounds on checking or reading one PDF, far below ``item_timeout_seconds``.
+    """Bounds on one child job, checking or reading one PDF.
 
-    A receipt is kilobytes to a few megabytes; Drive's own export limit is
-    10 MB. The memory limit is the child's whole address space.
+    The memory limit is the child's whole address space. The wall clock is
+    a small multiple of the CPU limit, for a loaded host.
     """
 
+    cpu_seconds: int
+    wall_seconds: float
     max_bytes: int = 25 * 1024 * 1024
     memory_bytes: int = 512 * 1024 * 1024
-    cpu_seconds: int = 30
-    wall_seconds: float = 60.0
 
 
-DEFAULT_LIMITS = PdfLimits()
+@dataclass(frozen=True)
+class PdfBounds:
+    """The limits for one kind of document's PDFs, per job.
+
+    ``max_read_pages``: a longer PDF isn't read for text at all.
+    """
+
+    check: PdfLimits
+    read: PdfLimits
+    max_read_pages: int
+
+
+# Receipts are a page or two, and kilobytes to a few megabytes (Drive's own
+# export limit is 10 MB). The bounds are there to stop malicious input, so
+# they sit well above an ordinary receipt's cost and far below
+# item_timeout_seconds. Another kind of document, such as a statement,
+# gets its own bounds rather than loosening these.
+RECEIPT_BOUNDS = PdfBounds(
+    check=PdfLimits(cpu_seconds=10, wall_seconds=30.0),
+    read=PdfLimits(cpu_seconds=15, wall_seconds=45.0),
+    max_read_pages=50,
+)
 
 _UNPARSEABLE = PdfCheck(status="unparseable")
 
@@ -227,7 +248,7 @@ def _run_check(data: bytes, limits: PdfLimits) -> PdfCheck | None:
     return PdfCheck(status="ok") if status == b"ok" else _UNPARSEABLE
 
 
-def check_pdf(data: bytes, *, limits: PdfLimits = DEFAULT_LIMITS) -> PdfCheck:
+def check_pdf(data: bytes, *, limits: PdfLimits = RECEIPT_BOUNDS.check) -> PdfCheck:
     """Judge ``data`` as ``ok``, ``repaired`` (with the repair) or ``unparseable``.
 
     qpdf runs in a bounded child process; see the module docstring.

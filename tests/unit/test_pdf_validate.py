@@ -7,6 +7,7 @@ import io
 import resource
 import subprocess
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
@@ -15,7 +16,13 @@ import pytest
 
 from receipt_index import pdf_validate
 from receipt_index.errors import classify
-from receipt_index.pdf_validate import PdfCheck, PdfLimits, _judge, check_pdf
+from receipt_index.pdf_validate import (
+    RECEIPT_BOUNDS,
+    PdfCheck,
+    PdfLimits,
+    _judge,
+    check_pdf,
+)
 from tests.pdfs import (
     broken_header_pdf,
     filter_chain_pdf,
@@ -173,7 +180,7 @@ def test_under_the_default_limits_a_memory_bomb_is_unparseable() -> None:
     before = _peak_rss_mb()
     start = time.monotonic()
     assert check_pdf(data) == PdfCheck(status="unparseable")
-    assert time.monotonic() - start < pdf_validate.DEFAULT_LIMITS.wall_seconds
+    assert time.monotonic() - start < RECEIPT_BOUNDS.check.wall_seconds
     assert _peak_rss_mb() - before < 100
 
 
@@ -197,13 +204,17 @@ def test_a_killed_or_failed_child_is_unparseable(code: int) -> None:
 @pytest.mark.parametrize("stdout", [b"", b"bogus\n"], ids=["empty", "unknown"])
 def test_a_child_that_writes_no_status_is_unparseable(stdout: bytes) -> None:
     done = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=b"")
+    data = make_pdf("Odd child")
     with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
-        assert check_pdf(make_pdf("Odd child")) == PdfCheck(status="unparseable")
+        assert check_pdf(data) == PdfCheck(status="unparseable")
+    # Not remembered: the next, real check judges the bytes afresh.
+    assert check_pdf(data) == PdfCheck(status="ok")
 
 
 def test_a_pdf_over_the_size_cap_is_unparseable_without_a_check() -> None:
     with patch("receipt_index.pdf_validate.subprocess.run") as run:
-        result = check_pdf(make_pdf("Too big"), limits=PdfLimits(max_bytes=100))
+        limits = replace(RECEIPT_BOUNDS.check, max_bytes=100)
+        result = check_pdf(make_pdf("Too big"), limits=limits)
     assert result == PdfCheck(status="unparseable")
     run.assert_not_called()
 

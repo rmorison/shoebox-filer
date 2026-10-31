@@ -8,8 +8,9 @@ The PDF is untrusted, and reading its text decodes its page content: a file
 of under a kilobyte can hold pdfplumber for minutes or inflate to gigabytes.
 So pdfplumber never runs in the caller's process. :func:`read_pdf` runs it
 through PDF validation's runner (:func:`receipt_index.pdf_validate.run_bounded`),
-under the same address-space, CPU, wall-clock and size limits. A PDF that
-hits a limit reads as unreadable, the same as one pdfplumber can't open.
+under its own address-space, CPU, wall-clock and size limits, and reads
+no text from a PDF over a page cap (:data:`RECEIPT_BOUNDS`). A PDF that hits
+a limit or the cap reads as unreadable, the same as one pdfplumber can't open.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 
-from receipt_index.pdf_validate import DEFAULT_LIMITS, PdfLimits, run_bounded
+from receipt_index.pdf_validate import RECEIPT_BOUNDS, PdfLimits, run_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -67,29 +68,39 @@ def read_pdf(
     data: bytes,
     *,
     text_up_to_pages: int | None = None,
-    limits: PdfLimits = DEFAULT_LIMITS,
+    limits: PdfLimits = RECEIPT_BOUNDS.read,
+    max_pages: int = RECEIPT_BOUNDS.max_read_pages,
 ) -> PdfRead | None:
     """A PDF's page count, text and encryption, or None when it can't be read.
 
     pdfplumber runs in a bounded child (see the module docstring); a limit,
-    kill or timeout means unreadable. With ``text_up_to_pages``, a longer
-    PDF's text isn't read.
+    kill or timeout means unreadable, and so does a PDF over ``max_pages``,
+    whose text is never read. With ``text_up_to_pages``, a longer PDF's text
+    isn't read either, but its page count is returned.
     """
-    limit = "" if text_up_to_pages is None else str(text_up_to_pages)
-    output = run_bounded("read", data, limits, limit)
+    limit = max_pages if text_up_to_pages is None else min(text_up_to_pages, max_pages)
+    output = run_bounded("read", data, limits, str(limit))
     if output is None:
         return None
     try:
         found = json.loads(output)
-        return None if found is None else PdfRead(**found)
+        read = None if found is None else PdfRead(**found)
     except (ValueError, TypeError):
         logger.warning("PDF read gave no result (%d bytes)", len(data))
         return None
+    if read is not None and read.pages > max_pages:
+        logger.info(
+            "PDF of %d pages is over the %d-page cap; not reading its text",
+            read.pages,
+            max_pages,
+        )
+        return None
+    return read
 
 
 def read_job(data: bytes, args: list[str]) -> bytes:
     """The child's ``read`` job: :func:`_read_unbounded`, as JSON."""
-    limit = int(args[0]) if args and args[0] else None
+    limit = int(args[0])
     read = _read_unbounded(data, text_up_to_pages=limit)
     return json.dumps(None if read is None else asdict(read)).encode()
 

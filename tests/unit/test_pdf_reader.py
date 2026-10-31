@@ -5,6 +5,7 @@ from __future__ import annotations
 import resource
 import subprocess
 import time
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,7 +18,7 @@ from receipt_index.pdf_reader import (
     extract_text,
     read_pdf,
 )
-from receipt_index.pdf_validate import DEFAULT_LIMITS, PdfLimits
+from receipt_index.pdf_validate import RECEIPT_BOUNDS, PdfLimits
 from tests.pdfs import filter_chain_pdf, make_pdf
 
 
@@ -178,7 +179,7 @@ def test_a_weasyprint_pdf_reads_the_same_in_the_child() -> None:
     assert read_pdf(data) == _read_unbounded(data)
 
 
-def test_a_multi_page_pdf_reads_each_page_in_order() -> None:
+def test_a_multi_page_pdf_joins_its_pages_with_a_blank_line() -> None:
     assert read_pdf(make_pdf("Two pages", pages=2)) == PdfRead(
         pages=2, text="Two pages\n\nTwo pages", encrypted=False
     )
@@ -199,14 +200,57 @@ def _long_table_pdf(sections: int) -> bytes:
     ).write_pdf()
 
 
+def test_a_pdf_at_the_page_cap_is_read() -> None:
+    read = read_pdf(make_pdf("Fifty", pages=50))
+    assert read is not None
+    assert read.pages == 50
+    assert read.text is not None
+
+
+def test_a_pdf_over_the_page_cap_gives_no_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Decided from the page count: not one page's text is read.
+    import pdfplumber.page
+
+    def never(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("a page was read")
+
+    monkeypatch.setattr(pdfplumber.page.Page, "extract_text", never)
+    assert _read_unbounded(make_pdf("Long", pages=51), text_up_to_pages=50) == (
+        PdfRead(pages=51, text=None, encrypted=False)
+    )
+    with caplog.at_level("INFO", logger="receipt_index.pdf_reader"):
+        assert read_pdf(make_pdf("Long", pages=51)) is None
+        assert extract_text(make_pdf("Long", pages=51)) == ""
+    assert "over the 50-page cap" in caplog.text
+
+
+@pytest.mark.parametrize(("up_to", "sent"), [(None, "50"), (10, "10"), (80, "50")])
+def test_the_child_is_told_the_page_cap(up_to: int | None, sent: str) -> None:
+    with patch("receipt_index.pdf_reader.run_bounded", return_value=b"null") as run:
+        read_pdf(b"%PDF-1.4", text_up_to_pages=up_to)
+    assert run.call_args.args[-1] == sent
+
+
+def test_receipt_bounds_are_the_operators_limits() -> None:
+    assert RECEIPT_BOUNDS.read.cpu_seconds == 15
+    assert RECEIPT_BOUNDS.check.cpu_seconds == 10
+    assert RECEIPT_BOUNDS.max_read_pages == 50
+    for limits in (RECEIPT_BOUNDS.read, RECEIPT_BOUNDS.check):
+        assert limits.cpu_seconds < limits.wall_seconds <= 3 * limits.cpu_seconds
+
+
 def test_a_long_ordinary_pdf_reads_in_flat_memory() -> None:
     # pdfplumber keeps every page's layout objects until the file closes
     # unless each page is closed: kept, these 20 pages need over 144 MB.
     data = _long_table_pdf(20)
-    read = read_pdf(data, limits=PdfLimits(memory_bytes=128 * 1024 * 1024))
+    limits = replace(RECEIPT_BOUNDS.read, memory_bytes=128 * 1024 * 1024)
+    read = read_pdf(data, limits=limits)
     assert read is not None
-    assert read == _read_unbounded(data)
     assert read.pages == 20
+    assert read.text is not None
+    assert read.text.count("Parking session 39 53.43") == 20
 
 
 def _peak_rss_mb() -> int:
@@ -237,7 +281,7 @@ def test_under_the_default_limits_a_memory_bomb_gives_no_text() -> None:
 
     assert extract_text(data) == ""
 
-    assert time.monotonic() - start < DEFAULT_LIMITS.wall_seconds
+    assert time.monotonic() - start < RECEIPT_BOUNDS.read.wall_seconds
     assert _peak_rss_mb() - before < 100
 
 
@@ -274,5 +318,6 @@ def test_a_child_that_writes_no_result_gives_no_text(stdout: bytes) -> None:
 
 def test_a_pdf_over_the_size_cap_is_not_read() -> None:
     with patch("receipt_index.pdf_validate.subprocess.run") as run:
-        assert read_pdf(make_pdf("Too big"), limits=PdfLimits(max_bytes=100)) is None
+        limits = replace(RECEIPT_BOUNDS.read, max_bytes=100)
+        assert read_pdf(make_pdf("Too big"), limits=limits) is None
     run.assert_not_called()
