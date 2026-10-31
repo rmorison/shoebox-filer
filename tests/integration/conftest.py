@@ -60,10 +60,10 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000019 (tables, indexes and
-    constraints). receipt/000014 and 000019 hold grants only. The grants are not applied
-    here, since CI's Postgres has no application roles; apply_migration_grants
-    applies them for the tests that need them.
+    Mirrors: public/000001, receipt/000001-000020 (tables, indexes and
+    constraints). receipt/000014, 000019 and 000020 hold grants only. The
+    grants are not applied here, since CI's Postgres has no application roles;
+    apply_migration_grants applies them for the tests that need them.
     Keep in sync with db/migrations/ when schema changes.
     """
     # public/000001 — set_updated_at trigger function

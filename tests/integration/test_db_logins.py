@@ -330,6 +330,14 @@ def test_write_paths_run_as_the_write_login(
             "purpose": "original",
         }
     ]
+    # Its rendition, recorded with its PDF status (000020's grants).
+    rendition = pg_conn.execute(
+        "SELECT f.pdf_status, f.repaired_from_id FROM receipt.receipts r"
+        " JOIN receipt.stored_files f ON f.id = r.rendition_file_id"
+        " WHERE r.id = %s",
+        (receipt["id"],),
+    ).fetchone()
+    assert rendition == {"pdf_status": "ok", "repaired_from_id": None}
     state = pg_conn.execute(
         "SELECT imap_last_uid, last_poll_at, last_success_at "
         "FROM receipt.sync_state WHERE source_name = %s",
@@ -532,12 +540,23 @@ def test_write_paths_run_as_the_write_login(
     pg_conn.commit()
 
 
-# Write grants on the evidence-store tables (000017, 000019) reach only the
+@pytest.mark.parametrize("column", ["pdf_status", "repaired_from_id"])
+def test_write_login_can_insert_pdf_validation_columns(
+    write_conn: Conn, column: str
+) -> None:
+    # 000020: ingest records each stored PDF's status and a repair's source.
+    row = write_conn.execute(
+        "SELECT has_column_privilege('receipt.stored_files', %s, 'INSERT') AS ok",
+        (column,),
+    ).fetchone()
+    write_conn.rollback()
+    assert row == {"ok": True}
+
+
+# Write grants on the evidence-store tables (000017, 000019, 000020) reach only the
 # columns the code writes: (table, column or None for the whole table).
 _UNWRITTEN = [
     ("stored_files", "content_kind"),
-    ("stored_files", "pdf_status"),
-    ("stored_files", "repaired_from_id"),
     ("file_locations", "owner"),
     ("file_locations", "last_verified_at"),
     ("file_locations", "read_only_set"),
