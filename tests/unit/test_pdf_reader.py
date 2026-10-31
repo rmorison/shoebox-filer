@@ -210,7 +210,8 @@ def test_a_pdf_at_the_page_cap_is_read() -> None:
 def test_a_pdf_over_the_page_cap_gives_no_text(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Decided from the page count: not one page's text is read.
+    # Decided from the page count. The patch reaches only this process, so
+    # the _read_unbounded call is what shows no page's text is read.
     import pdfplumber.page
 
     def never(*_args: object, **_kwargs: object) -> str:

@@ -482,6 +482,20 @@ class TestReadPdfAttachments:
         assert pdfs.text_name == "receipt.pdf"
         assert limits == [None, 10]
 
+    def test_a_pdf_over_the_page_cap_is_left_out(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Over 50 pages, before or after the text is found: never read.
+        long = _pdf("statement.pdf", make_pdf(_RECEIPT_TEXT, pages=60))
+        with caplog.at_level("INFO"):
+            pdfs = _read_pdf_attachments(
+                [long, _pdf("receipt.pdf", make_pdf(_RECEIPT_TEXT)), long]
+            )
+        assert pdfs.text_name == "receipt.pdf"
+        assert pdfs.documents == []
+        assert caplog.text.count("over the 50-page cap") == 2
+        assert caplog.text.count("statement.pdf can't be read; left out") == 2
+
     def test_a_hostile_pdf_is_left_out_within_the_bound(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
