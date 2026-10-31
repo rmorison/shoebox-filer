@@ -14,11 +14,15 @@ call can never hold the process open:
   cursor and advances it under the cursor rule; a retry job runs the same
   retry pass ``ingest`` runs after its read. Only this thread touches item
   state or the Google API, so locking and the cursor work as in ``ingest``.
-- **The health loop.** For now it runs only the watchdog: if a job has been
-  busy on one step (an item, or a listing) for longer than
-  ``item_timeout_seconds``, the process exits with ``WATCHDOG_EXIT_CODE``,
-  because a thread blocked in a synchronous call can't be stopped from
-  outside. The health ticket adds the heartbeat and the dead-man ping here.
+- **The health loop.** It runs the watchdog: if a job has been busy on one
+  step (an item, or a listing) for longer than ``item_timeout_seconds``, the
+  process exits with ``WATCHDOG_EXIT_CODE``, because a thread blocked in a
+  synchronous call can't be stopped from outside. It also writes the
+  heartbeat file while the worker is alive and within that time
+  (``receipt_index.health``).
+- **The ping thread**, when ``ingest.health.ping_url`` is set: the dead-man
+  ping, on a thread of its own so a slow monitor or database never delays
+  the watchdog or the heartbeat.
 
 A transient or config failure has already written its uncounted ``failed``
 row when the pipeline reports the source stopped, so the worker pauses the
@@ -38,6 +42,7 @@ import time
 from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from imapclient.exceptions import LoginError
@@ -45,12 +50,20 @@ from imapclient.exceptions import LoginError
 from receipt_index.adapters.imap import connect_imap
 from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
 from receipt_index.fetching import SourcePool
+from receipt_index.health import (
+    HEARTBEAT_WRITE_SECONDS,
+    Pause,
+    PingLoop,
+    WorkerState,
+    write_heartbeat,
+)
 from receipt_index.locks import SourceLockLostError
 from receipt_index.pipeline import run_due_retries, run_ingest
 from receipt_index.repository import select_due
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
+    from pathlib import Path
 
     import psycopg
     from imapclient import IMAPClient
@@ -152,6 +165,7 @@ class ItemClock:
         self._lock = threading.Lock()
         self._busy: tuple[float, str] | None = None
         self._job_label: str | None = None
+        self._job_since: float | None = None
 
     def should_stop(self) -> bool:
         return self._stop.is_set()
@@ -161,6 +175,11 @@ class ItemClock:
         with self._lock:
             return self._busy
 
+    def job_since(self) -> float | None:
+        """When the current job began; None when idle."""
+        with self._lock:
+            return self._job_since
+
     def _mark(self, label: str | None) -> None:
         with self._lock:
             self._busy = None if label is None else (self._now(), label)
@@ -168,11 +187,15 @@ class ItemClock:
     @contextmanager
     def job(self, job: Job) -> Iterator[None]:
         self._job_label = f"{job.kind} {job.source}"
+        with self._lock:
+            self._job_since = self._now()
         self._mark(self._job_label)
         try:
             yield
         finally:
             self._job_label = None
+            with self._lock:
+                self._job_since = None
             self._mark(None)
 
     @contextmanager
@@ -440,7 +463,10 @@ class Worker:
         self.all_sources = list(all_sources or sources)
         self._now = now
         self._conn: psycopg.Connection[dict[str, Any]] | None = None
-        self._pauses: dict[str, tuple[float, float]] = {}  # until, last delay
+        # Read by the health loop: every change takes _state_lock.
+        self._state_lock = threading.Lock()
+        # until, last delay, and when this run of pauses began (wall clock)
+        self._pauses: dict[str, tuple[float, float, Pause]] = {}
         self.dropped: set[str] = set()
 
     def run(self) -> None:
@@ -458,8 +484,21 @@ class Worker:
             self._close_conn()
 
     def paused_until(self, source: str) -> float | None:
-        pause = self._pauses.get(source)
+        with self._state_lock:
+            pause = self._pauses.get(source)
         return None if pause is None else pause[0]
+
+    def health_state(self) -> tuple[dict[str, Pause], list[str]]:
+        """The paused sources (since their first pause in a row, and why),
+        and the sources dropped after losing their lock."""
+        with self._state_lock:
+            dropped = sorted(self.dropped)
+            paused = {
+                name: entry[2]
+                for name, entry in self._pauses.items()
+                if name not in self.dropped
+            }
+        return paused, dropped
 
     def run_job(self, job: Job) -> None:
         source = self.sources.get(job.source)
@@ -489,7 +528,8 @@ class Worker:
             self._discard_conn()
 
         if error is None:
-            self._pauses.pop(job.source, None)
+            with self._state_lock:
+                self._pauses.pop(job.source, None)
             return
         # The lock check and re-take reach the database too, so the watchdog
         # times them as well.
@@ -580,15 +620,20 @@ class Worker:
                 "watching it",
                 name,
             )
-            self.dropped.add(name)
+            with self._state_lock:
+                self.dropped.add(name)
         return True
 
     def _pause(self, name: str, error: str) -> None:
-        last = self._pauses.get(name)
-        delay = (
-            PAUSE_FIRST_SECONDS if last is None else min(last[1] * 2, PAUSE_MAX_SECONDS)
-        )
-        self._pauses[name] = (self._now() + delay, delay)
+        with self._state_lock:
+            last = self._pauses.get(name)
+            if last is None:
+                delay = PAUSE_FIRST_SECONDS
+                since = Pause(since=datetime.now(UTC), reason=error)
+            else:
+                delay = min(last[1] * 2, PAUSE_MAX_SECONDS)
+                since = Pause(since=last[2].since, reason=error)
+            self._pauses[name] = (self._now() + delay, delay, since)
         logger.warning("Source %s paused for %.0fs: %s", name, delay, error)
 
     def _connection(self) -> psycopg.Connection[dict[str, Any]]:
@@ -616,10 +661,13 @@ def _agent_kind(source: SourceConfig) -> str:
 
 
 class HealthLoop:
-    """The health loop. This ticket gives it only the watchdog.
+    """The health loop: the watchdog, and the heartbeat file.
 
     It keeps watching until the worker has finished, so a stop during a hung
     item still ends in a watchdog exit rather than a process that never ends.
+    The heartbeat is written every ``heartbeat_seconds`` while the worker is
+    alive and idle, or busy on its current step for no longer than
+    ``item_timeout_seconds``: a slow item keeps it fresh, a wedged one doesn't.
     """
 
     def __init__(
@@ -632,6 +680,9 @@ class HealthLoop:
         exit_fn: Callable[[int], object] = os._exit,
         now: Callable[[], float] = time.monotonic,
         interval_seconds: float = HEALTH_INTERVAL_SECONDS,
+        heartbeat_path: Path | None = None,
+        state: Callable[[], WorkerState] | None = None,
+        heartbeat_seconds: float = HEARTBEAT_WRITE_SECONDS,
     ) -> None:
         self.clock = clock
         self.stop = stop
@@ -640,6 +691,11 @@ class HealthLoop:
         self._exit = exit_fn
         self._now = now
         self.interval_seconds = interval_seconds
+        self.heartbeat_path = heartbeat_path
+        self._state = state
+        self.heartbeat_seconds = heartbeat_seconds
+        self._last_beat: float | None = None
+        self._write_failing = False
 
     def run(self) -> None:
         while not self.worker_done.is_set():
@@ -647,9 +703,49 @@ class HealthLoop:
             self.worker_done.wait(self.interval_seconds)
 
     def check(self) -> None:
+        running = self._watchdog()
+        self._beat(running)
+
+    def beat_now(self) -> None:
+        """Write the heartbeat at once if the worker is fit (``serve``'s start)."""
+        self._last_beat = None
+        busy = self.clock.busy_since()
+        self._beat(None if busy is None else self._now() - busy[0])
+
+    def _beat(self, running: float | None) -> None:
+        if self.heartbeat_path is None or self._state is None:
+            return
+        if self.worker_done.is_set():
+            return  # a dead worker gets no heartbeat
+        if running is not None and running > self.item_timeout_seconds:
+            return  # nor does a wedged one
+        now = self._now()
+        if (
+            self._last_beat is not None
+            and now - self._last_beat < self.heartbeat_seconds
+        ):
+            return
+        try:
+            write_heartbeat(self.heartbeat_path, self._state())
+        except Exception as exc:
+            # Never let a full /tmp end the loop, and the watchdog with it.
+            # Logged once per change, not every tick.
+            if not self._write_failing:
+                logger.warning(
+                    "Health: can't write the heartbeat (%s)", type(exc).__name__
+                )
+            self._write_failing = True
+            return
+        if self._write_failing:
+            logger.info("Health: heartbeat written again")
+            self._write_failing = False
+        self._last_beat = now
+
+    def _watchdog(self) -> float | None:
+        """Exit past ``item_timeout_seconds``; return how long the step has run."""
         busy = self.clock.busy_since()
         if busy is None:
-            return
+            return None
         since, label = busy
         running = self._now() - since
         if running > self.item_timeout_seconds:
@@ -663,6 +759,7 @@ class HealthLoop:
             # No logging.shutdown(): the stuck thread may hold a handler's
             # lock. The stream handler has already written the line.
             self._exit(WATCHDOG_EXIT_CODE)
+        return running
 
 
 @dataclass
@@ -700,8 +797,17 @@ class Service:
         policy: RetryPolicy,
         imap_connect: Callable[[ImapSourceConfig], IMAPClient] = connect_imap,
         exit_fn: Callable[[int], object] = os._exit,
+        heartbeat_path: Path | None = None,
+        ping_url: str | None = None,
+        ping_interval_seconds: float = 300.0,
+        ping_probe: Callable[[], list[str]] | None = None,
+        requested: Sequence[str] | None = None,
     ) -> None:
         self.timings = timings
+        self._watching = [s.name for s in sources]
+        # What serve was asked to watch, held or not (`status` flags the gap).
+        self._requested = list(requested) if requested is not None else self._watching
+        self._started_at = datetime.now(UTC)
         self.stop_event = threading.Event()
         self.worker_done = threading.Event()
         self.queue = JobQueue()
@@ -746,7 +852,17 @@ class Service:
             worker_done=self.worker_done,
             item_timeout_seconds=timings.item_timeout_seconds,
             exit_fn=exit_fn,
+            heartbeat_path=heartbeat_path,
+            state=self.worker_state,
         )
+        self.ping: PingLoop | None = None
+        if ping_url and ping_probe is not None:
+            self.ping = PingLoop(
+                ping_url,
+                probe=ping_probe,
+                stop=self.stop_event,
+                interval_seconds=ping_interval_seconds,
+            )
         self._threads: list[threading.Thread] = []
         self._worker_thread: threading.Thread | None = None
         self.worker_failed = False
@@ -768,10 +884,32 @@ class Service:
                     self.stop()
 
         self._worker_thread = self._spawn(work, "worker")
+        # The first ping reads this run's heartbeat, not one a previous
+        # process left in /tmp.
+        self.health.beat_now()
         self._spawn(self.health.run, "health")
+        if self.ping is not None:
+            self._spawn(self.ping.run, "ping")
         self._spawn(self.timer.run, "timer")
         for watcher in self.watchers:
             self._spawn(watcher.run, f"idle-{watcher.config.name}")
+
+    def worker_state(self) -> WorkerState:
+        """What the heartbeat file says about this process."""
+        paused, lost = self.worker.health_state()
+        busy = self.clock.busy_since()
+        job = self.clock.job_since()
+        return WorkerState(
+            pid=os.getpid(),
+            written_at=datetime.now(UTC),
+            watching=[n for n in self._watching if n not in lost],
+            paused=paused,
+            lock_lost=lost,
+            busy_seconds=None if busy is None else time.monotonic() - busy[0],
+            job_seconds=None if job is None else time.monotonic() - job,
+            requested=list(self._requested),
+            started_at=self._started_at,
+        )
 
     def _spawn(self, target: Callable[[], None], name: str) -> threading.Thread:
         thread = threading.Thread(target=target, name=f"serve-{name}", daemon=True)

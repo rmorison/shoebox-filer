@@ -15,12 +15,15 @@ import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Discriminator,
     Field,
+    SecretStr,
     Tag,
     ValidationError,
     field_validator,
@@ -142,12 +145,47 @@ class LoggingConfig(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
 
+class HealthConfig(BaseModel):
+    """``serve``'s health checks and dead-man ping (the ``ingest.health:`` block).
+
+    ``ping_url`` is a capability: anyone holding it can send pings. It is a
+    ``SecretStr``, and ``AppConfig`` hides input values in its errors, so a
+    bad value never reaches a log line or a config error.
+    """
+
+    # The heartbeat is written every 30 s; twice that is the floor.
+    heartbeat_stale_seconds: int = Field(default=120, ge=60)
+    # When unset, each source's threshold is 3x its poll interval.
+    # At least twice each poll interval it applies to (an AppConfig check).
+    source_stale_seconds: int | None = Field(default=None, ge=60)
+    # An item that turned terminal this recently fails the ping; 0 = never.
+    terminal_alert_seconds: int = Field(default=86400, ge=0)
+    ping_url: SecretStr | None = None
+    ping_interval_seconds: int = Field(default=300, ge=30)
+
+    @field_validator("ping_url")
+    @classmethod
+    def _http_url(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        # No value in any message: the URL is a capability.
+        url = value.get_secret_value().strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("ping_url must be an http or https URL")
+        if not urlsplit(url).hostname:
+            raise ValueError("ping_url must name a host")
+        if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+            raise ValueError("ping_url must not contain spaces or control characters")
+        if "?" in url or "#" in url:
+            # The failure ping appends /fail to the path.
+            raise ValueError("ping_url must not have a query string or fragment")
+        return SecretStr(url.rstrip("/"))
+
+
 class IngestConfig(BaseModel):
     """Ingest timing (the ``ingest:`` block).
 
-    Only the keys the current ingest and ``serve`` use are defined; later
-    keys (``health:``) arrive with the features that read them. Every key has
-    a default, so a config without the block loads unchanged.
+    Every key has a default, so a config without the block loads unchanged.
     """
 
     # A Drive change younger than this is left for the next run, because
@@ -186,6 +224,14 @@ class IngestConfig(BaseModel):
     )
     transient_item_max_seconds: int = Field(default=21600, ge=0)
 
+    health: HealthConfig = HealthConfig()
+
+    def poll_seconds(self, source_type: str) -> int:
+        """The poll interval of a source type: the IMAP safety poll or Drive's."""
+        if source_type == "imap":
+            return self.imap_poll_seconds
+        return self.drive_poll_seconds
+
     @model_validator(mode="after")
     def _check_backoff(self) -> IngestConfig:
         needed = self.retry_max_attempts - 1
@@ -220,7 +266,14 @@ class AnnotationsConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Top-level application configuration."""
+    """Top-level application configuration.
+
+    Validation errors name the key but never echo its value: config values
+    include credentials and the health ping URL. (Pydantic takes this setting
+    from the outermost model only.)
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     sources: list[SourceConfig]
     database: DatabaseConfig
@@ -229,6 +282,28 @@ class AppConfig(BaseModel):
     logging: LoggingConfig = LoggingConfig()
     ingest: IngestConfig = IngestConfig()
     annotations: AnnotationsConfig = AnnotationsConfig()
+
+    @model_validator(mode="after")
+    def _check_source_stale(self) -> AppConfig:
+        """An explicit stale threshold must be at least two polls it applies to.
+
+        With one, a healthy source's age just before its next read (an
+        interval plus the read) is over the threshold, and the check flaps.
+        """
+        stale = self.ingest.health.source_stale_seconds
+        if stale is None:
+            return self
+        for kind in sorted({s.type for s in self.sources}):
+            poll = self.ingest.poll_seconds(kind)
+            if stale < 2 * poll:
+                key = "imap_poll_seconds" if kind == "imap" else "drive_poll_seconds"
+                msg = (
+                    f"ingest.health.source_stale_seconds ({stale}) is below "
+                    f"twice ingest.{key} ({poll}), so a healthy {kind} source "
+                    "would read as stale before each poll"
+                )
+                raise ValueError(msg)
+        return self
 
 
 # ---------------------------------------------------------------------------

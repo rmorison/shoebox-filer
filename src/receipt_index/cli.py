@@ -314,6 +314,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         DOCUMENT_SYSTEM_PROMPT,
         create_extraction_agent,
     )
+    from receipt_index.health import HEARTBEAT_PATH
     from receipt_index.locks import SourceLock
     from receipt_index.retries import RetryPolicy
     from receipt_index.service import ServeTimings, Service
@@ -365,6 +366,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             ),
         }
         ingest_config = config.ingest
+        health = ingest_config.health
         service = Service(
             sources=held,
             all_sources=config.sources,
@@ -385,6 +387,11 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             store=open_store(config.store),
             llm_model=config.llm.model,
             policy=RetryPolicy.from_config(ingest_config),
+            heartbeat_path=HEARTBEAT_PATH,
+            ping_url=(health.ping_url.get_secret_value() if health.ping_url else None),
+            ping_interval_seconds=health.ping_interval_seconds,
+            ping_probe=_ping_probe(config),
+            requested=[s.name for s in sources],
         )
 
         def _on_signal(signum: int, _frame: object) -> None:
@@ -406,6 +413,89 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             for lock in locks.values():
                 lock.release()
     if not finished:
+        sys.exit(1)
+
+
+def _status_connection(config: AppConfig) -> Callable[[], Any]:
+    """A short-leashed read-only connection for `status` and the ping."""
+    from receipt_index.db import get_connection
+    from receipt_index.health import (
+        STATUS_CONNECT_TIMEOUT_SECONDS,
+        STATUS_STATEMENT_TIMEOUT_SECONDS,
+    )
+
+    return lambda: get_connection(
+        config.database.url,
+        read_only=True,
+        statement_timeout_seconds=STATUS_STATEMENT_TIMEOUT_SECONDS,
+        connect_timeout_seconds=STATUS_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+def _ping_probe(config: AppConfig) -> Callable[[], list[str]]:
+    """One ping round's checks: the same as `status --check`, plus terminals."""
+    from receipt_index.health import HEARTBEAT_PATH, collect, ping_lines
+
+    open_conn = _status_connection(config)
+
+    def probe() -> list[str]:
+        report = collect(
+            config, open_conn, heartbeat_path=HEARTBEAT_PATH, retries=False
+        )
+        return ping_lines(report, config.ingest.health.terminal_alert_seconds)
+
+    return probe
+
+
+@cli.command()
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    help="Exit 1, printing one line per problem, unless everything is healthy.",
+)
+@click.pass_context
+def status(ctx: click.Context, output_format: str, check: bool) -> None:
+    """Show each source's sync state, serve's heartbeat and the retry counts.
+
+    Works with or without `serve` running: it reads the database, and the
+    heartbeat file if there is one. With --check it prints only the problem
+    lines (or "ok") and exits 1 if there is any; it is serve's container
+    healthcheck. Terminal failures never fail the check.
+    """
+    from receipt_index.health import HEARTBEAT_PATH, collect, report_json, report_text
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    report = collect(
+        config,
+        _status_connection(config),
+        heartbeat_path=HEARTBEAT_PATH,
+        # The healthcheck needs no retry counts: fewer queries under its
+        # timeout.
+        retries=not (check and output_format == "text"),
+    )
+
+    if output_format == "json":
+        click.echo(json.dumps(report_json(report), indent=2))
+    elif check:
+        for problem in report.problems:
+            click.echo(problem.line)
+        if not report.problems:
+            click.echo("ok")
+    else:
+        for line in report_text(report):
+            click.echo(line)
+
+    if check and report.problems:
+        sys.exit(1)
+    if not report.database_ok:
         sys.exit(1)
 
 

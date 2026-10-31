@@ -315,27 +315,32 @@ receipt-index backfill --source NAME [--since DATE] [--until DATE]
 
 ### 9. Health
 
-**The heartbeat.** The health loop touches a heartbeat file (`/tmp/receipt-index-serve.heartbeat`) every 30 seconds while the worker thread is alive and is idle, paused on a transient error, or has run its current item for less than `item_timeout_seconds` (running time only, as for the watchdog). A slow LLM call therefore doesn't trip the check, but a wedged worker does. Each watcher updates `last_poll_at` and, on success, `last_success_at` in its sync-state row.
+**The heartbeat.** The health loop rewrites a heartbeat file (`/tmp/receipt-index-serve.heartbeat`) every 30 seconds while the worker thread is alive and is idle, or has run its current step for no longer than `item_timeout_seconds` (running time only, as for the watchdog). A slow LLM call therefore doesn't trip the check, but a wedged worker does. `serve` also writes it once at start, before its first ping. The worker's read of a source updates `last_poll_at` and, on success, `last_success_at` in its sync-state row. The IDLE watchers only queue those reads and don't write sync state.
+
+The file's content carries what lives only in `serve`'s memory, for `status` to read from another process: the process ID, the sources it watches, how long the worker has been on its current step, the sources paused after errors (since when, and why) and the sources dropped after losing their lock. Pauses are per source, not one pause of the whole worker. Without `serve` running, `status` shows none of this.
 
 **`receipt-index status [--output json] [--check]`** reports:
-- each source's cursor, `last_poll_at`, `last_success_at`, `last_error`, reset count and archive mode;
+- each source's cursor, `last_poll_at`, `last_success_at`, `last_error` (marked cleared when a success came after it), reset count and archive mode (`archive_enabled_at` until the `archive` key lands with ticket 6);
 - the worker's heartbeat age and whether it's paused on a transient error, and why;
-- retry counts: pending (`failed` with a due `next_retry_at`), terminal, and skipped in the last 7 days;
+- retry counts: pending (`failed` with a due `next_retry_at`), retrying (due later), queued, terminal, and skipped in the last 7 days;
 - any orphaned sync-state rows.
 
 `status` works without `serve` running. It reads the database, and the heartbeat file if present.
 
 **`status --check`** exits non-zero, printing one line per problem, when any of these holds:
-- the heartbeat file is older than `heartbeat_stale_seconds` (default 120);
+- the heartbeat file is missing, or older than `heartbeat_stale_seconds` (default 120). A missing file fails the check, because `--check` is the `ingest` container's healthcheck and a container whose `serve` never started must not pass;
 - a source's `last_success_at` is older than its stale threshold. That's `source_stale_seconds` when set, and otherwise three times the source's poll interval: 720 seconds for IMAP and 360 for Drive at the defaults. A threshold that follows the interval keeps hourly polling from failing the check between polls;
-- a watcher has stopped after losing its source lock to another process ([§ 1](#1-process-model));
-- the worker has been paused on transient errors for longer than `source_stale_seconds` when that's set, or otherwise the largest of the sources' stale thresholds (720 seconds at the defaults).
+- a watcher has stopped after losing its source lock to another process ([§ 1](#1-process-model)), or `serve` was asked to watch a source whose lock another process held when it started;
+- a source has been paused on errors for longer than `source_stale_seconds` when that's set, or otherwise the largest of the sources' stale thresholds (720 seconds at the defaults);
+- the database can't be reached.
+
+With a fresh heartbeat, only the sources `serve` watches are checked for staleness. While the worker is on a job, each stale and pause threshold is extended by how long the job has run, up to `item_timeout_seconds`; past its threshold plus `item_timeout_seconds`, a source or a pause is a problem however busy the worker is and whatever the start-up grace says. A source's age counts from its last success or from `serve`'s start, whichever is later, so a restart after a short outage gets up to one stale threshold to catch up before the first ping reports it (after an outage longer than the threshold plus `item_timeout_seconds`, the backstop reports it at once). The grace ends at the source's first read after the start, so a `serve` that keeps restarting can't hide a failing source. One worker takes the sources in turn, so a long job holds the others back without anything being wrong; a stream of short jobs, or a hang that keeps the watchdog restarting `serve`, gets no such cover. A stale heartbeat's content is ignored: the process that wrote it may be gone. A heartbeat file owned by another user, or that isn't a regular file, isn't trusted at all.
 
 Terminal failures don't fail the check. They're content problems, not liveness problems, so they mustn't mark the container unhealthy. They still reach the operator through the dead-man's ping (below) as well as `status` and `failures`.
 
 **The container healthcheck** runs `receipt-index status --check` every 60 seconds with `retries: 3`. Docker marks the container unhealthy. The `restart: unless-stopped` policy restarts only a process that exits, so the healthcheck is a signal, and the dead-man's switch is the alert.
 
-**The dead-man's switch.** Every `ping_interval_seconds` (default 300), the health loop runs the same checks as `status --check`:
+**The dead-man's switch.** At start and then every `ping_interval_seconds` (default 300), a ping thread beside the health loop runs the same checks as `status --check`. It has a thread of its own so a slow monitor or database never delays the watchdog or the heartbeat. Each request has a 10-second timeout, and a failed one is logged without the URL and never stops `serve`.
 
 - If they pass and no item has turned terminal within the last `terminal_alert_seconds` (default 86400), it sends an HTTP GET to `ping_url`.
 - Otherwise it sends an HTTP POST to `ping_url` + `/fail`. The body holds one line per problem: the check's name, the source name, and an age or a count (for example `source personal-email stale 1200s` or `terminal 2 in 24h`). It never holds `last_error`, exception text or receipt details, which stay on the host in `status`.
@@ -371,7 +376,7 @@ ingest:
   imap_poll_seconds: 240        # safety poll; also the poll interval without IDLE
   drive_poll_seconds: 120
   drive_settle_seconds: 60
-  item_timeout_seconds: 600
+  item_timeout_seconds: 1200   # at least 1200 (see `IngestConfig`)
   transient_item_max_seconds: 21600
   retry_max_attempts: 3
   retry_backoff_seconds: [300, 1800, 7200, 43200]
@@ -403,7 +408,7 @@ sources:
 
 Validation fails at load time, with the config error style used today, when:
 - `archive: true` is set without the matching folder fields, or on a Drive source while the store backend isn't Drive;
-- an explicit `source_stale_seconds` is below a poll interval it applies to;
+- an explicit `source_stale_seconds` is below twice a poll interval it applies to (with one interval, a healthy source reads as stale just before each poll);
 - `retry_backoff_seconds` has fewer than `retry_max_attempts - 1` entries;
 - an interval is below a floor: 30 seconds for polls, 60 seconds for IDLE re-issue.
 
