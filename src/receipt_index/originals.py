@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from slugify import slugify
 
+from receipt_index.pdf_validate import check_pdf
 from receipt_index.repository import record_original, store_original_ref
 from receipt_index.store import StoredFile, StoreError, StoreFolder
 
@@ -189,9 +190,13 @@ def store_email_original(
     def put(data: bytes, media_type: str, name: str) -> StoredFile:
         digest = hashlib.sha256(data).digest()
         if digest not in stored:
-            stored[digest] = _put_original(
+            file = _put_original(
                 conn, store, data, media_type=media_type, folder=folder, name=name
             )
+            # A PDF is stored as received, whatever its state (design §9).
+            if media_type == _PDF:
+                file = replace(file, pdf_status=check_pdf(data).status)
+            stored[digest] = file
         return stored[digest]
 
     message = put(raw.raw_bytes, MESSAGE_MEDIA_TYPE, MESSAGE_NAME)
@@ -219,6 +224,7 @@ def _record(conn: psycopg.Connection[dict[str, Any]], stored: StoredFile) -> Sto
         sha256=stored.sha256,
         byte_size=stored.byte_size,
         media_type=stored.media_type,
+        pdf_status=stored.pdf_status,
     )
     return replace(stored, id=file_id)
 

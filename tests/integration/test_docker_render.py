@@ -96,6 +96,7 @@ def _run_python(script: str) -> str:
 _PLAYWRIGHT_SCRIPT = """
 import os
 
+from receipt_index.pdf_validate import check_pdf
 from receipt_index.renderer import _html_to_pdf_playwright
 
 assert os.getuid() == 1000, f"expected uid 1000, got {os.getuid()}"
@@ -109,6 +110,9 @@ html = (
 )
 pdf = _html_to_pdf_playwright(html)
 assert pdf[:5] == b"%PDF-", repr(pdf[:20])
+# Ingest validates every rendition (design §9): Chromium's output must be ok.
+status = check_pdf(pdf).status
+assert status == "ok", status
 print(len(pdf))
 """
 
@@ -117,7 +121,7 @@ import os
 from datetime import UTC, datetime
 
 from receipt_index.models import RawReceipt
-from receipt_index.renderer import render_pdf
+from receipt_index.renderer import render_rendition
 
 assert os.getuid() == 1000, f"expected uid 1000, got {os.getuid()}"
 
@@ -130,7 +134,8 @@ raw = RawReceipt(
     sender="billing@example.com",
     text_body="Total: $42.99\\nThank you for your business.",
 )
-pdf = render_pdf(raw)
+# render_rendition validates the PDF and raises unless it is ok.
+pdf = render_rendition(raw).pdf
 assert pdf[:5] == b"%PDF-", repr(pdf[:20])
 print(len(pdf))
 """

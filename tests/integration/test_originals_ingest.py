@@ -29,10 +29,12 @@ from receipt_index.models import FieldConfidence, ReceiptMetadata
 from receipt_index.pipeline import process_item, run_ingest
 from receipt_index.repository import OriginalLocationConflictError, record_original
 from receipt_index.store import LocalEvidenceStore
+from tests.pdfs import make_pdf
 from tests.unit.test_gdrive_adapter import (
     FakeDrive,
     _make_file_meta,
     _make_gdrive_config,
+    _Req,
 )
 
 from .conftest import GREENMAIL_IMAP_PORT, seed_email
@@ -93,7 +95,8 @@ def _served_bytes(user: str) -> bytes:
 
 
 def _pdf(label: str) -> bytes:
-    return f"%PDF-1.4\n% {label} {uuid.uuid4().hex}\n%%EOF\n".encode()
+    """A valid PDF, unique to this call, so it passes through as the rendition."""
+    return make_pdf(f"{label} {uuid.uuid4().hex}")
 
 
 def _files(root: Path) -> dict[str, tuple[int, int]]:
@@ -364,6 +367,10 @@ class _ReadOnlyDrive(FakeDrive):
         self.unserved.append(name)
         raise AttributeError(name)
 
+    def get_media(self, fileId: str) -> _Req:  # noqa: N803 (Drive API name)
+        # A valid PDF, as ingest now validates a Drive PDF (design §9).
+        return _Req(lambda: make_pdf(fileId))
+
 
 def test_a_drive_item_on_the_local_backend_is_pending(
     pg_conn: Conn, tmp_path: Path
@@ -388,7 +395,7 @@ def test_a_drive_item_on_the_local_backend_is_pending(
     assert result.processed == 1
     assert drive.unserved == []
     prov = _provenance(pg_conn, file_id)
-    expected = hashlib.sha256(b"%PDF-" + file_id.encode()).digest()
+    expected = hashlib.sha256(make_pdf(file_id)).digest()
     assert bytes(prov["source_sha256"]) == expected
     assert prov["original_status"] == "pending"
     assert prov["original_file_id"] is None

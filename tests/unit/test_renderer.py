@@ -15,6 +15,8 @@ import pytest
 from receipt_index.models import Attachment, RawReceipt
 from receipt_index.renderer import (
     RemoteResourceBlockedError,
+    Rendition,
+    UnrenderablePdfError,
     _block_remote_requests,
     _embed_inline_images,
     _find_pdf_attachment,
@@ -26,8 +28,10 @@ from receipt_index.renderer import (
     _render_drive_file,
     _render_text_to_pdf,
     render_pdf,
+    render_rendition,
 )
 from tests.images import make_two_frame_mpo
+from tests.pdfs import garbage_pdf, make_pdf, truncated_pdf
 
 if TYPE_CHECKING:
     from playwright.sync_api import Route
@@ -681,3 +685,108 @@ class TestPlaywrightTimeouts:
         ):
             assert _html_to_pdf_bytes("<p>hi</p>") == b"%PDF-wp"
         weasy.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# render_rendition: validated renditions (evidence-store design, §9)
+# ---------------------------------------------------------------------------
+
+
+def _email(
+    pdf: bytes | None = None,
+    *,
+    html_body: str | None = None,
+    text_body: str | None = None,
+) -> RawReceipt:
+    attachments = (
+        [Attachment(filename="receipt.pdf", content_type="application/pdf", data=pdf)]
+        if pdf is not None
+        else []
+    )
+    return RawReceipt(
+        source_id="email-1",
+        source_name="test-source",
+        source_type="imap",
+        subject="Receipt",
+        sender="shop@example.com",
+        date=datetime(2025, 1, 1, tzinfo=UTC),
+        html_body=html_body,
+        text_body=text_body,
+        attachments=attachments,
+    )
+
+
+def _drive(pdf: bytes) -> RawReceipt:
+    return RawReceipt(
+        source_id="drive-1",
+        source_name="test-source",
+        source_type="gdrive",
+        date=datetime(2025, 1, 1, tzinfo=UTC),
+        file_content=pdf,
+        file_content_type="application/pdf",
+    )
+
+
+class TestRenderRendition:
+    def test_an_ok_pdf_attachment_passes_through_unchanged(self) -> None:
+        pdf = make_pdf("Clean receipt")
+        assert render_rendition(_email(pdf)) == Rendition(pdf=pdf)
+
+    def test_an_ok_drive_pdf_passes_through_unchanged(self) -> None:
+        pdf = make_pdf("Drive receipt")
+        assert render_rendition(_drive(pdf)) == Rendition(pdf=pdf)
+
+    @pytest.mark.parametrize("make_raw", [_email, _drive], ids=["email", "drive"])
+    def test_a_repaired_pdf_becomes_the_rendition(self, make_raw: object) -> None:
+        damaged = truncated_pdf("Repair me")
+        result = render_rendition(make_raw(damaged))  # type: ignore[operator]
+        assert result.repaired_from == damaged
+        assert result.pdf != damaged
+        assert result.pdf.startswith(b"%PDF-")
+        assert b"xref" in result.pdf
+
+    @patch("receipt_index.renderer._html_to_pdf_bytes")
+    def test_an_unparseable_attachment_renders_the_html_body(
+        self, html_to_pdf: MagicMock
+    ) -> None:
+        body_pdf = make_pdf("Body")
+        html_to_pdf.return_value = body_pdf
+        result = render_rendition(_email(garbage_pdf(), html_body="<p>Paid</p>"))
+        assert result == Rendition(pdf=body_pdf)
+        html_to_pdf.assert_called_once()
+
+    @patch("receipt_index.renderer._html_to_pdf_weasyprint")
+    def test_an_unparseable_attachment_renders_the_text_body(
+        self, weasyprint: MagicMock
+    ) -> None:
+        body_pdf = make_pdf("Text body")
+        weasyprint.return_value = body_pdf
+        result = render_rendition(_email(garbage_pdf(), text_body="Paid in full"))
+        assert result == Rendition(pdf=body_pdf)
+
+    @pytest.mark.parametrize("blank", [None, "", "  \n"])
+    def test_an_unparseable_attachment_with_no_body_raises(
+        self, blank: str | None
+    ) -> None:
+        raw = _email(garbage_pdf(), html_body=blank, text_body=blank)
+        with pytest.raises(UnrenderablePdfError, match="no body to render"):
+            render_rendition(raw)
+
+    def test_an_unparseable_drive_pdf_raises(self) -> None:
+        with pytest.raises(UnrenderablePdfError, match="Drive PDF"):
+            render_rendition(_drive(garbage_pdf()))
+
+    @patch("receipt_index.renderer._html_to_pdf_weasyprint")
+    def test_an_email_without_a_pdf_still_renders_its_headers(
+        self, weasyprint: MagicMock
+    ) -> None:
+        pdf = make_pdf("Headers only")
+        weasyprint.return_value = pdf
+        assert render_rendition(_email()) == Rendition(pdf=pdf)
+
+    @patch("receipt_index.renderer._html_to_pdf_bytes", return_value=b"%PDF-broken")
+    def test_a_generated_pdf_that_fails_validation_raises(
+        self, _html: MagicMock
+    ) -> None:
+        with pytest.raises(UnrenderablePdfError, match="rendered PDF"):
+            render_rendition(_email(html_body="<p>Paid</p>"))

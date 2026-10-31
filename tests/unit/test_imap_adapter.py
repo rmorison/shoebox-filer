@@ -20,6 +20,7 @@ from imapclient.exceptions import IMAPClientAbortError, IMAPClientError, LoginEr
 from receipt_index.adapters.base import SourceAdapter, SourceUnavailableError
 from receipt_index.adapters.imap import ImapAdapter, MessageRefusedError
 from receipt_index.models import ItemRef, SyncState
+from receipt_index.renderer import Rendition
 from receipt_index.store import StoredFile
 
 if TYPE_CHECKING:
@@ -873,7 +874,11 @@ class TestRefusedMessages:
         monkeypatch.setattr(
             pipeline, "extract_metadata", MagicMock(return_value=_extraction())
         )
-        monkeypatch.setattr(pipeline, "render_pdf", MagicMock(return_value=b"%PDF"))
+        monkeypatch.setattr(
+            pipeline,
+            "render_rendition",
+            MagicMock(return_value=Rendition(pdf=b"%PDF")),
+        )
         monkeypatch.setattr(pipeline, "record_ingest_evidence", MagicMock())
         store = MagicMock()
         store.put.return_value = StoredFile(

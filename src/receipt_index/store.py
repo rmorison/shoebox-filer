@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from receipt_index.config import StoreConfig
+    from receipt_index.pdf_validate import PdfStatus
 
 Purpose = Literal["original", "rendition"]
 
@@ -141,7 +142,8 @@ class StoredFile:
 
     ``id`` is the ``receipt.stored_files`` row. ``put`` writes no database
     row, so it leaves ``id`` None; the repository records the row
-    (``record_rendition``) in the caller's transaction.
+    (``record_rendition``) in the caller's transaction. ``pdf_status`` is
+    set by the caller that checked a PDF (``pdf_validate``); None otherwise.
     """
 
     sha256: bytes | None
@@ -149,6 +151,7 @@ class StoredFile:
     media_type: str
     ref: str
     id: UUID | None = None
+    pdf_status: PdfStatus | None = None
 
 
 @dataclass(frozen=True)
