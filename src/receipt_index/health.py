@@ -31,6 +31,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
 from receipt_index.config import ImapSourceConfig
@@ -83,8 +84,10 @@ class WorkerState:
     watching: list[str] = field(default_factory=list)
     paused: dict[str, Pause] = field(default_factory=dict)
     lock_lost: list[str] = field(default_factory=list)
-    # How long the worker had been on its current step; None when idle.
+    # How long the worker had been on its current step, and on its current
+    # job (a poll or retry pass of many steps); None when idle.
     busy_seconds: float | None = None
+    job_seconds: float | None = None
     # The sources this serve was asked to watch (every configured source, or
     # the --source set), and when it started.
     requested: list[str] = field(default_factory=list)
@@ -101,6 +104,7 @@ class WorkerState:
             },
             "lock_lost": list(self.lock_lost),
             "busy_seconds": self.busy_seconds,
+            "job_seconds": self.job_seconds,
             "requested": list(self.requested),
             "started_at": None
             if self.started_at is None
@@ -126,6 +130,9 @@ class WorkerState:
                 if data.get("busy_seconds") is None
                 else float(data["busy_seconds"])
             ),
+            job_seconds=(
+                None if data.get("job_seconds") is None else float(data["job_seconds"])
+            ),
             requested=[str(n) for n in data.get("requested", [])],
             started_at=(
                 None
@@ -139,13 +146,18 @@ class WorkerState:
 class Heartbeat:
     """The heartbeat file as read: its age, and its content if it parses.
 
-    ``ours`` is False when another user owns the file: on a host whose /tmp
-    is shared, anyone could create it first and keep it fresh.
+    ``untrusted`` names why the file can't be trusted (``not ours``: another
+    user owns it, or it isn't a regular file; ``unreadable``): on a host
+    whose /tmp is shared, anyone could create it first and keep it fresh.
     """
 
     age_seconds: float
     state: WorkerState | None
-    ours: bool = True
+    untrusted: str | None = None
+
+    @property
+    def ours(self) -> bool:
+        return self.untrusted is None
 
 
 def write_heartbeat(path: Path, state: WorkerState) -> None:
@@ -167,12 +179,14 @@ def read_heartbeat(path: Path, *, now: float | None = None) -> Heartbeat | None:
     liveness signal, the content is detail.
     """
     try:
-        stat = path.stat()
+        stat = path.lstat()  # a symlink is not followed, and not trusted
     except FileNotFoundError:
         return None
+    except OSError:
+        return Heartbeat(age_seconds=0.0, state=None, untrusted="unreadable")
     age = max(0.0, (time.time() if now is None else now) - stat.st_mtime)
-    if stat.st_uid != os.getuid():
-        return Heartbeat(age_seconds=age, state=None, ours=False)
+    if not S_ISREG(stat.st_mode) or stat.st_uid != os.getuid():
+        return Heartbeat(age_seconds=age, state=None, untrusted="not ours")
     state: WorkerState | None
     try:
         state = WorkerState.from_json(json.loads(path.read_text(encoding="utf-8")))
@@ -295,21 +309,22 @@ def evaluate(
     )
     if heartbeat is None:
         problems.append(Problem("heartbeat", "missing"))
-    elif not heartbeat.ours:
-        problems.append(Problem("heartbeat", "not ours"))
+    elif heartbeat.untrusted is not None:
+        problems.append(Problem("heartbeat", heartbeat.untrusted))
     elif not fresh:
         problems.append(Problem("heartbeat", f"stale {_secs(heartbeat.age_seconds)}"))
     # A stale heartbeat's content belongs to a process that may be gone.
     state = heartbeat.state if fresh and heartbeat is not None else None
 
-    # One worker takes the sources in turn, so a long step holds the others
-    # back: each threshold is extended by the current step's running time,
-    # capped at item_timeout_seconds (the watchdog's limit). Past that cap,
-    # a source or a pause is a problem however busy the worker is, and
+    # One worker takes the sources in turn, so a long job (a bulk drop)
+    # holds the others back: each threshold is extended by the current
+    # job's running time, capped at item_timeout_seconds. A stream of short
+    # jobs gets no cover. Past the threshold plus item_timeout_seconds, a
+    # source or a pause is a problem however busy the worker is, and
     # whatever the start-up grace below says.
-    busy_for = (
-        0.0 if state is None or state.busy_seconds is None else state.busy_seconds
-    )
+    busy_for = 0.0
+    if state is not None:
+        busy_for = state.job_seconds or state.busy_seconds or 0.0
     allowance = min(busy_for, float(ingest.item_timeout_seconds))
     backstop = float(ingest.item_timeout_seconds)
     # A serve that just started hasn't read its sources yet: each source's

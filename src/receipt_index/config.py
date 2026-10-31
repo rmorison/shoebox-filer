@@ -172,7 +172,7 @@ class HealthConfig(BaseModel):
         url = value.get_secret_value().strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("ping_url must be an http or https URL")
-        if not urlsplit(url).netloc:
+        if not urlsplit(url).hostname:
             raise ValueError("ping_url must name a host")
         if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
             raise ValueError("ping_url must not contain spaces or control characters")

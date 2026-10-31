@@ -165,6 +165,7 @@ class ItemClock:
         self._lock = threading.Lock()
         self._busy: tuple[float, str] | None = None
         self._job_label: str | None = None
+        self._job_since: float | None = None
 
     def should_stop(self) -> bool:
         return self._stop.is_set()
@@ -174,6 +175,11 @@ class ItemClock:
         with self._lock:
             return self._busy
 
+    def job_since(self) -> float | None:
+        """When the current job began; None when idle."""
+        with self._lock:
+            return self._job_since
+
     def _mark(self, label: str | None) -> None:
         with self._lock:
             self._busy = None if label is None else (self._now(), label)
@@ -181,11 +187,15 @@ class ItemClock:
     @contextmanager
     def job(self, job: Job) -> Iterator[None]:
         self._job_label = f"{job.kind} {job.source}"
+        with self._lock:
+            self._job_since = self._now()
         self._mark(self._job_label)
         try:
             yield
         finally:
             self._job_label = None
+            with self._lock:
+                self._job_since = None
             self._mark(None)
 
     @contextmanager
@@ -888,6 +898,7 @@ class Service:
         """What the heartbeat file says about this process."""
         paused, lost = self.worker.health_state()
         busy = self.clock.busy_since()
+        job = self.clock.job_since()
         return WorkerState(
             pid=os.getpid(),
             written_at=datetime.now(UTC),
@@ -895,6 +906,7 @@ class Service:
             paused=paused,
             lock_lost=lost,
             busy_seconds=None if busy is None else time.monotonic() - busy[0],
+            job_seconds=None if job is None else time.monotonic() - job,
             requested=list(self._requested),
             started_at=self._started_at,
         )

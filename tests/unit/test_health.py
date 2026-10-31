@@ -250,6 +250,13 @@ class TestChecks:
         )
         assert lines == ["source mail stale 1200s"]
 
+    def test_a_bulk_drop_s_job_time_covers_the_waiting_sources(self) -> None:
+        # 50 items at 20 s: each step is short, the job is long.
+        busy = _fresh(busy_seconds=20.0, job_seconds=1000.0)
+        assert (
+            _lines(_config(), ages={"mail": 1000, "scans": 1000}, heartbeat=busy) == []
+        )
+
     def test_the_current_step_s_busy_time_extends_the_threshold(self) -> None:
         busy = _fresh(busy_seconds=300.0)  # mail: 720 + 300
         assert _lines(_config(), ages={"mail": 1000, "scans": 10}, heartbeat=busy) == []
@@ -350,6 +357,29 @@ class TestChecks:
             _config(), heartbeat=_fresh(paused={"mail": pause}, busy_seconds=1e6)
         )
         assert lines == ["source mail paused 36000s"]
+
+    def test_a_symlinked_heartbeat_is_not_trusted(self, tmp_path: Path) -> None:
+        target = tmp_path / "ours"
+        write_heartbeat(target, _state())
+        link = tmp_path / "hb"
+        link.symlink_to(target)
+        read = read_heartbeat(link)
+        assert read is not None
+        assert _lines(_config(), heartbeat=read) == ["heartbeat not ours"]
+
+    def test_an_unreadable_heartbeat_is_a_problem_not_a_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pathlib import Path as RealPath
+
+        def refuse(_self: Any) -> Any:
+            raise PermissionError("protected_symlinks")
+
+        monkeypatch.setattr(RealPath, "lstat", refuse)
+        read = read_heartbeat(tmp_path / "hb")
+        monkeypatch.undo()
+        assert read is not None
+        assert _lines(_config(), heartbeat=read) == ["heartbeat unreadable"]
 
     def test_a_heartbeat_owned_by_another_user_is_not_trusted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

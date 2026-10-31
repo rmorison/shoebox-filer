@@ -339,6 +339,8 @@ class TestHealthKeys:
             f"https://hc-ping.example.com/{_PING_MARKER}\n/x",
             f"https://hc-ping.example.com/{_PING_MARKER} x",
             "http://",
+            "http://:80/x",
+            "http://user@/x",
             f"https:///{_PING_MARKER}",
             12345,
         ],
