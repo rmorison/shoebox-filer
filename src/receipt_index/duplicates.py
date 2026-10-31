@@ -112,6 +112,7 @@ class Decision:
     flags: list[tuple[UUID, FlagReason]] = field(default_factory=list)
 
     def flag(self, receipt_id: UUID, reason: FlagReason) -> None:
+        """Flag ``receipt_id`` once, never the receipt the item joins."""
         if receipt_id != self.join and all(r != receipt_id for r, _ in self.flags):
             self.flags.append((receipt_id, reason))
 
@@ -270,6 +271,7 @@ def decide(
 def primary_provenance(
     conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
 ) -> UUID | None:
+    """The ID of the receipt's primary provenance record, or None."""
     row = conn.execute(
         "SELECT id FROM receipt.provenance WHERE receipt_id = %s AND is_primary",
         (receipt_id,),
@@ -881,6 +883,43 @@ def decide_candidate(
 SCAN = Actor("duplicates-scan", "system", "duplicates scan")
 
 
+def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bool:
+    """Whether a person has decided receipts ``a`` and ``b`` are two receipts.
+
+    An unlink between them (either way, counting the receipts merged into
+    each), or a dismissed pair between their records. Such a decision
+    outranks the rules: the scan never links the pair again.
+    """
+    row = conn.execute(
+        """\
+        WITH fa AS (
+            SELECT id FROM receipt.receipts WHERE id = %(a)s OR merged_into_id = %(a)s
+        ), fb AS (
+            SELECT id FROM receipt.receipts WHERE id = %(b)s OR merged_into_id = %(b)s
+        )
+        SELECT EXISTS (
+            SELECT 1 FROM receipt.provenance_link_history h
+            WHERE h.action = 'unlink' AND (
+                (h.from_receipt_id IN (SELECT id FROM fa)
+                 AND h.to_receipt_id IN (SELECT id FROM fb))
+                OR (h.from_receipt_id IN (SELECT id FROM fb)
+                    AND h.to_receipt_id IN (SELECT id FROM fa))
+            )
+        ) OR EXISTS (
+            SELECT 1 FROM receipt.duplicate_candidates c
+            JOIN receipt.provenance pa ON pa.id = c.provenance_id
+            JOIN receipt.provenance pb ON pb.id = c.candidate_of_provenance_id
+            WHERE c.status = 'dismissed' AND (
+                (pa.receipt_id = %(a)s AND pb.receipt_id = %(b)s)
+                OR (pa.receipt_id = %(b)s AND pb.receipt_id = %(a)s)
+            )
+        ) AS apart
+        """,
+        {"a": a, "b": b},
+    ).fetchone()
+    return bool(row and row["apart"])
+
+
 @dataclass
 class ScanResult:
     """What a scan linked and flagged, counted per rule and reason."""
@@ -927,8 +966,9 @@ def scan(
 
     Each receipt is compared with the live receipts created before it, so the
     older receipt of a pair is the one that remains. A merge the guard
-    refuses is flagged ``merge_blocked``. The caller commits, or rolls back
-    for a dry run.
+    refuses is flagged ``merge_blocked``. A pair a person unlinked or
+    dismissed (``kept_apart``) is never linked again. The caller commits, or
+    rolls back for a dry run.
     """
     result = ScanResult()
     rows = conn.execute(
@@ -944,6 +984,12 @@ def scan(
             continue
         decision = decide(conn, _facts_for(conn, receipt), window_days=window_days)
         mine = primary_provenance(conn, receipt.id)
+        if (
+            decision.join is not None
+            and decision.method is not None
+            and kept_apart(conn, receipt.id, decision.join)
+        ):
+            decision.join = decision.method = None
         if decision.join is not None and decision.method is not None:
             conn.execute("SAVEPOINT scan_merge")
             try:

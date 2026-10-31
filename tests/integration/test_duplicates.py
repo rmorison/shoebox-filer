@@ -31,6 +31,7 @@ from receipt_index.renderer import Rendition
 from receipt_index.repository import (
     count_receipts,
     get_receipt_by_id,
+    list_refunds,
     search_receipts,
     select_for_reextract,
     with_provenance,
@@ -851,3 +852,120 @@ class TestScan:
         pg_conn.rollback()
         assert len(duplicates.scan(pg_conn, window_days=7).flags) == 1
         pg_conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: an operator's decision outranks the rules
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorDecisionsStick:
+    def test_a_scan_does_not_relink_an_item_unlinked_after_joining_at_ingest(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        first = ingest(_email(), order_number="U-1")
+        forward_raw = _email()
+        assert ingest(forward_raw, order_number="U-1").id == first.id
+        prov = _prov(pg_conn, forward_raw.source_id)
+        own = pipeline.unlink_to_own_receipt(
+            pg_conn, prov, forward_raw, store=ingest.store, llm_model="m", actor=PERSON
+        )
+
+        result = duplicates.scan(pg_conn)
+        pg_conn.commit()
+        assert result.links == []
+        assert _receipt(pg_conn, own.id).merged_into_id is None
+        assert len(_live(pg_conn)) == 2
+
+    def test_a_scan_does_not_remerge_a_restored_home_receipt(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        with _no_rules():
+            first = ingest(_email(), order_number="U-2")
+            second = ingest(_email(), order_number="U-2")
+        assert duplicates.scan(pg_conn).links == [(second.id, first.id, "order_number")]
+        pg_conn.commit()
+        duplicates.unlink_home(pg_conn, _home_prov(pg_conn, second.id), actor=PERSON)
+        pg_conn.commit()
+
+        again = duplicates.scan(pg_conn)
+        pg_conn.commit()
+        assert again.links == []
+        assert _receipt(pg_conn, second.id).merged_into_id is None
+
+    def test_a_scan_does_not_link_a_dismissed_pair(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        pdf = make_pdf("same pdf, two real visits")
+        with _no_rules():
+            first = ingest(_email(pdf), receipt_document="receipt.pdf")
+            later = ingest(_email(pdf), receipt_document="receipt.pdf")
+        # A person flagged the pair and dismissed it: two real visits.
+        duplicates.insert_candidate(
+            pg_conn,
+            _home_prov(pg_conn, later.id),
+            _home_prov(pg_conn, first.id),
+            "metadata",
+        )
+        pg_conn.commit()
+        (pair,) = _candidates(pg_conn)
+        duplicates.decide_candidate(pg_conn, pair["id"], "dismissed", actor=PERSON)
+        pg_conn.commit()
+
+        assert duplicates.scan(pg_conn).links == []
+        pg_conn.rollback()
+
+
+def _home_prov(conn: Conn, receipt_id: uuid.UUID) -> uuid.UUID:
+    (row,) = _all(
+        conn,
+        "SELECT id FROM receipt.provenance WHERE home_receipt_id = %s",
+        receipt_id,
+    )
+    rid: uuid.UUID = row["id"]
+    return rid
+
+
+class TestReviewGaps:
+    def test_rule_3_needs_the_same_paid_amount(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        ingest(_email(), order_number="P-7")
+        ingest(
+            _email(),
+            order_number="P-7",
+            amount=Decimal("7.00"),
+            paid_amount=Decimal("7.00"),
+        )
+        assert len(_live(pg_conn)) == 2
+        assert _candidates(pg_conn) == []
+
+    def test_exactly_three_days_apart_is_flagged(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        ingest(_email())
+        ingest(_email(), date=date(2026, 10, 17))
+        assert [c["reason"] for c in _candidates(pg_conn)] == ["metadata"]
+
+    def test_a_scan_links_identical_files_by_rule_1(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        pdf = make_pdf("back catalogue scan twice")
+        with _no_rules():
+            first = ingest(_drive(pdf))
+            second = ingest(_drive(pdf))
+        assert duplicates.scan(pg_conn).links == [
+            (second.id, first.id, "original_hash")
+        ]
+        pg_conn.rollback()
+
+    def test_refund_list_leaves_out_a_merged_refund(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        a = ingest(_email(), vendor="Shop", kind="refund")
+        b = ingest(_email(), vendor="Other", kind="refund")
+        duplicates.link(pg_conn, _only_prov(pg_conn, a.id), b.id, actor=PERSON)
+        pg_conn.commit()
+        refunds = list_refunds(pg_conn)
+        pg_conn.rollback()
+        assert [r.id for r in refunds] == [b.id]

@@ -1,3 +1,8 @@
+-- Lossy once duplicates have been linked: rolling back drops the link
+-- history and the merge columns, so every merged receipt counts again as a
+-- live receipt in search and totals, and rolling forward doesn't restore the
+-- merges. Unlink the merged receipts first if they must stay merged.
+
 -- Restore 000016's view first: it reads merged_into_id.
 CREATE OR REPLACE VIEW receipt.v_receipt_net AS
 WITH linked_refunds AS (

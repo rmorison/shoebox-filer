@@ -8,7 +8,7 @@ import re
 import sys
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
 from uuid import UUID
 
 import click
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from psycopg.errors import DeadlockDetected
 
 from receipt_index.config import AppConfig, ConfigError, load_config
+from receipt_index.duplicates import DEFAULT_WINDOW_DAYS
 from receipt_index.models import KINDS
 from receipt_index.paging import page_envelope
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 
     from receipt_index.adapters.base import SourceAdapter
     from receipt_index.config import SourceConfig
+    from receipt_index.duplicates import Actor, CandidateStatus
     from receipt_index.models import IngestLogEntry, Receipt, ReceiptEvent
     from receipt_index.requeue import OrphanReport, RequeueOutcome
 
@@ -2089,7 +2091,7 @@ _AS_OPTION = click.option(
 )
 
 
-def _person(config: AppConfig, actor: str | None, reason: str | None) -> Any:
+def _person(config: AppConfig, actor: str | None, reason: str | None) -> Actor:
     from receipt_index.duplicates import Actor
 
     return Actor(actor or config.annotations.actor, "person", reason)
@@ -2264,7 +2266,7 @@ def duplicates(ctx: click.Context, status: str, output_format: str) -> None:
     _configure_logging(config)
     with get_connection(config.database.url, read_only=True) as conn:
         pairs = dup.list_candidates(
-            conn, status=None if status == "all" else cast("Any", status)
+            conn, status=None if status == "all" else cast("CandidateStatus", status)
         )
     if output_format == "json":
         click.echo(
@@ -2307,7 +2309,12 @@ def duplicates(ctx: click.Context, status: str, output_format: str) -> None:
     click.echo(f"\n{len(pairs)} pair(s).")
 
 
-def _decide(ctx: click.Context, pair_id: str, status: str, actor: str | None) -> None:
+def _decide(
+    ctx: click.Context,
+    pair_id: str,
+    status: Literal["linked", "dismissed"],
+    actor: str | None,
+) -> None:
     from receipt_index import duplicates as dup
     from receipt_index.db import get_connection
 
@@ -2317,7 +2324,7 @@ def _decide(ctx: click.Context, pair_id: str, status: str, actor: str | None) ->
     who = _person(config, actor, None)
     try:
         with get_connection(config.database.url) as conn:
-            remaining = dup.decide_candidate(conn, uid, cast("Any", status), actor=who)
+            remaining = dup.decide_candidate(conn, uid, status, actor=who)
             conn.commit()
     except dup.DuplicateError as exc:
         click.echo(f"Error: {exc}", err=True)
@@ -2353,7 +2360,7 @@ def duplicates_dismiss(ctx: click.Context, pair_id: str, actor: str | None) -> N
 @click.option(
     "--window-days",
     type=click.IntRange(min=0),
-    default=3,
+    default=DEFAULT_WINDOW_DAYS,
     show_default=True,
     help="How many days apart two receipts' dates may be and still be flagged.",
 )

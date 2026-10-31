@@ -1560,7 +1560,10 @@ def list_refunds(
     conn: psycopg.Connection[dict[str, Any]], *, unlinked: bool = False
 ) -> list[Receipt]:
     """Every refund, newest first; only those with no purchase if ``unlinked``."""
-    where = "kind = 'refund'" + (" AND refund_of IS NULL" if unlinked else "")
+    # A refund merged into another as a duplicate isn't listed.
+    where = "kind = 'refund' AND merged_into_id IS NULL" + (
+        " AND refund_of IS NULL" if unlinked else ""
+    )
     cur = conn.execute(
         f"{_WITH_NET} WHERE {where} ORDER BY receipt_date DESC, vendor ASC, id ASC"
     )
