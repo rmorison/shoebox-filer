@@ -78,16 +78,13 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     )
 
     # receipt/000001 — receipts table, indexes, trigger
-    conn.execute("CREATE SCHEMA IF NOT EXISTS receipt")
+    # Drop the whole schema, so a table another branch's migration left in the
+    # shared devtest database goes too. Nothing outside it depends on it:
+    # set_updated_at, pg_trgm and the version tables live in public, and the
+    # roles are cluster-wide.
+    conn.execute("DROP SCHEMA IF EXISTS receipt CASCADE")
+    conn.execute("CREATE SCHEMA receipt")
     conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    # extractions and receipt_events reference receipts: drop them first
-    # (receipt/000011, receipt/000015).
-    conn.execute("DROP TABLE IF EXISTS receipt.extractions")
-    conn.execute("DROP TABLE IF EXISTS receipt.receipt_events")
-    # The evidence-store tables (receipt/000017) reference receipts too.
-    for table in ("provenance_files", "provenance", "file_locations", "stored_files"):
-        conn.execute(f"DROP TABLE IF EXISTS receipt.{table} CASCADE")
-    conn.execute("DROP TABLE IF EXISTS receipt.receipts CASCADE")
     conn.execute(
         """\
         CREATE TABLE receipt.receipts (
@@ -145,7 +142,6 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     )
 
     # receipt/000003 — ingest_log table and indexes
-    conn.execute("DROP TABLE IF EXISTS receipt.ingest_log CASCADE")
     conn.execute(
         """\
         CREATE TABLE receipt.ingest_log (
@@ -187,7 +183,6 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
 
     # receipt/000009 — sync_state table and trigger
     # (receipt/000010 — ingest_log 'started' status and source_name — is above)
-    conn.execute("DROP TABLE IF EXISTS receipt.sync_state CASCADE")
     conn.execute(
         """\
         CREATE TABLE receipt.sync_state (
@@ -237,9 +232,6 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
 
     # receipt/000012 — retries: attempt columns, error class, the 'queued'
     # status and retry_requests. Run from the migration file, up to its grants.
-    # ingest_log was dropped above; retry_requests goes now, so the file's
-    # CREATE TABLE IF NOT EXISTS builds a fresh one.
-    conn.execute("DROP TABLE IF EXISTS receipt.retry_requests CASCADE")
     conn.execute(_schema_part("receipt", "000012"))
 
     # receipt/000013 — ingest_log.receipt_link for link-only receipts. Run
