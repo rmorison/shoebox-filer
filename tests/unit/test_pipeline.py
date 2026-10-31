@@ -39,6 +39,7 @@ from receipt_index.models import (
     SyncState,
 )
 from receipt_index.pipeline import IngestResult, run_ingest
+from receipt_index.renderer import Rendition
 from receipt_index.store import StoredFile
 
 if TYPE_CHECKING:
@@ -351,7 +352,9 @@ def repo(monkeypatch: pytest.MonkeyPatch) -> FakeRepo:
 def extract(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     mock = MagicMock(return_value=_extraction())
     monkeypatch.setattr(pipeline, "extract_metadata", mock)
-    monkeypatch.setattr(pipeline, "render_pdf", MagicMock(return_value=b"%PDF"))
+    monkeypatch.setattr(
+        pipeline, "render_rendition", MagicMock(return_value=Rendition(pdf=b"%PDF"))
+    )
     return mock
 
 
@@ -1374,7 +1377,7 @@ class TestLinkOnly:
         self, repo: FakeRepo, extract: MagicMock
     ) -> None:
         extract.return_value = _link_extraction(confidence=0.2)
-        render = pipeline.render_pdf
+        render = pipeline.render_rendition
         result = _run(FakeAdapter(_imap_read([1])))
 
         assert result.skipped == 1

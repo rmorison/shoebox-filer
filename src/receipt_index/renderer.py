@@ -15,8 +15,11 @@ import html
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
+
+from receipt_index.pdf_validate import check_pdf
 
 if TYPE_CHECKING:
     from playwright.sync_api import Route
@@ -38,6 +41,27 @@ INLINE_URL_SCHEMES = frozenset({"data", "about", "blob"})
 
 class RemoteResourceBlockedError(Exception):
     """Raised when a render attempts to fetch a non-inline resource."""
+
+
+class UnrenderablePdfError(Exception):
+    """No rendition can be made that passes PDF validation.
+
+    A PDF to pass through can't be parsed or repaired and there is no email
+    body to render instead, or a generated PDF fails validation.
+    """
+
+
+@dataclass(frozen=True)
+class Rendition:
+    """A receipt's rendition, validated (evidence-store design, §9).
+
+    ``pdf`` always passes the strict check. ``repaired_from`` holds the
+    source PDF's bytes when ``pdf`` is qpdf's repair of it; the source is
+    never changed.
+    """
+
+    pdf: bytes
+    repaired_from: bytes | None = None
 
 
 PLAIN_TEXT_TEMPLATE = """\
@@ -64,10 +88,63 @@ PLAIN_TEXT_TEMPLATE = """\
 """
 
 
+def render_rendition(raw: RawReceipt) -> Rendition:
+    """Render a RawReceipt to a rendition that passes PDF validation.
+
+    A PDF passed through (a Drive PDF, or an email's first PDF attachment)
+    is checked: ``ok`` is used as it is; ``repaired`` gives qpdf's repair,
+    with the source in ``repaired_from``; ``unparseable`` falls back to
+    rendering the email body, or raises :class:`UnrenderablePdfError` when
+    there is none (a Drive file never has one). A generated PDF that isn't
+    ``ok`` raises too.
+    """
+    source = _pass_through_pdf(raw)
+    if source is None:
+        return _checked(render_pdf(raw))
+    check = check_pdf(source)
+    if check.status == "ok":
+        return Rendition(pdf=source)
+    if check.status == "repaired" and check.repaired is not None:
+        logger.info("Rendition of %s is a repaired PDF", raw.source_id)
+        return Rendition(pdf=check.repaired, repaired_from=source)
+    if raw.source_type == "gdrive":
+        msg = "Drive PDF can't be parsed or repaired"
+        raise UnrenderablePdfError(msg)
+    if not (raw.html_body or "").strip() and not (raw.text_body or "").strip():
+        msg = (
+            "PDF attachment can't be parsed or repaired, "
+            "and the email has no body to render"
+        )
+        raise UnrenderablePdfError(msg)
+    logger.warning(
+        "PDF attachment of %s can't be parsed or repaired; rendering the email body",
+        raw.source_id,
+    )
+    return _checked(_render_email_body(raw))
+
+
+def _pass_through_pdf(raw: RawReceipt) -> bytes | None:
+    """The PDF ``render_pdf`` would return as it is, if there is one."""
+    if raw.source_type == "gdrive":
+        is_pdf = (raw.file_content_type or "").lower() == "application/pdf"
+        return raw.file_content if is_pdf else None
+    return _find_pdf_attachment(raw.attachments)
+
+
+def _checked(pdf: bytes) -> Rendition:
+    """A generated PDF as a rendition, if it passes the strict check."""
+    status = check_pdf(pdf).status
+    if status != "ok":
+        msg = f"rendered PDF failed validation ({status})"
+        raise UnrenderablePdfError(msg)
+    return Rendition(pdf=pdf)
+
+
 def render_pdf(raw: RawReceipt) -> bytes:
     """Render a RawReceipt to PDF bytes.
 
-    Routes based on source_type:
+    Unvalidated: ingest uses :func:`render_rendition`. Routes based on
+    source_type:
     - "gdrive": return file directly (PDF) or convert image to PDF
     - Otherwise: email rendering (existing path)
     """
@@ -113,7 +190,11 @@ def _render_email(raw: RawReceipt) -> bytes:
     pdf_data = _find_pdf_attachment(raw.attachments)
     if pdf_data is not None:
         return pdf_data
+    return _render_email_body(raw)
 
+
+def _render_email_body(raw: RawReceipt) -> bytes:
+    """Render an email's HTML or text body, else its headers, to PDF."""
     # 2. HTML body rendering (Playwright for complex email CSS)
     if raw.html_body:
         return _render_html_to_pdf(raw.html_body, raw.attachments)

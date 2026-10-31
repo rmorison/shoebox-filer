@@ -36,7 +36,7 @@ from receipt_index.models import (
 )
 from receipt_index.originals import record_email_evidence, store_email_original
 from receipt_index.refunds import link_by_rule
-from receipt_index.renderer import render_pdf
+from receipt_index.renderer import render_rendition
 from receipt_index.repository import (
     get_item_history,
     get_processed_source_ids,
@@ -52,6 +52,7 @@ from receipt_index.repository import (
     orphaned_refs,
     record_poll,
     record_rendition,
+    record_stored_file,
     save_drive_cursor,
     save_imap_cursor,
 )
@@ -61,7 +62,7 @@ from receipt_index.retries import (
     attempt_state,
     failure_fields,
 )
-from receipt_index.store import pdf_path_for, store_rendition
+from receipt_index.store import PDF_MEDIA_TYPE, pdf_path_for, store_rendition
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -222,6 +223,7 @@ def record_ingest_evidence(
     source_type: str,
     email: StoredEmail | None = None,
     receipt_document: str | None = None,
+    repaired_from: bytes | None = None,
 ) -> None:
     """Write a new receipt's provenance, its original's and rendition's records.
 
@@ -230,6 +232,11 @@ def record_ingest_evidence(
     picked from the extraction's ``receipt_document``. Without one, the
     original is ``pending``. ``source_sha256`` is the whole original's hash
     whenever its bytes are in hand, stored or not.
+
+    ``repaired_from`` is the source PDF when the rendition is qpdf's repair
+    of it (design §9). The source's ``stored_files`` row is marked
+    ``repaired`` (an email attachment's own row, or, for a Drive PDF not
+    yet adopted, a row with no location), and the rendition points at it.
     """
     source_sha256 = (
         hashlib.sha256(raw.raw_bytes).digest() if raw.raw_bytes is not None else None
@@ -262,6 +269,17 @@ def record_ingest_evidence(
     if rendition.sha256 is None or rendition.byte_size is None:
         msg = f"rendition {rendition.ref} has no hash"
         raise ValueError(msg)
+    repaired_from_id = (
+        record_stored_file(
+            conn,
+            sha256=hashlib.sha256(repaired_from).digest(),
+            byte_size=len(repaired_from),
+            media_type=PDF_MEDIA_TYPE,
+            pdf_status="repaired",
+        )
+        if repaired_from is not None
+        else None
+    )
     record_rendition(
         conn,
         receipt_id=receipt.id,
@@ -269,6 +287,8 @@ def record_ingest_evidence(
         sha256=rendition.sha256,
         byte_size=rendition.byte_size,
         media_type=rendition.media_type,
+        pdf_status="ok",
+        repaired_from_id=repaired_from_id,
     )
 
 
@@ -364,10 +384,11 @@ def process_item(
                 # Nothing written yet: end the read so render isn't in a txn.
                 conn.commit()
 
-        pdf_data = render_pdf(raw)
+        # Validated (design §9): a repaired PDF's rendition is the repair.
+        rendition = render_rendition(raw)
         stored = store_rendition(
             store,
-            pdf_data,
+            rendition.pdf,
             receipt_date=metadata.date,
             vendor=metadata.vendor,
             amount=metadata.amount,
@@ -411,6 +432,7 @@ def process_item(
             source_type=source_type,
             email=email,
             receipt_document=metadata.receipt_document,
+            repaired_from=rendition.repaired_from,
         )
         # A refund is linked to its purchase, or a purchase to its waiting
         # refunds, in the same transaction (receipt data-model design, §6).
