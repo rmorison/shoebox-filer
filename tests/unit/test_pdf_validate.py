@@ -194,6 +194,13 @@ def test_a_killed_or_failed_child_is_unparseable(code: int) -> None:
         assert check_pdf(make_pdf("Killed")) == PdfCheck(status="unparseable")
 
 
+@pytest.mark.parametrize("stdout", [b"", b"bogus\n"], ids=["empty", "unknown"])
+def test_a_child_that_writes_no_status_is_unparseable(stdout: bytes) -> None:
+    done = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=b"")
+    with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
+        assert check_pdf(make_pdf("Odd child")) == PdfCheck(status="unparseable")
+
+
 def test_a_pdf_over_the_size_cap_is_unparseable_without_a_check() -> None:
     with patch("receipt_index.pdf_validate.subprocess.run") as run:
         result = check_pdf(make_pdf("Too big"), limits=PdfLimits(max_bytes=100))

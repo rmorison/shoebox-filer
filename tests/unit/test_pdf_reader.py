@@ -178,6 +178,37 @@ def test_a_weasyprint_pdf_reads_the_same_in_the_child() -> None:
     assert read_pdf(data) == _read_unbounded(data)
 
 
+def test_a_multi_page_pdf_reads_each_page_in_order() -> None:
+    assert read_pdf(make_pdf("Two pages", pages=2)) == PdfRead(
+        pages=2, text="Two pages\n\nTwo pages", encrypted=False
+    )
+
+
+def _long_table_pdf(sections: int) -> bytes:
+    """An ordinary statement-like PDF: one dense table page per section."""
+    import weasyprint
+
+    rows = "".join(
+        f"<tr><td>2026-01-{i % 28 + 1:02d}</td><td>Parking session {i}</td>"
+        f"<td>{i * 1.37:.2f}</td><td>Acme Parking (U.S.), LLC</td></tr>"
+        for i in range(40)
+    )
+    section = f"<table>{rows}</table><div style='page-break-after:always'></div>"
+    return weasyprint.HTML(
+        string=f"<html><body>{section * sections}</body></html>"
+    ).write_pdf()
+
+
+def test_a_long_ordinary_pdf_reads_in_flat_memory() -> None:
+    # pdfplumber keeps every page's layout objects until the file closes
+    # unless each page is closed: kept, these 20 pages need over 144 MB.
+    data = _long_table_pdf(20)
+    read = read_pdf(data, limits=PdfLimits(memory_bytes=128 * 1024 * 1024))
+    assert read is not None
+    assert read == _read_unbounded(data)
+    assert read.pages == 20
+
+
 def _peak_rss_mb() -> int:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
 
@@ -228,6 +259,17 @@ def test_a_killed_or_failed_child_gives_no_text(code: int) -> None:
     )
     with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
         assert read_pdf(make_pdf("Killed")) is None
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [b"", b"garbage", b'{"pages": 1}', b"[1, 2]"],
+    ids=["empty", "not-json", "missing-keys", "wrong-shape"],
+)
+def test_a_child_that_writes_no_result_gives_no_text(stdout: bytes) -> None:
+    done = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=b"")
+    with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
+        assert read_pdf(make_pdf("Odd child")) is None
 
 
 def test_a_pdf_over_the_size_cap_is_not_read() -> None:

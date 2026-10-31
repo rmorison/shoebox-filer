@@ -109,7 +109,12 @@ def _read_unbounded(
             encrypted = pdf.doc.encryption is not None
             if text_up_to_pages is not None and pages > text_up_to_pages:
                 return PdfRead(pages, None, encrypted)
-            texts = [page.extract_text() or "" for page in pdf.pages]
+            texts = []
+            for page in pdf.pages:
+                texts.append(page.extract_text() or "")
+                # pdfplumber keeps each page's layout objects until the file
+                # closes; a long document would otherwise outgrow the limit.
+                page.close()
     except Exception:  # any failure, a hit memory limit included
         logger.debug("pdfplumber can't read the PDF", exc_info=True)
         return None
