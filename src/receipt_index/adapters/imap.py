@@ -248,6 +248,7 @@ class ImapAdapter:
         client = self._session()
         uidvalidity = self._select(self.config.folder)
         self._use(self.config.folder, uidvalidity)
+        self._range_validity[self.config.folder] = uidvalidity
 
         reset: str | None = None
         start_uid = 0
@@ -314,7 +315,9 @@ class ImapAdapter:
                 response, refused = self._fetch_headers(client, batch)
                 for uid in batch:
                     if uid in refused:
-                        ref = self._unreadable_ref(uid, uidvalidity, refused[uid])
+                        ref = self._unreadable_ref(
+                            uid, uidvalidity, refused[uid], folder
+                        )
                     else:
                         data = response.get(uid)
                         headers = _header_bytes(data) if data else None
@@ -374,7 +377,9 @@ class ImapAdapter:
             )
         return response, refused
 
-    def _unreadable_ref(self, uid: int, uidvalidity: int, reason: str) -> ItemRef:
+    def _unreadable_ref(
+        self, uid: int, uidvalidity: int, reason: str, folder: str | None = None
+    ) -> ItemRef:
         """A ref for a message whose headers the server refuses.
 
         It has no Message-ID to key on, so its ID names the folder position.
@@ -383,7 +388,10 @@ class ImapAdapter:
         """
         logger.warning("Server refused the headers of UID %d: %s", uid, reason)
         return ItemRef(
-            source_id=f"imap-uid:{self.name}:{self.config.folder}:{uidvalidity}:{uid}",
+            source_id=(
+                f"imap-uid:{self.name}:{folder or self.config.folder}:"
+                f"{uidvalidity}:{uid}"
+            ),
             source_type="imap",
             imap_uid=uid,
             unreadable=f"server refused the message headers: {reason}",
@@ -418,8 +426,9 @@ class ImapAdapter:
             raise ValueError(f"IMAP ref without a UID: {ref.source_id}")
         if ref.unreadable is not None:
             raise MessageRefusedError(ref.unreadable)
-        if ref.imap_folder is not None and ref.imap_folder != self._selected:
-            self._select_listed(ref.imap_folder)
+        folder = ref.imap_folder or self.config.folder
+        if folder != self._selected:
+            self._select_listed(folder)
         response = self._fetch_body(ref.imap_uid)
         data = response.get(ref.imap_uid)
         raw = data.get(_BODY_KEY) if data else None
@@ -428,7 +437,7 @@ class ImapAdapter:
         return self._parse_message(raw, ref.source_id)
 
     def _select_listed(self, folder: str) -> None:
-        """Re-select a folder ``list_range`` listed, checking its UIDVALIDITY."""
+        """Re-select the folder a ref was listed from, checking its UIDVALIDITY."""
         try:
             uidvalidity = self._select(folder)
         except (OSError, IMAPClientError, ConnectionError) as exc:
@@ -520,8 +529,14 @@ class ImapAdapter:
         folder, _uidvalidity, uid = match
         self._select(folder)
         response, refused = self._fetch_headers(self._session(), [uid])
+        if uid in refused:
+            # A refusal isn't an answer: never let it read as "not this one",
+            # or a present message would be taken for a missing one.
+            raise MessageRefusedError(
+                f"server refused the headers of UID {uid}: {refused[uid]}"
+            )
         data = response.get(uid)
-        headers = _header_bytes(data) if data and uid not in refused else None
+        headers = _header_bytes(data) if data else None
         if headers is None:
             return False
         return self._get_message_id(message_from_bytes(headers)) == source_id

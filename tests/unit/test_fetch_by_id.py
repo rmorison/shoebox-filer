@@ -299,3 +299,19 @@ class TestDriveSetupFailures:
         monkeypatch.setattr(adapter, "_build_service", broken)
         with pytest.raises(SourceUnavailableError, match="Drive"):
             adapter.fetch_by_id("f1")
+
+
+class TestRefusedExactIdCheck:
+    def test_refused_header_check_is_an_item_error_not_a_miss(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        # SEARCH found the message, but the server refuses its headers (a
+        # corrupt message file). That isn't "no such message": backfill
+        # would otherwise mark a present original unavailable for good.
+        fake = SearchingIMAPClient({7: _mail("<a@example.com>")})
+        fake.header_error = IMAPClientError(
+            "FETCH command error: NO [SERVERBUG] Internal error"
+        )
+        with pytest.raises(MessageRefusedError, match="UID 7"):
+            _imap(imap_config, fake).fetch_by_id("<a@example.com>")
+        assert fake.body_fetches() == []

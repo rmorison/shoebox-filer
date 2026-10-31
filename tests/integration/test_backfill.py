@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from contextlib import ExitStack
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import psycopg
@@ -24,7 +24,11 @@ from receipt_index.adapters.imap import ImapAdapter
 from receipt_index.backfill import run_backfill, run_originals_only
 from receipt_index.fetching import SourcePool
 from receipt_index.locks import lock_key
-from receipt_index.repository import insert_ingest_log, save_imap_cursor
+from receipt_index.repository import (
+    insert_ingest_log,
+    provenance_missing_originals,
+    save_imap_cursor,
+)
 from receipt_index.store import LocalEvidenceStore
 
 from .conftest import _DB_DSN, GREENMAIL_IMAP_PORT, seed_email
@@ -84,7 +88,9 @@ def _originals(
         )
 
 
-def _back_catalogue(conn: Conn, source_id: str, source: str) -> Any:
+def _back_catalogue(
+    conn: Conn, source_id: str, source: str, received_at: str = "2024-01-15T10:00:00Z"
+) -> Any:
     """A receipt ingested before originals were kept: its original pending."""
     receipt = conn.execute(
         "INSERT INTO receipt.receipts (source_id, source_type, source_name, vendor,"
@@ -97,9 +103,9 @@ def _back_catalogue(conn: Conn, source_id: str, source: str) -> Any:
     prov = conn.execute(
         "INSERT INTO receipt.provenance (receipt_id, is_primary, source_type,"
         " source_name, source_id, received_at, home_receipt_id, original_status,"
-        " match_method) VALUES (%s, TRUE, 'imap', %s, %s, '2024-01-15T10:00:00Z',"
+        " match_method) VALUES (%s, TRUE, 'imap', %s, %s, %s,"
         " %s, 'pending', 'migrated') RETURNING id",
-        (receipt["id"], source, source_id, receipt["id"]),
+        (receipt["id"], source, source_id, received_at, receipt["id"]),
     ).fetchone()
     assert prov is not None
     conn.commit()
@@ -376,3 +382,25 @@ def test_an_item_locked_by_serve_is_left_to_it(
         )
         >= 1
     )
+
+
+def test_originals_only_range_is_inclusive_by_day(pg_conn: Conn) -> None:
+    source = "mail-bf-days"
+    days = {
+        "<before@x>": "2024-03-09T12:00:00Z",
+        "<first@x>": "2024-03-10T12:00:00Z",
+        "<last@x>": "2024-03-12T12:00:00Z",
+        "<after@x>": "2024-03-13T12:00:00Z",
+    }
+    for source_id, at in days.items():
+        _back_catalogue(pg_conn, source_id, source, received_at=at)
+
+    rows = provenance_missing_originals(
+        pg_conn, source, date(2024, 3, 10), date(2024, 3, 12)
+    )
+    pg_conn.rollback()
+    assert [r.source_id for r in rows] == ["<first@x>", "<last@x>"]
+    assert [
+        r.source_id for r in provenance_missing_originals(pg_conn, source, None, None)
+    ] == list(days)
+    pg_conn.rollback()

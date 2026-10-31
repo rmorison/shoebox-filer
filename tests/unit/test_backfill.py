@@ -331,6 +331,21 @@ class TestRunBackfill:
         assert adapter.fetched == []
         assert result.originals_missing == 0
 
+    def test_seen_item_gone_between_listing_and_fetch_is_left_pending(
+        self, h: Harness
+    ) -> None:
+        row = _provenance("<m1@example.com>")
+        h.processed = {row.source_id}
+        h.add_pending(row)
+
+        class Gone(FakeAdapter):
+            def fetch(self, ref: ItemRef) -> RawReceipt | None:
+                return None
+
+        result = h.run(Gone([_ref(1)]))
+        assert h.marked == [] and h.attached == []
+        assert (result.originals_stored, result.originals_failed) == (0, 1)
+
 
 # ---------------------------------------------------------------------------
 # --originals-only
@@ -358,6 +373,38 @@ def fetched(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 class TestRunOriginalsOnly:
+    def test_store_failure_rolls_back_and_leaves_the_row_pending(
+        self,
+        h: Harness,
+        fetched: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def broken(*a: Any, **kw: Any) -> object:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(backfill, "store_email_original", broken)
+        h.add_pending(_provenance("<a@example.com>"))
+        result = h.originals(fetched)
+        assert h.attached == [] and h.marked == []
+        assert result.failed == 1
+        h.conn.rollback.assert_called()
+
+    def test_row_changed_under_the_update_counts_as_unchanged(
+        self,
+        h: Harness,
+        fetched: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(backfill, "attach_email_original", lambda *a, **kw: False)
+        monkeypatch.setattr(
+            backfill, "mark_original_unavailable", lambda *a, **kw: False
+        )
+        a, b = _provenance("<a@example.com>"), _provenance("<b@example.com>")
+        h.add_pending(a, b)
+        fetched[b.source_id] = Fetched(None)
+        result = h.originals(fetched)
+        assert (result.stored, result.unavailable, result.unchanged) == (0, 0, 2)
+
     def test_found_item_is_stored_and_attached(
         self, h: Harness, fetched: dict[str, Any]
     ) -> None:
@@ -519,6 +566,27 @@ class TestImapListRange:
         fake.uidvalidity = 99
         with pytest.raises(SourceUnavailableError, match="UIDVALIDITY"):
             adapter.fetch(ref)
+
+    def test_watched_folder_ref_reselects_after_another_folder(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        # A list_new ref names no folder: it is the watched folder's, even
+        # after a lookup left another folder selected on the same session.
+        fake = RangeIMAPClient({3: _make_simple_email(message_id="<a@example.com>")})
+        adapter = ImapAdapter(imap_config)
+        adapter._client = fake  # type: ignore[assignment]
+        fake.selected = ("Archive", True)
+        adapter._selected = "Archive"
+        ref = ItemRef(source_id="<a@example.com>", source_type="imap", imap_uid=3)
+        assert adapter.fetch(ref) is not None
+        assert fake.selected == ("INBOX", True)
+
+    def test_unreadable_ref_names_the_folder_it_was_listed_in(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        adapter = ImapAdapter(imap_config)
+        ref = adapter._unreadable_ref(3, 7, "NO", "Archive")
+        assert ref.source_id == "imap-uid:test-imap:Archive:7:3"
 
     def test_search_by_id(self) -> None:
         assert can_search_by_id("<a@example.com>")

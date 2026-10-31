@@ -117,7 +117,6 @@ def ingest(
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
     from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
-    from receipt_index.extraction import create_extraction_agent
     from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
     from receipt_index.pipeline import IngestResult, run_due_retries, run_ingest
@@ -144,20 +143,8 @@ def ingest(
 
     store = open_store(config.store)
 
-    # Create extraction agents — email and document prompts differ
-    from receipt_index.extraction import DOCUMENT_SYSTEM_PROMPT
-
-    email_agent = create_extraction_agent(
-        api_key=config.llm.api_key,
-        model=config.llm.model,
-    )
-    document_agent = create_extraction_agent(
-        api_key=config.llm.api_key,
-        model=config.llm.model,
-        system_prompt=DOCUMENT_SYSTEM_PROMPT,
-    )
-
-    agents = {"email": email_agent, "document": document_agent}
+    agents = _extraction_agents(config, config.llm.model)
+    email_agent, document_agent = agents["email"], agents["document"]
     policy = RetryPolicy.from_config(config.ingest)
     totals = IngestResult()
     source_results: list[tuple[str, IngestResult]] = []
@@ -312,10 +299,6 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         INGEST_STATEMENT_TIMEOUT_SECONDS,
         get_connection,
     )
-    from receipt_index.extraction import (
-        DOCUMENT_SYSTEM_PROMPT,
-        create_extraction_agent,
-    )
     from receipt_index.health import HEARTBEAT_PATH
     from receipt_index.locks import SourceLock
     from receipt_index.retries import RetryPolicy
@@ -357,16 +340,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         if not held:
             sys.exit(3)
 
-        agents = {
-            "email": create_extraction_agent(
-                api_key=config.llm.api_key, model=config.llm.model
-            ),
-            "document": create_extraction_agent(
-                api_key=config.llm.api_key,
-                model=config.llm.model,
-                system_prompt=DOCUMENT_SYSTEM_PROMPT,
-            ),
-        }
+        agents = _extraction_agents(config, config.llm.model)
         ingest_config = config.ingest
         health = ingest_config.health
         service = Service(
@@ -1615,6 +1589,23 @@ def _source_adapter(config: AppConfig) -> Callable[[SourceConfig], SourceAdapter
     return build
 
 
+def _extraction_agents(config: AppConfig, model: str) -> dict[str, Any]:
+    """The email and document extraction agents: their prompts differ."""
+    from receipt_index.extraction import (
+        DOCUMENT_SYSTEM_PROMPT,
+        create_extraction_agent,
+    )
+
+    return {
+        "email": create_extraction_agent(api_key=config.llm.api_key, model=model),
+        "document": create_extraction_agent(
+            api_key=config.llm.api_key,
+            model=model,
+            system_prompt=DOCUMENT_SYSTEM_PROMPT,
+        ),
+    }
+
+
 def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
     from decimal import Decimal
 
@@ -1799,21 +1790,8 @@ def backfill(
 
         agent = None
         if not dry_run:
-            from receipt_index.extraction import (
-                DOCUMENT_SYSTEM_PROMPT,
-                create_extraction_agent,
-            )
-
-            if source_config.type == "gdrive":
-                agent = create_extraction_agent(
-                    api_key=config.llm.api_key,
-                    model=config.llm.model,
-                    system_prompt=DOCUMENT_SYSTEM_PROMPT,
-                )
-            else:
-                agent = create_extraction_agent(
-                    api_key=config.llm.api_key, model=config.llm.model
-                )
+            agents = _extraction_agents(config, config.llm.model)
+            agent = agents["document" if source_config.type == "gdrive" else "email"]
         adapter = _source_adapter(config)(source_config)
         result = run_backfill(
             conn,
@@ -2057,21 +2035,7 @@ def reextract(
                     click.echo("No receipts selected.")
                 return
 
-            from receipt_index.extraction import (
-                DOCUMENT_SYSTEM_PROMPT,
-                create_extraction_agent,
-            )
-
-            agents = {
-                "email": create_extraction_agent(
-                    api_key=config.llm.api_key, model=model
-                ),
-                "document": create_extraction_agent(
-                    api_key=config.llm.api_key,
-                    model=model,
-                    system_prompt=DOCUMENT_SYSTEM_PROMPT,
-                ),
-            }
+            agents = _extraction_agents(config, model)
 
             def report(outcome: ReceiptOutcome) -> None:
                 if output_format == "json":
