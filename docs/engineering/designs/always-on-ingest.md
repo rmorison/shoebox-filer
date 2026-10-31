@@ -334,7 +334,7 @@ The file's content carries what lives only in `serve`'s memory, for `status` to 
 - a source has been paused on errors for longer than `source_stale_seconds` when that's set, or otherwise the largest of the sources' stale thresholds (720 seconds at the defaults);
 - the database can't be reached.
 
-With a fresh heartbeat, only the sources `serve` watches are checked for staleness, and neither staleness nor pauses while its worker is busy on a job. A source's age counts from its last success or from `serve`'s start, whichever is later, so a restart after downtime gets up to one stale threshold to catch up before the first ping reports it. The grace ends at the source's first read after the start, so a `serve` that keeps restarting can't hide a failing source. One worker takes the sources in turn, so a long job (a bulk drop, a retry pass) holds the others back without anything being wrong, and a wedged job is the heartbeat's to catch. A stale heartbeat's content is ignored: the process that wrote it may be gone.
+With a fresh heartbeat, only the sources `serve` watches are checked for staleness. While the worker is busy, each stale and pause threshold is extended by the current step's running time, up to `item_timeout_seconds`; past its threshold plus `item_timeout_seconds`, a source or a pause is a problem however busy the worker is and whatever the start-up grace says. A source's age counts from its last success or from `serve`'s start, whichever is later, so a restart after downtime gets up to one stale threshold to catch up before the first ping reports it. The grace ends at the source's first read after the start, so a `serve` that keeps restarting can't hide a failing source. One worker takes the sources in turn, so a long step holds the others back without anything being wrong; a stream of short jobs, or a hang that keeps the watchdog restarting `serve`, gets no such cover. A stale heartbeat's content is ignored: the process that wrote it may be gone. A heartbeat file owned by another user isn't trusted at all.
 
 Terminal failures don't fail the check. They're content problems, not liveness problems, so they mustn't mark the container unhealthy. They still reach the operator through the dead-man's ping (below) as well as `status` and `failures`.
 
@@ -408,7 +408,7 @@ sources:
 
 Validation fails at load time, with the config error style used today, when:
 - `archive: true` is set without the matching folder fields, or on a Drive source while the store backend isn't Drive;
-- an explicit `source_stale_seconds` is below a poll interval it applies to;
+- an explicit `source_stale_seconds` is below twice a poll interval it applies to (with one interval, a healthy source reads as stale just before each poll);
 - `retry_backoff_seconds` has fewer than `retry_max_attempts - 1` entries;
 - an interval is below a floor: 30 seconds for polls, 60 seconds for IDLE re-issue.
 

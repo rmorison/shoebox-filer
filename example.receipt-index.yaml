@@ -74,7 +74,7 @@ ingest:
   item_timeout_seconds: 1200           # the watchdog exits serve past this (at least 1200)
   health:                              # `status --check` and serve's dead-man ping
     heartbeat_stale_seconds: 120       # serve's heartbeat older than this fails the check (at least 60)
-    # source_stale_seconds: 900        # optional; default 3x each source's poll interval
+    # source_stale_seconds: 900        # optional; default 3x each source's poll interval; at least 2x
     terminal_alert_seconds: 86400      # an item turned terminal this recently fails the ping; 0 = off
     # ping_url: ${HEALTH_PING_URL}     # add only once HEALTH_PING_URL is set: an unset ${VAR} stops every command
     ping_interval_seconds: 300         # how often serve pings the monitor (at least 30)

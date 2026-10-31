@@ -15,6 +15,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
@@ -155,7 +156,8 @@ class HealthConfig(BaseModel):
     # The heartbeat is written every 30 s; twice that is the floor.
     heartbeat_stale_seconds: int = Field(default=120, ge=60)
     # When unset, each source's threshold is 3x its poll interval.
-    source_stale_seconds: int | None = Field(default=None, ge=30)
+    # At least twice each poll interval it applies to (an AppConfig check).
+    source_stale_seconds: int | None = Field(default=None, ge=60)
     # An item that turned terminal this recently fails the ping; 0 = never.
     terminal_alert_seconds: int = Field(default=86400, ge=0)
     ping_url: SecretStr | None = None
@@ -170,6 +172,8 @@ class HealthConfig(BaseModel):
         url = value.get_secret_value().strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("ping_url must be an http or https URL")
+        if not urlsplit(url).netloc:
+            raise ValueError("ping_url must name a host")
         if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
             raise ValueError("ping_url must not contain spaces or control characters")
         if "?" in url or "#" in url:
@@ -281,18 +285,22 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_source_stale(self) -> AppConfig:
-        """An explicit stale threshold must not be below a poll it applies to."""
+        """An explicit stale threshold must be at least two polls it applies to.
+
+        With one, a healthy source's age just before its next read (an
+        interval plus the read) is over the threshold, and the check flaps.
+        """
         stale = self.ingest.health.source_stale_seconds
         if stale is None:
             return self
         for kind in sorted({s.type for s in self.sources}):
             poll = self.ingest.poll_seconds(kind)
-            if stale < poll:
+            if stale < 2 * poll:
                 key = "imap_poll_seconds" if kind == "imap" else "drive_poll_seconds"
                 msg = (
                     f"ingest.health.source_stale_seconds ({stale}) is below "
-                    f"ingest.{key} ({poll}), so every {kind} source "
-                    "would be stale between polls"
+                    f"twice ingest.{key} ({poll}), so a healthy {kind} source "
+                    "would read as stale before each poll"
                 )
                 raise ValueError(msg)
         return self

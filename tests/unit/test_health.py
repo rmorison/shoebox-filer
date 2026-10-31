@@ -241,14 +241,38 @@ class TestChecks:
         )
         assert lines == []
 
-    def test_a_busy_worker_holds_back_the_stale_lines(self) -> None:
-        # One worker: a long job leaves the other sources waiting their turn.
+    def test_a_stream_of_short_jobs_still_reports_stale(self) -> None:
+        # Busy at every heartbeat, but each step is short: no cover.
         lines = _lines(
             _config(),
-            ages={"mail": 1200, "scans": 1200},
-            heartbeat=_fresh(busy_seconds=30.0),
+            ages={"mail": 1200, "scans": 10},
+            heartbeat=_fresh(busy_seconds=5.0),
         )
-        assert lines == []
+        assert lines == ["source mail stale 1200s"]
+
+    def test_the_current_step_s_busy_time_extends_the_threshold(self) -> None:
+        busy = _fresh(busy_seconds=300.0)  # mail: 720 + 300
+        assert _lines(_config(), ages={"mail": 1000, "scans": 10}, heartbeat=busy) == []
+        lines = _lines(_config(), ages={"mail": 1100, "scans": 10}, heartbeat=busy)
+        assert lines == ["source mail stale 1100s"]
+
+    def test_the_extension_is_capped_at_item_timeout(self) -> None:
+        # threshold 720 + item_timeout 1200 = 1920, however long the step.
+        busy = _fresh(busy_seconds=50000.0)
+        assert _lines(_config(), ages={"mail": 1900, "scans": 10}, heartbeat=busy) == []
+        lines = _lines(_config(), ages={"mail": 1950, "scans": 10}, heartbeat=busy)
+        assert lines == ["source mail stale 1950s"]
+
+    def test_the_backstop_overrides_the_start_up_grace(self) -> None:
+        # A listing that hangs every run: the watchdog restarts serve every
+        # 1200 s, and each start would otherwise grant a fresh grace.
+        started = _NOW - timedelta(seconds=60)
+        lines = _lines(
+            _config(),
+            ages={"mail": 36000, "scans": 10},
+            heartbeat=_fresh(started_at=started, busy_seconds=60.0),
+        )
+        assert lines == ["source mail stale 36000s"]
 
     def test_without_a_heartbeat_every_source_is_checked(self) -> None:
         lines = _lines(_config(), ages={"mail": 1200, "scans": 10}, heartbeat=None)
@@ -273,11 +297,12 @@ class TestChecks:
         assert lines == ["source scans lock lost"]
 
     def test_a_fresh_start_gets_one_threshold_to_catch_up(self) -> None:
-        # Down for an hour, restarted 60 s ago: not stale yet.
+        # Down for 25 minutes, restarted 60 s ago: not stale yet. (Past the
+        # threshold plus item_timeout_seconds, the backstop reports it.)
         just_started = _NOW - timedelta(seconds=60)
         lines = _lines(
             _config(),
-            ages={"mail": 3600, "scans": None},
+            ages={"mail": 1500, "scans": None},
             heartbeat=_fresh(started_at=just_started),
         )
         assert lines == []
@@ -296,7 +321,7 @@ class TestChecks:
         # old success shows as stale at once.
         config = _config()
         started = _NOW - timedelta(seconds=60)
-        statuses = _statuses(config, {"mail": 3600, "scans": 10})
+        statuses = _statuses(config, {"mail": 1500, "scans": 10})
         mail = statuses[0]
         assert mail.row is not None
         mail.row = mail.row.model_copy(
@@ -310,14 +335,31 @@ class TestChecks:
             pause_after=pause_threshold(config.sources, config.ingest),
             now=_NOW,
         )
-        assert [p.line for p in problems] == ["source mail stale 3600s"]
+        assert [p.line for p in problems] == ["source mail stale 1500s"]
 
-    def test_a_busy_worker_holds_back_the_pause_lines(self) -> None:
+    def test_busy_time_extends_the_pause_threshold_too(self) -> None:
         pause = Pause(since=_NOW - timedelta(seconds=900), reason="x")
+        held = _fresh(paused={"mail": pause}, busy_seconds=300.0)  # 720 + 300
+        assert _lines(_config(), heartbeat=held) == []
+        short = _fresh(paused={"mail": pause}, busy_seconds=5.0)
+        assert _lines(_config(), heartbeat=short) == ["source mail paused 900s"]
+
+    def test_a_long_pause_is_reported_however_busy(self) -> None:
+        pause = Pause(since=_NOW - timedelta(hours=10), reason="x")
         lines = _lines(
-            _config(), heartbeat=_fresh(paused={"mail": pause}, busy_seconds=5.0)
+            _config(), heartbeat=_fresh(paused={"mail": pause}, busy_seconds=1e6)
         )
-        assert lines == []
+        assert lines == ["source mail paused 36000s"]
+
+    def test_a_heartbeat_owned_by_another_user_is_not_trusted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "hb"
+        write_heartbeat(path, _state())
+        monkeypatch.setattr(health.os, "getuid", lambda: path.stat().st_uid + 1)
+        read = read_heartbeat(path)
+        assert read is not None
+        assert _lines(_config(), heartbeat=read) == ["heartbeat not ours"]
 
     def test_terminal_failures_never_fail_the_check(self) -> None:
         conn = MagicMock()
@@ -591,6 +633,21 @@ class TestHeartbeatLoop:
         loop.check()
         assert not (tmp_path / "hb").exists()
 
+    def test_a_failing_write_logs_once_per_change(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now = Clock()
+        bad = tmp_path / "no" / "hb"
+        loop = self._loop(tmp_path, clock=ItemClock(now=now), now=now, path=bad)
+        with caplog.at_level(logging.INFO):
+            for _ in range(4):
+                loop.check()
+                now.now += 30
+            assert caplog.text.count("can't write the heartbeat") == 1
+            bad.parent.mkdir()
+            loop.check()
+        assert "heartbeat written again" in caplog.text
+
     def test_a_failed_write_never_stops_the_watchdog(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -713,6 +770,23 @@ class TestPing:
         assert monitor.requests == [
             ("POST", f"/{_MARKER}/fail", "health checks failed\n")
         ]
+
+    def test_an_http_error_response_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import urllib.error
+
+        closed: list[int] = []
+        real = urllib.error.HTTPError.close
+
+        def spy(self: Any) -> None:
+            closed.append(self.code)
+            real(self)
+
+        monkeypatch.setattr(urllib.error.HTTPError, "close", spy)
+        with FakeMonitor(status=500) as m:
+            _ping(m.url, []).ping_once()
+        assert closed == [500]
 
     def test_a_monitor_error_is_logged_without_the_url(
         self, caplog: pytest.LogCaptureFixture

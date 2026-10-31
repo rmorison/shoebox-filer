@@ -137,10 +137,15 @@ class WorkerState:
 
 @dataclass(frozen=True)
 class Heartbeat:
-    """The heartbeat file as read: its age, and its content if it parses."""
+    """The heartbeat file as read: its age, and its content if it parses.
+
+    ``ours`` is False when another user owns the file: on a host whose /tmp
+    is shared, anyone could create it first and keep it fresh.
+    """
 
     age_seconds: float
     state: WorkerState | None
+    ours: bool = True
 
 
 def write_heartbeat(path: Path, state: WorkerState) -> None:
@@ -162,10 +167,12 @@ def read_heartbeat(path: Path, *, now: float | None = None) -> Heartbeat | None:
     liveness signal, the content is detail.
     """
     try:
-        mtime = path.stat().st_mtime
+        stat = path.stat()
     except FileNotFoundError:
         return None
-    age = max(0.0, (time.time() if now is None else now) - mtime)
+    age = max(0.0, (time.time() if now is None else now) - stat.st_mtime)
+    if stat.st_uid != os.getuid():
+        return Heartbeat(age_seconds=age, state=None, ours=False)
     state: WorkerState | None
     try:
         state = WorkerState.from_json(json.loads(path.read_text(encoding="utf-8")))
@@ -283,19 +290,28 @@ def evaluate(
     health = ingest.health
     fresh = (
         heartbeat is not None
+        and heartbeat.ours
         and heartbeat.age_seconds <= health.heartbeat_stale_seconds
     )
     if heartbeat is None:
         problems.append(Problem("heartbeat", "missing"))
+    elif not heartbeat.ours:
+        problems.append(Problem("heartbeat", "not ours"))
     elif not fresh:
         problems.append(Problem("heartbeat", f"stale {_secs(heartbeat.age_seconds)}"))
     # A stale heartbeat's content belongs to a process that may be gone.
     state = heartbeat.state if fresh and heartbeat is not None else None
 
-    # While a live worker is busy on a long job (a bulk drop, a retry pass),
-    # the other sources wait their turn: that isn't staleness or a stuck
-    # pause, and a wedged step is the heartbeat's to catch.
-    busy = state is not None and state.busy_seconds is not None
+    # One worker takes the sources in turn, so a long step holds the others
+    # back: each threshold is extended by the current step's running time,
+    # capped at item_timeout_seconds (the watchdog's limit). Past that cap,
+    # a source or a pause is a problem however busy the worker is, and
+    # whatever the start-up grace below says.
+    busy_for = (
+        0.0 if state is None or state.busy_seconds is None else state.busy_seconds
+    )
+    allowance = min(busy_for, float(ingest.item_timeout_seconds))
+    backstop = float(ingest.item_timeout_seconds)
     # A serve that just started hasn't read its sources yet: each source's
     # age counts from the later of its last success and the start, so a
     # restart after downtime gets one stale threshold to catch up.
@@ -303,12 +319,15 @@ def evaluate(
 
     if not database_ok:
         problems.append(Problem("database", "unreachable"))
-    elif not busy:
+    else:
         watched = set(state.watching) if state is not None else None
         for status in sources:
             if watched is not None and status.name not in watched:
                 continue  # left to whatever else reads it (`serve --source`)
             age = status.success_age(now)
+            if age is not None and age > status.stale_after_seconds + backstop:
+                problems.append(Problem("source", f"stale {_secs(age)}", status.name))
+                continue
             since_start = None if started is None else (now - started).total_seconds()
             if (
                 since_start is not None
@@ -320,7 +339,7 @@ def evaluate(
                 continue  # this serve hasn't read it yet: catching up
             if age is None:
                 problems.append(Problem("source", "never succeeded", status.name))
-            elif age > status.stale_after_seconds:
+            elif age > status.stale_after_seconds + allowance:
                 problems.append(Problem("source", f"stale {_secs(age)}", status.name))
 
     if state is not None:
@@ -332,10 +351,10 @@ def evaluate(
             # Another process held its lock when serve started, and serve
             # never takes it later: nothing watches this source.
             problems.append(Problem("source", "not held", name))
-    if state is not None and not busy:
+    if state is not None:
         for name, pause in sorted(state.paused.items()):
             paused_for = (now - pause.since).total_seconds()
-            if paused_for > pause_after:
+            if paused_for > pause_after + allowance:
                 problems.append(Problem("source", f"paused {_secs(paused_for)}", name))
     return problems
 
@@ -664,6 +683,7 @@ class PingLoop:
             ) as response:
                 response.read(1024)
         except urllib.error.HTTPError as exc:
+            exc.close()  # it holds the response
             logger.warning("health: ping not delivered (HTTP %d)", exc.code)
             return False
         except Exception as exc:

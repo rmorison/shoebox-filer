@@ -526,6 +526,7 @@ uv run receipt-index status [--check] [--output text|json]
 | Line | When |
 |---|---|
 | `heartbeat missing` | There's no heartbeat file: `serve` isn't running here |
+| `heartbeat not ours` | The heartbeat file belongs to another user, so it isn't trusted (on a host whose `/tmp` is shared, anyone could create it and keep it fresh) |
 | `heartbeat stale 340s` | The heartbeat is older than `ingest.health.heartbeat_stale_seconds` (default 120). `serve` rewrites it every 30 seconds while its worker is alive and no step has run past `ingest.item_timeout_seconds` |
 | `source NAME stale 1200s` | The source's last successful read is older than its stale threshold: `ingest.health.source_stale_seconds` when set, otherwise three times its poll interval (720 seconds for IMAP and 360 for Drive at the defaults) |
 | `source NAME never succeeded` | The source has never been read successfully |
@@ -534,7 +535,7 @@ uv run receipt-index status [--check] [--output text|json]
 | `source NAME paused 900s` | `serve` has kept the source paused after errors for longer than `source_stale_seconds`, or by default the largest of the sources' stale thresholds |
 | `database unreachable` | The database didn't answer within 5 seconds |
 
-With a fresh heartbeat, only the sources that `serve` watches are checked for staleness. A source's age counts from its last successful read or from `serve`'s start, whichever is later, so a restart after downtime gets up to one stale threshold to catch up before the check or the ping reports it. The grace ends at the source's first read after the start, so a failed catch-up read, or a `serve` that keeps restarting, is reported at once. Neither staleness nor pauses are checked while the worker is busy on a job, because one worker takes the sources in turn and a long job holds the others back. A stuck job is caught by the heartbeat instead. A stale heartbeat's content is ignored, because the process that wrote it may be gone. Terminal failures never fail the check: they are content problems, reported by the ping below and by [`failures`](#failures).
+With a fresh heartbeat, only the sources that `serve` watches are checked for staleness. A source's age counts from its last successful read or from `serve`'s start, whichever is later, so a restart after downtime gets up to one stale threshold to catch up before the check or the ping reports it. The grace ends at the source's first read after the start, so a failed catch-up read, or a `serve` that keeps restarting, is reported at once. One worker takes the sources in turn, so a long step holds the others back: while the worker is busy, each stale and pause threshold is extended by the current step's running time, up to `ingest.item_timeout_seconds`. A source not read successfully for longer than its threshold plus `item_timeout_seconds` (1920 seconds for IMAP at the defaults), or paused for that long, is reported however busy the worker is and however recently `serve` started. A `serve` stuck in a restart loop is therefore reported too. A stale heartbeat's content is ignored, because the process that wrote it may be gone. Terminal failures never fail the check: they are content problems, reported by the ping below and by [`failures`](#failures).
 
 ### The dead-man ping
 
@@ -543,15 +544,15 @@ When `ingest.health.ping_url` is set, `serve` pings an external monitor (for exa
 - If the checks above pass and no item has turned terminal within `terminal_alert_seconds` (default 86400), it sends a GET to `ping_url`.
 - Otherwise it sends a POST to `ping_url` + `/fail` with the problem lines, plus for example `terminal 2 in 24h`. The body never includes error text or receipt details.
 
-The monitor alerts when the pings stop or a failure ping arrives. The ping has a 10-second timeout, and a monitor that is down or unreachable is logged but never stops `serve`. The URL is a capability: keep it in the environment (`ping_url: ${HEALTH_PING_URL}`). It is never logged or shown in a config error, and its key stays commented out until the variable is set, since a `${VAR}` whose variable is unset stops every command.
+The monitor alerts when the pings stop or a failure ping arrives. Each ping waits at most 10 seconds for each network step (connecting, sending, reading). That isn't a deadline on the whole ping: a server that answers a byte at a time can hold the ping longer, but only the ping thread waits, never the worker or the healthcheck. A monitor that is down or unreachable is logged but never stops `serve`. The URL is a capability: keep it in the environment (`ping_url: ${HEALTH_PING_URL}`), never written into the YAML. `serve` never logs it or shows it in a config error, but a YAML syntax error prints the offending line, which would show a URL written there. Keep the key commented out until the variable is set, since a `${VAR}` whose variable is unset stops every command.
 
 ```yaml
 ingest:
   health:
     heartbeat_stale_seconds: 120   # at least 60
-    # source_stale_seconds: 900    # optional; at least each poll interval it applies to
+    # source_stale_seconds: 900    # optional; at least twice each poll interval it applies to
     terminal_alert_seconds: 86400  # 0 turns terminal alerts off
-    # ping_url: ${HEALTH_PING_URL} # http or https, with no query string
+    # ping_url: ${HEALTH_PING_URL} # http or https with a host, no query string; never literal
     ping_interval_seconds: 300     # at least 30
 ```
 

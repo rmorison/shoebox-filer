@@ -338,6 +338,8 @@ class TestHealthKeys:
             f"https://hc-ping.example.com/{_PING_MARKER}?x=1",
             f"https://hc-ping.example.com/{_PING_MARKER}\n/x",
             f"https://hc-ping.example.com/{_PING_MARKER} x",
+            "http://",
+            f"https:///{_PING_MARKER}",
             12345,
         ],
     )
@@ -378,19 +380,29 @@ class TestHealthKeys:
         with pytest.raises(ValidationError, match="imap_poll_seconds"):
             AppConfig.model_validate(_health_config({"source_stale_seconds": 200}))
 
+    def test_source_stale_needs_two_poll_intervals(self) -> None:
+        # One interval flaps: a healthy source's age just before its next
+        # read is a whole interval plus the read.
+        with pytest.raises(ValidationError, match="twice"):
+            AppConfig.model_validate(_health_config({"source_stale_seconds": 300}))
+        config = AppConfig.model_validate(_health_config({"source_stale_seconds": 480}))
+        assert config.ingest.health.source_stale_seconds == 480
+
     def test_source_stale_checks_only_the_source_types_present(self) -> None:
-        # 200 is below the IMAP poll (240), but the only source is Drive.
-        data = _health_config({"source_stale_seconds": 200})
+        # 240 is below twice the IMAP poll (480), but the only source is
+        # Drive (twice 120).
+        data = _health_config({"source_stale_seconds": 240})
         data["sources"] = [
             {"name": "scans", "type": "gdrive", "folder_id": "f", "token_json": "{}"}
         ]
         config = AppConfig.model_validate(data)
-        assert config.ingest.health.source_stale_seconds == 200
+        assert config.ingest.health.source_stale_seconds == 240
 
     @pytest.mark.parametrize(
         ("key", "value"),
         [
             ("heartbeat_stale_seconds", 59),
+            ("source_stale_seconds", 59),
             ("terminal_alert_seconds", -1),
             ("ping_interval_seconds", 29),
         ],

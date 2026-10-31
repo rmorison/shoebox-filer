@@ -685,6 +685,7 @@ class HealthLoop:
         self._state = state
         self.heartbeat_seconds = heartbeat_seconds
         self._last_beat: float | None = None
+        self._write_failing = False
 
     def run(self) -> None:
         while not self.worker_done.is_set():
@@ -718,8 +719,16 @@ class HealthLoop:
             write_heartbeat(self.heartbeat_path, self._state())
         except Exception as exc:
             # Never let a full /tmp end the loop, and the watchdog with it.
-            logger.warning("Health: can't write the heartbeat (%s)", type(exc).__name__)
+            # Logged once per change, not every tick.
+            if not self._write_failing:
+                logger.warning(
+                    "Health: can't write the heartbeat (%s)", type(exc).__name__
+                )
+            self._write_failing = True
             return
+        if self._write_failing:
+            logger.info("Health: heartbeat written again")
+            self._write_failing = False
         self._last_beat = now
 
     def _watchdog(self) -> float | None:
