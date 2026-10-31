@@ -381,6 +381,23 @@ class TestChecks:
         assert read is not None
         assert _lines(_config(), heartbeat=read) == ["heartbeat unreadable"]
 
+    def test_an_owned_heartbeat_that_can_t_be_read_is_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pathlib import Path as RealPath
+
+        path = tmp_path / "hb"
+        write_heartbeat(path, _state())
+
+        def refuse(_self: Any, *args: Any, **kwargs: Any) -> str:
+            raise PermissionError("mode 000")
+
+        monkeypatch.setattr(RealPath, "read_text", refuse)
+        read = read_heartbeat(path)
+        monkeypatch.undo()
+        assert read is not None
+        assert _lines(_config(), heartbeat=read) == ["heartbeat unreadable"]
+
     def test_a_heartbeat_owned_by_another_user_is_not_trusted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1003,3 +1020,31 @@ class TestWorkerStateAssembly:
         self, tmp_path: Path, pipeline_calls: dict[str, MagicMock]
     ) -> None:
         assert _service(tmp_path).worker_state().requested == ["scans"]
+
+
+class TestJobClock:
+    def test_job_since_is_set_inside_a_job_and_cleared_after(self) -> None:
+        now = Clock()
+        clock = ItemClock(now=now)
+        assert clock.job_since() is None
+        with clock.job(Job("poll", "mail")):
+            assert clock.job_since() == now.now
+            now.now += 50
+            with clock.running("<a@example.com>"):
+                pass
+            assert clock.job_since() == now.now - 50  # items don't reset it
+        assert clock.job_since() is None
+        with pytest.raises(RuntimeError), clock.job(Job("retry", "mail")):
+            raise RuntimeError("boom")
+        assert clock.job_since() is None
+
+    def test_the_heartbeat_carries_the_job_time(
+        self, tmp_path: Path, pipeline_calls: dict[str, MagicMock]
+    ) -> None:
+        svc = _service(tmp_path)
+        assert svc.worker_state().job_seconds is None
+        with svc.clock.job(Job("poll", "scans")):
+            seconds = svc.worker_state().job_seconds
+        assert seconds is not None
+        assert 0 <= seconds < 5
+        assert svc.worker_state().job_seconds is None

@@ -189,8 +189,12 @@ def read_heartbeat(path: Path, *, now: float | None = None) -> Heartbeat | None:
         return Heartbeat(age_seconds=age, state=None, untrusted="not ours")
     state: WorkerState | None
     try:
-        state = WorkerState.from_json(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return Heartbeat(age_seconds=age, state=None, untrusted="unreadable")
+    try:
+        state = WorkerState.from_json(json.loads(text))
+    except (ValueError, KeyError, TypeError, AttributeError):
         state = None
     return Heartbeat(age_seconds=age, state=state)
 
