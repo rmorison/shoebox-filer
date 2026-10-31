@@ -522,13 +522,19 @@ A receipt is one purchase (or one refund). A provenance record is one source ite
 
 ### 9. PDF Validation at Ingest
 
-Every PDF that enters the store (a PDF attachment, a Drive PDF, a rendition) is opened with **pikepdf** (qpdf), a new dependency, in strict mode:
+Every PDF that enters the store (a PDF attachment, a Drive PDF, a rendition) is opened with **pikepdf** (qpdf), a new dependency, in strict mode: without recovery, saved again, and with no qpdf warnings. The warnings count because qpdf opens a PDF whose `%PDF-` header is damaged in strict mode, with only a warning.
 
-- **`ok`:** it parses cleanly and can be re-saved.
-- **`repaired`:** it fails the strict parse, but qpdf rewrites it into a file that does parse. **The original is never changed.** The repaired bytes become the receipt's *rendition*, a new `stored_files` row with `repaired_from_id` pointing at the original.
-- **`unparseable`:** it can't be repaired. The original is still stored (it is the evidence). If it was to be the rendition, the renderer falls back to rendering the email body. If there is no body, the item fails with a clear error and goes to the retry path.
+- **`ok`:** it passes the strict check.
+- **`repaired`:** it fails the strict check, but qpdf, with recovery, rewrites it into a file that passes. **The original is never changed.** The repaired bytes become the receipt's *rendition*, a new `stored_files` row with `repaired_from_id` pointing at the original.
+- **`unparseable`:** anything else, including a PDF that needs a user password. The original is still stored (it is the evidence). If it was to be the rendition, the renderer falls back to rendering the email body. If there is no body, the item fails with a clear error and goes to the retry path.
 
-`pdf_status` is recorded on the stored file, so packet builders know what they are merging. Repairing at ingest moves the failure from packet-building time, when the original source may be long gone, to ingest time, where it is logged and retried. pdfplumber stays for text extraction.
+**The PDF is untrusted, so qpdf runs in a bounded child process.** Saving a PDF decodes its streams, and a file of a few kilobytes can inflate to gigabytes (a twice-deflated XMP `/Metadata` stream) or take minutes of CPU (a filter chain). The check runs in a child process under an address-space limit (512 MB), a CPU limit (30 s) and a wall-clock timeout (60 s), well under `item_timeout_seconds`. It refuses a file over 25 MB without opening it. A child that hits a limit, is killed or times out makes the PDF `unparseable`, with the reason logged; the check never decodes PDF content in the ingest process. (Text extraction with pdfplumber, which reads the same attachments, still runs in-process and is not bounded by this.) A clean result is cached by content, so an item's attachment and its pass-through rendition, the same bytes, are checked once. A `MemoryError` that does reach an item is `transient`.
+
+PDFs from careless generators (a page missing `/Resources`, `/MediaBox` or `/Type`, or a `startxref` a byte off) fail the strict check and come out `repaired`: their rendition is qpdf's rewrite, and the original is kept as sent.
+
+`pdf_status` is recorded on the stored file and describes that row's own bytes. A source that failed the strict check is `repaired`, and its repaired copy is `ok`, with `repaired_from_id` set, so every rendition is `ok`. A generated rendition (from HTML, text or an image) that isn't `ok` fails the item. Packet builders know what they are merging. Repairing at ingest moves the failure from packet-building time, when the original source may be long gone, to ingest time, where it is logged and retried. pdfplumber stays for text extraction.
+
+Until Drive adopt is built, a Drive PDF enters the store only as a rendition. An unparseable one stores nothing and goes to the retry path. A repaired one's source bytes get a `stored_files` row with no location, so that `repaired_from_id` has a target; adopt reuses that row by sha256. Files stored before validation keep `pdf_status` NULL: rows are inserted whole and never updated. For the same reason, when two damaged copies repair to identical bytes, their receipts share one rendition row, and its `repaired_from_id` names the first source; each receipt's own source is its attachment, through `provenance_files`.
 
 ### 10. Reading
 
@@ -598,7 +604,7 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 5. **`verify` and `store report`, scheduled and alerting.** A daily `verify` and a monthly `verify --deep` in the service's schedule, each exiting non-zero on any mismatch, missing file or lifted restriction, and reported through the same channel as the always-on ingest design's health alerts. With no second copy, an unscheduled check would let a deleted original go unnoticed past Drive's 30-day trash. Files: `cli.py`, `store.py`, `repository.py`, `deploy/crontab` (or the service schedule that replaces it), `docs/user/server-deployment.md`, the CLI reference.
 6. **Migrate the local tree to Drive.** `store migrate`, the cutover runbook, then migration step 4. Files: `cli.py`, `store.py`, a new migration, `docs/user/server-deployment.md`.
 7. **Duplicate detection, link, unlink, duplicates.** A migration for `duplicate_candidates`, `provenance_link_history`, the merge columns and their triggers ([Schema](#6-schema)), and the merge conditions in `v_receipt_net`. Rules 1 to 4 with the guard, the commands, `duplicates scan` over existing receipts, and the JSON output fields. Rule 3 needs the data-model design's order number and paid amount. Files: new `duplicates.py`, `pipeline.py`, `repository.py`, `cli.py`, the CLI reference.
-8. **PDF validation and repair.** pikepdf, `pdf_status`, repaired renditions. Files: `pyproject.toml`, new `pdf_validate.py`, `pipeline.py`, `renderer.py`.
+8. **PDF validation and repair.** pikepdf, `pdf_status`, repaired renditions. Files: `pyproject.toml`, new `pdf_validate.py`, `pipeline.py`, `renderer.py`, `originals.py`, `store.py`, `repository.py`, and a grants-only migration.
 9. **Monthly database dump.** Files: `deploy/backup.sh`, `deploy/crontab`, `docs/user/server-deployment.md`.
 10. **Drop the old columns** (migration step 5), one release after ticket 6. Files: a new migration, `repository.py`, `models.py`, `cli.py`.
 
@@ -624,7 +630,7 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 - The application role can't UPDATE, DELETE or TRUNCATE `provenance_link_history`, tested as the owning role, as in production.
 - An email attachment whose bytes match an adopted (operator-owned) Drive file still gets its own store-owned copy.
 - The Drive guard: one test per row of the guard table, plus the import check.
-- PDF validation: a clean PDF, a PDF with a broken header that repairs, and an unparseable one, each a committed fixture.
+- PDF validation: a clean PDF, a truncated PDF and a PDF with a broken header that each repair, and an unparseable one, each built in the test from a small valid PDF, never a real document.
 
 ### Integration Tests (devtest Postgres)
 

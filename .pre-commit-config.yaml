@@ -27,6 +27,7 @@ repos:
           - python-dotenv>=1.0
           - "psycopg[binary]>=3.1"
           - mcp>=2.3
+          - pikepdf==10.17.0
         args: [--config-file=pyproject.toml]
         pass_filenames: false
         entry: mypy src/

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     import psycopg
 
     from receipt_index.models import ActorKind, EventType
+    from receipt_index.pdf_validate import PdfStatus
 
 DocumentCertainty = Literal["certain", "ambiguous"]
 ProvenanceFileRole = Literal["message", "attachment", "drive_original", "drive_export"]
@@ -1525,20 +1526,32 @@ def record_stored_file(
     sha256: bytes,
     byte_size: int,
     media_type: str,
+    pdf_status: PdfStatus | None = None,
+    repaired_from_id: UUID | None = None,
 ) -> UUID:
     """The ``stored_files`` row for these bytes, inserted if it is new.
 
     Two writers storing the same bytes at once end with one row: the loser's
-    insert does nothing, and it reads the winner's row.
+    insert does nothing, and it reads the winner's row. An existing row
+    keeps what it was stored with: the same bytes get the same
+    ``pdf_status``, and a row stored before validation keeps NULL.
     """
     row = conn.execute(
         """\
-        INSERT INTO receipt.stored_files (sha256, byte_size, media_type)
-        VALUES (%(sha256)s, %(size)s, %(media_type)s)
+        INSERT INTO receipt.stored_files
+            (sha256, byte_size, media_type, pdf_status, repaired_from_id)
+        VALUES (%(sha256)s, %(size)s, %(media_type)s, %(pdf_status)s,
+                %(repaired_from_id)s)
         ON CONFLICT (sha256) DO NOTHING
         RETURNING id
         """,
-        {"sha256": sha256, "size": byte_size, "media_type": media_type},
+        {
+            "sha256": sha256,
+            "size": byte_size,
+            "media_type": media_type,
+            "pdf_status": pdf_status,
+            "repaired_from_id": repaired_from_id,
+        },
     ).fetchone()
     if row is None:
         row = conn.execute(
@@ -1557,6 +1570,8 @@ def record_rendition(
     sha256: bytes,
     byte_size: int,
     media_type: str,
+    pdf_status: PdfStatus | None = None,
+    repaired_from_id: UUID | None = None,
 ) -> UUID:
     """Record a receipt's rendition: its stored file, location and file ID.
 
@@ -1564,9 +1579,15 @@ def record_rendition(
     the receipt's own rendition location, and ``receipts.rendition_file_id``.
     Doesn't commit. A location already recorded for this receipt is kept;
     one held by another receipt raises :class:`RenditionConflictError`.
+    ``repaired_from_id`` names the stored PDF a repaired rendition came from.
     """
     file_id = record_stored_file(
-        conn, sha256=sha256, byte_size=byte_size, media_type=media_type
+        conn,
+        sha256=sha256,
+        byte_size=byte_size,
+        media_type=media_type,
+        pdf_status=pdf_status,
+        repaired_from_id=repaired_from_id,
     )
     backend, locator = split_ref(ref)
     conn.execute(
@@ -1714,6 +1735,7 @@ def record_original(
     sha256: bytes,
     byte_size: int,
     media_type: str,
+    pdf_status: PdfStatus | None = None,
 ) -> UUID:
     """Record a stored original: its stored file and its location.
 
@@ -1723,7 +1745,11 @@ def record_original(
     :class:`OriginalLocationConflictError`.
     """
     file_id = record_stored_file(
-        conn, sha256=sha256, byte_size=byte_size, media_type=media_type
+        conn,
+        sha256=sha256,
+        byte_size=byte_size,
+        media_type=media_type,
+        pdf_status=pdf_status,
     )
     backend, locator = split_ref(ref)
     conn.execute(

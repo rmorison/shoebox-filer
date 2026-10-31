@@ -60,6 +60,7 @@ def _transient_types() -> tuple[type[BaseException], ...]:
         ModelRequestTimeout,
         ConnectionError,
         TimeoutError,
+        MemoryError,  # the host's state, not the item's: waiting can fix it
     )
 
 

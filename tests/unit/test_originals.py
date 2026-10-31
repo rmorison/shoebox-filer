@@ -32,7 +32,9 @@ from receipt_index.originals import (
     select_receipt_document,
     store_email_original,
 )
+from receipt_index.renderer import Rendition, UnrenderablePdfError
 from receipt_index.store import LocalEvidenceStore, StoredFile
+from tests.pdfs import garbage_pdf, make_pdf, truncated_pdf
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -586,7 +588,7 @@ class TestProcessItem:
         }
         mocks["insert_receipt"] = MagicMock(return_value=_RECEIPT)
         mocks["extract_metadata"] = MagicMock(return_value=_extraction())
-        mocks["render_pdf"] = MagicMock(return_value=b"%PDF")
+        mocks["render_rendition"] = MagicMock(return_value=Rendition(pdf=b"%PDF"))
         mocks["store_rendition"] = MagicMock(return_value=_RENDITION)
         for name, mock in mocks.items():
             monkeypatch.setattr(pipeline, name, mock)
@@ -619,7 +621,9 @@ class TestProcessItem:
         order: list[str] = []
         stub["store_email_original"].side_effect = lambda *a, **k: order.append("store")
         conn.commit.side_effect = lambda: order.append("commit")
-        stub["render_pdf"].side_effect = lambda raw: order.append("render") or b"%PDF"
+        stub["render_rendition"].side_effect = lambda raw: (
+            order.append("render") or Rendition(pdf=b"%PDF")
+        )
         pipeline.process_item(
             conn,
             _raw([_att("receipt.pdf")]),
@@ -650,3 +654,142 @@ class TestProcessItem:
         stub["store_email_original"].assert_not_called()
         assert stub["record_ingest_evidence"].call_args.kwargs["email"] is None
         assert "original stays pending" in caplog.text
+
+    def test_the_rendition_stored_is_the_repair_and_its_source_is_passed_on(
+        self, stub: dict[str, MagicMock]
+    ) -> None:
+        stub["render_rendition"].return_value = Rendition(
+            pdf=b"%PDF repaired", repaired_from=b"%PDF damaged"
+        )
+        assert self._process(_raw([_att("r.pdf")])).status == "success"
+        assert stub["store_rendition"].call_args.args[1] == b"%PDF repaired"
+        evidence = stub["record_ingest_evidence"].call_args.kwargs
+        assert evidence["repaired_from"] == b"%PDF damaged"
+
+    def test_an_unrenderable_pdf_fails_the_item_for_retry(
+        self, stub: dict[str, MagicMock]
+    ) -> None:
+        stub["render_rendition"].side_effect = UnrenderablePdfError(
+            "PDF attachment can't be parsed or repaired, "
+            "and the email has no body to render"
+        )
+        outcome = self._process(_raw([_att("junk.pdf", data=garbage_pdf())]))
+        assert outcome.status == "failed"
+        assert outcome.error_class == "content"
+        failed = stub["insert_ingest_log"].call_args.kwargs
+        assert failed["status"] == "failed"
+        assert "no body to render" in failed["error_message"]
+        stub["store_rendition"].assert_not_called()
+        stub["record_ingest_evidence"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PDF validation at ingest (evidence-store design, §9)
+# ---------------------------------------------------------------------------
+
+
+class TestPdfStatus:
+    def test_each_pdf_attachment_carries_its_status_and_is_stored_as_sent(
+        self, tmp_path: Path, held: dict[bytes, str]
+    ) -> None:
+        damaged = truncated_pdf()
+        raw = _raw(
+            [
+                _att("ok.pdf", data=make_pdf("Fine")),
+                _att("damaged.pdf", data=damaged),
+                _att("junk.pdf", data=garbage_pdf()),
+                _att("logo.png", "image/png", b"\x89PNG logo"),
+            ]
+        )
+        email = store_email_original(
+            MagicMock(),
+            LocalEvidenceStore(tmp_path),
+            raw,
+            source_name="m",
+            received_at=_RECEIVED,
+        )
+
+        assert email.message.pdf_status is None
+        assert [a.file.pdf_status for a in email.attachments] == [
+            "ok",
+            "repaired",
+            "unparseable",
+            None,
+        ]
+        # The original is never changed: the damaged bytes are what's stored.
+        stored = LocalEvidenceStore(tmp_path).local_path(email.attachments[1].file.ref)
+        assert stored.read_bytes() == damaged
+
+    def test_recording_an_attachment_passes_its_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: list[Any] = []
+        monkeypatch.setattr(
+            originals,
+            "record_original",
+            lambda conn, **kw: recorded.append(kw["pdf_status"]) or uuid4(),
+        )
+        file = _stored("01__r.pdf")
+        email = StoredEmail(
+            message=_stored("message.eml"),
+            attachments=[
+                StoredAttachment(
+                    file=StoredFile(
+                        sha256=file.sha256,
+                        byte_size=1,
+                        media_type="application/pdf",
+                        ref=file.ref,
+                        pdf_status="unparseable",
+                    ),
+                    file_name="r.pdf",
+                )
+            ],
+        )
+        originals.record_email_original(MagicMock(), email)
+        assert recorded == [None, "unparseable"]
+
+    def test_a_repaired_rendition_points_at_its_source_marked_repaired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _Evidence(monkeypatch)
+        source_id = uuid4()
+        record_file = MagicMock(return_value=source_id)
+        monkeypatch.setattr(pipeline, "record_stored_file", record_file)
+        damaged = truncated_pdf()
+        pipeline.record_ingest_evidence(
+            MagicMock(),
+            _RECEIPT,
+            _raw(raw_bytes=damaged, source_type="gdrive"),
+            _RENDITION,
+            source_name="drive",
+            source_type="gdrive",
+            repaired_from=damaged,
+        )
+        assert record_file.call_args.kwargs == {
+            "sha256": hashlib.sha256(damaged).digest(),
+            "byte_size": len(damaged),
+            "media_type": "application/pdf",
+            "pdf_status": "repaired",
+        }
+        rendition = pipeline.record_rendition.call_args.kwargs  # type: ignore[attr-defined]
+        assert rendition["pdf_status"] == "ok"
+        assert rendition["repaired_from_id"] == source_id
+
+    def test_a_rendition_that_needed_no_repair_is_ok_with_no_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _Evidence(monkeypatch)
+        record_file = MagicMock()
+        monkeypatch.setattr(pipeline, "record_stored_file", record_file)
+        pipeline.record_ingest_evidence(
+            MagicMock(),
+            _RECEIPT,
+            _raw(raw_bytes=None, source_type="gdrive"),
+            _RENDITION,
+            source_name="drive",
+            source_type="gdrive",
+        )
+        record_file.assert_not_called()
+        rendition = pipeline.record_rendition.call_args.kwargs  # type: ignore[attr-defined]
+        assert rendition["pdf_status"] == "ok"
+        assert rendition["repaired_from_id"] is None
