@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import smtplib
+from email import encoders
 from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -58,8 +60,8 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000018 (tables, indexes and
-    constraints). receipt/000014 holds grants only. The grants are not applied
+    Mirrors: public/000001, receipt/000001-000019 (tables, indexes and
+    constraints). receipt/000014 and 000019 hold grants only. The grants are not applied
     here, since CI's Postgres has no application roles; apply_migration_grants
     applies them for the tests that need them.
     Keep in sync with db/migrations/ when schema changes.
@@ -396,13 +398,15 @@ def seed_email(
     html_body: str | None = None,
     pdf_attachment: tuple[str, bytes] | None = None,
     message_id: str | None = None,
+    attachments: list[tuple[str, str, bytes]] | None = None,
 ) -> None:
     """Send a test email to GreenMail via SMTP.
 
     GreenMail auto-creates mailboxes on first delivery when
-    auth is disabled.
+    auth is disabled. ``attachments`` adds (file name, media type, bytes)
+    parts after ``pdf_attachment``.
     """
-    if html_body or pdf_attachment:
+    if html_body or pdf_attachment or attachments:
         msg = MIMEMultipart("mixed")
         if text_body:
             msg.attach(MIMEText(text_body, "plain"))
@@ -413,6 +417,13 @@ def seed_email(
             att = MIMEApplication(data, "pdf")
             att.add_header("Content-Disposition", "attachment", filename=filename)
             msg.attach(att)
+        for filename, media_type, data in attachments or []:
+            maintype, subtype = media_type.split("/", 1)
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=filename)
+            msg.attach(part)
     else:
         msg = MIMEText(text_body or "", "plain")  # type: ignore[assignment]
 

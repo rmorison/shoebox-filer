@@ -344,7 +344,7 @@ class ImapAdapter:
         raw = data.get(_BODY_KEY) if data else None
         if not isinstance(raw, bytes):
             return None
-        return self._parse_message(message_from_bytes(raw), ref.source_id)
+        return self._parse_message(raw, ref.source_id)
 
     def _lookup_folders(self) -> list[str]:
         """The folders ``fetch_by_id`` searches, in order.
@@ -389,7 +389,7 @@ class ImapAdapter:
         raw = data.get(_BODY_KEY) if data else None
         if not isinstance(raw, bytes):
             return None
-        return self._parse_message(message_from_bytes(raw), source_id)
+        return self._parse_message(raw, source_id)
 
     def _find_exact(self, criteria: str, source_id: str) -> int | None:
         """The UID of the one message with exactly this Message-ID, selected.
@@ -497,8 +497,13 @@ class ImapAdapter:
             )
         self._selected_ok = True
 
-    def _parse_message(self, msg: Message, source_id: str) -> RawReceipt:
-        """Convert an email Message to a RawReceipt."""
+    def _parse_message(self, raw: bytes, source_id: str) -> RawReceipt:
+        """Parse a fetched message into a RawReceipt.
+
+        The receipt keeps ``raw`` as its ``raw_bytes``, so the stored original
+        is byte for byte what extraction read.
+        """
+        msg = message_from_bytes(raw)
         subject = self._decode_header_value(msg.get("Subject", ""))
         sender = self._decode_header_value(msg.get("From", ""))
 
@@ -517,6 +522,7 @@ class ImapAdapter:
             html_body=html_body,
             text_body=text_body,
             attachments=attachments,
+            raw_bytes=raw,
         )
 
     @staticmethod
@@ -602,6 +608,7 @@ class ImapAdapter:
                         filename=filename or "unnamed",
                         content_type=content_type,
                         data=payload,
+                        mime_filename=filename or None,
                     )
                 )
             elif content_type == "text/html" and html_body is None:

@@ -677,6 +677,7 @@ class TestFetchFile:
         assert raw.file_content == b"%PDF-f1"
         assert raw.file_content_type == "application/pdf"
         assert raw.date == datetime(2024, 1, 15, 10, 30, tzinfo=UTC)
+        assert raw.raw_bytes == b"%PDF-f1"
 
     def test_exports_google_doc(self) -> None:
         drive = FakeDrive(
@@ -691,6 +692,8 @@ class TestFetchFile:
         raw = adapter.fetch(ref)
         assert raw is not None
         assert raw.file_content == b"%PDF-export-d1"
+        # The export isn't the original, so it has no whole-original bytes.
+        assert raw.raw_bytes is None
 
     def test_conforms_to_source_adapter_protocol(self) -> None:
         assert isinstance(GdriveAdapter(_make_gdrive_config()), SourceAdapter)

@@ -1322,7 +1322,15 @@ unset MURL
 
 **Don't use `make migrate-down` for this.** It also steps back the public directory, whose only migration creates `set_updated_at()`, the function every `updated_at` trigger runs.
 
-000018's down removes only the provenance records it made. 000017's down drops the new tables, including the records ingest wrote after the upgrade. That loses nothing, because ingest still writes the same facts to `receipts` in this release. Then check out the previous release and `up -d` it.
+000018's down removes only the provenance records it made. 000017's down drops the new tables, including the records ingest wrote after the upgrade. In this release, that loses nothing, because ingest still writes the same facts to `receipts`. From the release that keeps originals ([8.8](#88-keeping-originals)) on, it also drops the records of every kept original. Then check out the previous release and `up -d` it.
+
+### 8.8 Keeping originals
+
+From the release with receipt migration 000019, each email that becomes a receipt also has its original kept in the store: the message exactly as the mail server served it (`message.eml`) and each attachment, under `data/receipts/originals/YYYY/MM/<received date>__<source>__<hash>/`. The database records each file's sha256 and links it to the receipt's provenance record. A skipped email keeps nothing: it stays in the mailbox. A Drive item keeps nothing yet either. Its provenance record says its original is `pending`, and the Drive file stays where it is.
+
+The upgrade is [8.1](#81-upgrade) with no extra step: 000019 only grants the application's login what it now writes. The store grows by about the size of each email receipt and its attachments. An attachment whose bytes the store already keeps, such as a vendor's terms and conditions, isn't written again, and neither is a second copy within one email. The exception is two emails that bring the same new bytes and are stored at the same moment: each keeps its own file, recorded as one stored file in two places.
+
+**Rolling back** to the release before: `goto 18`, as in [8.7](#87-recording-renditions-after-the-provenance-schema), takes back 000019's grants. The kept files stay under `originals/` and their records stay in the database, so the earlier release ingests as before but keeps no new originals. Going back past 000017 drops those records too. The files stay on disk, but nothing then links them to a receipt.
 
 ---
 

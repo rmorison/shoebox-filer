@@ -24,11 +24,18 @@ from pydantic import (
 
 @dataclass
 class Attachment:
-    """An email attachment."""
+    """An email attachment.
+
+    ``filename`` is what the extractor is shown: the MIME file name, or a
+    stand-in (``unnamed``, or an inline image's Content-ID) for a part that
+    has none. ``mime_filename`` is the MIME file name alone, None for a
+    stand-in; it is the raw name the evidence store records and matches.
+    """
 
     filename: str
     content_type: str
     data: bytes
+    mime_filename: str | None = None
 
 
 @dataclass
@@ -39,6 +46,11 @@ class RawReceipt:
     Email fields (subject, sender, html_body, text_body, attachments) are used
     by the IMAP adapter. File fields (file_name, file_content, file_content_type)
     are used by the Drive adapter.
+
+    ``raw_bytes`` is the whole original exactly as fetched: an email's RFC 822
+    bytes, or a binary Drive file's bytes. It is None for a native Google Doc
+    (``file_content`` is then its PDF export, not the original) and for items
+    built elsewhere than an adapter.
     """
 
     source_id: str
@@ -53,6 +65,7 @@ class RawReceipt:
     file_name: str | None = None
     file_content: bytes | None = None
     file_content_type: str | None = None
+    raw_bytes: bytes | None = None
 
 
 @dataclass

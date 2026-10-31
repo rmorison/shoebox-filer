@@ -52,6 +52,10 @@ def test_finds_one_message_by_its_id(
     assert raw is not None
     assert raw.subject == "Wanted"
     assert raw.source_id == wanted
+    # The whole message as served, the bytes the store keeps as message.eml.
+    assert raw.raw_bytes is not None
+    assert wanted.encode() in raw.raw_bytes
+    assert b"Total 12.00" in raw.raw_bytes
 
 
 def test_shared_message_id_is_none(greenmail_available: bool) -> None:

@@ -591,6 +591,31 @@ class TestFetch:
         raw = a.fetch(ref)
         assert raw is not None
         assert [x.filename for x in raw.attachments] == ["receipt.pdf"]
+        assert [x.mime_filename for x in raw.attachments] == ["receipt.pdf"]
+
+    def test_keeps_the_fetched_bytes(
+        self, adapter: ImapAdapter, fake: FakeIMAPClient
+    ) -> None:
+        refs = adapter.list_new(None).items
+        raw = adapter.fetch(refs[1])
+        assert raw is not None
+        assert raw.raw_bytes == fake.messages[2]
+
+    def test_a_stand_in_name_is_no_mime_file_name(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        msg = _make_multipart_email(
+            inline_images=[("logo@example.com", "image/png", b"\x89PNG")]
+        )
+        fake = FakeIMAPClient({1: msg})
+        a = ImapAdapter(imap_config)
+        a._client = fake  # type: ignore[assignment]
+        (ref,) = a.list_new(None).items
+        raw = a.fetch(ref)
+        assert raw is not None
+        (att,) = raw.attachments
+        assert att.filename == "logo@example.com"
+        assert att.mime_filename is None
 
 
 class TestTransportErrors:

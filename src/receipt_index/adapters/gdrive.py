@@ -332,6 +332,9 @@ class GdriveAdapter:
         if result is None:
             return None
         content, mime_type = result
+        # A native Google Doc arrives as its PDF export, which isn't the
+        # original and has no stable hash; only a binary file's bytes are.
+        native = ref.drive_meta.get("mimeType") == _GOOGLE_DOCS_MIME_TYPE
         return RawReceipt(
             source_id=ref.source_id,
             source_name=self.config.name,
@@ -340,6 +343,7 @@ class GdriveAdapter:
             file_name=ref.file_name,
             file_content=content,
             file_content_type=mime_type,
+            raw_bytes=None if native else content,
         )
 
     def fetch_by_id(self, source_id: str) -> RawReceipt | None:
