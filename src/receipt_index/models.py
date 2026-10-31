@@ -89,6 +89,9 @@ class ItemRef:
     # Set when the source refused even this item's headers: fetching it
     # fails as an item error, so it gets a failed row and the cursor passes.
     unreadable: str | None = None
+    # The IMAP folder a date-range listing found the message in; None for
+    # the watched folder an incremental read lists.
+    imap_folder: str | None = None
 
 
 @dataclass

@@ -623,6 +623,45 @@ def test_duplicate_paths_run_as_the_write_login(
     assert [p.is_primary for p in found.provenance] == [True]
 
 
+_BACKFILL_UPDATES = [
+    "source_sha256",
+    "original_file_id",
+    "receipt_document_file_id",
+    "document_certainty",
+    "original_status",
+    "original_unavailable_reason",
+]
+
+
+@pytest.mark.parametrize("column", _BACKFILL_UPDATES)
+def test_write_login_can_update_backfill_original_columns(
+    write_conn: Conn, column: str
+) -> None:
+    # 000022: backfill --originals-only fills in or marks a pending original.
+    row = write_conn.execute(
+        "SELECT has_column_privilege('receipt.provenance', %s, 'UPDATE') AS ok",
+        (column,),
+    ).fetchone()
+    write_conn.rollback()
+    assert row == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    # receipt_id, is_primary, home_receipt_id and match_method are 000021's.
+    "column",
+    ["source_id", "source_name", "source_type", "received_at"],
+)
+def test_write_login_cannot_update_other_provenance_columns(
+    write_conn: Conn, column: str
+) -> None:
+    row = write_conn.execute(
+        "SELECT has_column_privilege('receipt.provenance', %s, 'UPDATE') AS ok",
+        (column,),
+    ).fetchone()
+    write_conn.rollback()
+    assert row == {"ok": False}
+
+
 # Write grants on the evidence-store tables (000017, 000019, 000020) reach only the
 # columns the code writes: (table, column or None for the whole table).
 _UNWRITTEN = [
@@ -673,7 +712,8 @@ def test_write_login_cannot_insert_columns_nothing_writes(
         # ingest_log is append-only; 000014 takes back 000007's UPDATE grant.
         "UPDATE receipt.ingest_log SET llm_model = 'changed'",
         "CREATE TABLE receipt.not_allowed (id INTEGER)",
-        # The evidence-store tables: no UPDATE or DELETE grants yet.
+        # The evidence-store tables: no DELETE grants, and UPDATE on
+        # provenance only for linking (000021) and its original (000022).
         "UPDATE receipt.provenance SET source_name = 'changed'",
         "DELETE FROM receipt.stored_files",
         "UPDATE receipt.file_locations SET locator = 'changed'",
@@ -779,3 +819,42 @@ def test_forensic_commands_run_as_the_read_login(
     ):
         result = _invoke(config, *args)
         assert result.exit_code == 0, (args, result.output)
+
+
+def test_write_login_runs_backfill_originals_only(
+    greenmail_available: bool, pg_conn: Conn, write_conn: Conn, tmp_path: Path
+) -> None:
+    """000022: the write login fills in one pending original and marks another."""
+    from contextlib import ExitStack
+
+    from receipt_index.adapters.imap import ImapAdapter
+    from receipt_index.backfill import run_originals_only
+    from receipt_index.fetching import SourcePool
+    from receipt_index.store import LocalEvidenceStore
+
+    from .test_backfill import _back_catalogue, _config
+    from .test_e2e_pipeline import _unique_user
+
+    user, source = _unique_user("bf-login"), "mail-bf-login"
+    found, gone = f"<{uuid.uuid4().hex}@example.com>", f"<{uuid.uuid4().hex}@x>"
+    seed_email(to_addr=user, subject="Parking", text_body="Total 12", message_id=found)
+    _r, found_id = _back_catalogue(pg_conn, found, source)
+    _r, gone_id = _back_catalogue(pg_conn, gone, source)
+
+    config = _config(user, source)
+    with ExitStack() as stack:
+        pool = SourcePool([config], ImapAdapter, stack)  # type: ignore[arg-type]
+        result = run_originals_only(
+            write_conn, pool, store=LocalEvidenceStore(tmp_path), source_name=source
+        )
+
+    assert (result.stored, result.unavailable, result.failed) == (1, 1, 0)
+    rows = pg_conn.execute(
+        "SELECT id, original_status FROM receipt.provenance WHERE id IN (%s, %s)",
+        (found_id, gone_id),
+    ).fetchall()
+    pg_conn.rollback()
+    assert {r["id"]: r["original_status"] for r in rows} == {
+        found_id: "stored",
+        gone_id: "unavailable",
+    }

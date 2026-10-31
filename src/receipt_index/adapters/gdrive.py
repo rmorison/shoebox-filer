@@ -18,6 +18,7 @@ from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import ItemRef, RawReceipt, SourceRead
 
 if TYPE_CHECKING:
+    from datetime import date
     from types import TracebackType
 
     from receipt_index.config import GdriveSourceConfig
@@ -210,6 +211,35 @@ class GdriveAdapter:
             )
             return self._bootstrap(service, account_id, reset="invalid page token")
 
+    def list_range(self, since: date | None, until: date | None) -> list[ItemRef]:
+        """List the dropoff's files created from ``since`` to ``until``, inclusive.
+
+        Days are UTC. Folders are dropped, and a file still inside the
+        settle time is left for a later run, as the bootstrap does. Never
+        touches the sync state.
+        """
+        clauses: list[str] = []
+        if since is not None:
+            clauses.append(f"createdTime >= '{since.isoformat()}T00:00:00Z'")
+        if until is not None:
+            end = until + timedelta(days=1)
+            clauses.append(f"createdTime < '{end.isoformat()}T00:00:00Z'")
+        files = self._list_files(self._session(), extra=clauses)
+        now = datetime.now(tz=UTC)
+        items: list[ItemRef] = []
+        for file_meta in files:
+            if file_meta.get("mimeType") == _FOLDER_MIME_TYPE:
+                continue
+            modified = file_meta.get("modifiedTime")
+            if modified and now - _parse_drive_date(modified) < self.settle:
+                logger.info(
+                    "Drive file %s is inside the settle time; left for later",
+                    file_meta.get("id"),
+                )
+                continue
+            items.append(self._ref(file_meta))
+        return items
+
     @staticmethod
     def _account_id(service: Any) -> str:
         """The stable ID of the account whose change log the token belongs to."""
@@ -394,14 +424,19 @@ class GdriveAdapter:
 
         return build("drive", "v3", credentials=creds)
 
-    def _list_files(self, service: Any) -> list[dict[str, Any]]:
+    def _list_files(
+        self, service: Any, *, extra: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """List all files in the configured Google Drive folder.
 
-        Handles pagination via nextPageToken.
+        ``extra`` adds query clauses (a ``createdTime`` range). Handles
+        pagination via nextPageToken.
         """
         all_files: list[dict[str, Any]] = []
         page_token: str | None = None
-        query = f"'{self.config.folder_id}' in parents and trashed = false"
+        query = " and ".join(
+            [f"'{self.config.folder_id}' in parents", "trashed = false", *(extra or [])]
+        )
 
         for _page in range(_MAX_LIST_PAGES):
             request_kwargs: dict[str, Any] = {

@@ -4,6 +4,7 @@
 
 - [`uv run receipt-index ingest`](#ingest) — Fetch and process receipts from email
 - [`uv run receipt-index serve`](#serve) — Watch the sources and ingest new items as they arrive
+- [`uv run receipt-index backfill`](#backfill) — Process a source's back catalogue over a date range, or store missing originals
 - [`uv run receipt-index search`](#search) — Find receipts by metadata
 - [`uv run receipt-index show`](#show) — View full details for a receipt
 - [`uv run receipt-index edit`](#edit) — Correct a receipt's fields by hand
@@ -205,6 +206,49 @@ ingest:
 | 1 | The worker crashed (`serve` then stops, so a restart policy brings it back), the worker didn't stop in time after a stop, or a `--source` name was not found |
 | 3 | Every selected source is held by another process |
 | 4 | The watchdog stopped a step that ran past `ingest.item_timeout_seconds` |
+
+---
+
+## backfill
+
+Process one source's back catalogue over a date range: every item it hasn't seen yet, and the missing originals of receipts already indexed. Backfill takes item locks only, never the source lock, so it runs while `serve` is up, and it never moves a source's read position. A second run over the same range does nothing new.
+
+```bash
+uv run receipt-index backfill --source NAME [--since DATE] [--until DATE]
+                              [--originals-only] [--dry-run] [--limit N]
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--source NAME` | The source to backfill (required) |
+| `--since DATE` | From this day, inclusive (`YYYY-MM-DD`). Default: the whole source |
+| `--until DATE` | To this day, inclusive (`YYYY-MM-DD`) |
+| `--originals-only` | Store the missing originals of indexed receipts, with no extraction and no LLM call |
+| `--dry-run` | Print the counts, and the full mode's estimated LLM cost, then stop. Writes nothing |
+| `--limit N` | Fetch at most N unseen items (or, with `--originals-only`, N originals) |
+
+### Examples
+
+```bash
+# How many items did the watchers miss since the cutover, and what would they cost?
+uv run receipt-index backfill --source personal-email --since 2026-11-01 --dry-run
+
+# Ingest them
+uv run receipt-index backfill --source personal-email --since 2026-11-01
+
+# Store the originals of the back catalogue, a thousand at a time
+uv run receipt-index backfill --source personal-email --originals-only --limit 1000
+```
+
+### How It Works
+
+- **The full mode** lists the source over the range. An IMAP source is searched by each message's arrival date (`UID SEARCH SINCE … BEFORE …`) in the folders the re-fetch path searches, which is the watched folder for now. A Drive source lists the dropoff folder by each file's created time. An item is **unseen** when it has no receipt and no ingest record. Unseen items go through the same steps as in `ingest`, at one LLM call each. A failed, skipped or retrying item isn't unseen: it stays with the retries. For a seen IMAP receipt whose original is missing, the original is stored.
+- **`--originals-only`** takes each receipt of the source whose original is still pending, finds its email by `Message-ID`, and stores the `.eml` and its attachments on the store. A message that can't be found is marked unavailable, with a reason. If the server refuses a lookup, the receipt stays pending for a later run. If the source can't be reached at all, the run stops. Drive originals stay pending until the store has a Drive backend, and an email with no `Message-ID` can't be looked up (the full mode stores it from its listing).
+- **Pacing.** One connection, one item at a time, and messages aren't marked read. Against Gmail, `--originals-only` takes about 1–2 seconds an item, so a few thousand receipts take one to two hours. When Gmail's IMAP limits refuse the session, the run stops and marks nothing, and the next run carries on from the receipts still pending.
+- **Cost.** `--dry-run` prints the unseen count and an estimate from measured token use. Set `llm.price_per_mtok_input` and `llm.price_per_mtok_output` to get the estimate in dollars.
+- **Exit codes**: 0, or 1 when an item failed or the source stopped the run.
 
 ---
 
