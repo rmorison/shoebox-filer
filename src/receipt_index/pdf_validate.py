@@ -8,7 +8,9 @@ Every PDF entering the evidence store is checked in strict mode
   damaged in strict mode, with only a warning.
 - ``repaired``: it fails that, but qpdf, with recovery, rewrites it into
   bytes that pass. The input is never changed; the rewrite is returned.
-- ``unparseable``: anything else, including a PDF that needs a user password.
+- ``unparseable``: anything else, including a PDF that needs a user password,
+  and any error qpdf raises reading it: an attachment is evidence, stored
+  whatever its state, so a hostile file must not fail the whole item.
 
 pdfplumber stays for text extraction; this module only judges and repairs.
 """
@@ -41,7 +43,7 @@ def _strict_ok(data: bytes) -> bool:
         with pikepdf.open(io.BytesIO(data), attempt_recovery=False) as pdf:
             pdf.save(io.BytesIO())
             return not pdf.get_warnings()
-    except (pikepdf.PdfError, pikepdf.PasswordError, ValueError):
+    except Exception:  # any qpdf failure means it can't be read
         return False
 
 
@@ -56,7 +58,7 @@ def _repair(data: bytes) -> bytes | None:
             out = io.BytesIO()
             pdf.save(out, deterministic_id=True)
             return out.getvalue()
-    except (pikepdf.PdfError, pikepdf.PasswordError, ValueError):
+    except Exception:  # any qpdf failure means it can't be read
         return None
 
 

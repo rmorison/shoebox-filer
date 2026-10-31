@@ -530,7 +530,7 @@ Every PDF that enters the store (a PDF attachment, a Drive PDF, a rendition) is 
 
 `pdf_status` is recorded on the stored file and describes that row's own bytes. A source that failed the strict check is `repaired`, and its repaired copy is `ok`, with `repaired_from_id` set, so every rendition is `ok`. A generated rendition (from HTML, text or an image) that isn't `ok` fails the item. Packet builders know what they are merging. Repairing at ingest moves the failure from packet-building time, when the original source may be long gone, to ingest time, where it is logged and retried. pdfplumber stays for text extraction.
 
-Until Drive adopt is built, a Drive PDF enters the store only as a rendition. An unparseable one stores nothing and goes to the retry path. A repaired one's source bytes get a `stored_files` row with no location, so that `repaired_from_id` has a target; adopt reuses that row by sha256. Files stored before validation keep `pdf_status` NULL: rows are inserted whole and never updated.
+Until Drive adopt is built, a Drive PDF enters the store only as a rendition. An unparseable one stores nothing and goes to the retry path. A repaired one's source bytes get a `stored_files` row with no location, so that `repaired_from_id` has a target; adopt reuses that row by sha256. Files stored before validation keep `pdf_status` NULL: rows are inserted whole and never updated. For the same reason, when two damaged copies repair to identical bytes, their receipts share one rendition row, and its `repaired_from_id` names the first source; each receipt's own source is its attachment, through `provenance_files`.
 
 ### 10. Reading
 

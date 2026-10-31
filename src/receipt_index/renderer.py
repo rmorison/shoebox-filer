@@ -124,7 +124,11 @@ def render_rendition(raw: RawReceipt) -> Rendition:
 
 
 def _pass_through_pdf(raw: RawReceipt) -> bytes | None:
-    """The PDF ``render_pdf`` would return as it is, if there is one."""
+    """The PDF a rendition passes through as it is, if there is one.
+
+    The one place that decides it: ``render_pdf`` routes through it too, so
+    what ingest validates is what would be passed through.
+    """
     if raw.source_type == "gdrive":
         is_pdf = (raw.file_content_type or "").lower() == "application/pdf"
         return raw.file_content if is_pdf else None
@@ -162,10 +166,11 @@ def _render_drive_file(raw: RawReceipt) -> bytes:
     if raw.file_content is None:
         raise ValueError("Drive-sourced receipt has no file_content")
 
-    content_type = (raw.file_content_type or "").lower()
+    pdf = _pass_through_pdf(raw)
+    if pdf is not None:
+        return pdf
 
-    if content_type == "application/pdf":
-        return raw.file_content
+    content_type = (raw.file_content_type or "").lower()
 
     if content_type in {"image/jpeg", "image/png"}:
         from receipt_index.image_converter import image_to_pdf
@@ -187,7 +192,7 @@ def _render_email(raw: RawReceipt) -> bytes:
     4. Render a minimal page with just the email headers via weasyprint
     """
     # 1. PDF attachment pass-through
-    pdf_data = _find_pdf_attachment(raw.attachments)
+    pdf_data = _pass_through_pdf(raw)
     if pdf_data is not None:
         return pdf_data
     return _render_email_body(raw)

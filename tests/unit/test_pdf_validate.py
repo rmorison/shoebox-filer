@@ -98,3 +98,11 @@ def test_a_repair_that_still_fails_strict_mode_is_unparseable() -> None:
         assert check_pdf(truncated_pdf()) == PdfCheck(status="unparseable")
     # The strict open, the recovering open, and the strict check of the repair.
     assert calls == [True, False, True]
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("qpdf"), RecursionError(), OverflowError()]
+)
+def test_any_error_reading_a_pdf_makes_it_unparseable(error: Exception) -> None:
+    with patch("receipt_index.pdf_validate.pikepdf.open", side_effect=error):
+        assert check_pdf(make_pdf("Hostile")) == PdfCheck(status="unparseable")
