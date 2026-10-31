@@ -43,7 +43,10 @@ def _strict_ok(data: bytes) -> bool:
         with pikepdf.open(io.BytesIO(data), attempt_recovery=False) as pdf:
             pdf.save(io.BytesIO())
             return not pdf.get_warnings()
-    except Exception:  # any qpdf failure means it can't be read
+    except MemoryError:
+        raise  # the host's state, not the file's: let the item be retried
+    except Exception:  # any other qpdf failure means it can't be read
+        logger.debug("Strict PDF check failed", exc_info=True)
         return False
 
 
@@ -58,7 +61,10 @@ def _repair(data: bytes) -> bytes | None:
             out = io.BytesIO()
             pdf.save(out, deterministic_id=True)
             return out.getvalue()
-    except Exception:  # any qpdf failure means it can't be read
+    except MemoryError:
+        raise
+    except Exception:  # any other qpdf failure means it can't be read
+        logger.debug("PDF repair failed", exc_info=True)
         return None
 
 

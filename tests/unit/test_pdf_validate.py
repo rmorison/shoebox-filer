@@ -106,3 +106,11 @@ def test_a_repair_that_still_fails_strict_mode_is_unparseable() -> None:
 def test_any_error_reading_a_pdf_makes_it_unparseable(error: Exception) -> None:
     with patch("receipt_index.pdf_validate.pikepdf.open", side_effect=error):
         assert check_pdf(make_pdf("Hostile")) == PdfCheck(status="unparseable")
+
+
+def test_running_out_of_memory_is_not_the_files_fault() -> None:
+    with (
+        patch("receipt_index.pdf_validate.pikepdf.open", side_effect=MemoryError),
+        pytest.raises(MemoryError),
+    ):
+        check_pdf(make_pdf("Big"))
