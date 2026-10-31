@@ -167,6 +167,16 @@ def test_a_hostile_pdf_is_unparseable_within_the_bound_and_this_process_stays_sm
     assert _peak_rss_mb() - before < 100
 
 
+def test_under_the_default_limits_a_memory_bomb_is_unparseable() -> None:
+    # 1 GiB inflated: past the default 512 MB address-space limit.
+    data = metadata_bomb_pdf(1024)
+    before = _peak_rss_mb()
+    start = time.monotonic()
+    assert check_pdf(data) == PdfCheck(status="unparseable")
+    assert time.monotonic() - start < pdf_validate.DEFAULT_LIMITS.wall_seconds
+    assert _peak_rss_mb() - before < 100
+
+
 def test_a_check_that_runs_past_the_wall_clock_is_unparseable(cpu_bomb: bytes) -> None:
     limits = PdfLimits(cpu_seconds=60, wall_seconds=0.5)
     start = time.monotonic()

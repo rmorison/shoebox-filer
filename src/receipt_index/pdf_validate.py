@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 PdfStatus = Literal["ok", "repaired", "unparseable"]
 
 _MODULE = "receipt_index.pdf_validate"
-_CACHE_SIZE = 16
+# Enough for one item's attachment and rendition; a repair can be 25 MB.
+_CACHE_SIZE = 4
 
 
 @dataclass(frozen=True)
