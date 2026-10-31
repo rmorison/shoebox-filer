@@ -22,6 +22,7 @@ dependencies = [
     "weasyprint>=62.0",
     "mcp>=2.3",
     "imapclient>=4.1",
+    "pikepdf==10.17.0",
 ]
 
 [project.scripts]

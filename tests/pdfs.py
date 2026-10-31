@@ -107,3 +107,30 @@ def make_pdf(
     out += b"trailer\n<< " + trailer + b" >>\n"
     out += f"startxref\n{xref}\n%EOF\n".encode()
     return bytes(out)
+
+
+# Damaged PDFs, made from a valid one, for the PDF validation tests.
+
+
+def truncated_pdf(text: str | None = "Truncated receipt") -> bytes:
+    """A valid PDF cut off before its xref table: qpdf rebuilds the xref."""
+    data = make_pdf(text)
+    return data[: data.rindex(b"xref")]
+
+
+def wrong_startxref_pdf(text: str | None = "Misplaced xref receipt") -> bytes:
+    """A valid PDF whose ``startxref`` points past the end of the file."""
+    data = make_pdf(text)
+    return data[: data.rindex(b"startxref")] + b"startxref\n999999\n%%EOF\n"
+
+
+def broken_header_pdf(text: str | None = "Broken header receipt") -> bytes:
+    """A valid PDF whose ``%PDF-`` header is damaged: qpdf only warns."""
+    data = make_pdf(text)
+    assert data.startswith(b"%PDF-")
+    return b"%PDX-" + data[5:]
+
+
+def garbage_pdf() -> bytes:
+    """Bytes that are no PDF at all, as an attachment named ``.pdf`` can hold."""
+    return b"this is not a pdf, only text in a file named receipt.pdf\n" * 20
