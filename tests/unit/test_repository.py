@@ -160,7 +160,7 @@ class TestSearchReceipts:
         conn = _mock_conn([_RECEIPT_ROW])
         results = search_receipts(conn)
         sql = conn.execute.call_args[0][0]
-        assert "WHERE TRUE" in sql
+        assert "WHERE merged_into_id IS NULL ORDER" in sql
         assert "ORDER BY receipt_date DESC, vendor ASC" in sql
         assert len(results) == 1
 
@@ -308,7 +308,7 @@ class TestSearchPaging:
     def test_count_without_filters(self) -> None:
         conn = _mock_conn([{"n": 0}])
         assert count_receipts(conn) == 0
-        assert "WHERE TRUE" in conn.execute.call_args.args[0]
+        assert conn.execute.call_args.args[0].endswith("WHERE merged_into_id IS NULL")
 
 
 class TestFailuresPaging:

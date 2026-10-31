@@ -587,6 +587,14 @@ def _last4_filter(
     ),
 )
 @click.option(
+    "--include-merged",
+    is_flag=True,
+    help=(
+        "Also list receipts merged into another as duplicates. Leave it off "
+        "for totals, so a duplicate counts once."
+    ),
+)
+@click.option(
     "--limit",
     type=click.IntRange(min=1),
     default=None,
@@ -620,11 +628,16 @@ def search(
     last4: str | None,
     payer: str | None,
     kinds: tuple[str, ...],
+    include_merged: bool,
     limit: int | None,
     offset: int | None,
     output_format: str,
 ) -> None:
     """Search indexed receipts.
+
+    A receipt merged into another as a duplicate is left out unless
+    --include-merged. JSON output lists each receipt's provenance (its
+    source items) and suspected_duplicate_of (open pairs to review).
 
     JSON output gives each receipt's kind and signed_amount: a sum of
     signed_amount is the net spend (a refund or credit counts against it, a
@@ -644,6 +657,7 @@ def search(
         count_ingest_failures,
         count_receipts,
         search_receipts,
+        with_provenance,
     )
 
     config = _load_config_or_exit(ctx)
@@ -681,6 +695,7 @@ def search(
         "last4": last4,
         "payer": payer,
         "kinds": list(kinds) or None,
+        "include_merged": include_merged,
     }
     paged = limit is not None or offset is not None
     total: int | None = None
@@ -694,6 +709,8 @@ def search(
             conn.read_only = True
             total = count_receipts(conn, **filters)
         results = search_receipts(conn, **filters, limit=limit, offset=offset)
+        if output_format == "json":
+            results = with_provenance(conn, results)
         # Items with no receipt to search: counted for the text output only,
         # so the JSON matches the MCP envelope.
         link_only = (
@@ -1198,7 +1215,8 @@ def retry(
 def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
     """Show details for a specific receipt."""
     from receipt_index.db import get_connection
-    from receipt_index.repository import get_receipt_by_id
+    from receipt_index.duplicates import merged_into_this
+    from receipt_index.repository import get_receipt_by_id, with_provenance
     from receipt_index.store import rendition_ref
 
     config = _load_config_or_exit(ctx)
@@ -1211,8 +1229,12 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
         click.echo(f"Error: invalid UUID: {receipt_id}", err=True)
         sys.exit(1)
 
+    merged_here: list[UUID] = []
     with get_connection(config.database.url) as conn:
         receipt = get_receipt_by_id(conn, uid)
+        if receipt is not None:
+            (receipt,) = with_provenance(conn, [receipt])
+            merged_here = merged_into_this(conn, receipt.id)
 
     if receipt is None:
         click.echo(f"Receipt not found: {receipt_id}", err=True)
@@ -1240,6 +1262,15 @@ def show(ctx: click.Context, receipt_id: str, output_format: str) -> None:
             click.echo("Kind:         purchase")
         else:
             click.echo(f"Kind:         {receipt.kind} (counts {receipt.signed_amount})")
+        if receipt.merged_into_id is not None:
+            click.echo(
+                f"Merged into:  {receipt.merged_into_id} (a duplicate; left out "
+                "of search and totals)"
+            )
+        for merged in merged_here:
+            click.echo(f"Merged here:  {merged}")
+        for other in receipt.suspected_duplicate_of:
+            click.echo(f"Possible duplicate of: {other} (see `duplicates`)")
         if receipt.refund_of is not None:
             click.echo(f"Refund of:    {receipt.refund_of}")
         if receipt.net_paid is not None and receipt.refunded:
@@ -2043,6 +2074,321 @@ def refund_list(ctx: click.Context, unlinked: bool, output_format: str) -> None:
             f"{r.refund_of or '(unlinked)'}"
         )
     click.echo(f"\n{len(rows)} refund(s).")
+
+
+# ---------------------------------------------------------------------------
+# Duplicates (evidence-store design, §8)
+# ---------------------------------------------------------------------------
+
+_AS_OPTION = click.option(
+    "--as",
+    "actor",
+    callback=_text_filter,
+    default=None,
+    help="Who made the change (default: annotations.actor, else 'operator').",
+)
+
+
+def _person(config: AppConfig, actor: str | None, reason: str | None) -> Any:
+    from receipt_index.duplicates import Actor
+
+    return Actor(actor or config.annotations.actor, "person", reason)
+
+
+def _required_reason(reason: str) -> str:
+    reason = reason.strip()
+    if not reason:
+        raise click.BadParameter("must not be blank", param_hint="--reason")
+    return reason
+
+
+@cli.command("link")
+@click.argument("provenance_id")
+@click.argument("receipt_id")
+@click.option("--reason", required=True, help="Why: recorded with the link.")
+@_AS_OPTION
+@click.pass_context
+def link_command(
+    ctx: click.Context,
+    provenance_id: str,
+    receipt_id: str,
+    reason: str,
+    actor: str | None,
+) -> None:
+    """Link a source item (PROVENANCE_ID) to RECEIPT_ID as a duplicate.
+
+    If it was its receipt's last source item, that receipt is merged: kept,
+    but left out of search and totals. Refused when the merged receipt has
+    hand-edited fields, or is a refund linked to another purchase.
+    """
+    from receipt_index import duplicates
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    prov = _parse_receipt_id(provenance_id)
+    target = _parse_receipt_id(receipt_id)
+    who = _person(config, actor, _required_reason(reason))
+    try:
+        with get_connection(config.database.url) as conn:
+            remaining = duplicates.link(conn, prov, target, actor=who)
+            conn.commit()
+    except duplicates.DuplicateError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
+    click.echo(f"Linked {prov} to receipt {remaining} as {who.name}.")
+
+
+@cli.command("unlink")
+@click.argument("provenance_id")
+@click.option("--reason", required=True, help="Why: recorded with the change.")
+@_AS_OPTION
+@click.pass_context
+def unlink_command(
+    ctx: click.Context, provenance_id: str, reason: str, actor: str | None
+) -> None:
+    """Move a source item (PROVENANCE_ID) out to a receipt of its own.
+
+    A receipt first made for it, and merged, is restored as it was. An item
+    that joined an existing receipt at ingest is fetched from its source,
+    extracted and rendered into a new receipt (one LLM call); if its source
+    no longer has it, nothing changes.
+    """
+    from contextlib import ExitStack
+
+    from receipt_index import duplicates
+    from receipt_index.db import get_connection
+    from receipt_index.extraction import DOCUMENT_SYSTEM_PROMPT, create_extraction_agent
+    from receipt_index.fetching import SourceDownError, SourcePool, fetch_item
+    from receipt_index.models import Provenance
+    from receipt_index.pipeline import unlink_to_own_receipt
+    from receipt_index.store import open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    prov_id = _parse_receipt_id(provenance_id)
+    who = _person(config, actor, _required_reason(reason))
+    try:
+        with get_connection(config.database.url) as conn:
+            result = duplicates.unlink_home(conn, prov_id, actor=who)
+            if result is not None:
+                conn.commit()
+                restored = " (restored)" if result.restored else ""
+                click.echo(
+                    f"Unlinked {prov_id} to receipt {result.receipt_id}{restored}"
+                    f" as {who.name}."
+                )
+                return
+            row = conn.execute(
+                "SELECT * FROM receipt.provenance WHERE id = %s", (prov_id,)
+            ).fetchone()
+            conn.commit()
+            prov = Provenance.model_validate(row)
+            with ExitStack() as stack:
+                pool = SourcePool(config.sources, _source_adapter(config), stack)
+                try:
+                    fetched = fetch_item(
+                        pool,
+                        source_id=prov.source_id,
+                        source_name=prov.source_name,
+                        source_type=prov.source_type,
+                    )
+                except SourceDownError as exc:
+                    click.echo(f"Error: {exc}; nothing changed.", err=True)
+                    sys.exit(1)
+                if fetched.raw is None:
+                    click.echo(
+                        f"Error: {prov.source_type} item {prov.source_id} can't be"
+                        " fetched from its source, so it can't be given a receipt"
+                        " of its own; nothing changed.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                agent = create_extraction_agent(
+                    api_key=config.llm.api_key,
+                    model=config.llm.model,
+                    **(
+                        {"system_prompt": DOCUMENT_SYSTEM_PROMPT}
+                        if fetched.raw.source_type == "gdrive"
+                        else {}
+                    ),
+                )
+                receipt = unlink_to_own_receipt(
+                    conn,
+                    prov,
+                    fetched.raw,
+                    store=open_store(config.store),
+                    llm_model=config.llm.model,
+                    actor=who,
+                    agent=agent,
+                )
+    except duplicates.DuplicateError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
+    click.echo(
+        f"Unlinked {prov_id} to new receipt {receipt.id}"
+        f" ({receipt.vendor}, {receipt.effective_amount}) as {who.name}."
+    )
+
+
+@cli.group(invoke_without_command=True)
+@click.option(
+    "--status",
+    type=click.Choice(["open", "linked", "dismissed", "all"]),
+    default="open",
+    help="Which pairs to list (default: open).",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+@click.pass_context
+def duplicates(ctx: click.Context, status: str, output_format: str) -> None:
+    """List suspected duplicate pairs, newest first.
+
+    Subcommands decide a pair (link, dismiss) or scan existing receipts.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+    from receipt_index import duplicates as dup
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    with get_connection(config.database.url, read_only=True) as conn:
+        pairs = dup.list_candidates(
+            conn, status=None if status == "all" else cast("Any", status)
+        )
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "id": str(p.id),
+                        "reason": p.reason,
+                        "status": p.status,
+                        "decided_by": p.decided_by,
+                        "decided_at": p.decided_at.isoformat()
+                        if p.decided_at
+                        else None,
+                        "created_at": p.created_at.isoformat(),
+                        "provenance_id": str(p.provenance_id),
+                        "candidate_of_provenance_id": str(p.candidate_of_provenance_id),
+                        "receipt": p.receipt.model_dump(mode="json"),
+                        "candidate_of_receipt": p.candidate_of_receipt.model_dump(
+                            mode="json"
+                        ),
+                    }
+                    for p in pairs
+                ],
+                indent=2,
+            )
+        )
+        return
+    if not pairs:
+        which = "" if status == "all" else f"{status} "
+        click.echo(f"No {which}duplicate pairs.")
+        return
+    for p in pairs:
+        click.echo(f"{p.id}  {p.reason}  {p.status}")
+        for label, r in (("  ", p.receipt), ("  ", p.candidate_of_receipt)):
+            click.echo(
+                f"{label}{r.id}  {r.receipt_date.isoformat()}  "
+                f"{_clip(r.vendor, 24):<24} {r.effective_amount!s:>10} {r.currency}"
+                f"  {r.kind}{'  (merged)' if r.merged_into_id else ''}"
+            )
+    click.echo(f"\n{len(pairs)} pair(s).")
+
+
+def _decide(ctx: click.Context, pair_id: str, status: str, actor: str | None) -> None:
+    from receipt_index import duplicates as dup
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _parse_receipt_id(pair_id)
+    who = _person(config, actor, None)
+    try:
+        with get_connection(config.database.url) as conn:
+            remaining = dup.decide_candidate(conn, uid, cast("Any", status), actor=who)
+            conn.commit()
+    except dup.DuplicateError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    except DeadlockDetected:
+        _concurrent_change()
+    if remaining is None:
+        click.echo(f"Dismissed pair {uid} as {who.name}.")
+    else:
+        click.echo(f"Linked pair {uid} into receipt {remaining} as {who.name}.")
+
+
+@duplicates.command("link")
+@click.argument("pair_id")
+@_AS_OPTION
+@click.pass_context
+def duplicates_link(ctx: click.Context, pair_id: str, actor: str | None) -> None:
+    """Link a flagged pair: the newer receipt merges into the older."""
+    _decide(ctx, pair_id, "linked", actor)
+
+
+@duplicates.command("dismiss")
+@click.argument("pair_id")
+@_AS_OPTION
+@click.pass_context
+def duplicates_dismiss(ctx: click.Context, pair_id: str, actor: str | None) -> None:
+    """Dismiss a flagged pair: two real receipts. It isn't flagged again."""
+    _decide(ctx, pair_id, "dismissed", actor)
+
+
+@duplicates.command("scan")
+@click.option("--dry-run", is_flag=True, help="Report what it would do; write nothing.")
+@click.option(
+    "--window-days",
+    type=click.IntRange(min=0),
+    default=3,
+    show_default=True,
+    help="How many days apart two receipts' dates may be and still be flagged.",
+)
+@click.pass_context
+def duplicates_scan(ctx: click.Context, dry_run: bool, window_days: int) -> None:
+    """Run the duplicate rules over existing receipts, oldest first.
+
+    No LLM calls. Identical files (rules 1 and 2) are found only among items
+    whose originals were kept; order-number and look-alike rules (3 and 4)
+    cover every receipt. The older receipt of a pair remains.
+    """
+    from receipt_index import duplicates as dup
+    from receipt_index.db import get_connection
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    try:
+        with get_connection(config.database.url) as conn:
+            result = dup.scan(conn, window_days=window_days)
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+    except DeadlockDetected:
+        _concurrent_change()
+    verb = "Would link" if dry_run else "Linked"
+    for merged, kept, method in result.links:
+        click.echo(f"{verb} {merged} into {kept} ({method})")
+    verb_f = "Would flag" if dry_run else "Flagged"
+    for receipt, other, reason in result.flags:
+        click.echo(f"{verb_f} {receipt} with {other} ({reason})")
+    linked = ", ".join(f"{k} {v}" for k, v in sorted(result.linked.items())) or "none"
+    flagged = ", ".join(f"{k} {v}" for k, v in sorted(result.flagged.items())) or "none"
+    prefix = "Dry run: nothing written. " if dry_run else ""
+    click.echo(f"\n{prefix}Linked: {linked}. Flagged: {flagged}.")
 
 
 @cli.command("mcp")

@@ -103,8 +103,11 @@ def link_by_rule(
 
     For an unlinked refund, look for its purchase. For a purchase, link each
     unlinked refund for which it is now the only matching purchase. Anything
-    else (a linked refund, a credit, a statement) links nothing.
+    else (a linked refund, a credit, a statement, a merged receipt) links
+    nothing.
     """
+    if receipt.merged_into_id is not None:
+        return []
     if receipt.kind == "refund":
         # A refund a person unlinked is theirs: only `refund link` links it.
         if receipt.refund_of is not None or was_unlinked(conn, receipt.id):

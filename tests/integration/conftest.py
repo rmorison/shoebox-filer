@@ -60,7 +60,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
     """Apply migrations inline so tests don't need golang-migrate.
 
-    Mirrors: public/000001, receipt/000001-000020 (tables, indexes and
+    Mirrors: public/000001, receipt/000001-000021 (tables, indexes and
     constraints). receipt/000014, 000019 and 000020 hold grants only. The
     grants are not applied here, since CI's Postgres has no application roles;
     apply_migration_grants applies them for the tests that need them.
@@ -255,6 +255,11 @@ def _run_migrations(conn: psycopg.Connection[dict[str, Any]]) -> None:
 
     # receipt/000018 — one provenance row per receipt (none at bootstrap).
     conn.execute(_schema_part("receipt", "000018"))
+
+    # receipt/000021 — duplicate_candidates, provenance_link_history and its
+    # append-only guard, the merge columns and their trigger, and the merge
+    # conditions of v_receipt_net.
+    conn.execute(_schema_part("receipt", "000021"))
     conn.commit()
 
 

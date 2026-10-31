@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from receipt_index import duplicates
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
@@ -34,7 +35,11 @@ from receipt_index.models import (
     receipt_values,
     redacted_traceback,
 )
-from receipt_index.originals import record_email_evidence, store_email_original
+from receipt_index.originals import (
+    record_email_evidence,
+    select_receipt_document,
+    store_email_original,
+)
 from receipt_index.refunds import link_by_rule
 from receipt_index.renderer import render_rendition
 from receipt_index.repository import (
@@ -67,11 +72,13 @@ from receipt_index.store import PDF_MEDIA_TYPE, pdf_path_for, store_rendition
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from contextlib import AbstractContextManager
+    from uuid import UUID
 
     import psycopg
     from pydantic_ai import Agent
 
     from receipt_index.adapters.base import SourceAdapter
+    from receipt_index.duplicates import LinkMethod
     from receipt_index.errors import ErrorClass
     from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
@@ -79,6 +86,7 @@ if TYPE_CHECKING:
         ExtractionResult,
         IngestLogEntry,
         ItemRef,
+        Provenance,
         RawReceipt,
         Receipt,
         ReceiptMetadata,
@@ -224,7 +232,7 @@ def record_ingest_evidence(
     email: StoredEmail | None = None,
     receipt_document: str | None = None,
     repaired_from: bytes | None = None,
-) -> None:
+) -> Provenance:
     """Write a new receipt's provenance, its original's and rendition's records.
 
     ``email`` is the item's stored original, if it was stored: its files are
@@ -238,34 +246,26 @@ def record_ingest_evidence(
     ``repaired`` (an email attachment's own row, or, for a Drive PDF not
     yet adopted, a row with no location), and the rendition points at it.
     """
-    source_sha256 = (
-        hashlib.sha256(raw.raw_bytes).digest() if raw.raw_bytes is not None else None
-    )
-    evidence = (
-        record_email_evidence(
-            conn, email, receipt_document=receipt_document, attachments=raw.attachments
-        )
-        if email is not None
-        else None
-    )
-    provenance = insert_provenance(
+    provenance = record_item_provenance(
         conn,
-        receipt_id=receipt.id,
-        source_type=source_type,
+        receipt.id,
+        raw,
         source_name=source_name,
-        source_id=raw.source_id,
-        received_at=raw.date,
-        email_subject=raw.subject,
-        email_sender=raw.sender,
-        email_date=_email_date(raw.source_type, raw),
-        file_name=raw.file_name,
-        source_sha256=source_sha256,
-        original_file_id=evidence.original_id if evidence else None,
-        receipt_document_file_id=evidence.document_id if evidence else None,
-        document_certainty=evidence.certainty if evidence else None,
+        source_type=source_type,
+        email=email,
+        receipt_document=receipt_document,
     )
-    if evidence is not None:
-        insert_provenance_files(conn, provenance.id, evidence.files)
+    record_receipt_rendition(conn, receipt.id, rendition, repaired_from)
+    return provenance
+
+
+def record_receipt_rendition(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    rendition: StoredFile,
+    repaired_from: bytes | None = None,
+) -> None:
+    """Record a receipt's own rendition location, and its repair's source."""
     if rendition.sha256 is None or rendition.byte_size is None:
         msg = f"rendition {rendition.ref} has no hash"
         raise ValueError(msg)
@@ -282,7 +282,7 @@ def record_ingest_evidence(
     )
     record_rendition(
         conn,
-        receipt_id=receipt.id,
+        receipt_id=receipt_id,
         ref=rendition.ref,
         sha256=rendition.sha256,
         byte_size=rendition.byte_size,
@@ -290,6 +290,271 @@ def record_ingest_evidence(
         pdf_status="ok",
         repaired_from_id=repaired_from_id,
     )
+
+
+def _source_sha256(raw: RawReceipt) -> bytes | None:
+    """The whole original's hash, whenever its bytes are in hand."""
+    return hashlib.sha256(raw.raw_bytes).digest() if raw.raw_bytes is not None else None
+
+
+def record_item_provenance(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt_id: UUID,
+    raw: RawReceipt,
+    *,
+    source_name: str,
+    source_type: str,
+    email: StoredEmail | None = None,
+    receipt_document: str | None = None,
+    joined: LinkMethod | None = None,
+) -> Provenance:
+    """Write an item's provenance row and its original's records.
+
+    ``joined`` is the duplicate rule an item joined an existing receipt by:
+    its row is then neither primary nor home. Doesn't commit.
+    """
+    evidence = (
+        record_email_evidence(
+            conn, email, receipt_document=receipt_document, attachments=raw.attachments
+        )
+        if email is not None
+        else None
+    )
+    provenance = insert_provenance(
+        conn,
+        receipt_id=receipt_id,
+        source_type=source_type,
+        source_name=source_name,
+        source_id=raw.source_id,
+        received_at=raw.date,
+        email_subject=raw.subject,
+        email_sender=raw.sender,
+        email_date=_email_date(raw.source_type, raw),
+        file_name=raw.file_name,
+        source_sha256=_source_sha256(raw),
+        original_file_id=evidence.original_id if evidence else None,
+        receipt_document_file_id=evidence.document_id if evidence else None,
+        document_certainty=evidence.certainty if evidence else None,
+        match_method=joined or "first",
+        joined=joined is not None,
+    )
+    if evidence is not None:
+        insert_provenance_files(conn, provenance.id, evidence.files)
+    return provenance
+
+
+def _store_original(
+    conn: psycopg.Connection[dict[str, Any]],
+    raw: RawReceipt,
+    *,
+    store: EvidenceStore,
+    source_name: str,
+    source_type: str,
+) -> StoredEmail | None:
+    """Store an IMAP item's original files; rows come in the item's transaction.
+
+    Only a receipt keeps its original (design §7): files now, rows with the
+    receipt, so a crash leaves files to reuse, never rows.
+    """
+    if source_type != "imap":
+        return None
+    if raw.raw_bytes is None:
+        logger.warning("No raw bytes for %s; its original stays pending", raw.source_id)
+        return None
+    return store_email_original(
+        conn, store, raw, source_name=source_name, received_at=raw.date
+    )
+
+
+def _doc_hashes(
+    raw: RawReceipt,
+    email: StoredEmail | None,
+    receipt_document: str | None,
+    source_sha256: bytes | None,
+) -> tuple[bytes, ...]:
+    """The item's receipt document hash, where rule 2 can use it.
+
+    An email's attachment counts only when the extraction names it for
+    certain; a Drive file is its own receipt document (spec drift a).
+    """
+    if email is not None:
+        index, certainty = select_receipt_document(receipt_document, raw.attachments)
+        if certainty == "certain" and index is not None:
+            sha = email.attachments[index].file.sha256
+            return (sha,) if sha is not None else ()
+        return ()
+    if raw.source_type == "gdrive" and source_sha256 is not None:
+        return (source_sha256,)
+    return ()
+
+
+def _join_existing(
+    conn: psycopg.Connection[dict[str, Any]],
+    raw: RawReceipt,
+    target_id: UUID,
+    method: LinkMethod,
+    *,
+    source_name: str,
+    source_type: str,
+    email: StoredEmail | None,
+    receipt_document: str | None,
+    extraction: ExtractionResult | None,
+    llm_model: str,
+    state: AttemptState,
+) -> ItemOutcome:
+    """Record an item as another source of an existing receipt (design §8).
+
+    No receipt, rendition or extraction row: the provenance row, its files,
+    the link history row and the success row, in one transaction.
+    """
+    target = duplicates.lock_target(conn, target_id)
+    provenance = record_item_provenance(
+        conn,
+        target.id,
+        raw,
+        source_name=source_name,
+        source_type=source_type,
+        email=email,
+        receipt_document=receipt_document,
+        joined=method,
+    )
+    duplicates.join_at_ingest(conn, provenance.id, target.id, method)
+    insert_ingest_log(
+        conn,
+        source_id=raw.source_id,
+        source_type=source_type,
+        source_name=source_name,
+        status="success",
+        receipt_id=target.id,
+        vendor=target.vendor,
+        amount=target.amount,
+        paid_amount=target.paid_amount,
+        email_subject=raw.subject,
+        email_sender=raw.sender,
+        email_date=_email_date(raw.source_type, raw),
+        llm_input_tokens=extraction.input_tokens if extraction else None,
+        llm_output_tokens=extraction.output_tokens if extraction else None,
+        llm_cache_read_tokens=(extraction.cache_read_tokens if extraction else None),
+        llm_requests=extraction.requests if extraction else None,
+        llm_model=llm_model if extraction else None,
+        attempt=state.number,
+    )
+    logger.info(
+        "Linked %s to receipt %s as a duplicate (%s)", raw.source_id, target.id, method
+    )
+    return ItemOutcome("success", target)
+
+
+def _insert_receipt(
+    conn: psycopg.Connection[dict[str, Any]],
+    raw: RawReceipt,
+    metadata: ReceiptMetadata,
+    stored: StoredFile,
+    *,
+    source_type: str,
+    source_name: str,
+) -> Receipt:
+    """Insert a new receipt for an item from its extraction. Doesn't commit."""
+    return insert_receipt(
+        conn,
+        source_id=raw.source_id,
+        source_type=source_type,
+        source_name=source_name,
+        vendor=metadata.vendor,
+        amount=metadata.amount,
+        paid_amount=metadata.paid_amount,
+        currency=metadata.currency,
+        receipt_date=metadata.date,
+        description=metadata.description,
+        confidence=metadata.confidence,
+        field_confidence=metadata.field_confidence.model_dump(exclude_none=True),
+        order_number=metadata.order_number,
+        payment_method=metadata.payment.method if metadata.payment else None,
+        payment_last4=metadata.payment.last4 if metadata.payment else None,
+        payer=metadata.payment.payer if metadata.payment else None,
+        kind=metadata.kind,
+        pdf_path=pdf_path_for(stored.ref),
+        email_subject=raw.subject,
+        email_sender=raw.sender,
+        email_date=_email_date(raw.source_type, raw),
+        file_name=raw.file_name,
+        commit=False,
+    )
+
+
+def _record_extraction(
+    conn: psycopg.Connection[dict[str, Any]],
+    receipt: Receipt,
+    extraction: ExtractionResult,
+    llm_model: str,
+) -> None:
+    """Record the ingest extraction a new receipt was written from."""
+    metadata = extraction.metadata
+    insert_extraction(
+        conn,
+        receipt_id=receipt.id,
+        origin="ingest",
+        input_kind="source",
+        prompt_version=EXTRACTION_PROMPT_VERSION,
+        llm_model=llm_model,
+        output=metadata.model_dump(mode="json"),
+        applied_fields=[
+            name
+            for name, value in receipt_values(metadata).items()
+            if value is not None
+        ],
+        replaced={},
+        llm_input_tokens=extraction.input_tokens,
+        llm_output_tokens=extraction.output_tokens,
+        llm_cache_read_tokens=extraction.cache_read_tokens,
+        llm_requests=extraction.requests,
+    )
+
+
+def unlink_to_own_receipt(
+    conn: psycopg.Connection[dict[str, Any]],
+    provenance: Provenance,
+    raw: RawReceipt,
+    *,
+    store: EvidenceStore,
+    llm_model: str,
+    actor: duplicates.Actor,
+    agent: Agent[None, ReceiptMetadata] | None = None,
+) -> Receipt:
+    """Give a record that joined at ingest a receipt of its own (spec drift c).
+
+    ``raw`` is its item, fetched again from its source. It is extracted and
+    rendered as ingest would, and the record moves to the new receipt as its
+    primary and home. Commits; rolls back and re-raises on any error.
+    """
+    extraction = extract_metadata(raw, agent=agent)
+    metadata = extraction.metadata
+    rendition = render_rendition(raw)
+    stored = store_rendition(
+        store,
+        rendition.pdf,
+        receipt_date=metadata.date,
+        vendor=metadata.vendor,
+        amount=metadata.amount,
+    )
+    try:
+        receipt = _insert_receipt(
+            conn,
+            raw,
+            metadata,
+            stored,
+            source_type=provenance.source_type,
+            source_name=provenance.source_name,
+        )
+        record_receipt_rendition(conn, receipt.id, stored, rendition.repaired_from)
+        duplicates.unlink_to_new(conn, provenance.id, receipt.id, actor=actor)
+        link_by_rule(conn, receipt)
+        _record_extraction(conn, receipt, extraction, llm_model)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return receipt
 
 
 def process_item(
@@ -315,6 +580,34 @@ def process_item(
     extraction = None
     stored_ref: str | None = None
     try:
+        # Rule 1 (design §8): identical bytes join the receipt that holds
+        # them, before the LLM call.
+        source_sha256 = _source_sha256(raw)
+        original = (
+            duplicates.match_original(conn, (source_sha256,))
+            if source_sha256 is not None
+            else None
+        )
+        if original is not None:
+            email = _store_original(
+                conn, raw, store=store, source_name=source_name, source_type=source_type
+            )
+            conn.commit()
+            return _join_existing(
+                conn,
+                raw,
+                original,
+                "original_hash",
+                source_name=source_name,
+                source_type=source_type,
+                email=email,
+                receipt_document=None,
+                extraction=None,
+                llm_model=llm_model,
+                state=state,
+            )
+        conn.commit()
+
         extraction = extract_metadata(raw, agent=agent)
         metadata = extraction.metadata
 
@@ -369,20 +662,45 @@ def process_item(
             )
             return ItemOutcome("skipped")
 
-        # Only a receipt keeps its original. Files now, rows in the receipt's
-        # transaction (design §7): a crash leaves files to reuse, never rows.
-        email: StoredEmail | None = None
-        if source_type == "imap":
-            if raw.raw_bytes is None:
-                logger.warning(
-                    "No raw bytes for %s; its original stays pending", raw.source_id
-                )
-            else:
-                email = store_email_original(
-                    conn, store, raw, source_name=source_name, received_at=raw.date
-                )
-                # Nothing written yet: end the read so render isn't in a txn.
-                conn.commit()
+        email = _store_original(
+            conn, raw, store=store, source_name=source_name, source_type=source_type
+        )
+        # Rules 2 to 4 (design §8), which need the extraction.
+        decision = duplicates.decide(
+            conn,
+            duplicates.ItemFacts(
+                kind=metadata.kind,
+                currency=metadata.currency,
+                vendor=metadata.vendor,
+                effective_amount=(
+                    metadata.amount
+                    if metadata.paid_amount is None
+                    else metadata.paid_amount
+                ),
+                paid_amount=metadata.paid_amount,
+                order_number=metadata.order_number,
+                receipt_date=metadata.date,
+                doc_hashes=_doc_hashes(
+                    raw, email, metadata.receipt_document, source_sha256
+                ),
+            ),
+        )
+        # Nothing written yet: end the read so render isn't in a txn.
+        conn.commit()
+        if decision.join is not None and decision.method is not None:
+            return _join_existing(
+                conn,
+                raw,
+                decision.join,
+                decision.method,
+                source_name=source_name,
+                source_type=source_type,
+                email=email,
+                receipt_document=metadata.receipt_document,
+                extraction=extraction,
+                llm_model=llm_model,
+                state=state,
+            )
 
         # Validated (design §9): a repaired PDF's rendition is the repair.
         rendition = render_rendition(raw)
@@ -396,34 +714,17 @@ def process_item(
         # Recorded on a failed row, so `retry` can report the file as
         # orphaned if the database writes below fail.
         stored_ref = stored.ref
-        receipt = insert_receipt(
+        receipt = _insert_receipt(
             conn,
-            source_id=raw.source_id,
+            raw,
+            metadata,
+            stored,
             source_type=source_type,
             source_name=source_name,
-            vendor=metadata.vendor,
-            amount=metadata.amount,
-            paid_amount=metadata.paid_amount,
-            currency=metadata.currency,
-            receipt_date=metadata.date,
-            description=metadata.description,
-            confidence=metadata.confidence,
-            field_confidence=metadata.field_confidence.model_dump(exclude_none=True),
-            order_number=metadata.order_number,
-            payment_method=metadata.payment.method if metadata.payment else None,
-            payment_last4=metadata.payment.last4 if metadata.payment else None,
-            payer=metadata.payment.payer if metadata.payment else None,
-            kind=metadata.kind,
-            pdf_path=pdf_path_for(stored.ref),
-            email_subject=raw.subject,
-            email_sender=raw.sender,
-            email_date=_email_date(raw.source_type, raw),
-            file_name=raw.file_name,
-            commit=False,
         )
         # Its source item and rendition are recorded in the same transaction
         # (evidence-store design, §7 step 5).
-        record_ingest_evidence(
+        provenance = record_ingest_evidence(
             conn,
             receipt,
             raw,
@@ -434,29 +735,13 @@ def process_item(
             receipt_document=metadata.receipt_document,
             repaired_from=rendition.repaired_from,
         )
+        # Suspected duplicates are flagged in the same transaction (§7 step 5).
+        duplicates.record_flags(conn, provenance.id, decision.flags)
         # A refund is linked to its purchase, or a purchase to its waiting
         # refunds, in the same transaction (receipt data-model design, §6).
         link_by_rule(conn, receipt)
         # The receipt, its extraction row and the success row commit together.
-        insert_extraction(
-            conn,
-            receipt_id=receipt.id,
-            origin="ingest",
-            input_kind="source",
-            prompt_version=EXTRACTION_PROMPT_VERSION,
-            llm_model=llm_model,
-            output=metadata.model_dump(mode="json"),
-            applied_fields=[
-                name
-                for name, value in receipt_values(metadata).items()
-                if value is not None
-            ],
-            replaced={},
-            llm_input_tokens=extraction.input_tokens,
-            llm_output_tokens=extraction.output_tokens,
-            llm_cache_read_tokens=extraction.cache_read_tokens,
-            llm_requests=extraction.requests,
-        )
+        _record_extraction(conn, receipt, extraction, llm_model)
         insert_ingest_log(
             conn,
             source_id=raw.source_id,

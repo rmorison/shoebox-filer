@@ -553,6 +553,76 @@ def test_write_login_can_insert_pdf_validation_columns(
     assert row == {"ok": True}
 
 
+def _seed_receipt(conn: Conn, vendor: str) -> Any:
+    """A receipt and its primary provenance, written as the superuser."""
+    from receipt_index.repository import insert_provenance, insert_receipt
+
+    source_id = f"<{uuid.uuid4().hex}@example.com>"
+    receipt = insert_receipt(
+        conn,
+        source_id=source_id,
+        source_type="imap",
+        source_name="mail",
+        vendor=vendor,
+        amount=Decimal("12.00"),
+        paid_amount=Decimal("12.00"),
+        currency="USD",
+        receipt_date=date(2026, 10, 14),
+        description=None,
+        confidence=0.9,
+        pdf_path=f"renditions/{source_id}.pdf",
+        email_subject="s",
+        email_sender="billing@example.com",
+        email_date=None,
+        commit=False,
+    )
+    prov = insert_provenance(
+        conn,
+        receipt_id=receipt.id,
+        source_type="imap",
+        source_name="mail",
+        source_id=source_id,
+        received_at=receipt.created_at,
+        email_subject="s",
+        email_sender="billing@example.com",
+        email_date=None,
+        file_name=None,
+    )
+    return receipt.id, prov.id
+
+
+def test_duplicate_paths_run_as_the_write_login(
+    pg_conn: Conn, write_conn: Conn
+) -> None:
+    # 000021: the scan flags, a pair is dismissed, link merges and unlink
+    # restores, all as the write login; search reads provenance and pairs.
+    from receipt_index import duplicates
+    from receipt_index.repository import search_receipts, with_provenance
+
+    person = duplicates.Actor("operator", "person", "grants test")
+    kept, _ = _seed_receipt(pg_conn, "Acme Parking (U.S.), LLC")
+    _seed_receipt(pg_conn, "Acme Parking (U.S.), LLC")
+    other, other_prov = _seed_receipt(pg_conn, "Another Vendor")
+    pg_conn.commit()
+
+    result = duplicates.scan(write_conn)
+    write_conn.commit()
+    assert result.flagged == {"metadata": 1}
+    (pair,) = duplicates.list_candidates(write_conn)
+    duplicates.decide_candidate(write_conn, pair.id, "dismissed", actor=person)
+    duplicates.link(write_conn, other_prov, kept, actor=person)
+    write_conn.commit()
+    assert duplicates.unlink_home(write_conn, other_prov, actor=person) == (
+        duplicates.UnlinkResult(other, restored=True)
+    )
+    write_conn.commit()
+    (found,) = with_provenance(
+        write_conn, [r for r in search_receipts(write_conn) if r.id == kept]
+    )
+    write_conn.rollback()
+    assert [p.is_primary for p in found.provenance] == [True]
+
+
 # Write grants on the evidence-store tables (000017, 000019, 000020) reach only the
 # columns the code writes: (table, column or None for the whole table).
 _UNWRITTEN = [
@@ -562,6 +632,11 @@ _UNWRITTEN = [
     ("file_locations", "read_only_set"),
     ("provenance", "original_unavailable_reason"),
     ("receipts", "rendition_file_id"),
+    # 000021: a pair is inserted open and decided by UPDATE; history rows
+    # take their id and time from their defaults.
+    ("duplicate_candidates", "status"),
+    ("duplicate_candidates", "decided_by"),
+    ("provenance_link_history", "created_at"),
 ]
 
 
@@ -602,6 +677,12 @@ def test_write_login_cannot_insert_columns_nothing_writes(
         "UPDATE receipt.provenance SET source_name = 'changed'",
         "DELETE FROM receipt.stored_files",
         "UPDATE receipt.file_locations SET locator = 'changed'",
+        # 000021: link history is insert-only; a pair's reason never changes.
+        "UPDATE receipt.provenance_link_history SET actor = 'someone else'",
+        "DELETE FROM receipt.provenance_link_history",
+        "UPDATE receipt.duplicate_candidates SET reason = 'changed'",
+        "DELETE FROM receipt.duplicate_candidates",
+        "UPDATE receipt.provenance SET source_id = 'changed'",
     ],
 )
 def test_write_login_cannot_change_history_or_schema(
