@@ -639,7 +639,7 @@ Proposed tickets, to be filed only after the operator signs off this design. Eac
 - The same Drive PDF dropped twice (two file IDs, identical bytes) links by rule 1, with no LLM call.
 - The same Message-ID in a second source is skipped by idempotency.
 - Two receipts whose renditions have identical bytes each get their own rendition location, and renaming one leaves the other alone.
-- `link` on a flagged pair deletes the emptied receipt, and the candidate row survives as `linked`.
+- `link` on a flagged pair keeps the emptied receipt, marked merged, and the candidate row survives as `linked`.
 - Two concurrent `put`s of the same bytes end with one `stored_files` row.
 
 ### Drive Backend
