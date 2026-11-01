@@ -775,3 +775,45 @@ class TestFullModeFills:
         assert adapter.fetched == ["<m1@example.com>"]
         assert h.attached == [first.id, second.id]
         assert result.originals_stored == 2
+
+
+class TestSourceDownAtTheFirstLookup:
+    def test_stops_cleanly_and_marks_nothing(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        def factory(config: Any) -> ImapAdapter:
+            adapter = ImapAdapter(config)
+
+            def refuse() -> Any:
+                raise ConnectionError("Failed to connect to IMAP after 3 attempts")
+
+            adapter._connect = refuse  # type: ignore[method-assign]
+            return adapter
+
+        a = _provenance("<a@example.com>").model_copy(
+            update={"source_name": imap_config.name}
+        )
+        b = _provenance("<b@example.com>").model_copy(
+            update={"source_name": imap_config.name}
+        )
+        h.add_pending(a, b)
+        with ExitStack() as stack:
+            pool = SourcePool([imap_config], factory, stack)
+            result = backfill.run_originals_only(
+                h.conn, pool, store=MagicMock(), source_name=imap_config.name
+            )
+        assert result.source_error is not None
+        assert "unavailable" in result.source_error
+        assert h.marked == [] and h.attached == []
+        assert (result.stored, result.unavailable, result.failed) == (0, 0, 0)
+
+    def test_the_reason_needs_no_connection(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        def factory(config: Any) -> ImapAdapter:
+            raise AssertionError("the reason must not open the source")
+
+        with ExitStack() as stack:
+            pool = SourcePool([imap_config], factory, stack)
+            reason = backfill._unavailable_reason(pool, imap_config.name)
+        assert reason == "not found in INBOX by Message-ID (source test-imap)"

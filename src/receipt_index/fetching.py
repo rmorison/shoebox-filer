@@ -61,6 +61,10 @@ class SourcePool:
             name for name, config in self._configs.items() if config.type == source_type
         ]
 
+    def config(self, name: str) -> SourceConfig | None:
+        """A configured source's settings, without opening its adapter."""
+        return self._configs.get(name)
+
     def adapter(self, name: str) -> SourceAdapter:
         if name not in self._adapters:
             adapter = self._factory(self._configs[name])

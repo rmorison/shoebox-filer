@@ -98,6 +98,16 @@ def _message_id_search(source_id: str) -> str | None:
     return f'HEADER Message-ID "{escaped}"'
 
 
+def lookup_folders(config: ImapSourceConfig) -> list[str]:
+    """The folders a source's ``fetch_by_id`` searches, in order.
+
+    Read from the configuration alone, so it needs no connection. Only the
+    watched folder for now; the archive and needs-attention folders join it
+    when the configuration has them.
+    """
+    return [config.folder]
+
+
 def can_search_by_id(source_id: str) -> bool:
     """Whether ``fetch_by_id`` can look this source ID up at all."""
     return _message_id_search(source_id) is not None
@@ -462,12 +472,8 @@ class ImapAdapter:
         self._use(folder, uidvalidity)
 
     def _lookup_folders(self) -> list[str]:
-        """The folders ``fetch_by_id`` searches, in order.
-
-        Only the watched folder for now; the archive and needs-attention
-        folders join it when the configuration has them.
-        """
-        return [self.config.folder]
+        """The folders ``fetch_by_id`` searches, in order."""
+        return lookup_folders(self.config)
 
     def fetch_by_id(self, source_id: str) -> RawReceipt | None:
         """Find one message by its Message-ID and download it.
@@ -509,11 +515,6 @@ class ImapAdapter:
         if not isinstance(raw, bytes):
             raise MessageRefusedError(f"server returned no body for UID {uid}")
         return self._parse_message(raw, source_id)
-
-    @property
-    def lookup_folders(self) -> list[str]:
-        """The folders ``fetch_by_id`` searches, in order."""
-        return self._lookup_folders()
 
     def _find_exact(self, criteria: str, source_id: str) -> int | None:
         """The UID of the one message with exactly this Message-ID, selected.

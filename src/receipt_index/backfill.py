@@ -22,7 +22,12 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from receipt_index.adapters.base import SourceUnavailableError
-from receipt_index.adapters.imap import AmbiguousMatchError, can_search_by_id
+from receipt_index.adapters.imap import (
+    AmbiguousMatchError,
+    can_search_by_id,
+    lookup_folders,
+)
+from receipt_index.config import ImapSourceConfig
 from receipt_index.fetching import SourceDownError, fetch_item
 from receipt_index.locks import item_lock
 from receipt_index.originals import attach_email_original, store_email_original
@@ -394,7 +399,12 @@ def run_originals_only(
 
 
 def _unavailable_reason(pool: SourcePool, source_name: str) -> str:
-    """Why a row is unavailable: which folders the search found nothing in."""
-    folders = getattr(pool.adapter(source_name), "lookup_folders", None)
+    """Why a row is unavailable: which folders the search found nothing in.
+
+    Read from the source's configuration, so it opens no connection: a
+    source that is down is met inside the lookup, and stops the run there.
+    """
+    config = pool.config(source_name)
+    folders = lookup_folders(config) if isinstance(config, ImapSourceConfig) else []
     where = ", ".join(folders) if folders else f"source {source_name}"
     return f"not found in {where} by Message-ID (source {source_name})"
