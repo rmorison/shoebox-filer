@@ -1496,7 +1496,7 @@ class TestPaidAmountOutput:
         result = _invoke(config_file, "search")
         assert result.exit_code == 0, result.output
         header = result.output.splitlines()[0]
-        assert header.split()[-2:] == ["Amount", "Total"]
+        assert header.split()[-3:] == ["Amount", "Total", "Note"]
         row = next(
             line for line in result.output.splitlines() if "Acme Parking" in line
         )

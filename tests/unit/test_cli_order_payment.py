@@ -181,6 +181,7 @@ class TestSearchOutput:
             "Kind",
             "Amount",
             "Total",
+            "Note",
         ]
         first, second = lines[2], lines[3]
         assert "A-100" in first and "1234" in first
