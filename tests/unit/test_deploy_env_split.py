@@ -1,4 +1,8 @@
-"""The production scheduler container holds no owner database credential.
+"""The production app containers hold no owner database credential.
+
+The app containers are `scheduler` (the cron lines) and `ingest` (`serve`);
+both read ../.env. Also checks the `ingest` service's shape and that the
+crontab no longer runs ingest.
 
 Lays out a scratch clone root from the templates in ``deploy/`` and asks
 ``docker compose config`` what environment each service would get, so the
@@ -45,7 +49,10 @@ REQUIRED_IN_DB = {
     "RECEIPT_INDEX_READ_PASSWORD",
 }
 
-# The scheduler's database logins: the write login and the read login.
+# The services that run the application and read ../.env.
+APP_SERVICES = ("scheduler", "ingest")
+
+# The app containers' database logins: the write login and the read login.
 REQUIRED_IN_SCHEDULER = {
     "DATABASE_URL",
     "RECEIPT_INDEX_READ_DATABASE_URL",
@@ -105,36 +112,102 @@ def _environment(services: dict[str, Any], name: str) -> dict[str, str]:
     return {k: v or "" for k, v in (services[name].get("environment") or {}).items()}
 
 
-def test_scheduler_has_no_owner_variable(services: dict[str, Any]) -> None:
-    found = sorted(FORBIDDEN_IN_SCHEDULER & _environment(services, "scheduler").keys())
-    assert found == [], f"scheduler environment holds owner variables: {found}"
+@pytest.mark.parametrize("name", APP_SERVICES)
+def test_app_service_has_no_owner_variable(services: dict[str, Any], name: str) -> None:
+    found = sorted(FORBIDDEN_IN_SCHEDULER & _environment(services, name).keys())
+    assert found == [], f"{name} environment holds owner variables: {found}"
 
 
-def test_scheduler_has_no_owner_secret_value(services: dict[str, Any]) -> None:
+@pytest.mark.parametrize("name", APP_SERVICES)
+def test_app_service_has_no_owner_secret_value(
+    services: dict[str, Any], name: str
+) -> None:
     db = _environment(services, "db")
-    scheduler = _environment(services, "scheduler")
-    secrets = {name: db[name] for name in OWNER_SECRETS if db.get(name)}
+    app = _environment(services, name)
+    secrets = {secret: db[secret] for secret in OWNER_SECRETS if db.get(secret)}
     assert secrets.keys() == set(OWNER_SECRETS), "db lacks an owner secret to compare"
     leaks = sorted(
         f"{var} carries {secret}"
-        for var, value in scheduler.items()
+        for var, value in app.items()
         for secret, secret_value in secrets.items()
         if secret_value in value
     )
-    assert leaks == [], f"scheduler environment holds owner secrets: {leaks}"
+    assert leaks == [], f"{name} environment holds owner secrets: {leaks}"
 
 
-def test_scheduler_has_no_owner_url(services: dict[str, Any]) -> None:
-    scheduler = _environment(services, "scheduler")
-    owner_urls = sorted(
-        var for var, value in scheduler.items() if OWNER_URL.search(value)
+@pytest.mark.parametrize("name", APP_SERVICES)
+def test_app_service_has_no_owner_url(services: dict[str, Any], name: str) -> None:
+    app = _environment(services, name)
+    owner_urls = sorted(var for var, value in app.items() if OWNER_URL.search(value))
+    assert owner_urls == [], f"{name} URLs log in as the owner: {owner_urls}"
+
+
+@pytest.mark.parametrize("name", APP_SERVICES)
+def test_app_service_keeps_its_logins(services: dict[str, Any], name: str) -> None:
+    missing = sorted(REQUIRED_IN_SCHEDULER - _environment(services, name).keys())
+    assert missing == [], f"{name} environment lacks: {missing}"
+
+
+_DURATION = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+
+
+def _seconds(duration: str) -> int:
+    """Seconds in a duration as `docker compose config` prints it (`21m0s`)."""
+    match = _DURATION.fullmatch(duration)
+    assert match and duration, f"unexpected duration {duration!r}"
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def test_ingest_service_runs_serve(services: dict[str, Any]) -> None:
+    ingest = services["ingest"]
+    assert ingest["entrypoint"] == ["receipt-index", "serve"]
+    assert ingest["restart"] == "unless-stopped"
+    assert ingest["init"] is True
+    assert int(ingest["shm_size"]) >= 1024**3
+    assert ingest["image"] == services["scheduler"]["image"]
+
+
+def test_ingest_mounts_the_store_and_config(services: dict[str, Any]) -> None:
+    """Without the store mount serve would write PDFs into the container layer."""
+    targets = {v["target"]: v for v in services["ingest"]["volumes"]}
+    assert targets["/app/data/receipts"]["type"] == "bind"
+    assert not targets["/app/data/receipts"].get("read_only")
+    assert targets["/app/receipt-index.yaml"]["type"] == "bind"
+    assert services["ingest"]["environment"]["RECEIPT_INDEX_CONFIG"] == (
+        "/app/receipt-index.yaml"
     )
-    assert owner_urls == [], f"scheduler URLs log in as the owner: {owner_urls}"
+    assert services["ingest"]["environment"]["PLAYWRIGHT_BROWSERS_PATH"] == (
+        "/ms-playwright"
+    )
 
 
-def test_scheduler_keeps_its_logins(services: dict[str, Any]) -> None:
-    missing = sorted(REQUIRED_IN_SCHEDULER - _environment(services, "scheduler").keys())
-    assert missing == [], f"scheduler environment lacks: {missing}"
+def test_ingest_healthcheck_is_status_check(services: dict[str, Any]) -> None:
+    check = services["ingest"]["healthcheck"]
+    assert check["test"] == ["CMD", "receipt-index", "status", "--check"]
+    assert _seconds(check["interval"]) == 60
+    assert check["retries"] == 3
+    assert _seconds(check["start_period"]) >= 60
+
+
+def test_ingest_stop_grace_covers_the_item_timeout(services: dict[str, Any]) -> None:
+    """SIGTERM lets the item in hand finish; Docker must not SIGKILL it first."""
+    from receipt_index.config import IngestConfig
+
+    floor = IngestConfig().item_timeout_seconds + 60
+    grace = _seconds(services["ingest"]["stop_grace_period"])
+    assert grace >= floor, f"stop_grace_period {grace}s is below {floor}s"
+
+
+def test_crontab_runs_no_ingest() -> None:
+    jobs = [
+        line
+        for line in (DEPLOY / "crontab").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert jobs, "crontab has no job lines"
+    ingest = [line for line in jobs if re.search(r"receipt-index\s+ingest\b", line)]
+    assert ingest == [], f"crontab still runs ingest: {ingest}"
 
 
 def test_db_has_what_init_needs(services: dict[str, Any]) -> None:

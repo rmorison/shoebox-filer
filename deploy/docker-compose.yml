@@ -66,16 +66,17 @@ services:
       context: ..
       dockerfile: Dockerfile
     image: receipt-index
-    # supercronic replaces the image's ENTRYPOINT ["receipt-index"]. The CLI is
-    # still reachable for ad-hoc use via `docker compose ... exec scheduler
-    # receipt-index <cmd>`.
+    # supercronic replaces the image's ENTRYPOINT ["receipt-index"]. It runs
+    # the Dropbox mirror and backup lines only; ingest runs in the `ingest`
+    # service below. The CLI is still reachable for ad-hoc use via
+    # `docker compose ... exec scheduler receipt-index <cmd>`. No
+    # stop_grace_period: no cron line runs an ingest any more, so the default
+    # is enough.
     entrypoint: ["supercronic", "/app/crontab"]
     restart: unless-stopped
-    # Give a mid-cycle ingest time to finish on docker stop / host shutdown:
-    # the 10s default would SIGKILL it mid-item, orphaning a PDF that the
-    # additive Dropbox mirror then preserves forever.
-    stop_grace_period: 5m
-    # PID 1 zombie reaping: Chromium forks aggressively during rendering.
+    # PID 1 zombie reaping: Chromium forks aggressively during rendering
+    # (ad-hoc `exec scheduler receipt-index backfill` and `unlink` still
+    # render receipts here).
     init: true
     # Chromium crashes on the 64 MB default /dev/shm.
     shm_size: 1gb
@@ -122,6 +123,63 @@ services:
       # A :ro mount or a single-file bind mount breaks that rename and the
       # mirror dies silently a few hours after deploy. See rclone-setup.md.
       - ../rclone-config:/app/.rclone
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "7"
+
+  # Always-on ingest: `receipt-index serve` watches every source (IMAP IDLE,
+  # Drive polling), runs due retries and writes the health heartbeat. It holds
+  # each source's lock, so a one-shot `receipt-index ingest` run anywhere else
+  # exits 3 rather than race it. See docs/user/server-deployment.md, "Cutover
+  # to serve", for the rollout and rollback.
+  ingest:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: receipt-index
+    entrypoint: ["receipt-index", "serve"]
+    # Restarts serve when it exits, including a watchdog exit (code 4) after an
+    # item outran item_timeout_seconds. Docker doesn't restart an unhealthy
+    # container: the healthcheck is a signal, and the dead-man's ping (the
+    # ping_url key) is the alert.
+    restart: unless-stopped
+    # On SIGTERM serve finishes the item in hand, which may run for up to
+    # ingest.item_timeout_seconds (1200 s by default, and never less). This is
+    # that plus a minute, so `stop` or `up -d` never SIGKILLs an item in its
+    # time. Raise it with item_timeout_seconds. A host shutdown is bounded by
+    # the Docker daemon's own stop timeout instead; an item it cuts short is
+    # recovered after the restart (design section 6, the dead `started` rule).
+    stop_grace_period: 21m
+    # PID 1 zombie reaping: Chromium forks aggressively during rendering.
+    init: true
+    # Chromium crashes on the 64 MB default /dev/shm.
+    shm_size: 1gb
+    depends_on:
+      db:
+        condition: service_healthy
+    # The same environment as the scheduler, and the same rule: no owner or
+    # superuser credential (tests/unit/test_deploy_env_split.py checks both).
+    env_file: ../.env
+    environment:
+      RECEIPT_INDEX_CONFIG: /app/receipt-index.yaml
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+    volumes:
+      - ../data/receipts:/app/data/receipts
+      - ./receipt-index.yaml:/app/receipt-index.yaml:ro
+    healthcheck:
+      # Fails when serve's heartbeat is missing or stale, a source is stale,
+      # paused too long or lost its lock, or the database can't be reached.
+      # Terminal failures never fail it.
+      test: ["CMD", "receipt-index", "status", "--check"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      # serve writes its first heartbeat about 15 s after `up -d` (measured on
+      # devtest). Two minutes leaves room for a host reboot, when the restart
+      # policy starts this service alongside a database that is still coming up.
+      start_period: 2m
     logging:
       driver: json-file
       options:

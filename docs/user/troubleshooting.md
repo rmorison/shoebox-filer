@@ -100,6 +100,63 @@ Ensure all required variables are set in `.env`. At minimum:
 - `ANTHROPIC_API_KEY`
 - `RECEIPT_STORE_PATH`
 
+## Always-on ingest (`serve`)
+
+These apply to the server's `ingest` service, after the cutover in [Server Deployment](server-deployment.md#89-cutover-to-serve) 8.9. Run every command from the clone root. Run `status` in the `ingest` container: it reads `serve`'s heartbeat file there, and anywhere else it says `heartbeat: none`.
+
+```bash
+docker compose -f deploy/docker-compose.yml exec ingest receipt-index status
+docker compose -f deploy/docker-compose.yml exec ingest receipt-index status --check
+```
+
+### The `ingest` container is unhealthy
+
+`docker compose ps` shows `(unhealthy)` after three failed `status --check` runs in a row, a minute apart. Docker doesn't restart an unhealthy container, so it stays that way until the cause clears. Read why:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec ingest receipt-index status --check
+docker inspect --format '{{range .State.Health.Log}}{{.Output}}{{end}}' "$(docker compose -f deploy/docker-compose.yml ps -q ingest)"
+docker compose -f deploy/docker-compose.yml logs --since 1h ingest
+```
+
+Each line names a problem; the table in 8.9 step 5 says what each means. The usual ones:
+
+- **`heartbeat missing` or `heartbeat stale ...`:** `serve` isn't running in the container, or its worker is stuck. A config error stops `serve` at start, and the log says which key. If the log shows nothing new for minutes, `docker compose -f deploy/docker-compose.yml restart ingest`.
+- **`source <name> stale ...` or `never succeeded`:** reads of that source fail. `status` shows the source's `last error`. A mail server or Drive outage clears itself; an expired app password or Drive token needs a new one in `.env`, then `up -d`.
+- **`source <name> paused ...`:** the worker paused the source after repeated transient or config failures. `status` shows the reason under `Worker`.
+- **`database unreachable`:** check `docker compose -f deploy/docker-compose.yml ps db` and `logs db`.
+
+### A missed or failed ping
+
+The monitor alerts for one of two reasons:
+
+- **Pings stopped.** `serve` isn't running, or the host or Docker is down, or `serve` can't reach the monitor. Check `ps` first. If `ingest` is up and healthy, look for failed pings in `logs ingest`: they're logged without the URL, and a failed ping never stops `serve`. If no ping was ever sent, check that `ping_url` is uncommented in `deploy/receipt-index.yaml` and that the container was recreated after the change (`up -d --force-recreate ingest`): `serve` reads its config only when it starts.
+- **A failure ping arrived.** Its body has one line per problem, the same lines as `status --check`, and never error text or receipt details. `terminal 1 in 24h` means an item failed for good in the last day: it doesn't make the container unhealthy, and the alert clears itself a day later. List them with `receipt-index failures --status terminal`, fix the cause, and requeue them with `retry`, as in [DLQ recovery](server-deployment.md#82-dlq-recovery).
+
+If every command fails with an error about `HEALTH_PING_URL` or `ping_url`, the config has `ping_url` uncommented but the variable isn't in the container's environment, or is empty. Set it in `.env` and `up -d`, or comment the key out again.
+
+### The watchdog restarted `serve`
+
+The log shows `Watchdog: <step> has run <N>s, past item_timeout_seconds (1200); ...` and `serve` exits with code 4. One item, or one source's listing, ran past `item_timeout_seconds` and couldn't be stopped from inside, so `serve` exited and Docker restarted it (`restart: unless-stopped`). The item's unfinished attempt is recovered after the restart and counts as a failed attempt, so an item that hangs every time ends up terminal rather than restarting `serve` for ever. One restart is nothing to act on. Several for the same item mean a renderer or extraction hang worth a look: `failures --source <name>` shows the item.
+
+### A source lock is held by another `ingest`
+
+`status --check` shows `source <name> lock lost` or `source <name> not held`, and `serve` doesn't watch that source. Another process holds its lock: almost always a one-shot `receipt-index ingest` started by hand, or a cron ingest line left in a crontab. While `serve` holds a source, a one-shot `ingest` exits 3 with `source <name> is being watched by a running serve`; it is the other order, a one-shot started first, that leaves `serve` without the source. If another process holds every source, `serve` has nothing to watch: it prints the same line for each source and exits 3, and Docker keeps restarting it. `ps` shows `ingest` restarting, `logs ingest` shows the lines, and the healthcheck or the monitor reports a missing or stale heartbeat.
+
+1. Find it. A one-shot run in the scheduler shows in its process list (the image has no `ps`, so read `/proc`):
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline' </dev/null
+   ```
+
+2. Let it finish, or stop it. Then restart `serve` so it takes the lock again:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml restart ingest
+   ```
+
+3. If a cron line started it, remove the line from `deploy/crontab` and `up -d`.
+
 ## Search
 
 ### `No receipts found`

@@ -34,6 +34,31 @@ sources:
     folder_id: "replace-with-gdrive-folder-id"
     token_json: ${GDRIVE_TOKEN_JSON}
 
+# Timing for `receipt-index serve` (the compose `ingest` service) and the
+# one-shot `ingest`. Every key has a default; these are the defaults.
+ingest:
+  idle_reissue_seconds: 600
+  imap_poll_seconds: 240        # IMAP safety poll; the only poll without IDLE
+  drive_poll_seconds: 120
+  drive_settle_seconds: 60
+  # How long one item may run before serve's watchdog restarts it. At least
+  # 1200. The ingest service's stop_grace_period in deploy/docker-compose.yml
+  # is this plus a minute: raise both together.
+  item_timeout_seconds: 1200
+  transient_item_max_seconds: 21600
+  retry_max_attempts: 3
+  retry_backoff_seconds: [300, 1800, 7200, 43200]
+  health:
+    heartbeat_stale_seconds: 120
+    # source_stale_seconds: 900   # optional; default is 3x each source's poll interval
+    terminal_alert_seconds: 86400
+    ping_interval_seconds: 300
+    # The dead-man's ping. Leave this commented out until HEALTH_PING_URL is
+    # set in the clone-root .env: the loader refuses an unset ${VAR}, so the
+    # key without the variable stops every command, including the ingest
+    # container's healthcheck and a rollback `ingest`.
+    # ping_url: ${HEALTH_PING_URL}
+
 database:
   url: ${DATABASE_URL}
 
