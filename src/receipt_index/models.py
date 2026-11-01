@@ -613,6 +613,23 @@ class ExtractionResult:
     requests: int = 0
 
 
+class ProvenanceSummary(BaseModel):
+    """One source item of a receipt, as search and show report it."""
+
+    id: UUID
+    is_primary: bool
+    source_type: str
+    source_name: str
+    source_id: str
+    received_at: datetime
+    email_subject: str | None = None
+    email_sender: str | None = None
+    file_name: str | None = None
+    home_receipt_id: UUID | None = None
+    match_method: str
+    original_status: str
+
+
 class Receipt(BaseModel):
     """Full receipt record as stored in the database."""
 
@@ -641,6 +658,15 @@ class Receipt(BaseModel):
     # linked refunds, and what it cost after them. None otherwise.
     refunded: Decimal | None = None
     net_paid: Decimal | None = None
+    # Set when a duplicate merge emptied this receipt: the receipt that
+    # remains (evidence-store design, §8). Merged receipts drop out of search.
+    merged_into_id: UUID | None = None
+    merged_at: datetime | None = None
+    # Filled by search and get_receipt_by_id: the source items that evidence
+    # this receipt (primary first), and the receipts it is flagged as a
+    # possible duplicate of, with the pair still open.
+    provenance: list[ProvenanceSummary] = Field(default_factory=list)
+    suspected_duplicate_of: list[UUID] = Field(default_factory=list)
     pdf_path: str
     email_subject: str | None
     email_sender: str | None

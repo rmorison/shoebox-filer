@@ -632,7 +632,10 @@ class TestProcessItem:
             source_type="imap",
             llm_model="m",
         )
-        assert order[:3] == ["store", "commit", "render"]
+        # Rule 1's read may commit first; the store's read ends before render.
+        render = order.index("render")
+        assert order[render - 1] == "commit"
+        assert order.index("store") < render - 1
 
     def test_a_skipped_item_stores_no_original(
         self, stub: dict[str, MagicMock]

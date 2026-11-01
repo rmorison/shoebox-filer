@@ -13,6 +13,7 @@
 - [`uv run receipt-index retry`](#retry) — Requeue failed or skipped items for the next ingest
 - [`uv run receipt-index reextract`](#reextract) — Re-extract existing receipts with the current prompt and model
 - [`uv run receipt-index refund`](#refund) — Link refunds to their purchases, unlink them, and list them
+- [`uv run receipt-index duplicates`](#duplicates) — Review suspected duplicates, scan existing receipts; `link` and `unlink` move a source item between receipts
 - [`uv run receipt-index store`](#store) — Record the hash and location of each stored rendition
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
@@ -230,6 +231,7 @@ uv run receipt-index search [OPTIONS]
 | `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
 | `--payer TEXT` | Filter by payer name (case-insensitive substring match) |
 | `--kind KIND` | Only receipts of this [kind](#kinds-and-totals): `purchase`, `refund`, `credit` or `statement`. Repeatable. Default: every kind |
+| `--include-merged` | Also list receipts merged into another as [duplicates](#merged-receipts). Leave it off for totals, so a duplicate counts once. The text table's Note column marks a merged receipt `merged`, and one with an open suspected-duplicate pair `dup?` |
 | `--limit N` | Print at most N receipts (1 or more). Default: every match |
 | `--offset N` | Skip the first N matches (0 or more). Default: 0 |
 | `--output text\|json` | Output format (default: `text`) |
@@ -302,6 +304,8 @@ Use `--output json` for machine-readable output. It is the same page envelope as
 - `next_offset`: the `--offset` for the next page, or `null` when this page is the last. It is always `null` without `--limit`, since the page then runs to the end.
 
 The total and the page are read from one snapshot, so they agree. Each receipt carries the same fields as an MCP receipt, except `file` (the PDF's path on the server and whether it exists), which only the MCP tool gives.
+
+Each receipt also lists its source items as `provenance` (primary first; more than one means [duplicates](#duplicates) were linked to it), the receipts it may duplicate as `suspected_duplicate_of` (open pairs; check them before counting both in a total), and `merged_into_id` and `merged_at`, set only on a [merged receipt](#merged-receipts) that `--include-merged` brings back.
 
 To read every page, start at `--offset 0` and pass `next_offset` as the next `--offset` until it is `null`.
 
@@ -800,6 +804,80 @@ uv run receipt-index refund unlink 01942a3d-1234-7def-8abc-567890abcdef --reason
 
 ---
 
+## duplicates
+
+The same receipt often arrives more than once: the vendor's email, a forward of it, and a scan dropped into Drive. Each arrival is a *source item* with its own provenance record (an ID shown in `provenance` in the JSON output). When the items are the same receipt, they belong to one receipt, so totals count it once.
+
+```bash
+uv run receipt-index duplicates [--status open|linked|dismissed|all] [--output text|json]
+uv run receipt-index duplicates link PAIR_ID [--as NAME]
+uv run receipt-index duplicates dismiss PAIR_ID [--as NAME]
+uv run receipt-index duplicates scan [--dry-run] [--window-days N]
+uv run receipt-index link PROVENANCE_ID RECEIPT_ID --reason TEXT [--as NAME]
+uv run receipt-index unlink PROVENANCE_ID --reason TEXT [--as NAME]
+```
+
+### The rules
+
+Ingest checks each new item against the receipts already indexed, in this order. Rules 2 to 4 only compare receipts of the same [kind](#kinds-and-totals) and currency, so a refund never joins its purchase. The vendor is compared ignoring case and extra spaces.
+
+| # | Match | Result |
+|---|-------|--------|
+| 1 | The whole file or email is byte for byte the same as one already indexed (the same scan dropped twice) | Linked. Checked before extraction, so it costs no LLM call |
+| 2 | The receipt document (the attachment the receipt was read from, when the extraction names it for certain, or a Drive file) has the same bytes as another's | Linked when the kind, vendor, [effective amount](#amounts) and date also match. Otherwise flagged (`document_hash_conflict`): the same file, such as an invoice re-attached to a refund or a template PDF reused each month, isn't the same receipt |
+| 3 | The same order or invoice number, vendor and paid amount (above zero), on the same date, from a different source (an email and a Drive scan, or two mailboxes) | Linked. From the same source, or with a different date up to three days away, flagged (`order_number_conflict`): an order charged once per shipment, a real double charge, or two equal partial refunds. A forward into the same mailbox is flagged; confirm it with `duplicates link` |
+| 4 | The same vendor and effective amount, dates up to three days apart | Flagged (`metadata`), never linked: two identical parking charges on one day are two real expenses |
+
+An unpaid invoice (paid amount 0) and the receipt for its payment are neither linked nor flagged: the invoice counts 0 in a total.
+
+A linked item joins the existing receipt: no new receipt and no rendition are made for it. A flagged pair waits in `duplicates` for review; both receipts still count until it is decided.
+
+### Reviewing flagged pairs
+
+`duplicates` lists the open pairs, each with both receipts. `duplicates link PAIR_ID` decides that a pair is one receipt: the newer receipt is merged into the older. `duplicates dismiss PAIR_ID` decides they are two, and the pair is never flagged again. Search and `show --output json` list a receipt's open pairs as `suspected_duplicate_of`.
+
+### Merged receipts
+
+When a link moves a receipt's last source item to another receipt, the emptied receipt is **merged**, not deleted. It keeps its fields, extractions, history and rendition, records the receipt that remains in `merged_into_id`, and drops out of `search`, counts and totals (`search --include-merged` lists it). A refund linked to a merged purchase counts against the receipt that remains. `show` on a merged receipt says what it was merged into, and `show` on the receipt that remains lists what was merged into it. Re-extraction and the refund linking rule skip merged receipts.
+
+A merge is refused, naming the reason, when the receipt it would empty has hand-edited fields ([`edit`](#edit); hand them back with `edit --clear-manual`, or move them), when the two receipts are of different kinds, or when it is a refund linked to a purchase the other refund isn't linked to.
+
+### Linking and unlinking by hand
+
+`link PROVENANCE_ID RECEIPT_ID --reason TEXT` moves one source item to a receipt (to the receipt that remains, if that one was merged). `unlink PROVENANCE_ID --reason TEXT` moves it out again:
+
+- If a receipt was first made for the item and later merged, that receipt is restored exactly as it was.
+- If the item joined an existing receipt at ingest, so no receipt was ever made for it, `unlink` fetches it again from its source, extracts it (one LLM call) and renders it into a new receipt. If its source no longer has it, nothing changes.
+- An item can't be unlinked from its own receipt, or when it is that receipt's only source item.
+
+Every link, unlink, merge and unmerge is recorded, with who did it (`--as`, default `annotations.actor`, else `operator`) and your reason, in an append-only history that nothing can change.
+
+### Scanning existing receipts
+
+`duplicates scan` runs the same rules over receipts that are already indexed, oldest first, so duplicates ingested before the rules existed stop counting twice. The older receipt of a pair is the one that remains; a merge the rules above refuse is flagged `merge_blocked` instead. It makes no LLM calls and reads no files. Rules 1 and 2 find only items whose originals have been kept; rules 3 and 4 cover every receipt. A receipt with no provenance record can't be linked; the scan lists any it finds, and re-running migration 000018 backfills them. A pair you unlinked or dismissed is never linked or flagged again. Run it again at any time: a pair already decided is never flagged again.
+
+- `--dry-run` prints what it would link and flag, with counts per rule, and writes nothing.
+- `--window-days N` (default 3) sets how many days apart two receipts' dates may be for rules 3 and 4 to flag them. Try other windows with `--dry-run` before a real scan.
+
+### Examples
+
+```bash
+# What would the first scan do?
+uv run receipt-index duplicates scan --dry-run
+
+# Run it, then review what it flagged
+uv run receipt-index duplicates scan
+uv run receipt-index duplicates
+
+# Two real purchases: never flag them again
+uv run receipt-index duplicates dismiss 01942a3d-1234-7def-8abc-567890abcdef
+
+# A wrong link: give the item its receipt back
+uv run receipt-index unlink 01942a3e-1234-7def-8abc-567890abcdef --reason "two separate visits"
+```
+
+---
+
 ## store
 
 Record what the evidence store holds for each receipt.
@@ -851,7 +929,7 @@ All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both di
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring), `kind` (a list of kinds; default every kind) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields, and `kind`, `signed_amount`, `refund_of`, `refunded` and `net_paid` ([Kinds and totals](#kinds-and-totals)). |
+| `search_receipts` | `vendor` (substring), `amount`, `amount_min`, `amount_max`, `date_from`, `date_to`, `source`, `order_number` (exact), `last4` (four digits), `payer` (substring), `kind` (a list of kinds; default every kind), `include_merged` (default false) (all optional); `limit` (1-200, default 50); `offset` (default 0) | `{receipts, total, limit, offset, next_offset}`. `amount` can't be combined with `amount_min`/`amount_max`. Each receipt carries the [order number and payment](#order-number-and-payment) fields, `kind`, `signed_amount`, `refund_of`, `refunded` and `net_paid` ([Kinds and totals](#kinds-and-totals)), and `provenance`, `suspected_duplicate_of`, `merged_into_id` and `merged_at` ([duplicates](#duplicates)). Merged receipts are left out unless `include_merged`. |
 | `get_receipt` | `receipt_id` | One receipt. An unknown ID or a malformed UUID is a tool error. |
 | `get_receipt_file` | `receipt_id`, `include_content` (default false) | `{receipt_id, path, size_bytes, mime_type, content_included, content_omitted_reason}`, plus the PDF as an embedded resource when content is asked for and fits the size limit |
 | `list_failures` | `limit`, `offset`, `status` (`failed`, the default, or `link-only`) | `{failures, total, limit, offset, next_offset}`, as `failures --output json` gives for that status, newest first. A link-only entry carries `receipt_link`, an unverified link from the email that may carry a personal token; the consumer agent must not fetch it automatically |

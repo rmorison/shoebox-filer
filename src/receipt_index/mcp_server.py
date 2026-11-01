@@ -45,7 +45,10 @@ from pydantic import BaseModel, Field
 
 from receipt_index import repository
 from receipt_index.db import get_connection
-from receipt_index.models import Kind  # noqa: TC001 (pydantic resolves it)
+from receipt_index.models import (  # noqa: TC001 (pydantic resolves them)
+    Kind,
+    ProvenanceSummary,
+)
 from receipt_index.paging import next_offset
 from receipt_index.store import InvalidRefError, LocalEvidenceStore, rendition_ref
 
@@ -225,6 +228,31 @@ class ReceiptOut(BaseModel):
     payer: str | None = Field(
         default=None,
         description="The cardholder or bill-to name as printed on the receipt.",
+    )
+    merged_into_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Set when this receipt was merged into another as a duplicate: the "
+            "receipt that remains. Merged receipts are left out of search and "
+            "totals unless include_merged is set."
+        ),
+    )
+    merged_at: datetime | None = Field(
+        default=None, description="When the merge happened; null if not merged."
+    )
+    provenance: list[ProvenanceSummary] = Field(
+        default_factory=list,
+        description=(
+            "The source items (emails, forwards, Drive files) that evidence this "
+            "receipt, primary first. More than one means duplicates were linked."
+        ),
+    )
+    suspected_duplicate_of: list[UUID] = Field(
+        default_factory=list,
+        description=(
+            "Receipts this one is flagged as a possible duplicate of, still open "
+            "for review. Check them before counting both in a total."
+        ),
     )
     pdf_path: str = Field(description="PDF path relative to the file store.")
     email_subject: str | None
@@ -652,6 +680,15 @@ def build_server(
                 )
             ),
         ] = None,
+        include_merged: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Also return receipts merged into another as duplicates. "
+                    "Leave false for totals, so a duplicate counts once."
+                )
+            ),
+        ] = False,
         limit: Limit = DEFAULT_PAGE_SIZE,
         offset: Offset = 0,
     ) -> SearchResult:
@@ -678,11 +715,13 @@ def build_server(
             "last4": _parse_last4(last4),
             "payer": _parse_text(payer, "payer"),
             "kinds": list(kind) if kind else None,
+            "include_merged": include_merged,
         }
         with snapshot() as conn:
             total = repository.count_receipts(conn, **filters)
-            page = repository.search_receipts(
-                conn, **filters, limit=limit, offset=offset
+            page = repository.with_provenance(
+                conn,
+                repository.search_receipts(conn, **filters, limit=limit, offset=offset),
             )
         return SearchResult(
             receipts=[receipt_out(r) for r in page],
@@ -700,6 +739,8 @@ def build_server(
         uid = _parse_uuid(receipt_id)
         with snapshot() as conn:
             receipt = repository.get_receipt_by_id(conn, uid)
+            if receipt is not None:
+                (receipt,) = repository.with_provenance(conn, [receipt])
         if receipt is None:
             # The canonical form: UUID() accepts padded input (any number of
             # hyphens, braces, a urn: prefix), which must not be echoed back.

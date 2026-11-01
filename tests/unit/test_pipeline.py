@@ -12,9 +12,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic_ai.exceptions import (
@@ -151,9 +152,12 @@ class FakeRepo:
         self.receipt_kwargs.append({"source_id": source_id, **kwargs})
         return Receipt.model_validate({**_RECEIPT_ROW, "source_id": source_id})
 
-    def insert_provenance(self, conn: Any, *, source_id: str, **kwargs: Any) -> None:
+    def insert_provenance(
+        self, conn: Any, *, source_id: str, **kwargs: Any
+    ) -> SimpleNamespace:
         self.writes.append("provenance")
         self.provenance.append({"source_id": source_id, **kwargs})
+        return SimpleNamespace(id=uuid4())
 
     def record_rendition(self, conn: Any, **kwargs: Any) -> None:
         self.writes.append("rendition")

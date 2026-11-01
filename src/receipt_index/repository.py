@@ -8,12 +8,14 @@ from uuid import UUID
 
 from psycopg.types.json import Jsonb
 
+from receipt_index import duplicates
 from receipt_index.adapters.gdrive import UNSUPPORTED_REASON
 from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
     IngestLogEntry,
     Provenance,
+    ProvenanceSummary,
     Receipt,
     ReceiptEvent,
     SyncState,
@@ -378,9 +380,14 @@ def _receipt_filters(
     last4: str | None = None,
     payer: str | None = None,
     kinds: Sequence[str] | None = None,
+    include_merged: bool = False,
 ) -> tuple[str, dict[str, object]]:
-    """Build the WHERE clause and parameters shared by search and count."""
-    clauses: list[str] = []
+    """Build the WHERE clause and parameters shared by search and count.
+
+    A receipt merged into another as a duplicate is left out unless
+    ``include_merged``, so a sum over the results counts it once.
+    """
+    clauses: list[str] = [] if include_merged else ["merged_into_id IS NULL"]
     params: dict[str, object] = {}
 
     if vendor is not None:
@@ -465,6 +472,7 @@ def search_receipts(
     last4: str | None = None,
     payer: str | None = None,
     kinds: Sequence[str] | None = None,
+    include_merged: bool = False,
 ) -> list[Receipt]:
     """Search receipts with optional filters, combined with AND.
 
@@ -489,6 +497,7 @@ def search_receipts(
         last4=last4,
         payer=payer,
         kinds=kinds,
+        include_merged=include_merged,
     )
     order = (
         _NEEDS_REVIEW_ORDER if needs_review else "receipt_date DESC, vendor ASC, id ASC"
@@ -516,6 +525,7 @@ def count_receipts(
     last4: str | None = None,
     payer: str | None = None,
     kinds: Sequence[str] | None = None,
+    include_merged: bool = False,
 ) -> int:
     """Count the receipts that ``search_receipts`` would return unpaged."""
     where, params = _receipt_filters(
@@ -531,6 +541,7 @@ def count_receipts(
         last4=last4,
         payer=payer,
         kinds=kinds,
+        include_merged=include_merged,
     )
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM receipt.receipts WHERE {where}", params
@@ -942,6 +953,30 @@ def orphaned_refs(
     return found
 
 
+def with_provenance(
+    conn: psycopg.Connection[dict[str, Any]], receipts: list[Receipt]
+) -> list[Receipt]:
+    """The receipts with ``provenance`` and ``suspected_duplicate_of`` filled.
+
+    Two queries for the whole list, for the JSON output of search and show.
+    """
+    ids = [r.id for r in receipts]
+    records = duplicates.provenance_for(conn, ids)
+    suspected = duplicates.suspected_duplicates(conn, ids)
+    return [
+        r.model_copy(
+            update={
+                "provenance": [
+                    ProvenanceSummary.model_validate(p.model_dump())
+                    for p in records.get(r.id, [])
+                ],
+                "suspected_duplicate_of": suspected.get(r.id, []),
+            }
+        )
+        for r in receipts
+    ]
+
+
 def get_receipt_by_id(
     conn: psycopg.Connection[dict[str, Any]],
     receipt_id: UUID,
@@ -1058,7 +1093,8 @@ def select_for_reextract(
     their kind not hand-edited, whose subject, description, vendor or file
     name has a word that a refund, credit or statement often uses.
     """
-    clauses: list[str] = []
+    # A receipt merged into another as a duplicate is never re-extracted.
+    clauses: list[str] = ["r.merged_into_id IS NULL"]
     params: dict[str, object] = {"version": prompt_version, "model": llm_model}
     if date_from is not None:
         clauses.append("r.receipt_date >= %(date_from)s")
@@ -1396,7 +1432,7 @@ def find_refund_purchases(
     cur = conn.execute(
         """\
         SELECT id FROM receipt.receipts
-        WHERE kind = 'purchase' AND id <> %(id)s
+        WHERE kind = 'purchase' AND id <> %(id)s AND merged_into_id IS NULL
           AND order_number = %(order_number)s
           AND lower(vendor) = lower(%(vendor)s)
           AND currency = %(currency)s
@@ -1427,6 +1463,7 @@ def find_unlinked_refunds(
         """\
         SELECT * FROM receipt.receipts
         WHERE kind = 'refund' AND refund_of IS NULL AND id <> %(id)s
+          AND merged_into_id IS NULL
           AND order_number = %(order_number)s
           AND lower(vendor) = lower(%(vendor)s)
           AND currency = %(currency)s
@@ -1461,7 +1498,7 @@ def lock_matching_purchase(
     cur = conn.execute(
         """\
         SELECT 1 FROM receipt.receipts
-        WHERE id = %(id)s AND kind = 'purchase'
+        WHERE id = %(id)s AND kind = 'purchase' AND merged_into_id IS NULL
           AND order_number = %(order_number)s
           AND lower(vendor) = lower(%(vendor)s)
           AND currency = %(currency)s
@@ -1511,9 +1548,10 @@ def set_refund_of(
 def has_linked_refunds(
     conn: psycopg.Connection[dict[str, Any]], purchase_id: UUID
 ) -> bool:
-    """Whether any refund is linked to this purchase."""
+    """Whether any refund, not merged away as a duplicate, is linked to it."""
     cur = conn.execute(
-        "SELECT 1 FROM receipt.receipts WHERE refund_of = %(id)s LIMIT 1",
+        "SELECT 1 FROM receipt.receipts WHERE refund_of = %(id)s"
+        " AND merged_into_id IS NULL LIMIT 1",
         {"id": purchase_id},
     )
     return cur.fetchone() is not None
@@ -1523,7 +1561,10 @@ def list_refunds(
     conn: psycopg.Connection[dict[str, Any]], *, unlinked: bool = False
 ) -> list[Receipt]:
     """Every refund, newest first; only those with no purchase if ``unlinked``."""
-    where = "kind = 'refund'" + (" AND refund_of IS NULL" if unlinked else "")
+    # A refund merged into another as a duplicate isn't listed.
+    where = "kind = 'refund' AND merged_into_id IS NULL" + (
+        " AND refund_of IS NULL" if unlinked else ""
+    )
     cur = conn.execute(
         f"{_WITH_NET} WHERE {where} ORDER BY receipt_date DESC, vendor ASC, id ASC"
     )
@@ -1675,11 +1716,14 @@ def insert_provenance(
     original_file_id: UUID | None = None,
     receipt_document_file_id: UUID | None = None,
     document_certainty: DocumentCertainty | None = None,
+    joined: bool = False,
 ) -> Provenance:
     """Record the source item that created a receipt. Doesn't commit.
 
-    The first item for a receipt is its primary and its home. Its original
-    is ``stored`` when ``original_file_id`` is given, else ``pending``.
+    The first item for a receipt is its primary and its home. An item that
+    ``joined`` an existing receipt as a duplicate is neither: it has no home
+    receipt, since none was created for it. Its original is ``stored`` when
+    ``original_file_id`` is given, else ``pending``.
     """
     row = conn.execute(
         """\
@@ -1689,15 +1733,18 @@ def insert_provenance(
             home_receipt_id, original_status, match_method, source_sha256,
             original_file_id, receipt_document_file_id, document_certainty
         ) VALUES (
-            %(receipt_id)s, TRUE, %(source_type)s, %(source_name)s, %(source_id)s,
-            %(received_at)s, %(email_subject)s, %(email_sender)s, %(email_date)s,
-            %(file_name)s, %(receipt_id)s, %(original_status)s, %(match_method)s,
+            %(receipt_id)s, %(primary)s, %(source_type)s, %(source_name)s,
+            %(source_id)s, %(received_at)s, %(email_subject)s, %(email_sender)s,
+            %(email_date)s, %(file_name)s, %(home)s, %(original_status)s,
+            %(match_method)s,
             %(source_sha256)s, %(original_file_id)s,
             %(receipt_document_file_id)s, %(document_certainty)s
         )
         RETURNING *
         """,
         {
+            "primary": not joined,
+            "home": None if joined else receipt_id,
             "original_status": "pending" if original_file_id is None else "stored",
             "source_sha256": source_sha256,
             "original_file_id": original_file_id,

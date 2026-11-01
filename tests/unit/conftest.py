@@ -210,3 +210,22 @@ def stub_api(
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _no_duplicates(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ingest finds no duplicates, unless the module tests the rules.
+
+    Unit tests drive ingest over a mock connection, whose rows would read as
+    matches. The duplicate rules have their own tests (test_duplicates.py),
+    which opt out by setting ``REAL_DUPLICATES = True``.
+    """
+    if getattr(request.module, "REAL_DUPLICATES", False):
+        return
+    from receipt_index import duplicates
+
+    monkeypatch.setattr(duplicates, "match_original", lambda *a, **k: None)
+    monkeypatch.setattr(duplicates, "decide", lambda *a, **k: duplicates.Decision())
+    monkeypatch.setattr(duplicates, "record_flags", lambda *a, **k: 0)
