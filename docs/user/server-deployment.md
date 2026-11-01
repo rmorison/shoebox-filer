@@ -861,11 +861,17 @@ After the cutover to `serve`, the external monitor ([8.9](#89-cutover-to-serve) 
 
 The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If ingest and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says.
 
-These commands are for a server that has made the cutover to `serve` ([8.9](#89-cutover-to-serve)). The upgrade that makes the cutover is 8.9 step 1, which has the cron-era form. Before running them, check that the clone is on its branch: after a [rollback](#89-cutover-to-serve) it is on a detached commit, `git pull` fails there, and returning to the branch starts `serve` again. The first command below stops on a detached clone.
+These commands are for a server that has made the cutover to `serve` ([8.9](#89-cutover-to-serve)). The upgrade that makes the cutover is 8.9 step 1, which has the cron-era form. A server that hasn't made the cutover yet, or has stayed on cron after a rollback, uses that form of 8.9 step 1 for every upgrade: its compose file has no `ingest` service. First check that the clone is on its branch. After a [rollback](#89-cutover-to-serve) it is on a detached commit, where `git pull` fails and returning to the branch starts `serve` again, so a detached clone follows the routes forward in 8.9 Rollback instead of this section:
 
 ```bash
 cd ~/receipt-index
-git symbolic-ref -q HEAD || { echo "detached: the cutover was rolled back; see 8.9 Rollback"; false; }
+git symbolic-ref -q --short HEAD || echo "DETACHED: stop here and see 8.9 Rollback"
+```
+
+It prints the branch name. Only then run the upgrade:
+
+```bash
+cd ~/receipt-index
 git pull
 docker compose -f deploy/docker-compose.yml build
 
@@ -873,24 +879,34 @@ docker compose -f deploy/docker-compose.yml build
 # `stop ingest` lets serve finish the item in hand (its stop_grace_period is
 # 21 minutes; it normally takes seconds), so no item runs while the schema
 # changes. Before stopping the scheduler, check that no ad-hoc receipt-index
-# command (a backfill, a retry) is running in it: recreating the container
+# command that writes (a backfill, a retry, an unlink) is running in it; a
+# read-only one such as an MCP session or a search is safe to cut: recreating the container
 # would kill it mid-item. The image has no pgrep, so the check reads each
 # process's command line from /proc and prints `idle` only when the exec ran
 # and found none. `NOT idle` means one is running (let it finish) or the check
 # didn't run at all: a stopped container or a failed exec never reads as idle.
 # If `ps` shows the scheduler isn't running, there is nothing to wait for. The
 # `[b]` keeps grep from matching the shell that runs it.
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[b]in/receipt-index" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+```
+
+Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't running. Then:
+
+```bash
 docker compose -f deploy/docker-compose.yml stop ingest scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
 make migrate-up
 
 docker compose -f deploy/docker-compose.yml up -d
-# A minute or two later: `ingest` is "(healthy)" and status --check prints ok.
+```
+
+A minute or two later, `ps` shows `ingest` as `(healthy)` and `status --check` prints `ok`:
+
+```bash
 docker compose -f deploy/docker-compose.yml ps
 docker compose -f deploy/docker-compose.yml logs --since 5m ingest scheduler
-docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status --check
+docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status --check </dev/null
 ```
 
 Rebuild the image on **every** `playwright` version bump — the browser build is pinned per Playwright release, and a mismatch between the pip package and the baked browser breaks HTML rendering (and therefore dead-letters receipts).
@@ -1263,7 +1279,7 @@ The scheduler then holds the owner credentials again, as before this section, an
 
 Sometimes the schedule has to stay off, so the scheduler isn't running. After the cutover to `serve` ([8.9](#89-cutover-to-serve)) the schedule is only the Dropbox mirror and backup lines, and ingest is the separate `ingest` service, which keeps running unless you stop it too (for example until a backfill finishes). `up -d` and `up -d scheduler` would start supercronic, and the schedule with it, and `exec` needs a running container. To run [8.1](#81-upgrade), [8.4](#84-separate-database-logins) or [8.5](#85-split-the-owner-credentials-out-of-env) and leave the schedule off, change their commands like this:
 
-- **Skip the idle check, and stop only `ingest`.** Nothing runs in a stopped scheduler. `docker compose -f deploy/docker-compose.yml stop ingest` before `make migrate-up` still keeps `serve` from ingesting while the schema changes.
+- **Skip the idle check and `stop scheduler`.** Nothing runs in a stopped scheduler. After the cutover to `serve`, still run `docker compose -f deploy/docker-compose.yml stop ingest` before `make migrate-up`, so `serve` doesn't ingest while the schema changes; before the cutover there is no `ingest` service to stop.
 - **Each `exec` becomes a one-off `run`.** The program goes in `--entrypoint` and its arguments after `scheduler`. A one-off container reads `.env` when it starts, so it sees an edit straight away, with no recreate:
 
   ```bash
@@ -1276,7 +1292,7 @@ Sometimes the schedule has to stay off, so the scheduler isn't running. After th
   ```
 
   [10.1](#101-one-time-setup) step 4 gives the same form for the MCP check.
-- **`up -d` and `up -d scheduler` become `up -d db ingest`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), starts `serve` again, and leaves the scheduler stopped. Leave `scheduler` out of the `logs` and `ps` checks. When ingest must stay off too, use `up -d db` instead: it leaves `ingest` stopped, and nothing ingests until you run `up -d ingest`.
+- **`up -d` and `up -d scheduler` become `up -d db`, and after the cutover to `serve`, `up -d db ingest`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), starts `serve` again when named, and leaves the scheduler stopped. Leave `scheduler` out of the `logs` and `ps` checks. After the cutover, when ingest must stay off too, use `up -d db`: it leaves `ingest` stopped, and nothing ingests until you run `up -d ingest`.
 - **No backup runs, nightly or monthly.** Both dumps are cron lines, so they stop with the scheduler, and supercronic doesn't run a missed one when it starts again. To take one by hand, as the read login like the scheduled ones, run the script in a one-off container. With no argument it writes today's day-of-week name; with `monthly` it writes this month's `receipt_index-month-<MM>.dump`, replacing the one already there:
 
   ```bash
@@ -1369,6 +1385,11 @@ docker compose -f deploy/docker-compose.yml build
 # again) or the check didn't run. If `ps` shows the scheduler isn't running,
 # there is no run to wait for. The `[r]` keeps grep from matching itself.
 docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+```
+
+Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't running. Then:
+
+```bash
 docker compose -f deploy/docker-compose.yml stop scheduler
 
 make migrate-up
@@ -1384,15 +1405,15 @@ docker compose -f deploy/docker-compose.yml up -d
 docker compose -f deploy/docker-compose.yml ps
 docker compose -f deploy/docker-compose.yml logs --since 10m ingest
 # Run status in the ingest container: it reads serve's heartbeat file there.
-docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status
-docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status --check   # prints ok
-# The crontab the scheduler is running has no ingest line: prints 0.
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -v "^#" /app/crontab | grep -c "receipt-index ingest"' </dev/null
+docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status </dev/null
+docker compose -f deploy/docker-compose.yml exec -T ingest receipt-index status --check </dev/null   # prints ok
+# The crontab the scheduler is running has no ingest line.
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -v "^#" /app/crontab | grep -q "receipt-index ingest" && echo "STILL HAS INGEST" || echo "no ingest line"' </dev/null
 # A one-shot ingest now finds every source held by serve and exits 3.
 docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index ingest </dev/null; echo "exit=$?"
 ```
 
-The crontab check prints `0`. If it prints anything else, the scheduler is still running the old crontab: `up -d` didn't recreate it, so run `docker compose -f deploy/docker-compose.yml up -d --force-recreate scheduler`. The last command prints `source <name> is being watched by a running serve; see receipt-index status` for each source, then `exit=3`: `serve` holds every source, so even a cron line left by mistake fails loudly instead of racing it. Then send yourself a test receipt, wait a minute or two, and find it in `docker compose -f deploy/docker-compose.yml logs --since 5m ingest`.
+The crontab check prints `no ingest line`. If it prints `STILL HAS INGEST`, or an error reading `/app/crontab`, the scheduler is still running the old crontab: `up -d` didn't recreate it, so run `docker compose -f deploy/docker-compose.yml up -d --force-recreate scheduler`. The last command prints `source <name> is being watched by a running serve; see receipt-index status` for each source, then `exit=3`: `serve` holds every source, so even a cron line left by mistake fails loudly instead of racing it. Then send yourself a test receipt, wait a minute or two, and find it in `docker compose -f deploy/docker-compose.yml logs --since 5m ingest`.
 
 **3. Set up the monitor.** Use any Healthchecks.io-style service, which alerts when pings stop and accepts a failure ping at the check's URL plus `/fail`.
 
@@ -1452,19 +1473,23 @@ Terminal failures never fail the check, since they are content problems, not liv
 cd ~/receipt-index
 # The newest merge that changed the crontab: the cutover, unless a later one did too.
 M=$(git log --first-parent --merges --format=%h -1 -- deploy/crontab)
-# Check: the diff removes the `receipt-index ingest` line. If not, set M to the
-# cutover merge from `git log --first-parent --merges --oneline -- deploy/crontab`.
 git show --first-parent "$M" -- deploy/crontab | grep '^-.*receipt-index ingest'
-git switch --detach "$M^1"
-docker compose -f deploy/docker-compose.yml up -d --remove-orphans
 ```
 
-`$M^1` is the release just before the cutover, so only the cutover's own `deploy/` changes go back. If step 1's `git pull` brought several releases, the commit you noted there would also undo the others, so use it only when it is that same commit. `--remove-orphans` removes the `ingest` container, since that compose file has no such service, and `up -d` recreates the scheduler with the cron ingest line back. The detached checkout leaves no commit on the server, so its clone never diverges from the repository. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Don't rebuild: the containers keep the image built for this release, and only the files in `deploy/` decide what runs. Nothing in the database needs undoing, and the one-shot `ingest` in that image works against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings.
+That prints the removed `*/15 * * * * receipt-index ingest` line. If it prints nothing, a later merge changed the crontab too: find the cutover merge in `git log --first-parent --merges --oneline -- deploy/crontab`, set `M` to it, and check again. Then, in the same shell, this runs only when `M` is the cutover merge:
 
-The clone now sits on a detached commit, and stays there until you take one of these two routes forward. While it is detached, [8.1](#81-upgrade) stops at its first command, because `git pull` fails there and a plain `git switch main` followed by `up -d` would quietly start `serve` again.
+```bash
+git show --first-parent "$M" -- deploy/crontab | grep -q '^-.*receipt-index ingest' &&
+  git switch --detach "$M^1" &&
+  docker compose -f deploy/docker-compose.yml up -d --remove-orphans
+```
+
+`$M^1` is the release just before the cutover, so the cutover's `deploy/` changes go back, along with any later `deploy/` change merged since. If step 1's `git pull` brought several releases, the commit you noted there would also undo the others, so use it only when it is that same commit. `--remove-orphans` removes the `ingest` container, since that compose file has no such service, and `up -d` recreates the scheduler with the cron ingest line back. The detached checkout leaves no commit on the server, so its clone never diverges from the repository. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Don't rebuild: the containers keep the image built for this release, and only the files in `deploy/` decide what runs. Nothing in the database needs undoing, and the one-shot `ingest` in that image works against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings.
+
+The clone now sits on a detached commit, and stays there until you take one of these two routes forward. While it is detached, [8.1](#81-upgrade)'s first check prints `DETACHED`: `git pull` fails there, and a plain `git switch main` followed by `up -d` would quietly start `serve` again.
 
 - **Retry the cutover**, once the cause is fixed: `git switch main`, then this section again from step 1.
-- **Stay on cron ingest** across later upgrades: revert the cutover change in the repository (a git revert of its merge). Once that has landed, `git switch main`, then a normal upgrade in the cron-era form of step 1 (pull, build, the idle check, `stop scheduler`, `make migrate-up`, then `up -d --remove-orphans`). By then `main` usually carries other changes too, which need the build and the migrations.
+- **Stay on cron ingest** across later upgrades: revert the cutover change in the repository (a git revert of its merge). Once that has landed, `git switch main`, then upgrade in the cron-era form of step 1, as every later upgrade does until the cutover is retried (pull, build, the idle check, `stop scheduler`, `make migrate-up`, then `up -d --remove-orphans`). By then `main` usually carries other changes too, which need the build and the migrations.
 
 ---
 
@@ -1533,10 +1558,10 @@ On [rootless Docker](#rootless-docker), chown it from inside a container instead
 RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 ```
 
-**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), stop the scheduler between ingest cycles first, going on only when the check prints `idle`:
+**4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), first check that no command that writes is running in it, going on only when the check prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
