@@ -133,7 +133,7 @@ The monitor alerts for one of two reasons:
 - **Pings stopped.** `serve` isn't running, or the host or Docker is down, or `serve` can't reach the monitor. Check `ps` first. If `ingest` is up and healthy, look for failed pings in `logs ingest`: they're logged without the URL, and a failed ping never stops `serve`. If no ping was ever sent, check that `ping_url` is uncommented in `deploy/receipt-index.yaml` and that the container was recreated after the change (`up -d --force-recreate ingest`): `serve` reads its config only when it starts.
 - **A failure ping arrived.** Its body has one line per problem, the same lines as `status --check`, and never error text or receipt details. `terminal 1 in 24h` means an item failed for good in the last day: it doesn't make the container unhealthy, and the alert clears itself a day later. List them with `receipt-index failures --status terminal`, fix the cause, and requeue them with `retry`, as in [DLQ recovery](server-deployment.md#82-dlq-recovery).
 
-If every command fails with an error about `HEALTH_PING_URL`, the config has `ping_url` uncommented but the variable isn't in the container's environment. Add it to `.env` and `up -d`, or comment the key out again.
+If every command fails with an error about `HEALTH_PING_URL` or `ping_url`, the config has `ping_url` uncommented but the variable isn't in the container's environment, or is empty. Set it in `.env` and `up -d`, or comment the key out again.
 
 ### The watchdog restarted `serve`
 
@@ -141,7 +141,7 @@ The log shows `Watchdog: <step> has run <N>s, past item_timeout_seconds (1200); 
 
 ### A source lock is held by another `ingest`
 
-`status --check` shows `source <name> lock lost` or `source <name> not held`, and `serve` doesn't watch that source. Another process holds its lock: almost always a one-shot `receipt-index ingest` started by hand, or a cron ingest line left in a crontab. While `serve` holds a source, a one-shot `ingest` exits 3 with `source <name> is being watched by a running serve`; it is the other order, a one-shot started first, that leaves `serve` without the source.
+`status --check` shows `source <name> lock lost` or `source <name> not held`, and `serve` doesn't watch that source. Another process holds its lock: almost always a one-shot `receipt-index ingest` started by hand, or a cron ingest line left in a crontab. While `serve` holds a source, a one-shot `ingest` exits 3 with `source <name> is being watched by a running serve`; it is the other order, a one-shot started first, that leaves `serve` without the source. If another process holds every source, `serve` has nothing to watch: it prints the same line for each source, exits 3, and Docker keeps restarting it, so `ps` shows `ingest` restarting and `status --check` says `heartbeat missing`.
 
 1. Find it. A one-shot run in the scheduler shows in its process list (the image has no `ps`, so read `/proc`):
 

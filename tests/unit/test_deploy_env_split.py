@@ -168,6 +168,20 @@ def test_ingest_service_runs_serve(services: dict[str, Any]) -> None:
     assert ingest["image"] == services["scheduler"]["image"]
 
 
+def test_ingest_mounts_the_store_and_config(services: dict[str, Any]) -> None:
+    """Without the store mount serve would write PDFs into the container layer."""
+    targets = {v["target"]: v for v in services["ingest"]["volumes"]}
+    assert targets["/app/data/receipts"]["type"] == "bind"
+    assert not targets["/app/data/receipts"].get("read_only")
+    assert targets["/app/receipt-index.yaml"]["type"] == "bind"
+    assert services["ingest"]["environment"]["RECEIPT_INDEX_CONFIG"] == (
+        "/app/receipt-index.yaml"
+    )
+    assert services["ingest"]["environment"]["PLAYWRIGHT_BROWSERS_PATH"] == (
+        "/ms-playwright"
+    )
+
+
 def test_ingest_healthcheck_is_status_check(services: dict[str, Any]) -> None:
     check = services["ingest"]["healthcheck"]
     assert check["test"] == ["CMD", "receipt-index", "status", "--check"]

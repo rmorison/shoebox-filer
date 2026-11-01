@@ -858,7 +858,7 @@ After the cutover to `serve`, the external monitor ([8.9](#89-cutover-to-serve) 
 
 ### 8.1 Upgrade
 
-The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says. After the cutover to `serve` ([8.9](#89-cutover-to-serve)), the idle check has no ingest to find, and `up -d` stops `serve` gracefully when it recreates the `ingest` container: SIGTERM lets the item in hand finish (the service's `stop_grace_period` is 21 minutes). Follow it with `logs -f ingest` and `ps`, which shows `ingest` healthy within a couple of minutes.
+The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says. After the cutover to `serve` ([8.9](#89-cutover-to-serve)), the idle check has no ingest to find. Stop `serve` with the scheduler instead, so no item runs while the migrations do: `docker compose -f deploy/docker-compose.yml stop scheduler ingest`. `stop` lets the item in hand finish first (the service's `stop_grace_period` is 21 minutes; it normally takes seconds). Then follow `up -d` with `logs -f ingest` instead of `logs -f scheduler`, and check that `ps` shows `ingest` healthy within a couple of minutes.
 
 ```bash
 cd ~/receipt-index
@@ -1430,16 +1430,22 @@ Terminal failures never fail the check, since they are content problems, not liv
 
 **Later, not now.** Archiving (`archive: true`) is a later step, after a week with `status --check` clean and `backfill --dry-run --since <cutover minus 7 days>` reporting no unseen items. It depends on the dropoff archive release, so it isn't part of this cutover. Drive sources follow once the evidence store's Drive backend lands.
 
-**Rollback**, at any step above. Revert the cutover change, then let compose remove the `ingest` container and restart the scheduler with the old crontab. The change arrived as a merge, so revert the merge against its first parent:
+**Rollback**, at any step above. Go back to the release you noted in step 1, then let compose remove the `ingest` container and restart the scheduler with the old crontab:
 
 ```bash
 cd ~/receipt-index
-git log --merges --oneline -5 -- deploy/crontab   # the merge that removed the cron ingest line
-git revert --no-edit -m 1 <that merge>
+git switch --detach <the commit noted in step 1>
 docker compose -f deploy/docker-compose.yml up -d --remove-orphans
 ```
 
-No rebuild is needed: the change is in `deploy/` only. `--remove-orphans` removes the `ingest` container, since the reverted compose file no longer has the service, and `up -d` recreates the scheduler with the cron line back. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Nothing in the database needs undoing, and the one-shot `ingest` keeps working against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings. Land the same revert in the repository as well, or the next `git pull` brings the cutover back.
+`--remove-orphans` removes the `ingest` container, since the older compose file has no such service, and `up -d` recreates the scheduler with the cron ingest line back. The detached checkout leaves no commit on the server, so its clone never diverges from the repository. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Don't rebuild: the containers keep the image built for this release, and only the files in `deploy/` decide what runs. Nothing in the database needs undoing, and the one-shot `ingest` in that image works against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings.
+
+To stay rolled back across later upgrades, revert the cutover change in the repository (a git revert of its merge). Then return the server to the branch, which brings in the revert and so keeps the cron line:
+
+```bash
+git switch main && git pull
+docker compose -f deploy/docker-compose.yml up -d --remove-orphans
+```
 
 ---
 

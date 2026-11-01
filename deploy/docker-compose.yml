@@ -146,8 +146,10 @@ services:
     restart: unless-stopped
     # On SIGTERM serve finishes the item in hand, which may run for up to
     # ingest.item_timeout_seconds (1200 s by default, and never less). This is
-    # that plus a minute, so `stop`, `up -d` or a host shutdown never SIGKILLs
-    # an item in its time. Raise it with item_timeout_seconds.
+    # that plus a minute, so `stop` or `up -d` never SIGKILLs an item in its
+    # time. Raise it with item_timeout_seconds. A host shutdown is bounded by
+    # the Docker daemon's own stop timeout instead; an item it cuts short is
+    # recovered after the restart (design section 6, the dead `started` rule).
     stop_grace_period: 21m
     # PID 1 zombie reaping: Chromium forks aggressively during rendering.
     init: true
