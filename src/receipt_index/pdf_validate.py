@@ -168,6 +168,9 @@ def _child_main() -> None:
     """
     logging.disable(logging.CRITICAL)
     warnings.simplefilter("ignore")
+    # Python ignores SIGXFSZ, so a write past the output cap would only
+    # raise; restored, the signal stops the child and names the limit.
+    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
     job = sys.argv[1]
     memory, cpu, cap = (int(arg) for arg in sys.argv[2:5])
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -231,7 +234,10 @@ def _stopped_by(returncode: int, limits: PdfLimits) -> str:
     if returncode == _EXIT_MEMORY:
         return f"hit the {limits.memory_bytes // (1024 * 1024)} MB memory limit"
     if returncode < 0:
-        name = signal.Signals(-returncode).name
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
         return f"crashed with {name}, most often at the memory limit"
     return f"failed with exit code {returncode}"
 
@@ -265,13 +271,16 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
         )
         return None
     cap = output_cap(limits)
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(  # our own interpreter and module
+    with (
+        tempfile.TemporaryFile() as out,
+        tempfile.TemporaryFile() as err,
+        subprocess.Popen(  # our own interpreter and module
             _command(job, limits, args),
             stdin=subprocess.PIPE,
             stdout=out,
             stderr=err,
-        )
+        ) as proc,
+    ):
         try:
             proc.communicate(input=data, timeout=limits.wall_seconds)
         except subprocess.TimeoutExpired:

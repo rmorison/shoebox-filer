@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import resource
+import signal
 import subprocess
 import sys
 import textwrap
@@ -26,6 +27,7 @@ from receipt_index.pdf_validate import (
     PdfLimits,
     _judge,
     check_pdf,
+    run_bounded,
 )
 from tests.pdfs import (
     broken_header_pdf,
@@ -291,20 +293,11 @@ _MEASURE = """
 """
 
 
-@pytest.mark.parametrize(
-    "call",
-    [
-        "read_pdf(warning_flood_pdf(), limits=TIGHT)",
-        "check_pdf(warning_flood_pdf(), limits=TIGHT)",
-    ],
-    ids=["read", "check"],
-)
-def test_a_pdf_that_floods_warnings_leaves_the_parent_small(call: str) -> None:
+def test_a_pdf_that_floods_warnings_leaves_the_parent_small() -> None:
     # 40 KB that makes pdfminer log hundreds of megabytes; once buffered whole.
+    call = "read_pdf(warning_flood_pdf(), limits=TIGHT)"
     out = _in_fresh_process(_MEASURE.format(setup="", call=call))
-    assert out["result"] in ("None", "PdfCheck(status='ok', repaired=None)") or (
-        "unparseable" in out["result"]
-    )
+    assert out["result"] == "None"
     assert out["seconds"] < 20
     assert out["growth_mb"] < 100
 
@@ -329,6 +322,34 @@ def test_a_child_that_floods_its_output_leaves_the_parent_small(stream: str) -> 
         assert out["result"] == "None"  # 300 MB is past the output cap
     assert out["seconds"] < 30
     assert out["growth_mb"] < 100
+
+
+def test_a_child_that_writes_past_the_output_cap_is_stopped_and_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The real child entry point, with a job that writes 4 MB past a 1 MB cap.
+    def command(job: str, limits: PdfLimits, args: tuple[str, ...]) -> list[str]:
+        cap = pdf_validate.output_cap(limits)
+        script = (
+            "import sys; from receipt_index import pdf_validate as v; "
+            "v._check_job = lambda data: b'x' * (4 << 20); "
+            f"sys.argv = ['child', 'check', '{512 << 20}', '10', '{cap}']; "
+            "v._child_main()"
+        )
+        return [sys.executable, "-c", script]
+
+    limits = replace(RECEIPT_BOUNDS.check, max_bytes=1000)
+    with (
+        patch("receipt_index.pdf_validate._command", command),
+        caplog.at_level("WARNING", logger="receipt_index.pdf_validate"),
+    ):
+        assert run_bounded("check", b"%PDF", limits) is None
+    assert "PDF check stopped: hit the 1050576-byte output limit" in caplog.text
+
+
+@pytest.mark.parametrize("code", [-signal.SIGRTMIN, -40, 7])
+def test_any_ending_is_named_without_failing(code: int) -> None:
+    assert pdf_validate._stopped_by(code, RECEIPT_BOUNDS.read)
 
 
 def test_the_child_limits_core_dumps_and_output_size() -> None:

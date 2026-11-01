@@ -259,4 +259,5 @@ def child_that_writes(stdout: bytes, *, ends_with: int = 0) -> str:
         else f"sys.exit({ends_with})"
     )
     write = f"sys.stdout.buffer.write({stdout!r}); sys.stdout.flush()"
-    return f"import os, sys; {write}; {end}"
+    no_core = "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))"
+    return f"import os, resource, sys; {no_core}; {write}; {end}"
