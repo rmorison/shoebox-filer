@@ -297,7 +297,8 @@ def test_a_pdf_that_floods_warnings_leaves_the_parent_small() -> None:
     # 40 KB that makes pdfminer log hundreds of megabytes; once buffered whole.
     call = "read_pdf(warning_flood_pdf(), limits=TIGHT)"
     out = _in_fresh_process(_MEASURE.format(setup="", call=call))
-    assert out["result"] == "None"
+    # With nothing logged, a fast host may finish the read inside the limit.
+    assert out["result"] in ("None", "PdfRead(pages=5, text='', encrypted=False)")
     assert out["seconds"] < 20
     assert out["growth_mb"] < 100
 
