@@ -879,15 +879,17 @@ docker compose -f deploy/docker-compose.yml build
 # `stop ingest` lets serve finish the item in hand (its stop_grace_period is
 # 21 minutes; it normally takes seconds), so no item runs while the schema
 # changes. Before stopping the scheduler, check that no ad-hoc receipt-index
-# command that writes (a backfill, a retry, an unlink) is running in it; a
-# read-only one such as an MCP session or a search is safe to cut: recreating the container
-# would kill it mid-item. The image has no pgrep, so the check reads each
-# process's command line from /proc and prints `idle` only when the exec ran
-# and found none. `NOT idle` means one is running (let it finish) or the check
+# command that writes (a backfill, a retry, an unlink, an edit) is running in
+# it: stopping the container would kill it mid-item. A read-only one, such as
+# an MCP session or a search, is safe to cut. The check looks for the command
+# name right after `receipt-index`, so it misses a command run with a global
+# option first (`receipt-index --config ... backfill`). The image has no
+# pgrep, so the check reads each process's command line from /proc and prints
+# `idle` only when the exec ran and found none. `NOT idle` means one is running (let it finish) or the check
 # didn't run at all: a stopped container or a failed exec never reads as idle.
 # If `ps` shows the scheduler isn't running, there is nothing to wait for. The
 # `[b]` keeps grep from matching the shell that runs it.
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry|edit|refund|store)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 ```
 
 Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't running. Then:
@@ -896,9 +898,7 @@ Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't runnin
 docker compose -f deploy/docker-compose.yml stop ingest scheduler
 
 # Migrations before the new code runs (the db service stays up throughout)
-make migrate-up
-
-docker compose -f deploy/docker-compose.yml up -d
+make migrate-up && docker compose -f deploy/docker-compose.yml up -d
 ```
 
 A minute or two later, `ps` shows `ingest` as `(healthy)` and `status --check` prints `ok`:
@@ -1379,12 +1379,14 @@ git rev-parse --short HEAD     # the release before the cutover
 git pull
 docker compose -f deploy/docker-compose.yml build
 
-# Stop the scheduler between cron ingest runs. Ticks land on :00/:15/:30/:45
-# and normally finish in well under a minute. `idle` means the exec ran and
-# found no ingest; `NOT idle` means one is running (wait a minute and check
-# again) or the check didn't run. If `ps` shows the scheduler isn't running,
-# there is no run to wait for. The `[r]` keeps grep from matching itself.
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsa "[r]eceipt-index.ingest" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+# Stop the scheduler between cron ingest runs, with no ad-hoc command that
+# writes (a backfill, a retry, an unlink) running in it. Ticks land on
+# :00/:15/:30/:45 and normally finish in well under a minute. `idle` means the
+# exec ran and found none; `NOT idle` means one is running (wait a minute and
+# check again) or the check didn't run. If `ps` shows the scheduler isn't
+# running, there is nothing to wait for. The `[b]` keeps grep from matching
+# itself.
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry|edit|refund|store)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
 ```
 
 Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't running. Then:
@@ -1392,8 +1394,7 @@ Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't runnin
 ```bash
 docker compose -f deploy/docker-compose.yml stop scheduler
 
-make migrate-up
-docker compose -f deploy/docker-compose.yml up -d
+make migrate-up && docker compose -f deploy/docker-compose.yml up -d
 ```
 
 `up -d` starts the new `ingest` container and recreates the scheduler with the new crontab, which has no ingest line. Every source stays on `archive: false`: archiving is a later step. Your `deploy/receipt-index.yaml` needs no `ingest:` block (every key has a default), and it must not have an uncommented `ping_url` yet.
@@ -1561,7 +1562,12 @@ RECEIPT_INDEX_MCP_ACCESS_LOG=/app/data/mcp-logs/mcp-access.jsonl
 **4. Recreate the scheduler.** Compose reads `env_file` only when it creates the container, so `exec` won't see the new lines until you recreate it. As in [8.1](#81-upgrade), first check that no command that writes is running in it, going on only when the check prints `idle`:
 
 ```bash
-docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+docker compose -f deploy/docker-compose.yml exec -T scheduler sh -c 'grep -lsaE "[b]in/receipt-index.(ingest|backfill|unlink|link|duplicates|reextract|retry|edit|refund|store)" /proc/[0-9]*/cmdline; echo "check-exit=$?"' </dev/null | grep -qx 'check-exit=1' && echo idle || echo "NOT idle"
+```
+
+Repeat it until it prints `idle`, or until `ps` shows the scheduler isn't running. Then:
+
+```bash
 docker compose -f deploy/docker-compose.yml stop scheduler
 docker compose -f deploy/docker-compose.yml up -d scheduler
 ```
