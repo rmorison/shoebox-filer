@@ -751,6 +751,30 @@ class TestOriginalsOnlyAgainstTheImapFake:
         assert (result.failed, result.unavailable) == (1, 0)
 
 
+class TestLinkedRows:
+    def test_receipt_document_comes_from_the_rows_home_receipt(
+        self,
+        h: Harness,
+        fetched: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Duplicate detection moved this row onto another receipt; its own
+        # email was extracted on its home receipt.
+        asked: list[UUID] = []
+
+        def document(conn: Any, receipt_id: UUID) -> None:
+            asked.append(receipt_id)
+
+        monkeypatch.setattr(backfill, "latest_receipt_document", document)
+        home = uuid4()
+        row = _provenance("<a@example.com>").model_copy(
+            update={"home_receipt_id": home}
+        )
+        h.add_pending(row)
+        assert h.originals(fetched).stored == 1
+        assert asked == [home]
+
+
 class TestFullModeFills:
     def test_limit_caps_original_fills_too(self, h: Harness) -> None:
         rows = [_provenance(f"<m{n}@example.com>") for n in (1, 2, 3)]

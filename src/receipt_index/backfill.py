@@ -126,7 +126,11 @@ def _attach(
         source_name=provenance.source_name,
         received_at=provenance.received_at,
     )
-    document = latest_receipt_document(conn, provenance.receipt_id)
+    # The extraction that read this email is on its home receipt: a row
+    # linked to another receipt by duplicate detection keeps its home there.
+    document = latest_receipt_document(
+        conn, provenance.home_receipt_id or provenance.receipt_id
+    )
     attached = attach_email_original(
         conn,
         provenance.id,
