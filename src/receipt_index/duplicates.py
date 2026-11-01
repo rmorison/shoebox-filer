@@ -899,9 +899,10 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
 
     An unlink between them (either way, counting the receipts merged into
     each), or a dismissed pair between their records. Such a decision
-    outranks the rules: the scan never links the pair again. A later hand
-    ``link`` doesn't cancel an earlier unlink, so after an unlink only a
-    person re-merges the pair.
+    outranks the rules' links: the scan never links the pair again. An
+    unlinked pair can still be flagged for review (a dismissed one can't). A
+    later hand ``link`` doesn't cancel an earlier unlink, so after an unlink
+    only a person re-merges the pair.
     """
     row = conn.execute(
         """\
