@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 import zlib
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # The standard security handler's password padding (PDF 1.7, 7.6.3.3).
 _PDF_PAD = bytes.fromhex(
@@ -196,3 +203,61 @@ def filter_chain_pdf(megabytes: int = 256) -> bytes:
             _stream(_double_flate_zeros(megabytes)),
         ]
     )
+
+
+def warning_flood_pdf(pages: int = 5, ops: int = 400, operand: int = 100_000) -> bytes:
+    """A PDF whose pages make pdfminer log hundreds of megabytes of warnings.
+
+    One Flate content stream, shared by every page, holds ``ops`` ``cm``
+    operators each given a ``operand``-byte string: pdfminer logs each bad
+    operand's ``repr``. About 40 KB on disk.
+    """
+    body = b"".join(b"(" + b"\x01" * operand + b") 1 1 1 1 1 cm\n" for _ in range(ops))
+    packed = zlib.compress(body, 9)
+    content = 3 + pages
+    kids = " ".join(f"{3 + n} 0 R" for n in range(pages)).encode()
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >>"
+        b" /Contents %d 0 R >>" % content
+    )
+    return _raw_pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % pages,
+            *[page] * pages,
+            b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(packed)
+            + packed
+            + b"\nendstream",
+        ]
+    )
+
+
+@contextmanager
+def fake_child(code: str) -> Iterator[list[str]]:
+    """Run the Python ``code`` as every bounded child, instead of the job.
+
+    Yields the list of jobs the runner started.
+    """
+    jobs: list[str] = []
+
+    def command(job: str, limits: object, args: tuple[str, ...]) -> list[str]:
+        jobs.append(job)
+        return [sys.executable, "-c", code]
+
+    with patch("receipt_index.pdf_validate._command", command):
+        yield jobs
+
+
+def child_that_writes(stdout: bytes, *, ends_with: int = 0) -> str:
+    """Code for a fake child: write ``stdout``, then exit or die.
+
+    A negative ``ends_with`` is a signal the child sends itself.
+    """
+    end = (
+        f"os.kill(os.getpid(), {-ends_with})"
+        if ends_with < 0
+        else f"sys.exit({ends_with})"
+    )
+    write = f"sys.stdout.buffer.write({stdout!r}); sys.stdout.flush()"
+    no_core = "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))"
+    return f"import os, resource, sys; {no_core}; {write}; {end}"
