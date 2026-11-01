@@ -344,12 +344,16 @@ def test_a_child_that_writes_past_the_output_cap_is_stopped_and_named(
         caplog.at_level("WARNING", logger="receipt_index.pdf_validate"),
     ):
         assert run_bounded("check", b"%PDF", limits) is None
-    assert "PDF check stopped: hit the 1050576-byte output limit" in caplog.text
+    cap = pdf_validate.output_cap(limits)
+    assert f"PDF check stopped: hit the {cap}-byte output limit" in caplog.text
 
 
-@pytest.mark.parametrize("code", [-signal.SIGRTMIN, -40, 7])
-def test_any_ending_is_named_without_failing(code: int) -> None:
-    assert pdf_validate._stopped_by(code, RECEIPT_BOUNDS.read)
+@pytest.mark.parametrize(
+    ("code", "named"),
+    [(-signal.SIGRTMIN, "SIGRTMIN"), (-40, "signal 40"), (7, "exit code 7")],
+)
+def test_any_ending_is_named_without_failing(code: int, named: str) -> None:
+    assert named in pdf_validate._stopped_by(code, RECEIPT_BOUNDS.read)
 
 
 def test_the_child_limits_core_dumps_and_output_size() -> None:

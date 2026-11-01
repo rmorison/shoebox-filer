@@ -305,6 +305,8 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
             )
             return None
         size = out.seek(0, os.SEEK_END)
+        # Our child is stopped at the cap; this guards against any child
+        # that doesn't limit itself, so the parent never relies on it.
         if size > cap:
             logger.warning(
                 "PDF %s stopped: wrote %d bytes, over the %d-byte output limit"
