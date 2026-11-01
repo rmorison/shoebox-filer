@@ -16,7 +16,11 @@ from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.adapters.gdrive import GdriveAdapter
-from receipt_index.adapters.imap import ImapAdapter, MessageRefusedError
+from receipt_index.adapters.imap import (
+    AmbiguousMatchError,
+    ImapAdapter,
+    MessageRefusedError,
+)
 from tests.unit.test_gdrive_adapter import (
     FakeDrive,
     _http_error,
@@ -98,12 +102,16 @@ class TestImapFetchById:
         assert _imap(imap_config, fake).fetch_by_id("<gone@example.com>") is None
         assert fake.body_fetches() == []
 
-    def test_two_matches_are_none(self, imap_config: ImapSourceConfig) -> None:
-        # A Message-ID is set by the sender and isn't guaranteed unique.
+    def test_two_matches_are_ambiguous_not_missing(
+        self, imap_config: ImapSourceConfig
+    ) -> None:
+        # A Message-ID is set by the sender and isn't guaranteed unique. The
+        # message is there, so it mustn't read as gone.
         fake = SearchingIMAPClient(
             {3: _mail("<dup@example.com>", "A"), 4: _mail("<dup@example.com>", "B")}
         )
-        assert _imap(imap_config, fake).fetch_by_id("<dup@example.com>") is None
+        with pytest.raises(AmbiguousMatchError, match="2 messages"):
+            _imap(imap_config, fake).fetch_by_id("<dup@example.com>")
         assert fake.body_fetches() == []
 
     def test_substring_match_is_not_a_match(

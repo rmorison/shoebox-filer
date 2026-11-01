@@ -400,7 +400,21 @@ def test_originals_only_range_is_inclusive_by_day(pg_conn: Conn) -> None:
     )
     pg_conn.rollback()
     assert [r.source_id for r in rows] == ["<first@x>", "<last@x>"]
+
+    # The days are UTC days whatever the session's time zone: 23:30 UTC on
+    # the 12th is the 13th in Tokyo, and still inside --until 2024-03-12.
+    _back_catalogue(pg_conn, "<late@x>", source, received_at="2024-03-12T23:30:00Z")
+    pg_conn.execute("SET TIME ZONE 'Asia/Tokyo'")
+    try:
+        rows = provenance_missing_originals(
+            pg_conn, source, date(2024, 3, 10), date(2024, 3, 12)
+        )
+    finally:
+        pg_conn.rollback()
+        pg_conn.execute("RESET TIME ZONE")
+        pg_conn.commit()
+    assert [r.source_id for r in rows] == ["<first@x>", "<last@x>", "<late@x>"]
     assert [
         r.source_id for r in provenance_missing_originals(pg_conn, source, None, None)
-    ] == list(days)
+    ] == ["<before@x>", "<first@x>", "<last@x>", "<late@x>", "<after@x>"]
     pg_conn.rollback()

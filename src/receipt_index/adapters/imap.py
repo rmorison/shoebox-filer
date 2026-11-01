@@ -52,6 +52,14 @@ class MessageRefusedError(Exception):
     """The server, on a healthy session, refused one message: an item error."""
 
 
+class AmbiguousMatchError(MessageRefusedError):
+    """Several messages carry the exact Message-ID looked for.
+
+    The message is there, so it isn't missing; which one is meant can't be
+    told from the ID. An item error, never "not found".
+    """
+
+
 # RFC 5530 response codes that describe the session or the mailbox, not one
 # message: a NO carrying one is an outage, never a refused message.
 # SERVERBUG and LIMIT are left out on purpose: Dovecot uses them for a FETCH
@@ -464,9 +472,13 @@ class ImapAdapter:
     def fetch_by_id(self, source_id: str) -> RawReceipt | None:
         """Find one message by its Message-ID and download it.
 
-        None unless exactly one message, across the searched folders, has
-        that exact Message-ID (it is set by the sender and isn't guaranteed
-        unique), and for IDs that can't be searched for.
+        None only when the search completed and no message, across the
+        searched folders, has that exact Message-ID, and for IDs that can't
+        be searched for. A message that is there but can't be read raises
+        instead, so it is never taken for a missing one:
+        ``AmbiguousMatchError`` when several carry the ID (it is set by the
+        sender and isn't guaranteed unique), ``MessageRefusedError`` when the
+        server refuses or returns nothing for its headers or body.
         """
         criteria = _message_id_search(source_id)
         if criteria is None:
@@ -495,13 +507,19 @@ class ImapAdapter:
         data = response.get(uid)
         raw = data.get(_BODY_KEY) if data else None
         if not isinstance(raw, bytes):
-            return None
+            raise MessageRefusedError(f"server returned no body for UID {uid}")
         return self._parse_message(raw, source_id)
+
+    @property
+    def lookup_folders(self) -> list[str]:
+        """The folders ``fetch_by_id`` searches, in order."""
+        return self._lookup_folders()
 
     def _find_exact(self, criteria: str, source_id: str) -> int | None:
         """The UID of the one message with exactly this Message-ID, selected.
 
-        None when none or several match. Leaves its folder selected.
+        None when none matches; ``AmbiguousMatchError`` when several do.
+        Leaves its folder selected.
         """
         matches: list[tuple[str, int, int]] = []
         for folder in self._lookup_folders():
@@ -511,13 +529,16 @@ class ImapAdapter:
 
         # SEARCH HEADER matches substrings: keep exact matches only.
         exact = [m for m in matches if self._has_message_id(m, source_id)]
-        if len(exact) != 1:
-            if len(exact) > 1:
-                logger.warning(
-                    "%d messages share Message-ID %s; not re-fetching",
-                    len(exact),
-                    source_id,
-                )
+        if len(exact) > 1:
+            logger.warning(
+                "%d messages share Message-ID %s; not re-fetching",
+                len(exact),
+                source_id,
+            )
+            raise AmbiguousMatchError(
+                f"{len(exact)} messages share Message-ID {source_id}"
+            )
+        if not exact:
             return None
         folder, uidvalidity, uid = exact[0]
         self._select(folder)
@@ -538,7 +559,7 @@ class ImapAdapter:
         data = response.get(uid)
         headers = _header_bytes(data) if data else None
         if headers is None:
-            return False
+            raise MessageRefusedError(f"server returned no headers for UID {uid}")
         return self._get_message_id(message_from_bytes(headers)) == source_id
 
     def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:

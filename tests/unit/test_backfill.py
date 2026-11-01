@@ -8,7 +8,7 @@ service the adapter tests use. The end-to-end runs are integration tests
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import MagicMock
@@ -26,9 +26,10 @@ from receipt_index.adapters.imap import (
     _range_criteria,
     can_search_by_id,
 )
-from receipt_index.fetching import Fetched, SourceDownError
+from receipt_index.fetching import Fetched, SourceDownError, SourcePool
 from receipt_index.models import ItemRef, Provenance, RawReceipt
 from receipt_index.pipeline import ItemOutcome
+from tests.unit.test_fetch_by_id import SearchingIMAPClient
 from tests.unit.test_gdrive_adapter import FakeDrive, _make_gdrive_config
 from tests.unit.test_imap_adapter import FakeIMAPClient, _make_simple_email
 
@@ -291,11 +292,13 @@ class TestRunBackfill:
         h.processed = {row.source_id, "<m2@example.com>"}
         h.add_pending(row)
         refs = [_ref(1), _ref(2), _ref(3), _ref(4), _ref(5)]
-        dry = h.run(FakeAdapter(refs), dry_run=True, limit=2)
+        dry = h.run(FakeAdapter(refs), dry_run=True, limit=3)
         assert h.handled == [] and h.stored == [] and h.attached == []
+        # --limit counts the fill and the unseen items together.
         assert (dry.unseen, dry.originals_missing) == (2, 1)
-        real = h.run(FakeAdapter(refs), limit=2)
+        real = h.run(FakeAdapter(refs), limit=3)
         assert len(h.handled) == dry.unseen == real.unseen
+        assert real.originals_stored == dry.originals_missing
 
     def test_never_moves_a_cursor(
         self, h: Harness, monkeypatch: pytest.MonkeyPatch
@@ -648,3 +651,127 @@ class TestDriveListRange:
         assert [r.source_id for r in refs] == ["f1", "f2"]
         assert refs[0].skip_reason is None
         assert refs[1].skip_reason is not None  # recorded as skipped, as in ingest
+
+
+# ---------------------------------------------------------------------------
+# --originals-only through the real fetch path, against the IMAP fake
+# ---------------------------------------------------------------------------
+
+
+class BodylessIMAPClient(SearchingIMAPClient):
+    """Answers a body FETCH with OK and no BODY[] item."""
+
+    def fetch(self, uids: list[int], items: list[str]) -> dict[int, dict[bytes, Any]]:
+        if items == ["BODY.PEEK[]"]:
+            self.fetches.append((list(uids), list(items)))
+            return {u: {b"SEQ": u} for u in uids}
+        return super().fetch(uids, items)
+
+
+def _pool_over(fake: FakeIMAPClient, imap_config: ImapSourceConfig) -> Any:
+    def factory(config: Any) -> ImapAdapter:
+        adapter = ImapAdapter(config)
+        adapter._client = fake  # type: ignore[assignment]
+        return adapter
+
+    stack = ExitStack()
+    return SourcePool([imap_config], factory, stack)  # type: ignore[arg-type]
+
+
+class TestOriginalsOnlyAgainstTheImapFake:
+    """No mocked fetch_item: the adapter decides found, gone or neither."""
+
+    def _run(self, h: Harness, fake: FakeIMAPClient, imap_config: Any) -> Any:
+        return backfill.run_originals_only(
+            h.conn,
+            _pool_over(fake, imap_config),
+            store=MagicMock(),
+            source_name=imap_config.name,
+        )
+
+    def _row(self, h: Harness, source_id: str, imap_config: Any) -> Provenance:
+        row = _provenance(source_id).model_copy(
+            update={"source_name": imap_config.name}
+        )
+        h.add_pending(row)
+        return row
+
+    def test_present_message_is_stored(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        row = self._row(h, "<a@example.com>", imap_config)
+        fake = SearchingIMAPClient({3: _make_simple_email(message_id=row.source_id)})
+        result = self._run(h, fake, imap_config)
+        assert (result.stored, h.attached) == (1, [row.id])
+
+    def test_zero_matches_is_unavailable_and_names_the_folder(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        row = self._row(h, "<gone@example.com>", imap_config)
+        fake = SearchingIMAPClient(
+            {3: _make_simple_email(message_id="<a@example.com>")}
+        )
+        result = self._run(h, fake, imap_config)
+        assert result.unavailable == 1
+        assert h.marked == [
+            (row.id, "not found in INBOX by Message-ID (source test-imap)")
+        ]
+
+    def test_duplicate_message_id_is_ambiguous_and_stays_pending(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        row = self._row(h, "<dup@example.com>", imap_config)
+        fake = SearchingIMAPClient(
+            {
+                3: _make_simple_email(message_id=row.source_id, subject="A"),
+                4: _make_simple_email(message_id=row.source_id, subject="B"),
+            }
+        )
+        result = self._run(h, fake, imap_config)
+        assert h.marked == [] and h.attached == []
+        assert (result.ambiguous, result.unavailable) == (1, 0)
+
+    def test_empty_body_stays_pending(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        row = self._row(h, "<a@example.com>", imap_config)
+        fake = BodylessIMAPClient({3: _make_simple_email(message_id=row.source_id)})
+        result = self._run(h, fake, imap_config)
+        assert h.marked == [] and h.attached == []
+        assert (result.failed, result.unavailable) == (1, 0)
+
+    def test_empty_header_answer_stays_pending(
+        self, h: Harness, imap_config: ImapSourceConfig
+    ) -> None:
+        row = self._row(h, "<a@example.com>", imap_config)
+        fake = SearchingIMAPClient({3: _make_simple_email(message_id=row.source_id)})
+        fake.drop_headers.add(3)
+        result = self._run(h, fake, imap_config)
+        assert h.marked == [] and h.attached == []
+        assert (result.failed, result.unavailable) == (1, 0)
+
+
+class TestFullModeFills:
+    def test_limit_caps_original_fills_too(self, h: Harness) -> None:
+        rows = [_provenance(f"<m{n}@example.com>") for n in (1, 2, 3)]
+        h.processed = {r.source_id for r in rows} | {"<m4@example.com>"}
+        h.add_pending(*rows)
+        refs = [_ref(1), _ref(2), _ref(3), _ref(5)]
+        dry = h.run(FakeAdapter(refs), dry_run=True, limit=2)
+        assert (dry.originals_missing, dry.unseen) == (2, 0)
+        adapter = FakeAdapter(refs)
+        result = h.run(adapter, limit=2)
+        assert len(adapter.fetched) == 2
+        assert (result.originals_stored, result.unseen) == (2, 0)
+        assert h.handled == []
+
+    def test_every_row_of_one_email_is_filled_from_one_fetch(self, h: Harness) -> None:
+        first = _provenance("<m1@example.com>")
+        second = _provenance("<m1@example.com>")
+        h.processed = {first.source_id}
+        h.add_pending(first, second)
+        adapter = FakeAdapter([_ref(1)])
+        result = h.run(adapter)
+        assert adapter.fetched == ["<m1@example.com>"]
+        assert h.attached == [first.id, second.id]
+        assert result.originals_stored == 2

@@ -1874,7 +1874,7 @@ def provenance_missing_originals(
 ) -> list[Provenance]:
     """A source's provenance rows whose original is still ``pending``.
 
-    ``since`` and ``until`` are inclusive days, on ``received_at``. Rows
+    ``since`` and ``until`` are inclusive UTC days, on ``received_at``. Rows
     already marked ``unavailable`` aren't listed again (evidence-store
     design, §7 "Backfill"). Oldest first.
     """
@@ -1883,9 +1883,10 @@ def provenance_missing_originals(
         SELECT * FROM receipt.provenance
          WHERE source_name = %(source_name)s
            AND original_status = 'pending'
-           AND (%(since)s::date IS NULL OR received_at >= %(since)s::date)
+           AND (%(since)s::date IS NULL
+                OR received_at >= %(since)s::date::timestamp AT TIME ZONE 'UTC')
            AND (%(until)s::date IS NULL
-                OR received_at < %(until)s::date + 1)
+                OR received_at < (%(until)s::date + 1)::timestamp AT TIME ZONE 'UTC')
          ORDER BY received_at, id
         """,
         {"source_name": source_name, "since": since, "until": until},

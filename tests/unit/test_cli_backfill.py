@@ -162,3 +162,9 @@ class TestOriginalsOnly:
         env["originals"].return_value = OriginalsResult(source_error="unavailable")
         result = _invoke(env, "--source", "test-email", "--originals-only")
         assert result.exit_code == 1
+
+    def test_reports_ambiguous_message_ids(self, env: dict[str, Any]) -> None:
+        env["originals"].return_value = OriginalsResult(to_fetch=1, ambiguous=1)
+        result = _invoke(env, "--source", "test-email", "--originals-only")
+        assert result.exit_code == 0, result.output
+        assert "1 whose Message-ID more than one message carries" in result.output

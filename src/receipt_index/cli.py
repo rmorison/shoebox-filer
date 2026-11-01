@@ -1698,7 +1698,10 @@ def _echo_estimate(estimate: dict[str, Any] | None) -> None:
     "--limit",
     type=click.IntRange(min=1),
     default=None,
-    help="Max unseen items (or, with --originals-only, originals) to fetch.",
+    help=(
+        "Max items to download: unseen items plus missing originals (with "
+        "--originals-only, originals)."
+    ),
 )
 @click.pass_context
 def backfill(
@@ -1770,6 +1773,11 @@ def backfill(
                     f"Failed: {originals.failed}  "
                     f"Locked: {originals.locked}"
                 )
+            if originals.ambiguous:
+                click.echo(
+                    f"Left pending: {originals.ambiguous} whose Message-ID more "
+                    "than one message carries (see the log; resolve by hand)"
+                )
             if originals.unsearchable:
                 click.echo(
                     f"Left pending: {originals.unsearchable} with no Message-ID to "
@@ -1811,6 +1819,7 @@ def backfill(
             click.echo(
                 f"Listed: {result.listed}  Unseen: {result.unseen}  "
                 f"Originals missing: {result.originals_missing}"
+                + (f"  (capped by --limit {limit})" if limit is not None else "")
             )
             _echo_estimate(
                 _token_estimate(conn, config, config.llm.model, result.unseen)

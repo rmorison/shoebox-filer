@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-from receipt_index.adapters.imap import ImapAdapter
+from receipt_index.adapters.imap import AmbiguousMatchError, ImapAdapter
 from receipt_index.config import ImapSourceConfig
 
 from .conftest import GREENMAIL_IMAP_PORT, seed_email
@@ -58,13 +58,14 @@ def test_finds_one_message_by_its_id(
     assert b"Total 12.00" in raw.raw_bytes
 
 
-def test_shared_message_id_is_none(greenmail_available: bool) -> None:
+def test_shared_message_id_is_ambiguous(greenmail_available: bool) -> None:
     adapter, user = _adapter()
     shared = f"<dup-{uuid.uuid4().hex[:6]}@example.com>"
     seed_email(to_addr=user, subject="One", text_body="x", message_id=shared)
     seed_email(to_addr=user, subject="Two", text_body="y", message_id=shared)
-    with adapter:
-        assert adapter.fetch_by_id(shared) is None
+    # Both messages are there, so the lookup is ambiguous, never "not found".
+    with adapter, pytest.raises(AmbiguousMatchError):
+        adapter.fetch_by_id(shared)
 
 
 def test_missing_and_substring_ids_are_none(greenmail_available: bool) -> None:

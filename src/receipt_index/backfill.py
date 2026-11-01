@@ -22,7 +22,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from receipt_index.adapters.base import SourceUnavailableError
-from receipt_index.adapters.imap import can_search_by_id
+from receipt_index.adapters.imap import AmbiguousMatchError, can_search_by_id
 from receipt_index.fetching import SourceDownError, fetch_item
 from receipt_index.locks import item_lock
 from receipt_index.originals import attach_email_original, store_email_original
@@ -61,8 +61,10 @@ class BackfillResult:
     """Summary of a full-mode backfill over one source.
 
     ``unseen`` counts the items handed to ``handle_item`` (in a dry run, the
-    items that would be). ``originals_missing`` counts seen items whose
-    original is still pending.
+    items that would be). ``originals_missing`` counts the pending
+    provenance rows of seen items that were (or would be) filled in; both
+    count towards ``limit``. ``originals_ambiguous`` rows share their
+    Message-ID with another message and stay pending.
     """
 
     listed: int = 0
@@ -74,6 +76,7 @@ class BackfillResult:
     originals_missing: int = 0
     originals_stored: int = 0
     originals_failed: int = 0
+    originals_ambiguous: int = 0
     receipts: list[Receipt] = field(default_factory=list)
     source_error: str | None = None
 
@@ -84,14 +87,16 @@ class OriginalsResult:
 
     ``to_fetch`` counts the rows looked up (in a dry run, those that would
     be). ``unsearchable`` rows have an ID the shared fetch path can't search
-    for, and ``drive_pending`` rows wait for the Drive backend: both stay
-    pending.
+    for, ``ambiguous`` rows share their exact Message-ID with another
+    message, and ``drive_pending`` rows wait for the Drive backend: all stay
+    pending. Only a search that found no message marks a row unavailable.
     """
 
     to_fetch: int = 0
     stored: int = 0
     unavailable: int = 0
     failed: int = 0
+    ambiguous: int = 0
     locked: int = 0
     unchanged: int = 0
     unsearchable: int = 0
@@ -144,6 +149,7 @@ def _fill_original(
     """Lock, re-check, fetch and attach one pending original.
 
     Returns ``stored``, ``locked``, ``unchanged`` (no longer pending),
+    ``ambiguous`` (several messages carry the ID: left pending),
     ``failed`` (``fetch`` raised, or storing failed: the row stays pending),
     and when ``fetch`` found nothing, ``unavailable`` (marked with
     ``unavailable_reason``) or, without a reason, ``gone`` (left pending).
@@ -161,6 +167,13 @@ def _fill_original(
             raw = fetch()
         except (SourceUnavailableError, SourceDownError):
             raise
+        except AmbiguousMatchError as exc:
+            logger.warning(
+                "Original of %s left pending: %s (resolve by hand)",
+                current.source_id,
+                exc,
+            )
+            return "ambiguous"
         except Exception:
             logger.warning(
                 "Can't fetch the original of %s", current.source_id, exc_info=True
@@ -185,8 +198,9 @@ def _fill_original(
 def _lookup(pool: SourcePool, provenance: Provenance) -> RawReceipt | None:
     """Find a row's item through the shared fetch path.
 
-    A refusal from the server raises: it isn't proof the item is gone, so
-    the row is never marked unavailable for it.
+    Anything but a completed search with no match raises (a refusal, an
+    empty response, several matches): none of those proves the item is
+    gone, so the row is never marked unavailable for it.
     """
     fetched = fetch_item(
         pool,
@@ -197,6 +211,18 @@ def _lookup(pool: SourcePool, provenance: Provenance) -> RawReceipt | None:
     if fetched.raw is None and fetched.item_error is not None:
         raise fetched.item_error
     return fetched.raw
+
+
+def _once(fetch: Callable[[], RawReceipt | None]) -> Callable[[], RawReceipt | None]:
+    """``fetch``, called at most once successfully; later calls reuse it."""
+    got: list[RawReceipt | None] = []
+
+    def call() -> RawReceipt | None:
+        if not got:
+            got.append(fetch())
+        return got[0]
+
+    return call
 
 
 def run_backfill(
@@ -218,7 +244,9 @@ def run_backfill(
 
     Unseen means no provenance row and no ``ingest_log`` row, the rule
     every full scan uses: a failed, skipped or retrying item stays the retry
-    machinery's. ``limit`` caps the unseen items handled. A dry run lists
+    machinery's. ``limit`` caps the downloads: unseen items handled plus
+    original fills. Every pending provenance row of a seen item is filled
+    from one fetch. A dry run lists
     and counts, and writes nothing. No cursor moves and no source lock is
     taken.
     """
@@ -232,31 +260,32 @@ def run_backfill(
             return result
         result.listed = len(refs)
         processed_ids = get_processed_source_ids(conn)
-        pending = (
-            {p.source_id: p for p in provenance_missing_originals(conn, source_name)}
-            if source_type == "imap"
-            else {}
-        )
+        pending: dict[str, list[Provenance]] = {}
+        if source_type == "imap":
+            for row in provenance_missing_originals(conn, source_name):
+                pending.setdefault(row.source_id, []).append(row)
         conn.commit()
+
+        def spent() -> int:
+            return result.unseen + result.originals_missing
 
         try:
             for ref in refs:
                 if ref.source_id in processed_ids:
-                    provenance = pending.get(ref.source_id)
-                    if provenance is None:
-                        continue
-                    result.originals_missing += 1
-                    if dry_run:
-                        continue
-                    status = _fill_original(
-                        conn, store, provenance, partial(adapter.fetch, ref)
-                    )
-                    if status == "stored":
-                        result.originals_stored += 1
-                    elif status in ("failed", "gone"):
-                        result.originals_failed += 1
+                    fetch = _once(partial(adapter.fetch, ref))
+                    for provenance in pending.get(ref.source_id, []):
+                        if limit is not None and spent() >= limit:
+                            break
+                        result.originals_missing += 1
+                        if dry_run:
+                            continue
+                        status = _fill_original(conn, store, provenance, fetch)
+                        if status == "stored":
+                            result.originals_stored += 1
+                        elif status in ("failed", "gone"):
+                            result.originals_failed += 1
                     continue
-                if limit is not None and result.unseen >= limit:
+                if limit is not None and spent() >= limit:
                     continue
                 result.unseen += 1
                 if dry_run:
@@ -316,11 +345,13 @@ def run_originals_only(
     marked ``unavailable`` with a reason. An item error leaves the row
     pending for a later run, and a source that can't be reached stops the
     run. Drive rows, and IDs that can't be searched for, stay pending.
-    ``limit`` caps the rows looked up.
+    ``limit`` caps the rows looked up. The unavailable reason names the
+    folders searched, so a later re-check can find those rows.
     """
     result = OriginalsResult()
     rows = provenance_missing_originals(conn, source_name, since, until)
     conn.commit()
+    reason: str | None = None
     for provenance in rows:
         if provenance.source_type != "imap":
             result.drive_pending += 1
@@ -334,15 +365,15 @@ def run_originals_only(
         if dry_run:
             continue
 
+        if reason is None:
+            reason = _unavailable_reason(pool, source_name)
         try:
             status = _fill_original(
                 conn,
                 store,
                 provenance,
                 partial(_lookup, pool, provenance),
-                unavailable_reason=(
-                    f"no single message with this Message-ID in source {source_name}"
-                ),
+                unavailable_reason=reason,
             )
         except SourceDownError as exc:
             logger.error("Originals for %s stopped: %s", source_name, exc)
@@ -355,8 +386,17 @@ def run_originals_only(
             result.stored += 1
         elif status == "failed":
             result.failed += 1
+        elif status == "ambiguous":
+            result.ambiguous += 1
         elif status == "locked":
             result.locked += 1
         else:
             result.unchanged += 1
     return result
+
+
+def _unavailable_reason(pool: SourcePool, source_name: str) -> str:
+    """Why a row is unavailable: which folders the search found nothing in."""
+    folders = getattr(pool.adapter(source_name), "lookup_folders", None)
+    where = ", ".join(folders) if folders else f"source {source_name}"
+    return f"not found in {where} by Message-ID (source {source_name})"
