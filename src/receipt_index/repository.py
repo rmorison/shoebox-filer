@@ -1866,6 +1866,116 @@ def insert_provenance_files(
         )
 
 
+def provenance_missing_originals(
+    conn: psycopg.Connection[dict[str, Any]],
+    source_name: str,
+    since: date | None = None,
+    until: date | None = None,
+) -> list[Provenance]:
+    """A source's provenance rows whose original is still ``pending``.
+
+    ``since`` and ``until`` are inclusive UTC days, on ``received_at``. Rows
+    already marked ``unavailable`` aren't listed again (evidence-store
+    design, §7 "Backfill"). Oldest first.
+    """
+    rows = conn.execute(
+        """\
+        SELECT * FROM receipt.provenance
+         WHERE source_name = %(source_name)s
+           AND original_status = 'pending'
+           AND (%(since)s::date IS NULL
+                OR received_at >= %(since)s::date::timestamp AT TIME ZONE 'UTC')
+           AND (%(until)s::date IS NULL
+                OR received_at < (%(until)s::date + 1)::timestamp AT TIME ZONE 'UTC')
+         ORDER BY received_at, id
+        """,
+        {"source_name": source_name, "since": since, "until": until},
+    ).fetchall()
+    return [Provenance.model_validate(r) for r in rows]
+
+
+def get_provenance(
+    conn: psycopg.Connection[dict[str, Any]], provenance_id: UUID
+) -> Provenance | None:
+    """One provenance row by its ID."""
+    row = conn.execute(
+        "SELECT * FROM receipt.provenance WHERE id = %(id)s", {"id": provenance_id}
+    ).fetchone()
+    return None if row is None else Provenance.model_validate(row)
+
+
+def latest_receipt_document(
+    conn: psycopg.Connection[dict[str, Any]], receipt_id: UUID
+) -> str | None:
+    """The ``receipt_document`` the receipt's latest good extraction named."""
+    row = conn.execute(
+        f"""\
+        SELECT output->>'receipt_document' AS doc FROM receipt.extractions
+         WHERE receipt_id = %(id)s AND NOT ({_failed()})
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+        """,
+        {"id": receipt_id},
+    ).fetchone()
+    return None if row is None else row["doc"]
+
+
+def attach_original(
+    conn: psycopg.Connection[dict[str, Any]],
+    provenance_id: UUID,
+    *,
+    original_file_id: UUID,
+    source_sha256: bytes,
+    receipt_document_file_id: UUID | None,
+    document_certainty: DocumentCertainty | None,
+) -> bool:
+    """Link a stored original to a pending provenance row. Doesn't commit.
+
+    The whole original's hash fills ``source_sha256`` only where the row has
+    none. Returns False, changing nothing, unless the row was ``pending``.
+    """
+    row = conn.execute(
+        """\
+        UPDATE receipt.provenance
+           SET original_file_id = %(original)s,
+               receipt_document_file_id = %(document)s,
+               document_certainty = %(certainty)s,
+               source_sha256 = COALESCE(source_sha256, %(sha256)s),
+               original_status = 'stored'
+         WHERE id = %(id)s AND original_status = 'pending'
+        RETURNING id
+        """,
+        {
+            "id": provenance_id,
+            "original": original_file_id,
+            "document": receipt_document_file_id,
+            "certainty": document_certainty,
+            "sha256": source_sha256,
+        },
+    ).fetchone()
+    return row is not None
+
+
+def mark_original_unavailable(
+    conn: psycopg.Connection[dict[str, Any]], provenance_id: UUID, reason: str
+) -> bool:
+    """Mark a pending original as gone from its source. Doesn't commit.
+
+    Returns False, changing nothing, unless the row was ``pending``.
+    """
+    row = conn.execute(
+        """\
+        UPDATE receipt.provenance
+           SET original_status = 'unavailable',
+               original_unavailable_reason = %(reason)s
+         WHERE id = %(id)s AND original_status = 'pending'
+        RETURNING id
+        """,
+        {"id": provenance_id, "reason": reason},
+    ).fetchone()
+    return row is not None
+
+
 def receipts_without_rendition(
     conn: psycopg.Connection[dict[str, Any]],
 ) -> list[tuple[UUID, str | None]]:

@@ -117,7 +117,6 @@ def ingest(
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
     from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
-    from receipt_index.extraction import create_extraction_agent
     from receipt_index.fetching import SourcePool
     from receipt_index.locks import SourceLock
     from receipt_index.pipeline import IngestResult, run_due_retries, run_ingest
@@ -144,20 +143,8 @@ def ingest(
 
     store = open_store(config.store)
 
-    # Create extraction agents — email and document prompts differ
-    from receipt_index.extraction import DOCUMENT_SYSTEM_PROMPT
-
-    email_agent = create_extraction_agent(
-        api_key=config.llm.api_key,
-        model=config.llm.model,
-    )
-    document_agent = create_extraction_agent(
-        api_key=config.llm.api_key,
-        model=config.llm.model,
-        system_prompt=DOCUMENT_SYSTEM_PROMPT,
-    )
-
-    agents = {"email": email_agent, "document": document_agent}
+    agents = _extraction_agents(config, config.llm.model)
+    email_agent, document_agent = agents["email"], agents["document"]
     policy = RetryPolicy.from_config(config.ingest)
     totals = IngestResult()
     source_results: list[tuple[str, IngestResult]] = []
@@ -312,10 +299,6 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         INGEST_STATEMENT_TIMEOUT_SECONDS,
         get_connection,
     )
-    from receipt_index.extraction import (
-        DOCUMENT_SYSTEM_PROMPT,
-        create_extraction_agent,
-    )
     from receipt_index.health import HEARTBEAT_PATH
     from receipt_index.locks import SourceLock
     from receipt_index.retries import RetryPolicy
@@ -357,16 +340,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         if not held:
             sys.exit(3)
 
-        agents = {
-            "email": create_extraction_agent(
-                api_key=config.llm.api_key, model=config.llm.model
-            ),
-            "document": create_extraction_agent(
-                api_key=config.llm.api_key,
-                model=config.llm.model,
-                system_prompt=DOCUMENT_SYSTEM_PROMPT,
-            ),
-        }
+        agents = _extraction_agents(config, config.llm.model)
         ingest_config = config.ingest
         health = ingest_config.health
         service = Service(
@@ -1615,12 +1589,252 @@ def _source_adapter(config: AppConfig) -> Callable[[SourceConfig], SourceAdapter
     return build
 
 
+def _extraction_agents(config: AppConfig, model: str) -> dict[str, Any]:
+    """The email and document extraction agents: their prompts differ."""
+    from receipt_index.extraction import (
+        DOCUMENT_SYSTEM_PROMPT,
+        create_extraction_agent,
+    )
+
+    return {
+        "email": create_extraction_agent(api_key=config.llm.api_key, model=model),
+        "document": create_extraction_agent(
+            api_key=config.llm.api_key,
+            model=model,
+            system_prompt=DOCUMENT_SYSTEM_PROMPT,
+        ),
+    }
+
+
 def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
     from decimal import Decimal
 
     if price is None:
         return None
     return tokens * price / Decimal(1_000_000)
+
+
+def _token_estimate(
+    conn: Any, config: AppConfig, model: str, count: int
+) -> dict[str, Any] | None:
+    """Estimated tokens and cost of ``count`` extractions, from measured runs.
+
+    None when nothing has been measured yet. ``cost`` is None without the
+    configured prices.
+    """
+    from decimal import Decimal
+
+    from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
+    from receipt_index.repository import token_averages
+
+    averages = token_averages(
+        conn, llm_model=model, prompt_version=EXTRACTION_PROMPT_VERSION
+    )
+    if averages is None:
+        return None
+    n = Decimal(count)
+    tokens_in = n * Decimal(str(averages["avg_input"]))
+    tokens_out = n * Decimal(str(averages["avg_output"]))
+    cost_in = _cost(tokens_in, config.llm.price_per_mtok_input)
+    cost_out = _cost(tokens_out, config.llm.price_per_mtok_output)
+    return {
+        "basis": averages["basis"],
+        "measured_runs": int(averages["runs"]),
+        "avg_input_tokens": round(float(averages["avg_input"])),
+        "avg_output_tokens": round(float(averages["avg_output"])),
+        "input_tokens": int(tokens_in),
+        "output_tokens": int(tokens_out),
+        "cost": (
+            str((cost_in + cost_out).quantize(Decimal("0.0001")))
+            if cost_in is not None and cost_out is not None
+            else None
+        ),
+    }
+
+
+def _echo_estimate(estimate: dict[str, Any] | None) -> None:
+    """Print a ``_token_estimate`` for a dry run."""
+    if estimate is None:
+        click.echo("Estimate: no measured token figures yet.")
+        return
+    click.echo(
+        f"Estimate: {estimate['input_tokens']:,} input and "
+        f"{estimate['output_tokens']:,} output tokens "
+        f"(averages of {estimate['measured_runs']} runs from "
+        f"{estimate['basis']})."
+    )
+    if estimate["cost"] is not None:
+        click.echo(f"Estimated cost: ${estimate['cost']}")
+    else:
+        click.echo(
+            "Set llm.price_per_mtok_input and "
+            "llm.price_per_mtok_output for a cost estimate."
+        )
+
+
+@cli.command()
+@click.option("--source", "source_name", required=True, help="The source to backfill.")
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="From this day, inclusive (YYYY-MM-DD). Default: the whole source.",
+)
+@click.option(
+    "--until",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="To this day, inclusive (YYYY-MM-DD).",
+)
+@click.option(
+    "--originals-only",
+    is_flag=True,
+    help="Store the missing originals of indexed receipts; no extraction.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Count what a run would do, and its LLM cost."
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help=(
+        "Max items to download: unseen items plus missing originals (with "
+        "--originals-only, originals)."
+    ),
+)
+@click.pass_context
+def backfill(
+    ctx: click.Context,
+    source_name: str,
+    since: datetime | None,
+    until: datetime | None,
+    originals_only: bool,
+    dry_run: bool,
+    limit: int | None,
+) -> None:
+    """Process a source's back catalogue over a date range.
+
+    The full mode lists the source (IMAP: arrival date; Drive: created time)
+    and processes every item it hasn't seen, at one LLM call each. For a
+    seen IMAP receipt whose original is missing, it stores the original.
+    --originals-only fetches and stores the missing originals of indexed
+    receipts and makes no LLM call; a message that is gone is marked
+    unavailable. Backfill takes item locks only, so it runs beside `serve`,
+    and never moves the sync cursor. A re-run does nothing new.
+    """
+    from contextlib import ExitStack
+
+    from receipt_index.backfill import run_backfill, run_originals_only
+    from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
+    from receipt_index.fetching import SourcePool
+    from receipt_index.retries import RetryPolicy
+    from receipt_index.store import open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    source_config = next((s for s in config.sources if s.name == source_name), None)
+    if source_config is None:
+        available = ", ".join(s.name for s in config.sources)
+        click.echo(
+            f"Error: source {source_name!r} not found in config. "
+            f"Available sources: {available}",
+            err=True,
+        )
+        sys.exit(1)
+    since_day = since.date() if since else None
+    until_day = until.date() if until else None
+    if since_day and until_day and until_day < since_day:
+        raise click.BadParameter("--until is before --since")
+    store = open_store(config.store)
+    with get_connection(
+        config.database.url,
+        statement_timeout_seconds=INGEST_STATEMENT_TIMEOUT_SECONDS,
+    ) as conn:
+        if originals_only:
+            with ExitStack() as stack:
+                pool = SourcePool([source_config], _source_adapter(config), stack)
+                originals = run_originals_only(
+                    conn,
+                    pool,
+                    store=store,
+                    source_name=source_name,
+                    since=since_day,
+                    until=until_day,
+                    dry_run=dry_run,
+                    limit=limit,
+                )
+            if dry_run:
+                click.echo(f"Originals to fetch: {originals.to_fetch}")
+            else:
+                click.echo(
+                    f"Stored: {originals.stored}  "
+                    f"Unavailable: {originals.unavailable}  "
+                    f"Failed: {originals.failed}  "
+                    f"Locked: {originals.locked}"
+                )
+            if originals.ambiguous:
+                click.echo(
+                    f"Left pending: {originals.ambiguous} whose Message-ID more "
+                    "than one message carries (see the log; resolve by hand)"
+                )
+            if originals.unsearchable:
+                click.echo(
+                    f"Left pending: {originals.unsearchable} with no Message-ID to "
+                    "search for (the full mode stores these from a listing)"
+                )
+            if originals.drive_pending:
+                click.echo(
+                    f"Left pending: {originals.drive_pending} Drive originals "
+                    "(no Drive store backend yet)"
+                )
+            if dry_run:
+                click.echo("No LLM calls: --originals-only makes none.")
+            if originals.source_error is not None:
+                click.echo(f"Error: {originals.source_error}", err=True)
+            if originals.failed or originals.source_error is not None:
+                sys.exit(1)
+            return
+
+        agent = None
+        if not dry_run:
+            agents = _extraction_agents(config, config.llm.model)
+            agent = agents["document" if source_config.type == "gdrive" else "email"]
+        adapter = _source_adapter(config)(source_config)
+        result = run_backfill(
+            conn,
+            adapter,
+            store=store,
+            source_name=source_name,
+            source_type=source_config.type,
+            llm_model=config.llm.model,
+            agent=agent,
+            since=since_day,
+            until=until_day,
+            dry_run=dry_run,
+            limit=limit,
+            policy=RetryPolicy.from_config(config.ingest),
+        )
+        if dry_run:
+            click.echo(
+                f"Listed: {result.listed}  Unseen: {result.unseen}  "
+                f"Originals missing: {result.originals_missing}"
+                + (f"  (capped by --limit {limit})" if limit is not None else "")
+            )
+            _echo_estimate(
+                _token_estimate(conn, config, config.llm.model, result.unseen)
+            )
+        else:
+            click.echo(
+                f"Listed: {result.listed}  Processed: {result.processed}  "
+                f"Skipped: {result.skipped}  Failed: {result.failed}  "
+                f"Locked: {result.locked}  "
+                f"Originals stored: {result.originals_stored}"
+            )
+    if result.source_error is not None:
+        click.echo(f"Error: source {source_name}: {result.source_error}", err=True)
+    if result.failed or result.originals_failed or result.source_error is not None:
+        sys.exit(1)
 
 
 @cli.command()
@@ -1723,7 +1937,6 @@ def reextract(
     locked, or its source couldn't be reached.
     """
     from contextlib import ExitStack
-    from decimal import Decimal
 
     from receipt_index.db import get_connection
     from receipt_index.extraction import EXTRACTION_PROMPT_VERSION
@@ -1734,7 +1947,7 @@ def reextract(
         planned_input,
         run_reextract,
     )
-    from receipt_index.repository import select_for_reextract, token_averages
+    from receipt_index.repository import select_for_reextract
     from receipt_index.store import open_store
 
     selectors = (
@@ -1787,30 +2000,8 @@ def reextract(
             )
 
             if dry_run:
-                averages = token_averages(
-                    conn, llm_model=model, prompt_version=EXTRACTION_PROMPT_VERSION
-                )
                 planned = [(r, planned_input(pool, r)) for r in receipts]
-                estimate: dict[str, Any] | None = None
-                if averages is not None:
-                    n = Decimal(len(receipts))
-                    tokens_in = n * Decimal(str(averages["avg_input"]))
-                    tokens_out = n * Decimal(str(averages["avg_output"]))
-                    cost_in = _cost(tokens_in, config.llm.price_per_mtok_input)
-                    cost_out = _cost(tokens_out, config.llm.price_per_mtok_output)
-                    estimate = {
-                        "basis": averages["basis"],
-                        "measured_runs": int(averages["runs"]),
-                        "avg_input_tokens": round(float(averages["avg_input"])),
-                        "avg_output_tokens": round(float(averages["avg_output"])),
-                        "input_tokens": int(tokens_in),
-                        "output_tokens": int(tokens_out),
-                        "cost": (
-                            str((cost_in + cost_out).quantize(Decimal("0.0001")))
-                            if cost_in is not None and cost_out is not None
-                            else None
-                        ),
-                    }
+                estimate = _token_estimate(conn, config, model, len(receipts))
                 if output_format == "json":
                     click.echo(
                         json.dumps(
@@ -1843,22 +2034,7 @@ def reextract(
                     f"\n{len(receipts)} receipt(s) selected "
                     f"(model {model}, prompt version {EXTRACTION_PROMPT_VERSION})."
                 )
-                if estimate is None:
-                    click.echo("Estimate: no measured token figures yet.")
-                else:
-                    click.echo(
-                        f"Estimate: {estimate['input_tokens']:,} input and "
-                        f"{estimate['output_tokens']:,} output tokens "
-                        f"(averages of {estimate['measured_runs']} runs from "
-                        f"{estimate['basis']})."
-                    )
-                    if estimate["cost"] is not None:
-                        click.echo(f"Estimated cost: ${estimate['cost']}")
-                    else:
-                        click.echo(
-                            "Set llm.price_per_mtok_input and "
-                            "llm.price_per_mtok_output for a cost estimate."
-                        )
+                _echo_estimate(estimate)
                 return
 
             if not receipts:
@@ -1868,21 +2044,7 @@ def reextract(
                     click.echo("No receipts selected.")
                 return
 
-            from receipt_index.extraction import (
-                DOCUMENT_SYSTEM_PROMPT,
-                create_extraction_agent,
-            )
-
-            agents = {
-                "email": create_extraction_agent(
-                    api_key=config.llm.api_key, model=model
-                ),
-                "document": create_extraction_agent(
-                    api_key=config.llm.api_key,
-                    model=model,
-                    system_prompt=DOCUMENT_SYSTEM_PROMPT,
-                ),
-            }
+            agents = _extraction_agents(config, model)
 
             def report(outcome: ReceiptOutcome) -> None:
                 if output_format == "json":

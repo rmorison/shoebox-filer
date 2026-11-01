@@ -12,7 +12,7 @@ import logging
 import re
 import ssl
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email import message_from_bytes
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
@@ -25,6 +25,7 @@ from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.models import Attachment, ItemRef, RawReceipt, SourceRead
 
 if TYPE_CHECKING:
+    from datetime import date
     from email.message import Message
     from types import TracebackType
 
@@ -51,17 +52,29 @@ class MessageRefusedError(Exception):
     """The server, on a healthy session, refused one message: an item error."""
 
 
+class AmbiguousMatchError(MessageRefusedError):
+    """Several messages carry the exact Message-ID looked for.
+
+    The message is there, so it isn't missing; which one is meant can't be
+    told from the ID. An item error, never "not found".
+    """
+
+
 # RFC 5530 response codes that describe the session or the mailbox, not one
 # message: a NO carrying one is an outage, never a refused message.
 # SERVERBUG and LIMIT are left out on purpose: Dovecot uses them for a FETCH
 # that fails on one message (a corrupt file), so they stay item errors. A
 # mailbox-wide failure under them is caught by the all-refused-batch rule.
 _SESSION_CODES = ("UNAVAILABLE", "INUSE", "OVERQUOTA")
+# Gmail's refusal once an account passes its IMAP command or download
+# allowance, which it may send without a response code. It ends the run,
+# so a throttled lookup is never taken for a missing message.
+_THROTTLE_TEXT = "EXCEEDED COMMAND OR BANDWIDTH LIMITS"
 
 
 def _is_session_refusal(exc: Exception) -> bool:
     text = str(exc).upper()
-    return any(f"[{code}" in text for code in _SESSION_CODES)
+    return _THROTTLE_TEXT in text or any(f"[{code}" in text for code in _SESSION_CODES)
 
 
 # The fallback ID of a message with no Message-ID: a SHA-256 hex digest.
@@ -83,6 +96,35 @@ def _message_id_search(source_id: str) -> str | None:
         return None
     escaped = source_id.replace("\\", "\\\\").replace('"', '\\"')
     return f'HEADER Message-ID "{escaped}"'
+
+
+def lookup_folders(config: ImapSourceConfig) -> list[str]:
+    """The folders a source's ``fetch_by_id`` searches, in order.
+
+    Read from the configuration alone, so it needs no connection. Only the
+    watched folder for now; the archive and needs-attention folders join it
+    when the configuration has them.
+    """
+    return [config.folder]
+
+
+def can_search_by_id(source_id: str) -> bool:
+    """Whether ``fetch_by_id`` can look this source ID up at all."""
+    return _message_id_search(source_id) is not None
+
+
+def _range_criteria(since: date | None, until: date | None) -> list[Any]:
+    """``SEARCH`` criteria for arrival days ``since`` to ``until``, inclusive.
+
+    IMAP's ``BEFORE`` excludes its own day, so it gets the day after
+    ``until``. Both use the server's internal (arrival) date.
+    """
+    criteria: list[Any] = []
+    if since is not None:
+        criteria += ["SINCE", since]
+    if until is not None:
+        criteria += ["BEFORE", until + timedelta(days=1)]
+    return criteria or ["ALL"]
 
 
 def _header_bytes(data: dict[bytes, Any]) -> bytes | None:
@@ -155,6 +197,12 @@ class ImapAdapter:
         # The folder's UIDVALIDITY as list_new saw it: the UIDs in its refs
         # mean something only while it is unchanged.
         self._uidvalidity: int | None = None
+        # The folder those UIDs belong to, and the folder selected on the
+        # live session (None after a reconnect, until one is selected).
+        self._uid_folder: str | None = None
+        self._selected: str | None = None
+        # Each folder's UIDVALIDITY as list_range saw it.
+        self._range_validity: dict[str, int] = {}
         # Whether the last reconnect logged in and re-selected the folder, so
         # an error after it is the message's, not the session's.
         self._selected_ok = False
@@ -180,6 +228,7 @@ class ImapAdapter:
     def close(self) -> None:
         """Log out, if connected."""
         client, self._client = self._client, None
+        self._selected = None
         if client is None:
             return
         try:
@@ -195,6 +244,17 @@ class ImapAdapter:
     def _connect(self) -> IMAPClient:
         return connect_imap(self.config)
 
+    def _select(self, folder: str) -> int:
+        """Select ``folder`` read-only (EXAMINE); return its UIDVALIDITY."""
+        info = self._session().select_folder(folder, readonly=True)
+        self._selected = folder
+        return int(info[b"UIDVALIDITY"])
+
+    def _use(self, folder: str, uidvalidity: int) -> None:
+        """Record which folder's UIDs are in hand."""
+        self._uid_folder = folder
+        self._uidvalidity = uidvalidity
+
     # -- reading ---------------------------------------------------------
 
     def list_new(self, state: SyncState | None) -> SourceRead:
@@ -204,9 +264,9 @@ class ImapAdapter:
         Both start from UID 0, which makes this a full header scan.
         """
         client = self._session()
-        info = client.select_folder(self.config.folder, readonly=True)  # EXAMINE
-        uidvalidity = int(info[b"UIDVALIDITY"])
-        self._uidvalidity = uidvalidity
+        uidvalidity = self._select(self.config.folder)
+        self._use(self.config.folder, uidvalidity)
+        self._range_validity[self.config.folder] = uidvalidity
 
         reset: str | None = None
         start_uid = 0
@@ -252,6 +312,46 @@ class ImapAdapter:
             searched_uids=uids,
         )
 
+    def list_range(self, since: date | None, until: date | None) -> list[ItemRef]:
+        """List the messages that arrived from ``since`` to ``until``, inclusive.
+
+        Searches every folder ``fetch_by_id`` searches, from headers only,
+        and never touches the sync state. A Message-ID found twice is listed
+        once, from the first folder searched. Each ref names its folder.
+        """
+        criteria = _range_criteria(since, until)
+        items: list[ItemRef] = []
+        seen: set[str] = set()
+        for folder in self._lookup_folders():
+            client = self._session()
+            uidvalidity = self._select(folder)
+            self._use(folder, uidvalidity)
+            self._range_validity[folder] = uidvalidity
+            uids = sorted(int(u) for u in client.search(criteria))
+            for i in range(0, len(uids), _FETCH_BATCH):
+                batch = uids[i : i + _FETCH_BATCH]
+                response, refused = self._fetch_headers(client, batch)
+                for uid in batch:
+                    if uid in refused:
+                        ref = self._unreadable_ref(
+                            uid, uidvalidity, refused[uid], folder
+                        )
+                    else:
+                        data = response.get(uid)
+                        headers = _header_bytes(data) if data else None
+                        if headers is None:
+                            logger.warning(
+                                "No headers returned for UID %d; skipping", uid
+                            )
+                            continue
+                        ref = self._ref(uid, headers)
+                    if ref.source_id in seen:
+                        continue
+                    seen.add(ref.source_id)
+                    ref.imap_folder = folder
+                    items.append(ref)
+        return items
+
     @staticmethod
     def _fetch_headers(
         client: IMAPClient, batch: list[int]
@@ -295,7 +395,9 @@ class ImapAdapter:
             )
         return response, refused
 
-    def _unreadable_ref(self, uid: int, uidvalidity: int, reason: str) -> ItemRef:
+    def _unreadable_ref(
+        self, uid: int, uidvalidity: int, reason: str, folder: str | None = None
+    ) -> ItemRef:
         """A ref for a message whose headers the server refuses.
 
         It has no Message-ID to key on, so its ID names the folder position.
@@ -304,7 +406,10 @@ class ImapAdapter:
         """
         logger.warning("Server refused the headers of UID %d: %s", uid, reason)
         return ItemRef(
-            source_id=f"imap-uid:{self.name}:{self.config.folder}:{uidvalidity}:{uid}",
+            source_id=(
+                f"imap-uid:{self.name}:{folder or self.config.folder}:"
+                f"{uidvalidity}:{uid}"
+            ),
             source_type="imap",
             imap_uid=uid,
             unreadable=f"server refused the message headers: {reason}",
@@ -339,6 +444,9 @@ class ImapAdapter:
             raise ValueError(f"IMAP ref without a UID: {ref.source_id}")
         if ref.unreadable is not None:
             raise MessageRefusedError(ref.unreadable)
+        folder = ref.imap_folder or self.config.folder
+        if folder != self._selected:
+            self._select_listed(folder)
         response = self._fetch_body(ref.imap_uid)
         data = response.get(ref.imap_uid)
         raw = data.get(_BODY_KEY) if data else None
@@ -346,20 +454,37 @@ class ImapAdapter:
             return None
         return self._parse_message(raw, ref.source_id)
 
-    def _lookup_folders(self) -> list[str]:
-        """The folders ``fetch_by_id`` searches, in order.
+    def _select_listed(self, folder: str) -> None:
+        """Re-select the folder a ref was listed from, checking its UIDVALIDITY."""
+        try:
+            uidvalidity = self._select(folder)
+        except (OSError, IMAPClientError, ConnectionError) as exc:
+            self._drop_client()
+            raise SourceUnavailableError(
+                f"IMAP connection to {self.config.host} failed: {exc}"
+            ) from exc
+        listed = self._range_validity.get(folder)
+        if listed is not None and listed != uidvalidity:
+            raise SourceUnavailableError(
+                f"UIDVALIDITY of {folder} changed during the run "
+                f"({listed} -> {uidvalidity})"
+            )
+        self._use(folder, uidvalidity)
 
-        Only the watched folder for now; the archive and needs-attention
-        folders join it when the configuration has them.
-        """
-        return [self.config.folder]
+    def _lookup_folders(self) -> list[str]:
+        """The folders ``fetch_by_id`` searches, in order."""
+        return lookup_folders(self.config)
 
     def fetch_by_id(self, source_id: str) -> RawReceipt | None:
         """Find one message by its Message-ID and download it.
 
-        None unless exactly one message, across the searched folders, has
-        that exact Message-ID (it is set by the sender and isn't guaranteed
-        unique), and for IDs that can't be searched for.
+        None only when the search completed and no message, across the
+        searched folders, has that exact Message-ID, and for IDs that can't
+        be searched for. A message that is there but can't be read raises
+        instead, so it is never taken for a missing one:
+        ``AmbiguousMatchError`` when several carry the ID (it is set by the
+        sender and isn't guaranteed unique), ``MessageRefusedError`` when the
+        server refuses or returns nothing for its headers or body.
         """
         criteria = _message_id_search(source_id)
         if criteria is None:
@@ -388,47 +513,54 @@ class ImapAdapter:
         data = response.get(uid)
         raw = data.get(_BODY_KEY) if data else None
         if not isinstance(raw, bytes):
-            return None
+            raise MessageRefusedError(f"server returned no body for UID {uid}")
         return self._parse_message(raw, source_id)
 
     def _find_exact(self, criteria: str, source_id: str) -> int | None:
         """The UID of the one message with exactly this Message-ID, selected.
 
-        None when none or several match. Leaves its folder selected.
+        None when none matches; ``AmbiguousMatchError`` when several do.
+        Leaves its folder selected.
         """
         matches: list[tuple[str, int, int]] = []
         for folder in self._lookup_folders():
-            client = self._session()
-            info = client.select_folder(folder, readonly=True)  # EXAMINE
-            uidvalidity = int(info[b"UIDVALIDITY"])
-            for hit in client.search(criteria):
+            uidvalidity = self._select(folder)
+            for hit in self._session().search(criteria):
                 matches.append((folder, uidvalidity, int(hit)))
 
         # SEARCH HEADER matches substrings: keep exact matches only.
         exact = [m for m in matches if self._has_message_id(m, source_id)]
-        if len(exact) != 1:
-            if len(exact) > 1:
-                logger.warning(
-                    "%d messages share Message-ID %s; not re-fetching",
-                    len(exact),
-                    source_id,
-                )
+        if len(exact) > 1:
+            logger.warning(
+                "%d messages share Message-ID %s; not re-fetching",
+                len(exact),
+                source_id,
+            )
+            raise AmbiguousMatchError(
+                f"{len(exact)} messages share Message-ID {source_id}"
+            )
+        if not exact:
             return None
         folder, uidvalidity, uid = exact[0]
-        self._session().select_folder(folder, readonly=True)
-        self._uidvalidity = uidvalidity
+        self._select(folder)
+        self._use(folder, uidvalidity)
         return uid
 
     def _has_message_id(self, match: tuple[str, int, int], source_id: str) -> bool:
         """Whether a search hit's own Message-ID is exactly ``source_id``."""
         folder, _uidvalidity, uid = match
-        client = self._session()
-        client.select_folder(folder, readonly=True)
-        response, refused = self._fetch_headers(client, [uid])
+        self._select(folder)
+        response, refused = self._fetch_headers(self._session(), [uid])
+        if uid in refused:
+            # A refusal isn't an answer: never let it read as "not this one",
+            # or a present message would be taken for a missing one.
+            raise MessageRefusedError(
+                f"server refused the headers of UID {uid}: {refused[uid]}"
+            )
         data = response.get(uid)
-        headers = _header_bytes(data) if data and uid not in refused else None
+        headers = _header_bytes(data) if data else None
         if headers is None:
-            return False
+            raise MessageRefusedError(f"server returned no headers for UID {uid}")
         return self._get_message_id(message_from_bytes(headers)) == source_id
 
     def _fetch_body(self, uid: int) -> dict[int, dict[bytes, Any]]:
@@ -475,6 +607,7 @@ class ImapAdapter:
     def _drop_client(self) -> None:
         """Forget a broken connection, so the next session reconnects."""
         client, self._client = self._client, None
+        self._selected = None
         if client is not None:
             try:
                 client.shutdown()
@@ -482,17 +615,17 @@ class ImapAdapter:
                 logger.debug("Error closing a broken IMAP connection", exc_info=True)
 
     def _reselect(self) -> None:
-        """Open a fresh session on the folder list_new read.
+        """Open a fresh session on the folder whose UIDs are in hand.
 
         A changed UIDVALIDITY means the UIDs in hand point at other messages:
         stop the source, and the next run's list_new resets the cursor.
         """
         self._selected_ok = False
-        info = self._session().select_folder(self.config.folder, readonly=True)
-        uidvalidity = int(info[b"UIDVALIDITY"])
+        folder = self._uid_folder or self.config.folder
+        uidvalidity = self._select(folder)
         if self._uidvalidity is not None and uidvalidity != self._uidvalidity:
             raise SourceUnavailableError(
-                f"UIDVALIDITY of {self.config.folder} changed during the run "
+                f"UIDVALIDITY of {folder} changed during the run "
                 f"({self._uidvalidity} -> {uidvalidity})"
             )
         self._selected_ok = True

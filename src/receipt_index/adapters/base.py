@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 if TYPE_CHECKING:
+    from datetime import date
     from types import TracebackType
 
     from receipt_index.models import ItemRef, RawReceipt, SourceRead, SyncState
@@ -35,6 +36,9 @@ class SourceAdapter(Protocol):
     ``fetch_by_id(source_id)`` re-fetches one item from its source ID alone,
     for re-extraction, with the same meaning for None and for errors.
 
+    ``list_range(since, until)`` lists the items from a date range, for
+    ``backfill``, without touching the sync state.
+
     An adapter is a context manager, so a connection can be held across
     both steps; ``close()`` releases it.
     """
@@ -51,6 +55,8 @@ class SourceAdapter(Protocol):
     def fetch(self, ref: ItemRef) -> RawReceipt | None: ...
 
     def fetch_by_id(self, source_id: str) -> RawReceipt | None: ...
+
+    def list_range(self, since: date | None, until: date | None) -> list[ItemRef]: ...
 
     def close(self) -> None: ...
 

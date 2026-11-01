@@ -7,6 +7,10 @@ and idempotent: the folder and every name follow from the bytes, so a retry
 writes nothing, and bytes the store already holds as an original are reused
 rather than written again.
 
+``attach_email_original`` links a stored email to a provenance row that had
+none: a receipt ingested before originals were kept (``backfill
+--originals-only``, always-on ingest design, section 8).
+
 ``select_receipt_document`` picks the file the receipt was read from, from the
 extraction's ``receipt_document`` (section 2, "The receipt document").
 """
@@ -21,7 +25,12 @@ from typing import TYPE_CHECKING, Any
 from slugify import slugify
 
 from receipt_index.pdf_validate import check_pdf
-from receipt_index.repository import record_original, store_original_ref
+from receipt_index.repository import (
+    attach_original,
+    insert_provenance_files,
+    record_original,
+    store_original_ref,
+)
 from receipt_index.store import StoredFile, StoreError, StoreFolder
 
 if TYPE_CHECKING:
@@ -298,3 +307,38 @@ def record_email_evidence(
         certainty=certainty,
         files=files,
     )
+
+
+def attach_email_original(
+    conn: psycopg.Connection[dict[str, Any]],
+    provenance_id: UUID,
+    email: StoredEmail,
+    *,
+    attachments: Sequence[Attachment],
+    receipt_document: str | None,
+) -> bool:
+    """Record a stored email and link it to a pending provenance row.
+
+    Doesn't commit. ``attachments`` are the parsed attachments the email was
+    stored from; ``receipt_document`` is the receipt's latest extraction's,
+    if any. Returns False, and the caller rolls back, unless the row was
+    still ``pending``.
+    """
+    evidence = record_email_evidence(
+        conn, email, receipt_document=receipt_document, attachments=attachments
+    )
+    sha256 = email.message.sha256
+    if sha256 is None:
+        msg = f"original {email.message.ref} has no hash"
+        raise ValueError(msg)
+    if not attach_original(
+        conn,
+        provenance_id,
+        original_file_id=evidence.original_id,
+        source_sha256=sha256,
+        receipt_document_file_id=evidence.document_id,
+        document_certainty=evidence.certainty,
+    ):
+        return False
+    insert_provenance_files(conn, provenance_id, evidence.files)
+    return True
