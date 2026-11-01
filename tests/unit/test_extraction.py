@@ -661,7 +661,7 @@ class TestHostileFileNames:
     def test_the_log_line_is_one_line(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level("INFO", logger="receipt_index.extraction"):
             _read_pdf_attachments([_pdf(_HOSTILE, b"not a pdf")])
-        (record,) = caplog.records
+        (record,) = [r for r in caplog.records if r.name == "receipt_index.extraction"]
         assert "\n" not in record.getMessage()
 
     def test_an_ordinary_name_is_unchanged(self) -> None:

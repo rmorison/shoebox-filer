@@ -88,6 +88,8 @@ def read_pdf(
     except (ValueError, TypeError):
         logger.warning("PDF read gave no result (%d bytes)", len(data))
         return None
+    if read is None:
+        logger.info("pdfplumber can't read the PDF (%d bytes)", len(data))
     if read is not None and read.pages > max_pages:
         logger.info(
             "PDF of %d pages is over the %d-page cap; not reading its text",
@@ -126,10 +128,25 @@ def _read_unbounded(
                 # pdfplumber keeps each page's layout objects until the file
                 # closes; a long document would otherwise outgrow the limit.
                 page.close()
-    except Exception:  # any failure, a hit memory limit included
+    except Exception as exc:  # any failure means unreadable
+        if _out_of_memory(exc):
+            raise MemoryError from exc  # the child reports the memory limit
         logger.debug("pdfplumber can't read the PDF", exc_info=True)
         return None
     return PdfRead(pages, "\n\n".join(texts).strip(), encrypted)
+
+
+def _out_of_memory(exc: BaseException) -> bool:
+    """Whether ``exc`` is, or was caused by, running out of memory.
+
+    pdfplumber wraps what pdfminer raises, a MemoryError included.
+    """
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, MemoryError):
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
 
 
 def _is_sufficient_text(text: str) -> bool:

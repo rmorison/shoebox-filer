@@ -34,13 +34,17 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 import resource
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Literal
+from typing import IO, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -155,21 +159,33 @@ def _child_main() -> None:
     """Limit this process, run the job on the PDF on stdin, write its output.
 
     Arguments: the job (``check`` or ``read``), the memory and CPU limits,
-    then the job's own arguments.
+    the output cap, then the job's own arguments.
+
+    The libraries log and warn about what they read, and a hostile PDF can
+    make that gigabytes, so nothing is logged or warned. No core is dumped
+    when a limit kills the child, and no file it writes, its output and
+    stderr included, can pass the output cap.
     """
+    logging.disable(logging.CRITICAL)
+    warnings.simplefilter("ignore")
     job = sys.argv[1]
-    memory, cpu = (int(arg) for arg in sys.argv[2:4])
+    memory, cpu, cap = (int(arg) for arg in sys.argv[2:5])
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (cap, cap))
     resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
     data = sys.stdin.buffer.read()
-    if job == "check":
-        output = _check_job(data)
-    elif job == "read":
-        from receipt_index.pdf_reader import read_job
+    try:
+        if job == "check":
+            output = _check_job(data)
+        elif job == "read":
+            from receipt_index.pdf_reader import read_job
 
-        output = read_job(data, sys.argv[4:])
-    else:
-        sys.exit(f"unknown job {job!r}")
+            output = read_job(data, sys.argv[5:])
+        else:
+            sys.exit(f"unknown job {job!r}")
+    except MemoryError:
+        os._exit(_EXIT_MEMORY)  # no traceback: there is no memory to build it
     sys.stdout.buffer.write(output)
     sys.stdout.buffer.flush()
 
@@ -178,6 +194,54 @@ def _child_main() -> None:
 # The caller's side
 # ---------------------------------------------------------------------------
 
+# The child's exit code when the job ran out of memory.
+_EXIT_MEMORY = 3
+# How much of a failed child's stderr is logged.
+_STDERR_TAIL = 300
+
+
+def output_cap(limits: PdfLimits) -> int:
+    """The most a child may write: a repair is about the input's size."""
+    return 2 * limits.max_bytes + 1024 * 1024
+
+
+def _command(job: str, limits: PdfLimits, args: tuple[str, ...]) -> list[str]:
+    """The child's command line: our own interpreter and module."""
+    return [
+        sys.executable,
+        "-I",
+        "-m",
+        _MODULE,
+        job,
+        str(limits.memory_bytes),
+        str(limits.cpu_seconds),
+        str(output_cap(limits)),
+        *args,
+    ]
+
+
+def _stopped_by(returncode: int, limits: PdfLimits) -> str:
+    """Why a child that failed stopped, for the log."""
+    if returncode == -signal.SIGXCPU:
+        return f"hit the {limits.cpu_seconds} s CPU limit"
+    if returncode == -signal.SIGKILL:
+        return "was killed: past the CPU hard limit, or by the system"
+    if returncode == -signal.SIGXFSZ:
+        return f"hit the {output_cap(limits)}-byte output limit"
+    if returncode == _EXIT_MEMORY:
+        return f"hit the {limits.memory_bytes // (1024 * 1024)} MB memory limit"
+    if returncode < 0:
+        name = signal.Signals(-returncode).name
+        return f"crashed with {name}, most often at the memory limit"
+    return f"failed with exit code {returncode}"
+
+
+def _tail(file: IO[bytes], size: int) -> str:
+    """The end of a failed child's stderr."""
+    file.seek(max(0, size - _STDERR_TAIL))
+    return file.read(_STDERR_TAIL).decode(errors="replace").strip()
+
+
 _cache: OrderedDict[bytes, PdfCheck] = OrderedDict()
 _cache_lock = threading.Lock()
 
@@ -185,8 +249,12 @@ _cache_lock = threading.Lock()
 def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes | None:
     """The output of ``job`` run on ``data`` in a bounded child process.
 
-    None, with the reason logged, when ``data`` is over the size cap or the
-    child times out, is killed (a hit limit) or fails.
+    None, with the reason logged, when ``data`` is over the size cap, or the
+    child hits a limit, times out, crashes or fails.
+
+    The child's output goes to unlinked temporary files, not pipes, so the
+    parent never holds more of it than the output cap allows: stdout is read
+    only when it is within the cap, and only the tail of stderr is read.
     """
     if len(data) > limits.max_bytes:
         logger.warning(
@@ -196,42 +264,50 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
             job,
         )
         return None
-    try:
-        proc = subprocess.run(  # our own interpreter and module
-            [
-                sys.executable,
-                "-I",
-                "-m",
-                _MODULE,
+    cap = output_cap(limits)
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(  # our own interpreter and module
+            _command(job, limits, args),
+            stdin=subprocess.PIPE,
+            stdout=out,
+            stderr=err,
+        )
+        try:
+            proc.communicate(input=data, timeout=limits.wall_seconds)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "PDF %s stopped: hit the %g s wall-clock limit (%d bytes)",
                 job,
-                str(limits.memory_bytes),
-                str(limits.cpu_seconds),
-                *args,
-            ],
-            input=data,
-            capture_output=True,
-            timeout=limits.wall_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "PDF %s timed out after %.0fs (%d bytes)",
-            job,
-            limits.wall_seconds,
-            len(data),
-        )
-        return None
-    if proc.returncode != 0:
-        # A negative code is the signal: SIGXCPU for the CPU limit, SIGKILL...
-        logger.warning(
-            "PDF %s ended with exit code %d (%d bytes): %s",
-            job,
-            proc.returncode,
-            len(data),
-            proc.stderr.decode(errors="replace").strip()[-300:],
-        )
-        return None
-    return proc.stdout
+                limits.wall_seconds,
+                len(data),
+            )
+            return None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if proc.returncode != 0:
+            logger.warning(
+                "PDF %s stopped: %s (%d bytes): %s",
+                job,
+                _stopped_by(proc.returncode, limits),
+                len(data),
+                _tail(err, err.seek(0, os.SEEK_END)),
+            )
+            return None
+        size = out.seek(0, os.SEEK_END)
+        if size > cap:
+            logger.warning(
+                "PDF %s stopped: wrote %d bytes, over the %d-byte output limit"
+                " (%d bytes)",
+                job,
+                size,
+                cap,
+                len(data),
+            )
+            return None
+        out.seek(0)
+        return out.read()
 
 
 def _run_check(data: bytes, limits: PdfLimits) -> PdfCheck | None:

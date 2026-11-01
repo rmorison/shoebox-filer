@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import resource
-import subprocess
 import time
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
@@ -19,7 +18,7 @@ from receipt_index.pdf_reader import (
     read_pdf,
 )
 from receipt_index.pdf_validate import RECEIPT_BOUNDS, PdfLimits
-from tests.pdfs import filter_chain_pdf, make_pdf
+from tests.pdfs import child_that_writes, fake_child, filter_chain_pdf, make_pdf
 
 
 def _make_text_pdf(text: str) -> bytes:
@@ -264,45 +263,55 @@ def cpu_bomb() -> bytes:
     return filter_chain_pdf(64)
 
 
-def test_a_cpu_bomb_gives_no_text_within_the_bound(cpu_bomb: bytes) -> None:
+def test_a_cpu_bomb_gives_no_text_within_the_bound(
+    cpu_bomb: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
     before = _peak_rss_mb()
     start = time.monotonic()
 
-    assert read_pdf(cpu_bomb, limits=_TIGHT) is None
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert read_pdf(cpu_bomb, limits=_TIGHT) is None
+
+    assert "PDF read stopped: hit the 2 s CPU limit" in caplog.text
 
     assert time.monotonic() - start < _TIGHT.wall_seconds
     assert _peak_rss_mb() - before < 100
 
 
-def test_under_the_default_limits_a_memory_bomb_gives_no_text() -> None:
+def test_under_the_default_limits_a_memory_bomb_gives_no_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # 1 GiB of page content: past the default 512 MB address-space limit.
     data = filter_chain_pdf(1024)
     before = _peak_rss_mb()
     start = time.monotonic()
 
-    assert extract_text(data) == ""
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert extract_text(data) == ""
+
+    assert "PDF read stopped: hit the 512 MB memory limit" in caplog.text
 
     assert time.monotonic() - start < RECEIPT_BOUNDS.read.wall_seconds
     assert _peak_rss_mb() - before < 100
 
 
-def test_a_read_that_runs_past_the_wall_clock_gives_no_text(cpu_bomb: bytes) -> None:
+def test_a_read_that_runs_past_the_wall_clock_gives_no_text(
+    cpu_bomb: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
     limits = PdfLimits(cpu_seconds=60, wall_seconds=0.5)
     start = time.monotonic()
-    assert read_pdf(cpu_bomb, limits=limits) is None
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert read_pdf(cpu_bomb, limits=limits) is None
+    assert "PDF read stopped: hit the 0 s wall-clock limit" not in caplog.text
+    assert "PDF read stopped: hit the 0.5 s wall-clock limit" in caplog.text
     assert time.monotonic() - start < 5
 
 
 @pytest.mark.parametrize("code", [-9, -24, 1])
 def test_a_killed_or_failed_child_gives_no_text(code: int) -> None:
     # It wrote a result before it was killed: only the exit code tells.
-    done = subprocess.CompletedProcess(
-        args=[],
-        returncode=code,
-        stdout=b'{"pages": 1, "text": "Total 12.34 paid in full", "encrypted": false}',
-        stderr=b"Killed",
-    )
-    with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
+    result = b'{"pages": 1, "text": "Total 12.34 paid in full", "encrypted": false}'
+    with fake_child(child_that_writes(result, ends_with=code)):
         assert read_pdf(make_pdf("Killed")) is None
 
 
@@ -312,13 +321,12 @@ def test_a_killed_or_failed_child_gives_no_text(code: int) -> None:
     ids=["empty", "not-json", "missing-keys", "wrong-shape"],
 )
 def test_a_child_that_writes_no_result_gives_no_text(stdout: bytes) -> None:
-    done = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=b"")
-    with patch("receipt_index.pdf_validate.subprocess.run", return_value=done):
+    with fake_child(child_that_writes(stdout)):
         assert read_pdf(make_pdf("Odd child")) is None
 
 
 def test_a_pdf_over_the_size_cap_is_not_read() -> None:
-    with patch("receipt_index.pdf_validate.subprocess.run") as run:
+    with fake_child("") as jobs:
         limits = replace(RECEIPT_BOUNDS.read, max_bytes=100)
         assert read_pdf(make_pdf("Too big"), limits=limits) is None
-    run.assert_not_called()
+    assert jobs == []
