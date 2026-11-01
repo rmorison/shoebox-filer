@@ -63,8 +63,7 @@ class BackfillResult:
     ``unseen`` counts the items handed to ``handle_item`` (in a dry run, the
     items that would be). ``originals_missing`` counts the pending
     provenance rows of seen items that were (or would be) filled in; both
-    count towards ``limit``. ``originals_ambiguous`` rows share their
-    Message-ID with another message and stay pending.
+    count towards ``limit``.
     """
 
     listed: int = 0
@@ -76,7 +75,6 @@ class BackfillResult:
     originals_missing: int = 0
     originals_stored: int = 0
     originals_failed: int = 0
-    originals_ambiguous: int = 0
     receipts: list[Receipt] = field(default_factory=list)
     source_error: str | None = None
 
