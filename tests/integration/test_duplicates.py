@@ -969,3 +969,50 @@ class TestReviewGaps:
         refunds = list_refunds(pg_conn)
         pg_conn.rollback()
         assert [r.id for r in refunds] == [b.id]
+
+    def test_a_kept_apart_pair_does_not_hide_other_matches(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        with _no_rules():
+            first = ingest(_email(), order_number="K-1")
+            lookalike = ingest(_email(), date=date(2026, 10, 15))
+            second = ingest(_email(), order_number="K-1")
+        # A person decided first and second are two receipts.
+        duplicates.link(pg_conn, _home_prov(pg_conn, second.id), first.id, actor=PERSON)
+        pg_conn.commit()
+        duplicates.unlink_home(pg_conn, _home_prov(pg_conn, second.id), actor=PERSON)
+        pg_conn.commit()
+
+        result = duplicates.scan(pg_conn)
+        pg_conn.commit()
+        assert result.links == []
+        flagged = {(r, o) for r, o, _ in result.flags}
+        assert (second.id, lookalike.id) in flagged
+        assert (second.id, first.id) not in flagged
+
+    def test_an_unlink_still_holds_after_a_merge_into_a_third_receipt(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        with _no_rules():
+            oldest = ingest(_email(), vendor="Third")
+            first = ingest(_email(), order_number="K-2")
+            second = ingest(_email(), order_number="K-2")
+        duplicates.link(pg_conn, _home_prov(pg_conn, second.id), first.id, actor=PERSON)
+        pg_conn.commit()
+        duplicates.unlink_home(pg_conn, _home_prov(pg_conn, second.id), actor=PERSON)
+        pg_conn.commit()
+        # first is then merged into an older receipt by hand.
+        duplicates.merge_receipt(
+            pg_conn, first.id, oldest.id, actor=PERSON, method="manual"
+        )
+        pg_conn.commit()
+        pg_conn.execute(
+            "UPDATE receipt.receipts SET vendor = %s, order_number = 'K-2'"
+            " WHERE id = %s",
+            (VENDOR, oldest.id),
+        )
+        pg_conn.commit()
+
+        assert duplicates.scan(pg_conn).links == []
+        pg_conn.rollback()
+        assert _receipt(pg_conn, second.id).merged_into_id is None

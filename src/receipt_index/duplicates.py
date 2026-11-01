@@ -23,7 +23,7 @@ unlink, merge and unmerge is recorded in ``provenance_link_history``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -100,6 +100,8 @@ class ItemFacts:
     doc_hashes: tuple[bytes, ...] = ()
     exclude: UUID | None = None
     before: tuple[datetime, UUID] | None = None
+    # Receipts a person kept apart from this one: the rules skip them.
+    kept_apart: tuple[UUID, ...] = ()
 
 
 @dataclass
@@ -121,12 +123,16 @@ def _scope(
     params: dict[str, object],
     exclude: UUID | None,
     before: tuple[datetime, UUID] | None,
+    kept: tuple[UUID, ...] = (),
 ) -> str:
     """The live receipts (aliased r) an item may match."""
     clauses = ["r.merged_into_id IS NULL"]
     if exclude is not None:
         clauses.append("r.id <> %(exclude)s")
         params["exclude"] = exclude
+    if kept:
+        clauses.append("NOT (r.id = ANY(%(kept)s))")
+        params["kept"] = list(kept)
     if before is not None:
         clauses.append("(r.created_at, r.id) < (%(before_at)s, %(before_id)s)")
         params["before_at"], params["before_id"] = before
@@ -142,6 +148,7 @@ def match_original(
     *,
     exclude: UUID | None = None,
     before: tuple[datetime, UUID] | None = None,
+    kept: tuple[UUID, ...] = (),
 ) -> UUID | None:
     """Rule 1: the oldest live receipt holding an item with identical bytes.
 
@@ -155,7 +162,7 @@ def match_original(
         SELECT r.id FROM receipt.provenance p
         JOIN receipt.receipts r ON r.id = p.receipt_id
         WHERE p.source_sha256 = ANY(%(hashes)s)
-          AND {_scope(params, exclude, before)}
+          AND {_scope(params, exclude, before, kept)}
         {_OLDEST} LIMIT 1
         """,
         params,
@@ -172,7 +179,11 @@ def decide(
     """Run rules 1 to 4 for one item against the receipts in scope."""
     decision = Decision()
     original = match_original(
-        conn, facts.source_hashes, exclude=facts.exclude, before=facts.before
+        conn,
+        facts.source_hashes,
+        exclude=facts.exclude,
+        before=facts.before,
+        kept=facts.kept_apart,
     )
     if original is not None:
         decision.join, decision.method = original, "original_hash"
@@ -205,7 +216,7 @@ def decide(
             JOIN receipt.receipts r ON r.id = p.receipt_id
             LEFT JOIN receipt.stored_files d ON d.id = p.receipt_document_file_id
             WHERE ({_DOC_HASH}) = ANY(%(docs)s)
-              AND {_scope(params, facts.exclude, facts.before)}
+              AND {_scope(params, facts.exclude, facts.before, facts.kept_apart)}
             ORDER BY r.created_at, r.id
             """,
             params,
@@ -232,7 +243,7 @@ def decide(
             WHERE {same_receipt} AND r.order_number = %(order_number)s
               AND r.paid_amount = %(paid)s AND r.paid_amount > 0
               AND abs(r.receipt_date - %(date)s::date) <= %(window)s
-              AND {_scope(params, facts.exclude, facts.before)}
+              AND {_scope(params, facts.exclude, facts.before, facts.kept_apart)}
             {_OLDEST}
             """,
             params,
@@ -253,7 +264,7 @@ def decide(
         WHERE {same_receipt}
           AND COALESCE(r.paid_amount, r.amount) = %(effective)s
           AND abs(r.receipt_date - %(date)s::date) <= %(window)s
-          AND {_scope(params, facts.exclude, facts.before)}
+          AND {_scope(params, facts.exclude, facts.before, facts.kept_apart)}
         {_OLDEST}
         """,
         params,
@@ -888,7 +899,9 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
 
     An unlink between them (either way, counting the receipts merged into
     each), or a dismissed pair between their records. Such a decision
-    outranks the rules: the scan never links the pair again.
+    outranks the rules: the scan never links the pair again. A later hand
+    ``link`` doesn't cancel an earlier unlink, so after an unlink only a
+    person re-merges the pair.
     """
     row = conn.execute(
         """\
@@ -982,14 +995,14 @@ def scan(
         ).fetchone()
         if current is None or current["merged_into_id"] is not None:
             continue
-        decision = decide(conn, _facts_for(conn, receipt), window_days=window_days)
+        facts = _facts_for(conn, receipt)
+        decision = decide(conn, facts, window_days=window_days)
+        # A receipt a person kept apart from this one drops out, and the
+        # rules run again without it, so its other matches still count.
+        while decision.join is not None and kept_apart(conn, receipt.id, decision.join):
+            facts = replace(facts, kept_apart=(*facts.kept_apart, decision.join))
+            decision = decide(conn, facts, window_days=window_days)
         mine = primary_provenance(conn, receipt.id)
-        if (
-            decision.join is not None
-            and decision.method is not None
-            and kept_apart(conn, receipt.id, decision.join)
-        ):
-            decision.join = decision.method = None
         if decision.join is not None and decision.method is not None:
             conn.execute("SAVEPOINT scan_merge")
             try:
