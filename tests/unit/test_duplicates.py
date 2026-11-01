@@ -98,32 +98,41 @@ class TestRuleOrder:
 class TestRule3:
     @pytest.mark.parametrize("paid", [None, Decimal("0.00")])
     def test_no_paid_amount_skips_the_rule(self, paid: Decimal | None) -> None:
-        conn = _Conn(rule3=[{"id": A, "same_date": True}])
+        conn = _Conn(rule3=[{"id": A, "same_date": True, "other_source": True}])
         d = _decide(conn, _facts(order_number="O-1", paid_amount=paid))
         assert d.join is None
         assert "rule3" not in conn.ran
 
     def test_no_order_number_skips_the_rule(self) -> None:
-        conn = _Conn(rule3=[{"id": A, "same_date": True}])
+        conn = _Conn(rule3=[{"id": A, "same_date": True, "other_source": True}])
         _decide(conn, _facts())
         assert "rule3" not in conn.ran
 
     def test_the_same_date_joins(self) -> None:
-        conn = _Conn(rule3=[{"id": A, "same_date": True}])
+        conn = _Conn(rule3=[{"id": A, "same_date": True, "other_source": True}])
         d = _decide(conn, _facts(order_number="O-1"))
         assert (d.join, d.method) == (A, "order_number")
 
     def test_another_date_flags(self) -> None:
-        conn = _Conn(rule3=[{"id": A, "same_date": False}], rule4=[{"id": A}])
+        conn = _Conn(
+            rule3=[{"id": A, "same_date": False, "other_source": True}],
+            rule4=[{"id": A}],
+        )
         d = _decide(conn, _facts(order_number="O-1"))
         assert d.join is None
         # One row per receipt: the first reason found is the one kept.
         assert d.flags == [(A, "order_number_conflict")]
 
+    def test_the_same_source_flags_rather_than_links(self) -> None:
+        conn = _Conn(rule3=[{"id": A, "same_date": True, "other_source": False}])
+        d = _decide(conn, _facts(order_number="O-1", source_names=("mail",)))
+        assert d.join is None
+        assert d.flags == [(A, "order_number_conflict")]
+
     def test_a_join_drops_an_earlier_flag_on_the_same_receipt(self) -> None:
         conn = _Conn(
             rule2=[{"id": A, "guarded": False}],
-            rule3=[{"id": A, "same_date": True}],
+            rule3=[{"id": A, "same_date": True, "other_source": True}],
         )
         d = _decide(conn, _facts(order_number="O-1", doc_hashes=(b"d" * 32,)))
         assert (d.join, d.flags) == (A, [])

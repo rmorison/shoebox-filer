@@ -332,3 +332,29 @@ class TestSearchIncludeMerged:
     ) -> None:
         assert _invoke(config_file, "search", "--include-merged").exit_code == 0
         assert mock_search.call_args.kwargs["include_merged"] is True
+
+
+class TestSearchMarksMerged:
+    @patch("receipt_index.repository.search_receipts")
+    @patch("receipt_index.db.get_connection")
+    def test_merged_and_suspected_rows_are_marked(
+        self,
+        mock_conn: MagicMock,
+        mock_search: MagicMock,
+        config_file: Path,  # noqa: F811
+    ) -> None:
+        merged = _RECEIPT.model_copy(
+            update={"merged_into_id": _OTHER, "merged_at": datetime.now(UTC)}
+        )
+        suspect = _RECEIPT.model_copy(
+            update={"id": uuid4(), "suspected_duplicate_of": [_OTHER]}
+        )
+        mock_search.return_value = [merged, suspect]
+        with patch(
+            "receipt_index.repository.with_provenance", side_effect=lambda c, rs: rs
+        ):
+            result = _invoke(config_file, "search", "--include-merged")
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert any(str(merged.id) in ln and "merged" in ln for ln in lines)
+        assert any(str(suspect.id) in ln and "dup?" in ln for ln in lines)

@@ -70,7 +70,9 @@ def _meta(**kw: Any) -> ReceiptMetadata:
     return ReceiptMetadata(**values)
 
 
-def _email(pdf: bytes | None = None, *, name: str = "receipt.pdf") -> RawReceipt:
+def _email(
+    pdf: bytes | None = None, *, name: str = "receipt.pdf", source: str = "mail"
+) -> RawReceipt:
     mid = f"<{uuid.uuid4().hex}@example.com>"
     attachments = (
         [Attachment(name, "application/pdf", pdf, mime_filename=name)]
@@ -79,7 +81,7 @@ def _email(pdf: bytes | None = None, *, name: str = "receipt.pdf") -> RawReceipt
     )
     return RawReceipt(
         source_id=mid,
-        source_name="mail",
+        source_name=source,
         source_type="imap",
         date=_WHEN,
         subject="Your receipt",
@@ -298,11 +300,11 @@ class TestRule2:
 
 
 class TestRule3:
-    def test_a_forward_with_the_same_order_links(
+    def test_a_forward_from_another_source_with_the_same_order_links(
         self, ingest: _Ingest, pg_conn: Conn
     ) -> None:
         first = ingest(_email(), order_number="ORD-7")
-        joined = ingest(_email(), order_number="ORD-7")
+        joined = ingest(_email(source="household-mail"), order_number="ORD-7")
         assert joined.id == first.id
         assert _history(pg_conn) == [("link", "order_number")]
 
@@ -795,7 +797,11 @@ class TestScan:
         five = {"amount": Decimal("5.00"), "paid_amount": Decimal("5.00")}
         with _no_rules():
             first = ingest(_email(), order_number="B-1")
-            forward = ingest(_email(), order_number="B-1", vendor=VENDOR.upper())
+            forward = ingest(
+                _email(source="household-mail"),
+                order_number="B-1",
+                vendor=VENDOR.upper(),
+            )
             ingest(_email(), vendor="Lookalike", **five)
             ingest(_email(), vendor="Lookalike", **five)
         assert len(_live(pg_conn)) == 4
@@ -833,7 +839,7 @@ class TestScan:
     def test_a_blocked_merge_is_flagged(self, pg_conn: Conn, ingest: _Ingest) -> None:
         with _no_rules():
             ingest(_email(), order_number="C-1")
-            forward = ingest(_email(), order_number="C-1")
+            forward = ingest(_email(source="household-mail"), order_number="C-1")
         pg_conn.execute(
             "UPDATE receipt.receipts SET manual_fields = '{description}' WHERE id = %s",
             (forward.id,),
@@ -864,7 +870,7 @@ class TestOperatorDecisionsStick:
         self, ingest: _Ingest, pg_conn: Conn
     ) -> None:
         first = ingest(_email(), order_number="U-1")
-        forward_raw = _email()
+        forward_raw = _email(source="household-mail")
         assert ingest(forward_raw, order_number="U-1").id == first.id
         prov = _prov(pg_conn, forward_raw.source_id)
         own = pipeline.unlink_to_own_receipt(
@@ -882,7 +888,7 @@ class TestOperatorDecisionsStick:
     ) -> None:
         with _no_rules():
             first = ingest(_email(), order_number="U-2")
-            second = ingest(_email(), order_number="U-2")
+            second = ingest(_email(source="household-mail"), order_number="U-2")
         assert duplicates.scan(pg_conn).links == [(second.id, first.id, "order_number")]
         pg_conn.commit()
         duplicates.unlink_home(pg_conn, _home_prov(pg_conn, second.id), actor=PERSON)
@@ -1016,3 +1022,152 @@ class TestReviewGaps:
         assert duplicates.scan(pg_conn).links == []
         pg_conn.rollback()
         assert _receipt(pg_conn, second.id).merged_into_id is None
+
+
+# ---------------------------------------------------------------------------
+# Done gate round
+# ---------------------------------------------------------------------------
+
+
+def _bare_receipt(conn: Conn, **kw: Any) -> uuid.UUID:
+    """A receipt with no provenance row, as if 000018 had missed it."""
+    from receipt_index.repository import insert_receipt
+
+    values: dict[str, Any] = {
+        "source_id": f"<{uuid.uuid4().hex}@example.com>",
+        "source_type": "imap",
+        "source_name": "mail",
+        "vendor": VENDOR,
+        "amount": Decimal("12.00"),
+        "paid_amount": Decimal("12.00"),
+        "currency": "USD",
+        "receipt_date": date(2026, 10, 14),
+        "description": None,
+        "confidence": 0.9,
+        "pdf_path": f"renditions/{uuid.uuid4().hex}.pdf",
+        "email_subject": None,
+        "email_sender": None,
+        "email_date": None,
+    }
+    values.update(kw)
+    return insert_receipt(conn, **values).id
+
+
+class TestGate:
+    def test_a_receipt_with_no_provenance_is_reported_not_linked(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        with _no_rules():
+            ingest(_email(), order_number="G-1")
+        bare = _bare_receipt(pg_conn, order_number="G-1")
+        result = duplicates.scan(pg_conn)
+        pg_conn.rollback()
+        assert result.links == []
+        assert result.no_provenance == [bare]
+
+    def test_merge_receipt_refuses_a_receipt_with_no_provenance(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        first = ingest(_email(), vendor="A")
+        bare = _bare_receipt(pg_conn, vendor="B")
+        with pytest.raises(duplicates.DuplicateError, match="no provenance"):
+            duplicates.merge_receipt(
+                pg_conn, bare, first.id, actor=PERSON, method="manual"
+            )
+        pg_conn.rollback()
+
+    def test_an_unlinked_pair_is_not_flagged_again(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        with _no_rules():
+            first = ingest(_email(), order_number="G-2")
+            second = ingest(_email(), order_number="G-2", date=date(2026, 10, 16))
+        duplicates.link(pg_conn, _home_prov(pg_conn, second.id), first.id, actor=PERSON)
+        pg_conn.commit()
+        duplicates.unlink_home(pg_conn, _home_prov(pg_conn, second.id), actor=PERSON)
+        pg_conn.commit()
+        assert duplicates.scan(pg_conn).flags == []
+        pg_conn.rollback()
+
+    def test_a_dismissed_pair_is_not_flagged_again_after_its_primary_changes(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        pdf = make_pdf("rescanned twice")
+        first = ingest(_email())
+        later = ingest(_drive(pdf), date=date(2026, 10, 15))
+        (pair,) = _candidates(pg_conn)
+        duplicates.decide_candidate(pg_conn, pair["id"], "dismissed", actor=PERSON)
+        pg_conn.commit()
+        # A rescan joins `later`, and its first record moves to another receipt,
+        # so the rescan becomes its primary.
+        rescan = _drive(pdf)
+        ingest(rescan)
+        other = ingest(_email(), vendor="Elsewhere")
+        duplicates.link(pg_conn, _home_prov(pg_conn, later.id), other.id, actor=PERSON)
+        pg_conn.commit()
+        assert _prov(pg_conn, rescan.source_id).is_primary is True
+
+        result = duplicates.scan(pg_conn)
+        pg_conn.commit()
+        assert (later.id, first.id) not in {(r, o) for r, o, _ in result.flags}
+        assert len(_candidates(pg_conn)) == 1
+
+    def test_a_merged_refund_does_not_count_as_linked(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        from receipt_index import refunds
+        from receipt_index.repository import has_linked_refunds
+
+        purchase = ingest(_email(), vendor="Shop", order_number="H-1")
+        r1 = ingest(_email(), vendor="Shop", kind="refund", order_number="H-1")
+        r2 = ingest(_email(), vendor="Shop", kind="refund", date=date(2026, 10, 25))
+        refunds.link(pg_conn, r2.id, purchase.id, actor="operator", reason=None)
+        pg_conn.commit()
+        assert _receipt(pg_conn, r1.id).refund_of == purchase.id
+        duplicates.link(pg_conn, _home_prov(pg_conn, r1.id), r2.id, actor=PERSON)
+        pg_conn.commit()
+        refunds.unlink(pg_conn, r2.id, actor="operator", reason=None)
+        pg_conn.commit()
+        assert has_linked_refunds(pg_conn, purchase.id) is False
+        pg_conn.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Operator decision: how far rules 2 and 3 link until line items exist
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorTightening:
+    def test_a_monthly_template_pdf_is_flagged_not_linked(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        pdf = make_pdf("monthly membership invoice, same every month")
+        ingest(_email(pdf), receipt_document="receipt.pdf")
+        ingest(_email(pdf), receipt_document="receipt.pdf", date=date(2026, 11, 14))
+        assert len(_live(pg_conn)) == 2
+        assert [c["reason"] for c in _candidates(pg_conn)] == ["document_hash_conflict"]
+
+    def test_same_day_equal_charges_on_one_order_from_one_source_are_flagged(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        ingest(_email(), order_number="S-1")
+        ingest(_email(), order_number="S-1")
+        assert len(_live(pg_conn)) == 2
+        assert [c["reason"] for c in _candidates(pg_conn)] == ["order_number_conflict"]
+
+    def test_the_same_order_from_an_email_and_a_drive_file_links(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        first = ingest(_email(), order_number="S-2")
+        drive = _drive(make_pdf("a photo of the paper receipt"))
+        assert ingest(drive, order_number="S-2").id == first.id
+        assert _prov(pg_conn, drive.source_id).match_method == "order_number"
+
+    def test_two_equal_partial_refunds_from_one_source_are_flagged(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        refund = {"kind": "refund", "order_number": "S-3", "vendor": "Shop"}
+        ingest(_email(), **refund)
+        ingest(_email(), **refund)
+        assert len(_live(pg_conn)) == 2
+        assert [c["reason"] for c in _candidates(pg_conn)] == ["order_number_conflict"]

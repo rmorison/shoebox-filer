@@ -680,6 +680,7 @@ def process_item(
                 paid_amount=metadata.paid_amount,
                 order_number=metadata.order_number,
                 receipt_date=metadata.date,
+                source_names=(source_name,),
                 doc_hashes=_doc_hashes(
                     raw, email, metadata.receipt_document, source_sha256
                 ),

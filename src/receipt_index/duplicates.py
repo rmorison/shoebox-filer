@@ -9,11 +9,11 @@ every rule compares only receipts that aren't merged):
 
 1. the whole original's sha256 equals an existing record's: link;
 2. the receipt document's sha256 equals an existing record's, both certain:
-   link when kind, vendor and effective amount match, else flag
+   link when kind, vendor, effective amount and date match, else flag
    ``document_hash_conflict``;
-3. the same order number, vendor, paid amount above zero and date: link;
-   with only the date differing, within the window: flag
-   ``order_number_conflict``;
+3. the same order number, vendor, paid amount above zero and date, from a
+   different source: link; from the same source, or with only the date
+   differing within the window: flag ``order_number_conflict``;
 4. the same vendor and effective amount, dates within the window: flag
    ``metadata``. Never link.
 
@@ -102,6 +102,8 @@ class ItemFacts:
     before: tuple[datetime, UUID] | None = None
     # Receipts a person kept apart from this one: the rules skip them.
     kept_apart: tuple[UUID, ...] = ()
+    # The sources the item came from: rule 3 links only across sources.
+    source_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -211,7 +213,8 @@ def decide(
             f"""\
             SELECT DISTINCT r.id, r.created_at,
                    ({same_receipt}
-                    AND COALESCE(r.paid_amount, r.amount) = %(effective)s) AS guarded
+                    AND COALESCE(r.paid_amount, r.amount) = %(effective)s
+                    AND r.receipt_date = %(date)s) AS guarded
             FROM receipt.provenance p
             JOIN receipt.receipts r ON r.id = p.receipt_id
             LEFT JOIN receipt.stored_files d ON d.id = p.receipt_document_file_id
@@ -229,16 +232,23 @@ def decide(
         for row in rows:
             decision.flag(row["id"], "document_hash_conflict")
 
-    # Rule 3: a paid amount above zero on both sides, or nothing at all.
+    # Rule 3: a paid amount above zero on both sides, or nothing at all. It
+    # links only across sources (the operator's interim rule until line items
+    # exist): within one source, equal charges on one order are flagged.
     if (
         facts.order_number is not None
         and facts.paid_amount is not None
         and facts.paid_amount > 0
     ):
-        params = dict(base)
+        params = {**base, "sources": list(facts.source_names)}
         rows = conn.execute(
             f"""\
-            SELECT r.id, r.receipt_date = %(date)s AS same_date
+            SELECT r.id, r.receipt_date = %(date)s AS same_date,
+                   NOT EXISTS (
+                       SELECT 1 FROM receipt.provenance s
+                       WHERE s.receipt_id = r.id
+                         AND s.source_name = ANY(%(sources)s)
+                   ) AS other_source
             FROM receipt.receipts r
             WHERE {same_receipt} AND r.order_number = %(order_number)s
               AND r.paid_amount = %(paid)s AND r.paid_amount > 0
@@ -249,7 +259,7 @@ def decide(
             params,
         ).fetchall()
         for row in rows:
-            if row["same_date"]:
+            if row["same_date"] and row["other_source"]:
                 decision.join, decision.method = row["id"], "order_number"
                 decision.flags = [f for f in decision.flags if f[0] != row["id"]]
                 return decision
@@ -332,9 +342,18 @@ def record_flags(
     provenance_id: UUID,
     flags: list[tuple[UUID, FlagReason]],
 ) -> int:
-    """Flag a new item's record against each flagged receipt's primary."""
+    """Flag a new item's record against each flagged receipt's primary.
+
+    A pair a person kept apart (``kept_apart``) isn't flagged again.
+    """
+    row = conn.execute(
+        "SELECT receipt_id FROM receipt.provenance WHERE id = %s", (provenance_id,)
+    ).fetchone()
+    mine = row["receipt_id"] if row else None
     written = 0
     for receipt_id, reason in flags:
+        if mine is not None and kept_apart(conn, mine, receipt_id):
+            continue
         other = primary_provenance(conn, receipt_id)
         if other is not None and insert_candidate(conn, provenance_id, other, reason):
             written += 1
@@ -715,6 +734,12 @@ def merge_receipt(
         " ORDER BY is_primary, created_at, id",
         (emptied.id,),
     ).fetchall()
+    if not rows:
+        msg = (
+            f"receipt {emptied_id} has no provenance record, so there is nothing"
+            " to move; re-run migration 000018, which backfills it"
+        )
+        raise DuplicateError(msg)
     for row in rows:
         link(conn, row["id"], target.id, actor=actor, method=method)
     return target.id
@@ -898,11 +923,11 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
     """Whether a person has decided receipts ``a`` and ``b`` are two receipts.
 
     An unlink between them (either way, counting the receipts merged into
-    each), or a dismissed pair between their records. Such a decision
-    outranks the rules' links: the scan never links the pair again. An
-    unlinked pair can still be flagged for review (a dismissed one can't). A
-    later hand ``link`` doesn't cancel an earlier unlink, so after an unlink
-    only a person re-merges the pair.
+    each), or a dismissed pair between their records (counting records
+    linked away from a receipt since, so a dismissal holds after its primary
+    changes). Such a decision outranks the rules: the scan never links or
+    flags the pair again. A later hand ``link`` doesn't cancel an earlier
+    unlink, so after an unlink only a person re-merges the pair.
     """
     row = conn.execute(
         """\
@@ -910,6 +935,17 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
             SELECT id FROM receipt.receipts WHERE id = %(a)s OR merged_into_id = %(a)s
         ), fb AS (
             SELECT id FROM receipt.receipts WHERE id = %(b)s OR merged_into_id = %(b)s
+        ), ra AS (
+            -- The records on a, and those linked away from it since.
+            SELECT id FROM receipt.provenance WHERE receipt_id IN (SELECT id FROM fa)
+            UNION
+            SELECT provenance_id FROM receipt.provenance_link_history
+            WHERE action = 'link' AND from_receipt_id IN (SELECT id FROM fa)
+        ), rb AS (
+            SELECT id FROM receipt.provenance WHERE receipt_id IN (SELECT id FROM fb)
+            UNION
+            SELECT provenance_id FROM receipt.provenance_link_history
+            WHERE action = 'link' AND from_receipt_id IN (SELECT id FROM fb)
         )
         SELECT EXISTS (
             SELECT 1 FROM receipt.provenance_link_history h
@@ -921,11 +957,11 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
             )
         ) OR EXISTS (
             SELECT 1 FROM receipt.duplicate_candidates c
-            JOIN receipt.provenance pa ON pa.id = c.provenance_id
-            JOIN receipt.provenance pb ON pb.id = c.candidate_of_provenance_id
             WHERE c.status = 'dismissed' AND (
-                (pa.receipt_id = %(a)s AND pb.receipt_id = %(b)s)
-                OR (pa.receipt_id = %(b)s AND pb.receipt_id = %(a)s)
+                (c.provenance_id IN (SELECT id FROM ra)
+                 AND c.candidate_of_provenance_id IN (SELECT id FROM rb))
+                OR (c.provenance_id IN (SELECT id FROM rb)
+                    AND c.candidate_of_provenance_id IN (SELECT id FROM ra))
             )
         ) AS apart
         """,
@@ -944,12 +980,14 @@ class ScanResult:
     links: list[tuple[UUID, UUID, str]] = field(default_factory=list)
     # (receipt, other receipt, reason)
     flags: list[tuple[UUID, UUID, str]] = field(default_factory=list)
+    # Live receipts with no provenance record: the rules can't link them.
+    no_provenance: list[UUID] = field(default_factory=list)
 
 
 def _facts_for(conn: psycopg.Connection[dict[str, Any]], receipt: Receipt) -> ItemFacts:
     rows = conn.execute(
         f"""\
-        SELECT p.source_sha256, ({_DOC_HASH}) AS doc
+        SELECT p.source_sha256, p.source_name, ({_DOC_HASH}) AS doc
         FROM receipt.provenance p
         LEFT JOIN receipt.stored_files d ON d.id = p.receipt_document_file_id
         WHERE p.receipt_id = %s
@@ -966,6 +1004,7 @@ def _facts_for(conn: psycopg.Connection[dict[str, Any]], receipt: Receipt) -> It
         receipt_date=receipt.receipt_date,
         source_hashes=tuple(r["source_sha256"] for r in rows if r["source_sha256"]),
         doc_hashes=tuple(r["doc"] for r in rows if r["doc"]),
+        source_names=tuple(sorted({r["source_name"] for r in rows})),
         exclude=receipt.id,
         before=(receipt.created_at, receipt.id),
     )
@@ -981,10 +1020,20 @@ def scan(
     Each receipt is compared with the live receipts created before it, so the
     older receipt of a pair is the one that remains. A merge the guard
     refuses is flagged ``merge_blocked``. A pair a person unlinked or
-    dismissed (``kept_apart``) is never linked again. The caller commits, or
-    rolls back for a dry run.
+    dismissed (``kept_apart``) is never linked or flagged again. A live
+    receipt with no provenance record is listed in ``no_provenance`` and
+    skipped. The caller commits, or rolls back for a dry run.
     """
     result = ScanResult()
+    result.no_provenance = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT r.id FROM receipt.receipts r WHERE r.merged_into_id IS NULL"
+            " AND NOT EXISTS (SELECT 1 FROM receipt.provenance p"
+            " WHERE p.receipt_id = r.id) ORDER BY r.created_at, r.id"
+        ).fetchall()
+    ]
+    skip = set(result.no_provenance)
     rows = conn.execute(
         "SELECT * FROM receipt.receipts WHERE merged_into_id IS NULL"
         " ORDER BY created_at, id"
@@ -995,6 +1044,8 @@ def scan(
             "SELECT merged_into_id FROM receipt.receipts WHERE id = %s", (receipt.id,)
         ).fetchone()
         if current is None or current["merged_into_id"] is not None:
+            continue
+        if receipt.id in skip:
             continue
         facts = _facts_for(conn, receipt)
         decision = decide(conn, facts, window_days=window_days)
@@ -1027,6 +1078,8 @@ def scan(
         if mine is None:
             continue
         for other_id, reason in decision.flags:
+            if kept_apart(conn, receipt.id, other_id):
+                continue
             other = primary_provenance(conn, other_id)
             if other is not None and insert_candidate(conn, mine, other, reason):
                 result.flagged[reason] = result.flagged.get(reason, 0) + 1

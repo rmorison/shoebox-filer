@@ -710,9 +710,9 @@ def search(
             conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
             conn.read_only = True
             total = count_receipts(conn, **filters)
-        results = search_receipts(conn, **filters, limit=limit, offset=offset)
-        if output_format == "json":
-            results = with_provenance(conn, results)
+        results = with_provenance(
+            conn, search_receipts(conn, **filters, limit=limit, offset=offset)
+        )
         # Items with no receipt to search: counted for the text output only,
         # so the JSON matches the MCP envelope.
         link_only = (
@@ -757,6 +757,16 @@ def _payment_line(receipt: Receipt) -> str | None:
     return " ".join(parts) or None
 
 
+def _duplicate_note(r: Receipt) -> str:
+    """'merged' for a receipt merged away (it doesn't count in a total), 'dup?'
+    for one with an open suspected-duplicate pair, else nothing."""
+    if r.merged_into_id is not None:
+        return "merged"
+    if r.suspected_duplicate_of:
+        return "dup?"
+    return ""
+
+
 def _print_receipts(
     results: list[Receipt], *, total: int | None = None, offset: int = 0
 ) -> None:
@@ -775,9 +785,9 @@ def _print_receipts(
     # unsigned; Kind says which way it counts.
     click.echo(
         f"{'ID':<38} {'Date':<12} {'Vendor':<20} {'Order':<16} {'Last4':<5} "
-        f"{'Kind':<9} {'Amount':>10} {'Total':>10}"
+        f"{'Kind':<9} {'Amount':>10} {'Total':>10}  Note"
     )
-    click.echo("-" * 126)
+    click.echo("-" * 134)
     for r in results:
         click.echo(
             f"{r.id!s:<38} "
@@ -787,7 +797,8 @@ def _print_receipts(
             f"{r.payment_last4 or '':<5} "
             f"{r.kind:<9} "
             f"{r.effective_amount!s:>10} "
-            f"{r.amount!s:>10}"
+            f"{r.amount!s:>10}  "
+            f"{_duplicate_note(r)}".rstrip()
         )
     if total is None:
         click.echo(f"\n{len(results)} receipt(s) found.")
@@ -2394,6 +2405,12 @@ def duplicates_scan(ctx: click.Context, dry_run: bool, window_days: int) -> None
         click.echo(f"{verb_f} {receipt} with {other} ({reason})")
     linked = ", ".join(f"{k} {v}" for k, v in sorted(result.linked.items())) or "none"
     flagged = ", ".join(f"{k} {v}" for k, v in sorted(result.flagged.items())) or "none"
+    if result.no_provenance:
+        click.echo(
+            f"\n{len(result.no_provenance)} receipt(s) have no provenance record,"
+            " so the rules can't link them (re-run migration 000018, which"
+            " backfills it): " + ", ".join(str(r) for r in result.no_provenance)
+        )
     prefix = "Dry run: nothing written. " if dry_run else ""
     click.echo(f"\n{prefix}Linked: {linked}. Flagged: {flagged}.")
 

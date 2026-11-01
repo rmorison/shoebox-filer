@@ -1548,9 +1548,10 @@ def set_refund_of(
 def has_linked_refunds(
     conn: psycopg.Connection[dict[str, Any]], purchase_id: UUID
 ) -> bool:
-    """Whether any refund is linked to this purchase."""
+    """Whether any refund, not merged away as a duplicate, is linked to it."""
     cur = conn.execute(
-        "SELECT 1 FROM receipt.receipts WHERE refund_of = %(id)s LIMIT 1",
+        "SELECT 1 FROM receipt.receipts WHERE refund_of = %(id)s"
+        " AND merged_into_id IS NULL LIMIT 1",
         {"id": purchase_id},
     )
     return cur.fetchone() is not None

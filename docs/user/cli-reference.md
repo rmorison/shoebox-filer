@@ -231,7 +231,7 @@ uv run receipt-index search [OPTIONS]
 | `--last4 NNNN` | Filter by the payment card's or account's last four digits (exactly four digits) |
 | `--payer TEXT` | Filter by payer name (case-insensitive substring match) |
 | `--kind KIND` | Only receipts of this [kind](#kinds-and-totals): `purchase`, `refund`, `credit` or `statement`. Repeatable. Default: every kind |
-| `--include-merged` | Also list receipts merged into another as [duplicates](#merged-receipts). Leave it off for totals, so a duplicate counts once |
+| `--include-merged` | Also list receipts merged into another as [duplicates](#merged-receipts). Leave it off for totals, so a duplicate counts once. The text table's Note column marks a merged receipt `merged`, and one with an open suspected-duplicate pair `dup?` |
 | `--limit N` | Print at most N receipts (1 or more). Default: every match |
 | `--offset N` | Skip the first N matches (0 or more). Default: 0 |
 | `--output text\|json` | Output format (default: `text`) |
@@ -824,8 +824,8 @@ Ingest checks each new item against the receipts already indexed, in this order.
 | # | Match | Result |
 |---|-------|--------|
 | 1 | The whole file or email is byte for byte the same as one already indexed (the same scan dropped twice) | Linked. Checked before extraction, so it costs no LLM call |
-| 2 | The receipt document (the attachment the receipt was read from, when the extraction names it for certain, or a Drive file) has the same bytes as another's | Linked when the kind, vendor and [effective amount](#amounts) also match. Otherwise flagged (`document_hash_conflict`): the same file, such as an invoice re-attached to a refund, isn't the same receipt |
-| 3 | The same order or invoice number, vendor and paid amount (above zero), on the same date | Linked. With a different date up to three days away, flagged (`order_number_conflict`): an order charged once per shipment |
+| 2 | The receipt document (the attachment the receipt was read from, when the extraction names it for certain, or a Drive file) has the same bytes as another's | Linked when the kind, vendor, [effective amount](#amounts) and date also match. Otherwise flagged (`document_hash_conflict`): the same file, such as an invoice re-attached to a refund or a template PDF reused each month, isn't the same receipt |
+| 3 | The same order or invoice number, vendor and paid amount (above zero), on the same date, from a different source (an email and a Drive scan, or two mailboxes) | Linked. From the same source, or with a different date up to three days away, flagged (`order_number_conflict`): an order charged once per shipment, a real double charge, or two equal partial refunds. A forward into the same mailbox is flagged; confirm it with `duplicates link` |
 | 4 | The same vendor and effective amount, dates up to three days apart | Flagged (`metadata`), never linked: two identical parking charges on one day are two real expenses |
 
 An unpaid invoice (paid amount 0) and the receipt for its payment are neither linked nor flagged: the invoice counts 0 in a total.
@@ -854,7 +854,7 @@ Every link, unlink, merge and unmerge is recorded, with who did it (`--as`, defa
 
 ### Scanning existing receipts
 
-`duplicates scan` runs the same rules over receipts that are already indexed, oldest first, so duplicates ingested before the rules existed stop counting twice. The older receipt of a pair is the one that remains; a merge the rules above refuse is flagged `merge_blocked` instead. It makes no LLM calls and reads no files. Rules 1 and 2 find only items whose originals have been kept; rules 3 and 4 cover every receipt. Run it again at any time: a pair already decided is never flagged again.
+`duplicates scan` runs the same rules over receipts that are already indexed, oldest first, so duplicates ingested before the rules existed stop counting twice. The older receipt of a pair is the one that remains; a merge the rules above refuse is flagged `merge_blocked` instead. It makes no LLM calls and reads no files. Rules 1 and 2 find only items whose originals have been kept; rules 3 and 4 cover every receipt. A receipt with no provenance record can't be linked; the scan lists any it finds, and re-running migration 000018 backfills them. A pair you unlinked or dismissed is never linked or flagged again. Run it again at any time: a pair already decided is never flagged again.
 
 - `--dry-run` prints what it would link and flag, with counts per rule, and writes nothing.
 - `--window-days N` (default 3) sets how many days apart two receipts' dates may be for rules 3 and 4 to flag them. Try other windows with `--dry-run` before a real scan.

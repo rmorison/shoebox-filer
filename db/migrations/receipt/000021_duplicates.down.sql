@@ -39,6 +39,6 @@ ALTER TABLE receipt.receipts
     DROP COLUMN IF EXISTS merged_at,
     DROP COLUMN IF EXISTS merged_into_id;
 
--- 000017 and 000019 granted no UPDATE on provenance; take back this one's.
+-- Take back this migration's UPDATE grant on provenance.
 REVOKE UPDATE (receipt_id, is_primary, home_receipt_id, match_method)
     ON receipt.provenance FROM receipt_index_dev_write;
