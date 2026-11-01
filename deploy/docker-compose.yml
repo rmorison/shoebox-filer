@@ -75,7 +75,8 @@ services:
     entrypoint: ["supercronic", "/app/crontab"]
     restart: unless-stopped
     # PID 1 zombie reaping: Chromium forks aggressively during rendering
-    # (an ad-hoc `exec scheduler receipt-index retry` still renders).
+    # (ad-hoc `exec scheduler receipt-index backfill` and `unlink` still
+    # render receipts here).
     init: true
     # Chromium crashes on the 64 MB default /dev/shm.
     shm_size: 1gb
