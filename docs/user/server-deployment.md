@@ -1,6 +1,6 @@
 # Server Deployment
 
-Take a clean Ubuntu box to an unattended receipt-index service: Postgres in Docker, `receipt-index ingest` on a 15-minute schedule, receipts and nightly and monthly database dumps mirrored to Dropbox.
+Take a clean Ubuntu box to an unattended receipt-index service: Postgres in Docker, `receipt-index serve` ingesting as receipts arrive, receipts and nightly and monthly database dumps mirrored to Dropbox.
 
 This is the canonical operations document for the always-on deployment — provisioning, first-launch gates, the one-time cutover from the dev machine, weekly monitoring, upgrades, and disaster recovery.
 
@@ -23,12 +23,13 @@ This is the canonical operations document for the always-on deployment — provi
 
 ## 1. Overview and layout
 
-One Docker Compose project, named `receipt-index` (set by `name:` at the top of `deploy/docker-compose.yml`), with two services:
+One Docker Compose project, named `receipt-index` (set by `name:` at the top of `deploy/docker-compose.yml`), with three services:
 
 | Service | What it is |
 |---|---|
 | `db` | `postgres:18`, named volume `pgdata`, published on `127.0.0.1:15432` only |
-| `scheduler` | The app image with `supercronic /app/crontab` as its entrypoint — ingest every 15 min, two rclone mirror lines, a nightly and a monthly `pg_dump` |
+| `ingest` | The app image running `receipt-index serve`: watches the sources and ingests new items as they arrive, with a healthcheck on `status --check` (see [8.9](#89-cutover-to-serve)) |
+| `scheduler` | The app image with `supercronic /app/crontab` as its entrypoint — two rclone mirror lines, a nightly and a monthly `pg_dump` |
 
 **The git clone is the deployment unit.** There is no registry and no CI: the image is built on the server from the checkout, and deploying an update is `git pull` + rebuild. Everything the server needs beyond the clone is a handful of git-ignored files at the clone root.
 
@@ -818,7 +819,14 @@ docker compose -f deploy/docker-compose.yml logs --since 168h scheduler \
 
 Grep for the exact strings recorded during Gate G; the pattern above is the broad net.
 
-Two things to know:
+After the cutover to `serve` ([8.9](#89-cutover-to-serve)), ingest logs to the `ingest` service, so scan both. The two notes below are about the cron ingest and no longer apply then; look instead for `Watchdog:` lines, each one a restart of `serve` (see [Troubleshooting](troubleshooting.md#the-watchdog-restarted-serve)):
+
+```bash
+docker compose -f deploy/docker-compose.yml logs --since 168h ingest \
+    | grep -Ei 'level=error|watchdog|Traceback'
+```
+
+Before the cutover, two things to know:
 
 - **One failed ingest tick immediately after every reboot is expected.** Container restart policies do not honour `depends_on` health ordering, so the scheduler can fire its first tick while Postgres is still starting. The run aborts on connection failure *before* any item is processed, so it writes no `ingest_log` rows and dead-letters nothing; the next tick self-heals. A *second* consecutive failure is not expected.
 - **Falling-behind warnings** mean a cycle outran its 15-minute interval. supercronic's no-overlap guarantee holds (it will not start an overlapping run), so nothing is corrupted — but this is the early-warning signal for the O(N) mailbox enumeration issue, and the cue to revisit the cadence.
@@ -840,9 +848,9 @@ du -sh ~/receipt-index/data/*
 
 Container logs are capped (10 MB × 7 files per service) and the backup directory is bounded at nineteen dumps (seven by day of week, twelve by month), so growth should be dominated by the receipt tree and pgdata.
 
-### 7.5 Future work
+### 7.5 The monitor
 
-A dead-man's-snitch (healthchecks.io-style) ping as a fourth crontab line after each successful cycle. Absence-of-ping covers crash-loop, falling-behind, and config breakage in one mechanism — and unlike everything above, it pages *you* instead of waiting to be checked.
+After the cutover to `serve`, the external monitor ([8.9](#89-cutover-to-serve) step 3) pages you when pings stop or a failure ping arrives, instead of waiting for this weekly check. Glance at its history here too, and run `docker compose -f deploy/docker-compose.yml exec ingest receipt-index status`.
 
 ---
 
@@ -850,7 +858,7 @@ A dead-man's-snitch (healthchecks.io-style) ping as a fourth crontab line after 
 
 ### 8.1 Upgrade
 
-The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says.
+The first upgrade to a release that reads `.env.db` needs that file before `up -d`: follow [8.5](#85-split-the-owner-credentials-out-of-env) instead of this section, once. The first upgrade to the release that brings the provenance schema (receipt migrations 000017 and 000018) needs one more step after `up -d`: [8.7](#87-recording-renditions-after-the-provenance-schema). If the scheduler is stopped and the schedule must stay off, change the commands below as [8.6](#86-with-the-scheduler-stopped) says. After the cutover to `serve` ([8.9](#89-cutover-to-serve)), the idle check has no ingest to find, and `up -d` stops `serve` gracefully when it recreates the `ingest` container: SIGTERM lets the item in hand finish (the service's `stop_grace_period` is 21 minutes). Follow it with `logs -f ingest` and `ps`, which shows `ingest` healthy within a couple of minutes.
 
 ```bash
 cd ~/receipt-index
@@ -915,7 +923,7 @@ Only requeue for **environmental** causes: a rendering gap, a permissions proble
 
    After an LLM outage, `--transient` selects every failure classed as transient. Use `--status skipped` for skipped items that should have been recognized as receipts.
 
-4. **The next scheduled cycle runs them.** Run `receipt-index ingest` by hand to run them at once. Watch it, then re-check with `receipt-index failures --status queued` (should be empty) and the per-status breakdown. Each requeue is on record:
+4. **The next scheduled cycle runs them.** Run `receipt-index ingest` by hand to run them at once. After the cutover to `serve` ([8.9](#89-cutover-to-serve)), its retry job runs them within a minute, and a one-shot `ingest` exits 3, because `serve` holds the sources; follow them with `logs -f ingest` instead. Watch it, then re-check with `receipt-index failures --status queued` (should be empty) and the per-status breakdown. Each requeue is on record:
 
    ```bash
    docker compose -f deploy/docker-compose.yml exec scheduler sh -c '
@@ -1262,7 +1270,7 @@ Sometimes the schedule has to stay off, for example until a backfill finishes, s
   ```
 
   [10.1](#101-one-time-setup) step 4 gives the same form for the MCP check.
-- **`up -d` and `up -d scheduler` become `up -d db`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), and leaves the scheduler stopped. Skip `logs -f scheduler`.
+- **`up -d` and `up -d scheduler` become `up -d db`.** It still recreates `db` when its env file changed (8.4 step 6, 8.5 step 5), and leaves the scheduler stopped. Skip `logs -f scheduler`. After the cutover to `serve`, ingest is the `ingest` service: to keep it off too, `stop ingest` first, and `up -d db` leaves it stopped.
 - **No backup runs, nightly or monthly.** Both dumps are cron lines, so they stop with the scheduler, and supercronic doesn't run a missed one when it starts again. To take one by hand, as the read login like the scheduled ones, run the script in a one-off container. With no argument it writes today's day-of-week name; with `monthly` it writes this month's `receipt_index-month-<MM>.dump`, replacing the one already there:
 
   ```bash
@@ -1331,6 +1339,107 @@ From the release with receipt migration 000019, each email that becomes a receip
 The upgrade is [8.1](#81-upgrade) with no extra step: 000019 only grants the application's login what it now writes. The store grows by about the size of each email receipt and its attachments. An attachment whose bytes the store already keeps, such as a vendor's terms and conditions, isn't written again, and neither is a second copy within one email. The exception is two emails that bring the same new bytes and are stored at the same moment: each keeps its own file, recorded as one stored file in two places.
 
 **Rolling back** to the release before: `goto 18`, as in [8.7](#87-recording-renditions-after-the-provenance-schema), takes back 000019's grants. The kept files stay under `originals/` and their records stay in the database, so the earlier release ingests as before but keeps no new originals. Going back past 000017 drops those records too. The files stay on disk, but nothing then links them to a receipt.
+
+### 8.9 Cutover to `serve`
+
+From this release, ingest runs all the time in the `ingest` service (`receipt-index serve`) instead of every 15 minutes from cron. `serve` watches IMAP sources with IDLE, polls Drive, runs due retries every minute and writes a heartbeat that its healthcheck reads. An external monitor then tells you when it stops. The steps run in this order. Do each one fully before the next.
+
+**Before you start.** These rollout steps should already be done:
+
+- The cron ingest has run the incremental release (sync state and retries) for a few days, and its runs read only new items.
+- The historical failures have had their one retry by hand: `docker compose -f deploy/docker-compose.yml exec scheduler receipt-index retry --status failed --all --yes`.
+
+**1. Deploy `serve` and remove the cron line, in one change.** This is [8.1](#81-upgrade) with this release: the same idle check, `stop scheduler`, `make migrate-up` and `up -d`. Note the commit you're on first, for the rollback below:
+
+```bash
+cd ~/receipt-index
+git rev-parse --short HEAD     # write it down: the release to roll back to
+git pull
+docker compose -f deploy/docker-compose.yml build
+# ... the idle check and `stop scheduler`, as in 8.1 ...
+make migrate-up
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`up -d` starts the new `ingest` container and recreates the scheduler with the new crontab, which has no ingest line. Every source stays on `archive: false`: archiving is a later step. Your `deploy/receipt-index.yaml` needs no `ingest:` block (every key has a default), and it must not have an uncommented `ping_url` yet.
+
+**2. Check that it runs.**
+
+```bash
+# `ingest` shows "Up ... (healthy)" a minute or two after it starts.
+docker compose -f deploy/docker-compose.yml ps
+docker compose -f deploy/docker-compose.yml logs --since 10m ingest
+# Run status in the ingest container: it reads serve's heartbeat file there.
+docker compose -f deploy/docker-compose.yml exec ingest receipt-index status
+docker compose -f deploy/docker-compose.yml exec ingest receipt-index status --check   # prints ok
+# A one-shot ingest now finds every source held by serve and exits 3.
+docker compose -f deploy/docker-compose.yml exec scheduler receipt-index ingest; echo "exit=$?"
+```
+
+The last command prints `source <name> is being watched by a running serve; see receipt-index status` for each source, then `exit=3`. That is the guard against a cron line left in place by mistake: it fails loudly instead of racing `serve`. Then send yourself a test receipt and watch it arrive in `logs -f ingest` within a minute or two.
+
+**3. Set up the monitor.** Use any Healthchecks.io-style service, which alerts when pings stop and accepts a failure ping at the check's URL plus `/fail`.
+
+1. Create a check with a **5-minute period** (`serve` pings every 5 minutes) and a **15-minute grace** (three missed pings). Copy its ping URL. The URL is a capability: anyone holding it can send pings. Keep it out of the repository, notes and chat.
+2. Add it to the clone-root `.env` with your editor:
+
+   ```bash
+   HEALTH_PING_URL=https://hc-ping.example.com/replace-with-check-id
+   ```
+
+3. Recreate both app containers so their environment has the variable. Both read `deploy/receipt-index.yaml`, so both need it before the next step:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d
+   ```
+
+4. Only now uncomment `ping_url: ${HEALTH_PING_URL}` under `ingest:` → `health:` in `deploy/receipt-index.yaml` (copy the block from `deploy/example.receipt-index.yaml` if your copy has none). The order matters: the config loader refuses a `${VAR}` that isn't set, so the key without the variable stops every command, the healthcheck and a rollback `ingest` included.
+5. Restart `serve` so it reads the config. `up -d` alone doesn't, because the config file is a bind mount and compose doesn't see its content change:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d --force-recreate ingest
+   ```
+
+6. The monitor shows the first ping within a minute. If it doesn't, read `logs ingest` for a failed ping. A failed ping is logged without the URL and never stops `serve`.
+
+**4. Prove the alert, once.**
+
+```bash
+docker compose -f deploy/docker-compose.yml stop ingest
+```
+
+`stop` waits for the item in hand, which normally takes seconds (up to 21 minutes for an item at its time limit). Within the check's period plus grace, about 20 minutes, the monitor alerts. Then start it again, and the next ping clears the alert:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d ingest
+```
+
+**5. Read `status` and `status --check`.** Run both in the `ingest` container, as above. Run in the scheduler, or with `serve` stopped, `status` says `heartbeat: none (serve isn't running here)` and `--check` fails on it. `--check` prints `ok`, or one line per problem, and exits 1 if there is any. The same lines are the body of a failure ping:
+
+| `status --check` line | What it means | What to do |
+|---|---|---|
+| `heartbeat missing` | `serve` isn't running in this container, or never started | `ps` and `logs ingest`. A config error stops `serve` at start, with the reason in the log |
+| `heartbeat stale 300s` | `serve`'s worker is wedged, or the process is gone | The watchdog exits `serve` once an item runs past `item_timeout_seconds`, and Docker restarts it. If it stays stale, `restart ingest` |
+| `source <name> stale 1200s` | No successful read of that source for longer than its threshold (3 × its poll interval by default, 720 s for IMAP) | `status` shows `last error`. A mailbox or Drive outage clears itself; a bad password or token doesn't |
+| `source <name> never succeeded` | The source has never had a successful read since `serve` started | As for stale |
+| `source <name> paused 900s` | The worker paused the source after transient or config failures, for longer than the threshold | `status` shows the pause and its reason under `Worker` |
+| `source <name> lock lost`, `source <name> not held` | Another process holds the source's lock, so `serve` stopped watching it, or never started | Usually a one-shot `ingest` left running; see [Troubleshooting](troubleshooting.md#a-source-lock-is-held-by-another-ingest) |
+| `database unreachable` | The database can't be reached | `ps db`, `logs db` |
+
+Terminal failures never fail the check, since they are content problems, not liveness. A new one still turns the next ping into a failure (`terminal 1 in 24h`), which clears itself after a day. Work through them with `failures --status terminal` and `retry`, as in [8.2](#82-dlq-recovery).
+
+**Later, not now.** Archiving (`archive: true`) is a later step, after a week with `status --check` clean and `backfill --dry-run --since <cutover minus 7 days>` reporting no unseen items. It depends on the dropoff archive release, so it isn't part of this cutover. Drive sources follow once the evidence store's Drive backend lands.
+
+**Rollback**, at any step above. Revert the cutover change, then let compose remove the `ingest` container and restart the scheduler with the old crontab. The change arrived as a merge, so revert the merge against its first parent:
+
+```bash
+cd ~/receipt-index
+git log --merges --oneline -5 -- deploy/crontab   # the merge that removed the cron ingest line
+git revert --no-edit -m 1 <that merge>
+docker compose -f deploy/docker-compose.yml up -d --remove-orphans
+```
+
+No rebuild is needed: the change is in `deploy/` only. `--remove-orphans` removes the `ingest` container, since the reverted compose file no longer has the service, and `up -d` recreates the scheduler with the cron line back. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Nothing in the database needs undoing, and the one-shot `ingest` keeps working against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings. Land the same revert in the repository as well, or the next `git pull` brings the cutover back.
 
 ---
 

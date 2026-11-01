@@ -3,34 +3,30 @@
 # Mounted read-only at /app/crontab; the compose `scheduler` service overrides
 # the image ENTRYPOINT with `supercronic /app/crontab`.
 #
+# Ingest isn't here. It runs all the time in the compose `ingest` service
+# (`receipt-index serve`). A `receipt-index ingest` line added back by mistake
+# would find each source's lock held by serve and exit 3 on every tick, so it
+# can't race it.
+#
 # Notes:
 #   * supercronic will not start a job while its previous run is still going —
-#     no-overlap is the default, per job line. That is the whole of the
-#     no-overlap guarantee; the application has no locking of its own.
-#     "Falling behind" warnings in the container log mean a cycle outran its
-#     interval — the early-warning signal for the O(N) IMAP enumeration issue.
+#     no-overlap is the default, per job line.
 #   * No environment is declared here. supercronic does not scrub the
 #     environment before running jobs, so everything from the compose
-#     `env_file` / `environment` (DATABASE_URL, ANTHROPIC_API_KEY,
-#     RECEIPT_INDEX_CONFIG, ...) is already visible to these commands.
-#   * Job stdout/stderr goes to the container log. `receipt-index ingest` exits
-#     1 when any single item failed; that is a per-cycle signal, not a stuck
-#     state, and supercronic simply schedules the next tick.
+#     `env_file` / `environment` (DATABASE_URL, RECEIPT_INDEX_CONFIG, ...) is
+#     already visible to these commands.
+#   * Job stdout/stderr goes to the container log.
 #   * Schedules are in the container's timezone, which is UTC unless TZ is set
 #     in the compose environment. Only the two backup lines care.
 #   * Commands run under /bin/sh -c (supercronic's default; it takes no `%`
 #     shortcuts — see deploy/backup.sh).
-#   * The ingest and sync lines are deliberately decoupled: a failed item must
-#     never hold up the Dropbox mirror. Their minute offsets keep them from
-#     routinely colliding, but note that no-overlap is per line — a long ingest
-#     can still run through a sync tick.
+#   * The two mirror lines are offset from each other and from the backups.
+#     No-overlap is per line, so a long mirror can still run through another
+#     line's tick.
 
-# Ingest every 15 minutes.
-*/15 * * * * receipt-index ingest
-
-# Mirror rendered receipts to Dropbox, offset from the ingest boundaries.
-# `copy` is additive: it never deletes at the destination. The store writes
-# each file to a `.tmp` name first, so those are skipped.
+# Mirror rendered receipts to Dropbox. `copy` is additive: it never deletes at
+# the destination. The store writes each file to a `.tmp` name first, so those
+# are skipped.
 7,22,37,52 * * * * rclone copy /app/data/receipts dropbox:receipt-index/receipts --exclude "*.tmp" --config /app/.rclone/rclone.conf -v
 
 # Mirror the rotating database dumps. Same additive semantics; the fixed set of
