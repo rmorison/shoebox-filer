@@ -127,8 +127,15 @@ def _scope(
     before: tuple[datetime, UUID] | None,
     kept: tuple[UUID, ...] = (),
 ) -> str:
-    """The live receipts (aliased r) an item may match."""
-    clauses = ["r.merged_into_id IS NULL"]
+    """The live receipts (aliased r) an item may match.
+
+    A receipt with no provenance record isn't one: rule 3's source test
+    can't read it, and nothing could be moved off it. The scan lists them.
+    """
+    clauses = [
+        "r.merged_into_id IS NULL",
+        "EXISTS (SELECT 1 FROM receipt.provenance px WHERE px.receipt_id = r.id)",
+    ]
     if exclude is not None:
         clauses.append("r.id <> %(exclude)s")
         params["exclude"] = exclude
@@ -923,11 +930,12 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
     """Whether a person has decided receipts ``a`` and ``b`` are two receipts.
 
     An unlink between them (either way, counting the receipts merged into
-    each), or a dismissed pair between their records (counting records
-    linked away from a receipt since, so a dismissal holds after its primary
-    changes). Such a decision outranks the rules: the scan never links or
-    flags the pair again. A later hand ``link`` doesn't cancel an earlier
-    unlink, so after an unlink only a person re-merges the pair.
+    each), or a dismissed pair between their records. A record linked away
+    from a receipt after the pair was dismissed still counts for it, so a
+    dismissal holds after a receipt's primary changes. Such a decision
+    outranks the rules: the scan never links or flags the pair again. A
+    later hand ``link`` doesn't cancel an earlier unlink, so after an unlink
+    only a person re-merges the pair.
     """
     row = conn.execute(
         """\
@@ -936,15 +944,19 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
         ), fb AS (
             SELECT id FROM receipt.receipts WHERE id = %(b)s OR merged_into_id = %(b)s
         ), ra AS (
-            -- The records on a, and those linked away from it since.
-            SELECT id FROM receipt.provenance WHERE receipt_id IN (SELECT id FROM fa)
-            UNION
-            SELECT provenance_id FROM receipt.provenance_link_history
+            -- The records on a (left_at NULL), and those linked away from it,
+            -- with when they left: a dismissal binds a only through a record
+            -- that was still on it when the pair was dismissed.
+            SELECT id, NULL::timestamptz AS left_at FROM receipt.provenance
+            WHERE receipt_id IN (SELECT id FROM fa)
+            UNION ALL
+            SELECT provenance_id, created_at FROM receipt.provenance_link_history
             WHERE action = 'link' AND from_receipt_id IN (SELECT id FROM fa)
         ), rb AS (
-            SELECT id FROM receipt.provenance WHERE receipt_id IN (SELECT id FROM fb)
-            UNION
-            SELECT provenance_id FROM receipt.provenance_link_history
+            SELECT id, NULL::timestamptz AS left_at FROM receipt.provenance
+            WHERE receipt_id IN (SELECT id FROM fb)
+            UNION ALL
+            SELECT provenance_id, created_at FROM receipt.provenance_link_history
             WHERE action = 'link' AND from_receipt_id IN (SELECT id FROM fb)
         )
         SELECT EXISTS (
@@ -958,10 +970,17 @@ def kept_apart(conn: psycopg.Connection[dict[str, Any]], a: UUID, b: UUID) -> bo
         ) OR EXISTS (
             SELECT 1 FROM receipt.duplicate_candidates c
             WHERE c.status = 'dismissed' AND (
-                (c.provenance_id IN (SELECT id FROM ra)
-                 AND c.candidate_of_provenance_id IN (SELECT id FROM rb))
-                OR (c.provenance_id IN (SELECT id FROM rb)
-                    AND c.candidate_of_provenance_id IN (SELECT id FROM ra))
+                (EXISTS (SELECT 1 FROM ra x WHERE x.id = c.provenance_id
+                         AND (x.left_at IS NULL OR x.left_at >= c.created_at))
+                 AND EXISTS (SELECT 1 FROM rb y
+                             WHERE y.id = c.candidate_of_provenance_id
+                             AND (y.left_at IS NULL OR y.left_at >= c.created_at)))
+                OR (EXISTS (SELECT 1 FROM rb x WHERE x.id = c.provenance_id
+                            AND (x.left_at IS NULL OR x.left_at >= c.created_at))
+                    AND EXISTS (SELECT 1 FROM ra y
+                                WHERE y.id = c.candidate_of_provenance_id
+                                AND (y.left_at IS NULL
+                                     OR y.left_at >= c.created_at)))
             )
         ) AS apart
         """,

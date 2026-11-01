@@ -1171,3 +1171,44 @@ class TestOperatorTightening:
         ingest(_email(), **refund)
         assert len(_live(pg_conn)) == 2
         assert [c["reason"] for c in _candidates(pg_conn)] == ["order_number_conflict"]
+
+
+class TestGateReReview:
+    def test_a_dismissal_made_after_a_record_left_does_not_bind_its_old_receipt(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        pdf = make_pdf("scanned twice into one receipt")
+        a = ingest(_drive(pdf))
+        twin = _drive(pdf)
+        ingest(twin)  # joins a by rule 1
+        c = ingest(_email(), vendor="Elsewhere")
+        d = ingest(_email(), vendor="Further")
+        with _no_rules():
+            b = ingest(_email(), date=date(2026, 10, 15))
+        # The twin moves to c, then c's own record moves on, so the twin is
+        # c's primary; only then does a person dismiss c against b.
+        twin_id = _prov(pg_conn, twin.source_id).id
+        duplicates.link(pg_conn, twin_id, c.id, actor=PERSON)
+        pg_conn.commit()
+        duplicates.link(pg_conn, _home_prov(pg_conn, c.id), d.id, actor=PERSON)
+        pg_conn.commit()
+        duplicates.insert_candidate(
+            pg_conn, _home_prov(pg_conn, b.id), twin_id, "metadata"
+        )
+        pg_conn.commit()
+        (pair,) = _candidates(pg_conn)
+        duplicates.decide_candidate(pg_conn, pair["id"], "dismissed", actor=PERSON)
+        pg_conn.commit()
+
+        assert duplicates.kept_apart(pg_conn, a.id, b.id) is False
+        assert duplicates.kept_apart(pg_conn, c.id, b.id) is True
+        pg_conn.rollback()
+
+    def test_a_receipt_with_no_provenance_is_not_a_target(
+        self, ingest: _Ingest, pg_conn: Conn
+    ) -> None:
+        bare = _bare_receipt(pg_conn, order_number="N-1")
+        pg_conn.commit()
+        item = ingest(_email(), order_number="N-1")
+        assert item.id != bare
+        assert _candidates(pg_conn) == []
