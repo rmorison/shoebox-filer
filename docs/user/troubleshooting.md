@@ -141,7 +141,7 @@ The log shows `Watchdog: <step> has run <N>s, past item_timeout_seconds (1200); 
 
 ### A source lock is held by another `ingest`
 
-`status --check` shows `source <name> lock lost` or `source <name> not held`, and `serve` doesn't watch that source. Another process holds its lock: almost always a one-shot `receipt-index ingest` started by hand, or a cron ingest line left in a crontab. While `serve` holds a source, a one-shot `ingest` exits 3 with `source <name> is being watched by a running serve`; it is the other order, a one-shot started first, that leaves `serve` without the source. If another process holds every source, `serve` has nothing to watch: it prints the same line for each source, exits 3, and Docker keeps restarting it, so `ps` shows `ingest` restarting and `status --check` says `heartbeat missing`.
+`status --check` shows `source <name> lock lost` or `source <name> not held`, and `serve` doesn't watch that source. Another process holds its lock: almost always a one-shot `receipt-index ingest` started by hand, or a cron ingest line left in a crontab. While `serve` holds a source, a one-shot `ingest` exits 3 with `source <name> is being watched by a running serve`; it is the other order, a one-shot started first, that leaves `serve` without the source. If another process holds every source, `serve` has nothing to watch: it prints the same line for each source and exits 3, and Docker keeps restarting it. `ps` shows `ingest` restarting, `logs ingest` shows the lines, and the healthcheck or the monitor reports a missing or stale heartbeat.
 
 1. Find it. A one-shot run in the scheduler shows in its process list (the image has no `ps`, so read `/proc`):
 

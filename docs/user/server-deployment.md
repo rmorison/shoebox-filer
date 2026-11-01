@@ -1257,7 +1257,7 @@ The scheduler then holds the owner credentials again, as before this section, an
 
 Sometimes the schedule has to stay off, for example until a backfill finishes, so the scheduler isn't running. `up -d` and `up -d scheduler` would start supercronic, and the schedule with it, and `exec` needs a running container. To run [8.1](#81-upgrade), [8.4](#84-separate-database-logins) or [8.5](#85-split-the-owner-credentials-out-of-env) and leave the schedule off, change their commands like this:
 
-- **Skip the idle check and `stop scheduler`.** No cycle is running.
+- **Skip the idle check and `stop scheduler`.** No cycle is running. After the cutover to `serve`, still `stop ingest` before `make migrate-up`.
 - **Each `exec` becomes a one-off `run`.** The program goes in `--entrypoint` and its arguments after `scheduler`. A one-off container reads `.env` when it starts, so it sees an edit straight away, with no recreate:
 
   ```bash
@@ -1430,22 +1430,19 @@ Terminal failures never fail the check, since they are content problems, not liv
 
 **Later, not now.** Archiving (`archive: true`) is a later step, after a week with `status --check` clean and `backfill --dry-run --since <cutover minus 7 days>` reporting no unseen items. It depends on the dropoff archive release, so it isn't part of this cutover. Drive sources follow once the evidence store's Drive backend lands.
 
-**Rollback**, at any step above. Go back to the release you noted in step 1, then let compose remove the `ingest` container and restart the scheduler with the old crontab:
+**Rollback**, at any step above. Check out the commit just before the cutover merge, then let compose remove the `ingest` container and restart the scheduler with the old crontab:
 
 ```bash
 cd ~/receipt-index
-git switch --detach <the commit noted in step 1>
+git log --first-parent --merges --oneline -3 -- deploy/crontab   # find the cutover merge
+git show --first-parent <merge> -- deploy/crontab   # check: it removes the receipt-index ingest line
+git switch --detach <merge>^1
 docker compose -f deploy/docker-compose.yml up -d --remove-orphans
 ```
 
-`--remove-orphans` removes the `ingest` container, since the older compose file has no such service, and `up -d` recreates the scheduler with the cron ingest line back. The detached checkout leaves no commit on the server, so its clone never diverges from the repository. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Don't rebuild: the containers keep the image built for this release, and only the files in `deploy/` decide what runs. Nothing in the database needs undoing, and the one-shot `ingest` in that image works against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings.
+`<merge>^1` is the release just before the cutover, so only the cutover's own `deploy/` changes go back. If step 1's `git pull` brought several releases, the commit you noted there would also undo the others, so use it only when it is that same commit. `--remove-orphans` removes the `ingest` container, since that compose file has no such service, and `up -d` recreates the scheduler with the cron ingest line back. The detached checkout leaves no commit on the server, so its clone never diverges from the repository. A plain `docker compose stop ingest` isn't a rollback: the cron line is still gone, so nothing ingests, and the next `up -d` starts `serve` again. Don't rebuild: the containers keep the image built for this release, and only the files in `deploy/` decide what runs. Nothing in the database needs undoing, and the one-shot `ingest` in that image works against the current schema. If `ping_url` is set, comment it out and pause the monitor's check: with no `serve`, nothing pings.
 
-To stay rolled back across later upgrades, revert the cutover change in the repository (a git revert of its merge). Then return the server to the branch, which brings in the revert and so keeps the cron line:
-
-```bash
-git switch main && git pull
-docker compose -f deploy/docker-compose.yml up -d --remove-orphans
-```
+To stay rolled back across later upgrades, revert the cutover change in the repository (a git revert of its merge). Once it has landed, return the server to the branch with `git switch main`, then a normal [8.1](#81-upgrade) upgrade: pull, build, the idle check, `stop scheduler`, `make migrate-up` and `up -d --remove-orphans`. By then `main` usually carries other changes too, which need the build and the migrations.
 
 ---
 
