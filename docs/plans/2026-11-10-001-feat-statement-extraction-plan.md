@@ -209,7 +209,7 @@ Asked of the ledger's session, one question at a time, on 2026-11-10:
 2. **Revisions and duplicates.** Accepted as proposed: a statement ID per original's bytes, a new revision per re-extraction, account and line IDs stable only within a revision, and a second statement (no merge, no flag) for the same account and period in different bytes. Additions, adopted above: a monotonic `revision` number, and a `content_digest` per account covering its status and lines. The ledger's facts are immutable, so it never replaces imported lines: an unchanged digest is a no-op, held to clean imports, and changed lines or clean to held after an import go to the ledger's review. Shoebox only has to report revisions honestly. The ledger dedupes lines with its own fingerprint (posted date, amount, normalised description, position among identical lines that day, per account), which also catches overlap with a structured file of the same account.
 3. **Change feed semantics.** Fits the ledger's poller as proposed: latest revision only (the ledger compares digests, so skipped revisions don't matter), at-least-once, an opaque cursor that the ledger advances only after applying a page. Rejected documents stay in the feed, so the owner sees them. Conditions, adopted above: the cursor survives restarts, redeploys and backup restores and never goes backwards; the contract states whether an identical re-extraction makes a revision (it does).
 
-The ledger's session pre-reviews the contract with this plan's pull request. Points for that pre-review, raised by the document review: the `match_key` for pairing accounts across revisions, the restore rule on `source_sha256`, the safe defaults for unknown values, and two review cases the agreed rules don't name yet (a statement that was clean and is now rejected, and an account present before and missing now).
+4. **Pre-review of this contract (on this plan's pull request, 2026-11-10).** Good to build, with no blocking changes. The document review's changes are accepted: revisions from the clock-floored counter, `match_key` with a digest over a fixed field list, unsigned totals and loan breakdown (the ledger flips only signed fields), and the restore rule. The ledger keys statements on `source_sha256` throughout and treats `statement_id` as shoebox's handle for fetching. After a restore it never treats a lower revision as newer: it compares digests. A statement that was clean and is now rejected, or an account present before and missing now, becomes a review item in the ledger if it imported anything, and never an automatic change. The ledger checks a loan's `principal_after`, negated, against its own balance.
 
 ---
 
@@ -518,8 +518,8 @@ Run 2026-11-10 with four reviewers: coherence, feasibility, scope guardian, and 
 - Degraded mode when the statement grants are missing: rollout applies both migrations before the new image starts.
 - Diagnosis of a footing difference (sign error, missed section, page break): `does_not_foot` with the difference and pages is enough to act on; classes can be added later.
 
-**Left for the ledger's pre-review**
-- The review cases the agreed rules don't name: clean to rejected, and an account removed between revisions.
+**Answered in the ledger's pre-review**
+- The review cases the agreed rules didn't name (clean to rejected, and an account removed between revisions): review items in the ledger, never automatic changes. See decision 4.
 
 **Not changed**
 - Canonical JSON details (escaping, normalisation) are now stated; the worked example in the contract document settles the rest at build time.
