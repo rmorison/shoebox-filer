@@ -6,7 +6,7 @@ Started 2026-11-02, after the always-on ingest work reached production and devel
 
 Listed in no particular order.
 
-1. **Reconciliation.** Import card, bank and loan statements, match their lines to receipts and payments, and report what's left unmatched. Use cases are below.
+1. **Document extraction, without classification.** Read card, bank and loan statements, extract their accounts, lines and printed figures, check them against the statement's own totals, keep the originals, and serve the result to the ledger, a separate project. Matching lines to receipts and payments, classifying them and reconciling the books belong to the ledger, not here. Use cases are below.
 2. **Extraction quality, measured.**
    - An evaluation set of synthetic and anonymized receipts with expected fields, scored for each prompt version together with its cost, so that a prompt change and any back-catalogue re-extraction are decided on numbers.
    - The rest of the receipt data model: line items, full-text search, tags and external links.
@@ -30,16 +30,16 @@ Listed in no particular order.
    - Trend metrics: latency, cost per receipt and failure rate.
 
 **Open questions for the operator:**
-- Is reconciliation the north star, or is a searchable, deduplicated archive the main value?
+- Is document extraction for the ledger the north star, or is a searchable, deduplicated archive the main value?
 - Will anyone else run this? If so, a packaging and contributor-experience lane belongs here.
 - Is the Drive migration still wanted?
 - How far may the assistant act without review?
 
 ## Use cases
 
-### Loan payment splits and escrow (reconciliation)
+### Loan payment splits and escrow (document extraction)
 
-*Captured 2026-11-02. No priority assigned.*
+*Captured 2026-11-02. No priority assigned.* Since 2026-11-10 the ledger owns matching payments and producing what the accounting system needs. This filer's part is the ingest and extract steps below, limited to the figures the statement prints.
 
 **Today, by hand.**
 - A mortgage payment leaves the bank as one transaction, but the lender applies it as principal, interest and escrow.
@@ -55,7 +55,7 @@ Listed in no particular order.
   - each payment applied: date, total, and its split into principal, interest, escrow, fees or other components;
   - escrow disbursements: date, payee type (taxes, insurance), amount;
   - running balances: principal remaining, escrow balance.
-- **Match** each applied payment to the bank transaction that paid it, on date and amount. This ties in with statement-line matching elsewhere in reconciliation.
+- **Match** each applied payment to the bank transaction that paid it, on date and amount. This is the ledger's job now.
 - **Produce what the accounting system needs:** the split for each payment transaction by account category, and a journal entry for each escrow disbursement into or out of the escrow account. The form is open: a reviewable report the operator applies by hand, an import file, or later a direct integration.
 - **Generalize** across mortgages, SBA loans and other amortizing loans or accounts whose statements carry a per-payment breakdown. The mapping from each component to an account category is configured per account.
 
