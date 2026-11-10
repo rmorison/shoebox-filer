@@ -192,15 +192,26 @@ def metadata_bomb_pdf(megabytes: int = 512) -> bytes:
     )
 
 
-def filter_chain_pdf(megabytes: int = 256) -> bytes:
-    """A PDF whose page content is a filter chain that takes seconds to decode."""
+def filter_chain_pdf(megabytes: int = 256, *, streams: int = 1) -> bytes:
+    """A PDF whose page content is a filter chain that takes seconds to decode.
+
+    With ``streams`` above 1, the page's content is that many streams, each
+    holding the same ``megabytes`` MiB body: the CPU to save it grows with
+    ``streams``, while the file stays a few kilobytes and builds as fast as
+    one stream.
+    """
+    contents = b"4 0 R"
+    if streams > 1:
+        contents = (
+            b"[" + " ".join(f"{4 + n} 0 R" for n in range(streams)).encode() + b"]"
+        )
     return _raw_pdf(
         [
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >>"
-            b" /Contents 4 0 R >>",
-            _stream(_double_flate_zeros(megabytes)),
+            b" /Contents " + contents + b" >>",
+            *[_stream(_double_flate_zeros(megabytes))] * streams,
         ]
     )
 

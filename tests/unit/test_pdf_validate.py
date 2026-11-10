@@ -160,7 +160,10 @@ def memory_bomb() -> bytes:
 
 @pytest.fixture(scope="module")
 def cpu_bomb() -> bytes:
-    return filter_chain_pdf(256)  # ~1 KB that takes seconds of CPU to save
+    # ~11 KB that takes 38 s of CPU to save on an older server core, far
+    # past the 1 s limit on any runner. One 256 MiB stream took 2.6 s there,
+    # so a fast runner saved it within the limit and judged it ok.
+    return filter_chain_pdf(256, streams=16)
 
 
 def _peak_rss_mb() -> int:
@@ -169,15 +172,20 @@ def _peak_rss_mb() -> int:
 
 @pytest.mark.parametrize("bomb", ["memory_bomb", "cpu_bomb"])
 def test_a_hostile_pdf_is_unparseable_within_the_bound_and_this_process_stays_small(
-    bomb: str, request: pytest.FixtureRequest
+    bomb: str, request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture
 ) -> None:
     data = request.getfixturevalue(bomb)
     before = _peak_rss_mb()
     start = time.monotonic()
 
-    result = check_pdf(data, limits=_TIGHT)
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        result = check_pdf(data, limits=_TIGHT)
 
     assert result == PdfCheck(status="unparseable")
+    if bomb == "cpu_bomb":
+        # The child ran and the limit stopped it: not a cached verdict.
+        # The memory bomb stops at whichever limit a host reaches first.
+        assert "PDF check stopped: hit the 1 s CPU limit" in caplog.text
     assert time.monotonic() - start < _TIGHT.wall_seconds
     assert _peak_rss_mb() - before < 100
 
@@ -192,10 +200,14 @@ def test_under_the_default_limits_a_memory_bomb_is_unparseable() -> None:
     assert _peak_rss_mb() - before < 100
 
 
-def test_a_check_that_runs_past_the_wall_clock_is_unparseable(cpu_bomb: bytes) -> None:
+def test_a_check_that_runs_past_the_wall_clock_is_unparseable(
+    cpu_bomb: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
     limits = PdfLimits(cpu_seconds=60, wall_seconds=0.5)
     start = time.monotonic()
-    assert check_pdf(cpu_bomb, limits=limits) == PdfCheck(status="unparseable")
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert check_pdf(cpu_bomb, limits=limits) == PdfCheck(status="unparseable")
+    assert "PDF check stopped: hit the 0.5 s wall-clock limit" in caplog.text
     assert time.monotonic() - start < 5
 
 
