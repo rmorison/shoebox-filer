@@ -101,7 +101,7 @@ Settled by the operator on 2026-11-09, not reopened here:
 Decided here:
 
 - **Amount sign: the statement's own balance.** A line is positive when it raises the printed balance and negative when it lowers it. That is the sign the gate verifies, so the ledger re-foots the same figures with no transformation. Turning it into the ledger's debit-positive sign is one flip by account type (a card's balance is owed). Choosing the owner's side of the books is an accounting reading, the ledger's side of the boundary. Shoebox emits account type and section, which are extraction.
-- **Section and column totals are a gate too.** The spike's grader used them. A printed total that disagrees with the lines is held as a totals mismatch. The operator's list doesn't name this check, so it is flagged for sign-off.
+- **Section and column totals are a gate too.** The spike's grader used them. A printed total that disagrees with the lines is held as a totals mismatch. The operator confirmed it on 2026-11-10.
 - **Clean accounts of an incomplete statement pass their lines.** The hold is per account. This follows the spike's recommendation that a clean account imports while another on the same document is held.
 - **No automatic retry of a held account in this version.** A re-run is by hand and produces a new revision.
 - **Statements live in the `receipt` schema**, beside the evidence-store tables they reference, not in a new schema.
@@ -142,11 +142,11 @@ Decided here:
 
 ## Outstanding Questions
 
-### For the operator (product)
-- [Affects R11][Product] Is a printed section or column total that disagrees with the lines a hold, as proposed?
-- [Affects R11][Product] How many days of grace before the period on card lines? Proposed: 7.
-- [Affects R13][Product] Confirm that a clean account on an incomplete statement passes its lines to the ledger.
-- [Affects F3][Product] Should a held statement be re-tried automatically once, on the same model, given the first pass isn't fully stable? Proposed: not in this version.
+### Answered by the operator (2026-11-10)
+- [R11] A printed section or column total that disagrees with the lines holds the account.
+- [R11] Card grace: 7 days before the period start.
+- [R13] A clean account on an incomplete statement passes its lines, and a failed account list holds every account.
+- [F3] No automatic retry of a held statement in this version.
 
 ### Deferred to planning
 - [Affects R5][Technical] Statement bound values.

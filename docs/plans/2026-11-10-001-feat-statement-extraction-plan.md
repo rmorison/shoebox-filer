@@ -1,7 +1,7 @@
 ---
 title: "feat: Statement extraction and the ledger's read contract"
 type: feat
-status: proposed
+status: approved
 date: 2026-11-10
 origin: docs/brainstorms/2026-11-10-statement-extraction-requirements.md
 ---
@@ -12,7 +12,7 @@ origin: docs/brainstorms/2026-11-10-statement-extraction-requirements.md
 
 Read PDF bank and card statements from their own Drive folder, keep each original in the evidence store, and extract every account and line with Haiku: a first pass that classifies the document and lists its accounts, then one call per account. Each account is checked against the statement's own printed figures. A clean account's lines are served to the ledger through new read-only MCP tools under a published, versioned contract, with a change feed. An account that fails a check is held, with its failure class, difference and page range, and contributes no line. The same pull request as this plan renames the roadmap's "Reconciliation" lane to document extraction.
 
-This plan proposes the read contract for the ledger's pre-review. Nothing is built until the operator signs off the plan and the ledger's session has reviewed the contract.
+The ledger's session pre-reviewed the read contract and found it good to build, and the operator gave the go on 2026-11-10 (see Open Questions). The build starts when the lead says so.
 
 ---
 
@@ -215,12 +215,14 @@ Asked of the ledger's session, one question at a time, on 2026-11-10:
 
 ## Open Questions
 
-### For the operator
+### Answered by the operator (2026-11-10)
 
-1. **Totals as a gate.** A printed section or column total that disagrees with the lines holds the account (`totals_mismatch`). The spike's grader did this. The 2026-11-09 list doesn't name it. Keep it?
-2. **Card grace.** Proposed 7 days before the period start for card lines' posted dates. Statement-level constant, not configuration.
-3. **Clean accounts of an incomplete statement** pass their lines (the hold is per account, as the spike recommended). A completeness failure holds every account. Confirm.
-4. **Automatic retry of a held statement.** Proposed: none in this version; `statements rerun` by hand.
+The operator gave the go on this plan, after the ledger's pre-review of the contract, and answered the four open questions:
+
+1. **Totals as a gate:** kept. A printed section or column total that disagrees with the lines holds the account (`totals_mismatch`).
+2. **Card grace:** 7 days before the period start, as a statement-level constant, not configuration.
+3. **Clean accounts of an incomplete statement** pass their lines, and a completeness failure holds every account.
+4. **Automatic retry of a held statement:** none in this version; `statements rerun` by hand.
 
 ### Resolved during planning
 
