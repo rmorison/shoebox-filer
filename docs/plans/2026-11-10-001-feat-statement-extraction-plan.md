@@ -115,6 +115,7 @@ Published at build time as `docs/engineering/designs/statement-read-contract.md`
 - **Integers** (`revision`, `ordinal`, `page`, counts): JSON numbers. `revision` is a 64-bit integer. Its values are microseconds since the epoch, about 1.8 × 10^15 today: exact as a JSON number (below 2^53) until about the year 2255, but a consumer stores it as a 64-bit integer, never a 32-bit one or a float.
 - **Text:** UTF-8, as extracted (no Unicode normalisation), except the two normalised fields below.
 - **Normalised text:** `institution` is trimmed, with inner whitespace collapsed to one space, and case left alone. `section`, on lines and in totals alike, goes through one function: trimmed, inner whitespace collapsed, a trailing colon dropped, lower case. The same printed heading always gives the same `section` on a line and in a total.
+- **Masked text:** `description`, `section` (on lines and in totals) and `institution` all go through the one mask in [Masking](#masking), after normalisation and before the gates and the digest.
 
 ### Tools (read-only, on the existing MCP server)
 
@@ -161,6 +162,7 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 | `printed_account_count` | Accounts the document's own summary lists; null when it prints none |
 | `pages` | Page count |
 | `extractor` | `{model, prompt_version, first_pass_version}`; null fields for a rejection before any model call |
+| `masked_runs` | How many digit runs the mask cut in this revision, across every account's masked fields (0 for a rejection). Not in any digest |
 | `accounts` | Below, in document order |
 
 **Statement status.** Exactly one applies, tested in this order:
@@ -223,7 +225,7 @@ A model or schema error makes no revision: the item is retried, and after `retry
 | `ordinal` | 1-based position in the printed order within the account, across pages. For a `newest_first` account, ordinal 1 is the newest line |
 | `posted_date` | The date the line posted. When a line prints one date, it goes here, whatever the column is called |
 | `transaction_date` | A second, transaction date where printed, else null. Not gated |
-| `description` | Text as extracted, wrapped lines joined with one space, then masked: every run of 8 or more digits, counting single spaces and dashes between digits as part of the run, is replaced by its last four digits. The masking is deterministic and runs after extraction and before the gates and the digest, so the digest covers the masked text. The model is also told to cut account and card numbers, but the mask is the guarantee. Side effects in [Masking](#masking) |
+| `description` | Text as extracted, wrapped lines joined with one space, then masked (see [Masking](#masking)). The digest covers the masked text. The model is also told to cut account and card numbers, but the mask is the guarantee |
 | `amount` | Signed by its effect on the statement's printed balance |
 | `running_balance` | As printed on the line, else null |
 | `section` | The printed heading it sits under, normalised as above; null when it sits under none |
@@ -231,7 +233,24 @@ A model or schema error makes no revision: the item is retried, and after `retry
 
 **Years.** A statement often prints dates without a year. The model returns each date as printed parts (month, day, and the year only when printed), and shoebox assigns the year after extraction, from the account's period: the year that puts the date inside the period, or for a card inside the grace window before it. A December to January period is the usual case where that matters. A date that no year places that way takes `period_end`'s year, and then fails the date gate, holding the account as `date_out_of_period`. An account with a yearless date and no period is held as `undated`; it carries no lines, so no line needs a guessed year.
 
-<a id="masking"></a>**Masking.** The mask cuts any long digit run, not only account numbers. Known side effects: a reference or confirmation number of 8 or more digits keeps only its last four; a phone number printed with dashes (ten digits) keeps its last four; a date printed with no separators (`20261109`) becomes `1109`; two shorter numbers separated by a single space or dash (a store number then a terminal number) join into one run and are cut together. All of these are accepted for version 1. The description isn't used by any arithmetic check; the mask is deterministic, so the same input always gives the same description and the ledger's fingerprint stays stable across re-extractions; and the original PDF is one `get_statement_file` call away when a full reference is needed. A narrower rule (only runs next to words like "account" or "card") would miss numbers printed without such a word, and the point of the mask is that it misses none. Each masked run is counted in the log and in `statements show`, counts only.
+<a id="masking"></a>**Masking.** One deterministic function masks `description`, `section` and `institution`, after normalisation and before the gates and the digest. It replaces every match of this pattern, over ASCII digits only (no Unicode digit classes), with the last four digits of the match:
+
+```
+[0-9](?:[ -]*[0-9]){7,}
+```
+
+That is, 8 or more digits in a row, where any number of spaces and dashes between two digits count as part of the run. Runs of several separators join, since the mask's point is to miss nothing. Wrapped description lines are joined with a space before the mask runs, so a number split across a wrap is caught. Other separators break a run: `/`, `.`, `,`, a letter, or any other character, so slash dates (`11/09/2026`) and amounts (`1,234.56`) are never masked.
+
+The mask cuts any long digit run, not only account numbers. Known side effects, all accepted for version 1:
+- a reference or confirmation number of 8 or more digits keeps only its last four;
+- a phone number printed with dashes or spaces (ten digits) keeps its last four;
+- a date printed with no separators (`20261109`) becomes `1109`;
+- a dashed date is one run: `2026-11-09` becomes `1109`, and `11-09-2026` becomes `2026`;
+- two shorter numbers separated only by spaces or dashes (a store number then a terminal number) join into one run and are cut together.
+
+Why accepted: no arithmetic check reads these fields; the mask is deterministic, so the same input always gives the same text and the ledger's fingerprint stays stable across re-extractions; and the original PDF is one `get_statement_file` call away when a full reference is needed. A narrower rule (only runs next to words like "account" or "card") would miss numbers printed without such a word. `last4` and `match_key` are unaffected: `last4` is extracted as four digits on its own.
+
+The mask covers what the contract's JSON carries. It doesn't touch the original: `get_statement_file` returns the PDF as stored, with every number in it, which is why that tool is access-logged. Each revision stores how many runs were masked (`masked_runs`), shown by `statements show`; the masked text is never logged.
 
 ### Sign basis
 
@@ -347,7 +366,7 @@ CREATE TABLE receipt.statement_sources (    -- one row per source item, as prove
 
 CREATE TABLE receipt.statement_revisions (  -- append-only, guarded like receipt.extractions
     id, statement_id /* FK, DEFERRABLE INITIALLY DEFERRED */, revision BIGINT UNIQUE,
-    document_type, status, hold_reason, rejected_bound,
+    document_type, status, hold_reason, rejected_bound, masked_runs INTEGER NOT NULL DEFAULT 0,
     period_start, period_end, printed_account_count, pages,
     llm_model, prompt_version, first_pass_version, input_tokens, output_tokens, origin, created_at
 );
@@ -395,7 +414,7 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 
 **Tests:** schema validation refuses a float, a three-place amount and a five-digit `last4`; money reformatting gives `0.00` for a negative zero and drops a `+`; section normalisation gives the same value for a heading on a line and in a total; a stubbed response that stops at the output ceiling holds the account as `too_many_lines` with no retry; the prompts contain no statement text (a test checks them against the fixture generator's strings).
 
-**Tests, masking:** a stubbed model output whose description carries a full 16-digit card number, grouped by spaces and by dashes, comes out with the last four only, in the stored line and in the digest's input; a 7-digit run is left alone; each side effect in the contract's Masking list has a case pinning the behaviour; the mask is written to fail first against an identity function.
+**Tests, masking:** a stubbed model output whose description carries a full 16-digit card number, grouped by spaces, by dashes and by runs of several separators, comes out with the last four only, in the stored line and in the digest's input; the same for a number in a `section` and in `institution`; boundaries: exactly 8 digits in a row is masked, 8 digits in two groups of four (`1234 5678`, `1234-5678`) is masked, and 7 digits (in a row or grouped) is left alone; a number split across a wrapped description line is masked after the join; each side effect in the contract's Masking list has a case pinning its result, the dashed dates `2026-11-09` and `11-09-2026` included; a slash date, a dotted number and an amount with a comma are left alone; a Unicode digit (such as a full-width one) isn't matched; `masked_runs` on the revision equals the number of runs cut; the mask is written to fail first against an identity function.
 
 What the stubbed tests can't show: whether the real model trims account numbers before the mask, places printed years correctly, or picks the right date column. The stub returns what the test chose. Those are measured by `make statement-eval` against the real model on the synthetic fixtures (Testing Strategy), which counts masked runs and dates outside each fixture's period.
 
@@ -410,7 +429,7 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 - dormant account: no lines and equal printed balances is clean;
 - statement: `rejected`, else the hold reasons in order (`no_accounts`, `dropped_account`, `account_count_mismatch`, `no_usable_account`), else `incomplete` or `complete`. The first three set `held_by_statement` on every account and keep each account's own class;
 - the canonical form and `content_digest`;
-- the description mask runs before the gates and the digest (see the contract's Masking); masked runs are counted, never logged as text. Masking is not a gate.
+- the mask on `description`, `section` and `institution` runs before the gates and the digest (see the contract's Masking); masked runs are counted into the revision's `masked_runs`, never logged as text. Masking is not a gate.
 
 **Tests:** one test per gate, failure class, hold reason and statement status, each written to fail first against a stub that passes everything. Named cases: a loan-only statement is `complete`; a loan beside a deposit account held by its own gates is `incomplete`; a statement with no accounts is `held` with `no_accounts`; an empty loan holds the statement as `dropped_account`, and every account, the clean ones included, is held and marked `held_by_statement` while a held one keeps its own class; a newest-first chain passes when walked in date order and fails when walked in printed order; a December to January card period with a line dated in late December passes, and one dated in the next December fails; a digest test against the contract document's worked example; the same account with its institution's whitespace varied keeps its `match_key` and its digest.
 
@@ -619,6 +638,13 @@ Not changed:
 - Dates come back as `{month, day, year}` with `year` nullable; shoebox assigns years; an unplaceable date takes `period_end`'s year and fails the date gate.
 - Null-`last4` pairing by document order, and the feed's single `next_cursor`, are stated.
 - The ledger's change: a deterministic mask on descriptions, replacing the earlier "no scrub" decision and the 9-digit flag, with its side effects stated and accepted.
+
+**Third app review (2026-11-11), all on the mask**
+- The rule is an exact pattern over ASCII digits, `[0-9](?:[ -]*[0-9]){7,}`; runs of several separators join.
+- Dashed dates are listed as side effects and tested; slash dates, dots, commas and other separators are stated as not masked.
+- R18 overclaimed: the mask now covers `section` and `institution` too, and the contract says `get_statement_file` returns the original with every number.
+- `masked_runs` is stored on each revision and shown by `statements show`.
+- Boundary tests: exactly 8 digits, 8 digits in two groups, and 7 digits.
 
 **Not changed (document review)**
 - Canonical JSON details (escaping, normalisation) are now stated; the worked example in the contract document settles the rest at build time.
