@@ -100,10 +100,12 @@ class StatementRead:
       the caller retries it too;
     - ``unreadable``: not a PDF, needs a password, or pdfplumber can't open
       it or failed reading it;
-    - ``scan``: fewer than 20 readable non-whitespace characters on every
-      page together, ``(cid:N)`` glyphs (fonts with no text map) not
-      counting; or no more readable characters than glyphs, each glyph
-      counting as one;
+    - ``scan``: fewer than 20 readable characters on every page together,
+      or no more readable characters than glyphs. A readable character is
+      a non-whitespace character outside a ``(cid:N)`` glyph (what a font
+      with no text map gives); each glyph counts as one. The test is over
+      the whole document, not per page, so a readable header over blank
+      or glyph-only pages passes here and is left to the extraction gates;
     - ``text``: the page-marked text is over :data:`STATEMENT_TOKEN_CAP`
       estimated tokens. The cap is applied here, once; callers don't
       apply it again.

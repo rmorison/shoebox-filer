@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import io
 import json
-import time
 from dataclasses import fields, replace
 from typing import Any
 
@@ -317,13 +316,17 @@ def test_a_cpu_bomb_stops_with_timeout_at_the_cpu_limit(
     assert "wall-clock" not in caplog.text
 
 
-def test_a_read_past_the_wall_clock_stops_with_timeout(cpu_bomb: bytes) -> None:
+def test_a_read_past_the_wall_clock_stops_with_timeout(
+    cpu_bomb: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The CPU limit is far above the wall clock, so only the wall clock can
+    # stop it; the log line shows which fired, however fast the runner.
     bounds = _with_read(cpu_seconds=60, wall_seconds=0.5)
-    start = time.monotonic()
-    assert read_statement(cpu_bomb, bounds=bounds) == StatementRead(
-        None, reason="timeout"
-    )
-    assert time.monotonic() - start < 5
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert read_statement(cpu_bomb, bounds=bounds) == StatementRead(
+            None, reason="timeout"
+        )
+    assert "PDF read stopped: hit the 0.5 s wall-clock limit" in caplog.text
 
 
 def test_a_memory_bomb_stops_with_memory() -> None:
