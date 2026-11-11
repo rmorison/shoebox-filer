@@ -70,6 +70,27 @@ StatementReadReason = Literal[
 # What pdfplumber gives for a glyph whose font has no usable text map.
 _CID = re.compile(r"\(cid:\d+\)")
 
+# Characters dropped from a statement's text before anything else: NUL and
+# the other C0 and C1 controls (but not a newline or a tab), bidirectional
+# overrides, isolates and marks, and zero-width characters. None carries
+# statement content; each can hide or reorder text for a reader or a model.
+_DROPPED = dict.fromkeys(
+    [
+        *(c for c in range(0x20) if c not in (0x09, 0x0A)),
+        *range(0x7F, 0xA0),
+        0x061C,
+        0x200E,
+        0x200F,
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+        0x200B,
+        0x200C,
+        0x200D,
+        0x2060,
+        0xFEFF,
+    ]
+)
+
 # How a bounded child's stop reads for a statement. A child that wrote past
 # the output cap had more text than any statement under the token cap.
 _STATEMENT_STOP: dict[StopReason, StatementReadReason] = {
@@ -197,7 +218,10 @@ def read_statement(
     """A statement's per-page text under ``bounds``, or why there is none.
 
     pdfplumber runs in a bounded child, as for :func:`read_pdf`, but the
-    limits, page cap and stop reasons are the statement's. No text from the
+    limits, page cap and stop reasons are the statement's. The child's
+    output is capped, so the parent never parses more than the token cap
+    could let through. Each page's text is normalised once, here (see
+    :func:`normalise_statement_text`), before any check. No text from the
     statement is logged.
     """
     max_pages = bounds.max_read_pages
@@ -221,7 +245,7 @@ def read_statement(
     except (ValueError, TypeError, KeyError):
         logger.warning("Statement PDF read gave no result (%d bytes)", len(data))
         return StatementRead(None, reason="unreadable")
-    if found is None:
+    if found is None or pages < 1:
         logger.info("pdfplumber can't read the statement PDF (%d bytes)", len(data))
         return StatementRead(None, reason="unreadable")
     if pages > max_pages or texts is None:
@@ -229,9 +253,9 @@ def read_statement(
             "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
         )
         return StatementRead(None, pages=pages, reason="pages", encrypted=encrypted)
-    if not _is_usable_statement_text("".join(texts)):
-        logger.info("Statement PDF has too little text: a scan (%d pages)", pages)
-        return StatementRead(None, pages=pages, reason="scan", encrypted=encrypted)
+    texts = [normalise_statement_text(text) for text in texts]
+    # The token cap is a length check, so it runs before anything that
+    # looks at each character.
     tokens = estimate_tokens(page_marked_text(texts))
     if tokens > STATEMENT_TOKEN_CAP:
         logger.info(
@@ -240,7 +264,25 @@ def read_statement(
             STATEMENT_TOKEN_CAP,
         )
         return StatementRead(None, pages=pages, reason="text", encrypted=encrypted)
+    if not _is_usable_statement_text("".join(texts)):
+        logger.info("Statement PDF has too little text: a scan (%d pages)", pages)
+        return StatementRead(None, pages=pages, reason="scan", encrypted=encrypted)
     return StatementRead(tuple(texts), pages=pages, encrypted=encrypted)
+
+
+def normalise_statement_text(text: str) -> str:
+    """``text`` without control, bidirectional and zero-width characters.
+
+    Drops NUL and the other C0 and C1 controls except a newline and a tab,
+    bidirectional overrides, isolates and marks, and zero-width characters.
+    Nothing else changes.
+    """
+    return text.translate(_DROPPED)
+
+
+def _non_space(text: str) -> int:
+    """How many non-whitespace characters ``text`` has, copying nothing."""
+    return sum(1 for char in text if not char.isspace())
 
 
 def _is_usable_statement_text(text: str) -> bool:
@@ -252,9 +294,12 @@ def _is_usable_statement_text(text: str) -> bool:
     reach the model as noise; a disclosures page in such a font beside
     readable transaction pages is still read.
     """
-    found = _CID.findall(text)
-    glyphs = len(found)
-    usable = len("".join(_CID.sub("", text).split()))
+    glyphs = 0
+    markup = 0
+    for match in _CID.finditer(text):
+        glyphs += 1
+        markup += len(match.group())  # a glyph's markup has no whitespace
+    usable = _non_space(text) - markup
     return usable >= _MIN_TEXT_LENGTH and usable > glyphs
 
 

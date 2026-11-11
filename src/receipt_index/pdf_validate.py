@@ -76,13 +76,16 @@ class PdfLimits:
     """Bounds on one child job, checking or reading one PDF.
 
     The memory limit is the child's whole address space. The wall clock is
-    a small multiple of the CPU limit, for a loaded host.
+    a small multiple of the CPU limit, for a loaded host. ``max_output_bytes``
+    caps what the child may write back; None means :func:`output_cap`'s
+    default, room for a repaired PDF.
     """
 
     cpu_seconds: int
     wall_seconds: float
     max_bytes: int = 25 * 1024 * 1024
     memory_bytes: int = 512 * 1024 * 1024
+    max_output_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -118,12 +121,18 @@ STATEMENT_BOUNDS = PdfBounds(
         wall_seconds=60.0,
         max_bytes=25 * 1024 * 1024,
         memory_bytes=512 * 1024 * 1024,
+        max_output_bytes=None,
     ),
+    # The read writes back the text as JSON. 4 MiB holds the most text the
+    # token cap lets through (about 212,500 characters) even at six bytes a
+    # character escaped, so the parent never parses more than that: a small
+    # PDF whose fonts expand each glyph to many characters stops here.
     read=PdfLimits(
         cpu_seconds=90,
         wall_seconds=270.0,
         max_bytes=25 * 1024 * 1024,
         memory_bytes=1024 * 1024 * 1024,
+        max_output_bytes=4 * 1024 * 1024,
     ),
     max_read_pages=60,
 )
@@ -232,7 +241,10 @@ _STDERR_TAIL = 300
 
 
 def output_cap(limits: PdfLimits) -> int:
-    """The most a child may write: a repair is about the input's size."""
+    """The most a child may write: by default, room for a repair, which is
+    about the input's size."""
+    if limits.max_output_bytes is not None:
+        return limits.max_output_bytes
     return 2 * limits.max_bytes + 1024 * 1024
 
 

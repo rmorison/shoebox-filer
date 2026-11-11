@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 from dataclasses import fields, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -28,7 +30,18 @@ from receipt_index.pdf_validate import (
     PdfLimits,
     output_cap,
 )
-from tests.pdfs import child_that_writes, fake_child, filter_chain_pdf, make_pdf
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from tests.pdfs import (
+    child_that_writes,
+    expanding_font_pdf,
+    fake_child,
+    filter_chain_pdf,
+    make_pdf,
+    zero_page_pdf,
+)
 
 
 def _pages_pdf(*page_texts: str) -> bytes:
@@ -75,6 +88,7 @@ def test_statement_bounds_set_every_limit_explicitly() -> None:
         wall_seconds=270.0,
         max_bytes=25 * 1024 * 1024,
         memory_bytes=1024 * 1024 * 1024,
+        max_output_bytes=4 * 1024 * 1024,
     )
     for limits in (STATEMENT_BOUNDS.read, STATEMENT_BOUNDS.check):
         assert limits.cpu_seconds < limits.wall_seconds <= 3 * limits.cpu_seconds
@@ -106,6 +120,21 @@ def test_statement_bounds_dont_depend_on_the_limits_defaults() -> None:
         assert {kw.arg for kw in call.keywords} == every_field
 
 
+def test_the_token_cap_is_85000() -> None:
+    assert STATEMENT_TOKEN_CAP == 85_000
+
+
+def test_the_read_output_cap_holds_the_most_text_the_token_cap_lets_through() -> None:
+    # 2.5 characters a token, every one escaped as \\uXXXX in the JSON.
+    most = STATEMENT_TOKEN_CAP * 25 // 10
+    worst = json.dumps(
+        {"pages": 60, "page_texts": ["\u00e9" * (most // 60)] * 60, "encrypted": True}
+    )
+    cap = STATEMENT_BOUNDS.read.max_output_bytes
+    assert cap == 4 * 1024 * 1024
+    assert len(worst.encode()) < cap
+
+
 def test_receipt_bounds_are_unchanged() -> None:
     assert (
         PdfBounds(
@@ -134,6 +163,71 @@ def test_each_page_keeps_its_own_text_in_order() -> None:
     assert read.pages == 3
     assert read.page_texts is not None
     assert [text.split()[3] for text in read.page_texts] == ["one", "two", "three"]
+
+
+def test_an_empty_page_keeps_its_place() -> None:
+    read = read_statement(
+        _pages_pdf(
+            "Synthetic first page with an opening balance",
+            "",
+            "Synthetic third page with a closing balance",
+        )
+    )
+    assert read.page_texts is not None
+    assert len(read.page_texts) == 3
+    assert read.page_texts[1] == ""
+    marked = page_marked_text(read.page_texts)
+    assert "[Page 2]\n\n\n[Page 3]\nSynthetic third page" in marked
+
+
+def test_a_pdf_with_no_pages_is_unreadable() -> None:
+    assert read_statement(zero_page_pdf()) == StatementRead(None, reason="unreadable")
+    result = b'{"pages": 0, "page_texts": [], "encrypted": false}'
+    with fake_child(child_that_writes(result)):
+        assert read_statement(make_pdf("No pages")) == StatementRead(
+            None, reason="unreadable"
+        )
+
+
+def test_the_parent_checks_the_page_count_too() -> None:
+    # A child that read the text anyway is still refused on its count.
+    result = json.dumps(
+        {"pages": 61, "page_texts": ["Synthetic page text"] * 61, "encrypted": False}
+    ).encode()
+    with fake_child(child_that_writes(result)):
+        assert read_statement(make_pdf("Long")) == StatementRead(
+            None, pages=61, reason="pages"
+        )
+
+
+def test_the_page_cap_comes_from_the_bounds_given() -> None:
+    bounds = replace(STATEMENT_BOUNDS, max_read_pages=2)
+    assert (
+        read_statement(make_pdf("Synthetic page", pages=2), bounds=bounds).reason
+        is None
+    )
+    assert read_statement(
+        make_pdf("Synthetic page", pages=3), bounds=bounds
+    ) == StatementRead(None, pages=3, reason="pages")
+
+
+def test_a_file_exactly_at_the_size_bound_is_read() -> None:
+    data = make_pdf("Synthetic statement exactly at the size bound")
+    assert read_statement(data, bounds=_with_read(max_bytes=len(data))).reason is None
+    assert read_statement(data, bounds=_with_read(max_bytes=len(data) - 1)) == (
+        StatementRead(None, reason="size")
+    )
+
+
+def test_control_bidi_and_zero_width_characters_are_dropped() -> None:
+    raw = (
+        "\x00Syn\x07the\rtic \x85state\u202ement\u200b text\u2066\u2069"
+        "\ufeff\u200e\tcolumn\nnext line"
+    )
+    result = json.dumps({"pages": 1, "page_texts": [raw], "encrypted": False}).encode()
+    with fake_child(child_that_writes(result)):
+        read = read_statement(make_pdf("Normalised"))
+    assert read.page_texts == ("Synthetic statement text\tcolumn\nnext line",)
 
 
 def test_a_statement_at_the_page_cap_is_read() -> None:
@@ -428,6 +522,45 @@ def test_a_result_with_no_page_texts_is_over_the_page_cap() -> None:
         assert read_statement(make_pdf("No texts")) == StatementRead(
             None, pages=3, reason="pages"
         )
+
+
+_PEAK_RSS = """
+import resource, sys
+from pathlib import Path
+from receipt_index.pdf_reader import read_statement
+data = Path(sys.argv[1]).read_bytes()
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+read = read_statement(data)
+after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(read.reason, (after - before) // 1024)
+"""
+
+
+def test_a_small_pdf_that_expands_to_megabytes_of_text_stays_small_in_the_parent(
+    tmp_path: Path,
+) -> None:
+    # A 1 KB PDF whose font maps one glyph to 3,000 characters: about 9
+    # million characters of text. The child's output cap stops it as
+    # "text" before the parent parses it. Measured in a fresh process, as
+    # the growth of its peak over its peak after imports, so nothing this
+    # test run has already allocated hides it. Before the fix it grew by
+    # about 240 MB on this PDF; the bound is loose because the figure
+    # varies with the allocator. The child's own log line pins the cap that
+    # stops it, which a parent-side check alone would not.
+    pdf = tmp_path / "expanding.pdf"
+    pdf.write_bytes(expanding_font_pdf(glyphs_per_page=3000, chars_per_glyph=3000))
+    run = subprocess.run(
+        [sys.executable, "-I", "-c", _PEAK_RSS, str(pdf)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
+    )
+    reason, growth_mb = run.stdout.split()
+    assert reason == "text"
+    assert int(growth_mb) < 100
+    cap = STATEMENT_BOUNDS.read.max_output_bytes
+    assert f"PDF read stopped: hit the {cap}-byte output limit" in run.stderr
 
 
 def test_a_receipt_read_still_joins_its_pages() -> None:
