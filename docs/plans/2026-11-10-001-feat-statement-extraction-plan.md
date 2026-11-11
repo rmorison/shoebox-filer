@@ -298,6 +298,10 @@ The operator gave the go on this plan, after the ledger's pre-review of the cont
 3. **Clean accounts of an incomplete statement** pass their lines, and a completeness failure holds every account.
 4. **Automatic retry of a held statement:** none in this version; `statements rerun` by hand.
 
+### Answered by the operator (2026-11-11)
+
+5. **Encrypted statements:** a PDF with only an owner password is read, whatever its permission flags say, and its `encrypted` flag is kept. A PDF that needs a user password to open stays rejected as `unreadable`. This confirms the reading of "encrypted" that U1 was built on.
+
 ### Resolved during planning
 
 - Schema: `receipt`. Migration numbers: 000023 and 000024 (main's last is 000022).
