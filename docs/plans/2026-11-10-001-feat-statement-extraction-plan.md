@@ -12,7 +12,7 @@ origin: docs/brainstorms/2026-11-10-statement-extraction-requirements.md
 
 Read PDF bank and card statements from their own Drive folder, keep each original in the evidence store, and extract every account and line with Haiku: a first pass that classifies the document and lists its accounts, then one call per account. Each account is checked against the statement's own printed figures. A clean account's lines are served to the ledger through new read-only MCP tools under a published, versioned contract, with a change feed. An account that fails a check is held, with its failure class, difference and page range, and contributes no line. The same pull request as this plan renames the roadmap's "Reconciliation" lane to document extraction.
 
-The ledger's session pre-reviewed the read contract and found it good to build, and the operator gave the go on 2026-11-10 (see Open Questions). The build starts when the lead says so.
+The ledger's session pre-reviewed the read contract and found it good to build, and the operator gave the go on 2026-11-10 (see Open Questions). An app review on 2026-11-11 found a status contradiction, contract gaps and build traps; this revision answers them, with the ledger's answers recorded as decision 5 (see Document Review). The build starts when the lead says so.
 
 ---
 
@@ -81,69 +81,99 @@ Carried from the origin document: no scans, no structured-file import, no classi
 - **One schema.** Statement tables go in the `receipt` schema, next to the evidence-store tables they reference. A new schema would need its own migration directory, migration table, grants, and Makefile and deploy changes, for no isolation the read role needs. The MCP role check already covers every table in the schema.
 - **Statement ID per original.** One statement per distinct PDF (SHA-256 of its bytes). The same bytes dropped twice are one statement with two source rows. Different bytes for the same account and period are two statements.
 - **Every run is a revision.** Each processing run of a statement, a rejection included, writes one immutable revision that holds its document type, status, period, model, prompt versions, tokens, accounts and lines. The statement row only points at its current revision and copies its status and type for the feed. Status and type change only with a new revision.
-- **One counter for the feed and for revisions, never going backwards.** Every transaction that writes a revision takes one transaction-level advisory lock, then sets the next value to the greater of the last value plus one and the current time in microseconds since the epoch, in one `UPDATE … RETURNING` on a one-row state table. The value is both the new revision's number and the statement's `change_seq`. A trigger enforces it, so no code path can skip it, and statement writes run at `READ COMMITTED`.
+- **One counter for the feed and for revisions, never going backwards.** Every transaction that writes a revision, or republishes a statement, takes one transaction-level advisory lock, then sets the next value to the greater of the last value plus one and the current time in microseconds since the epoch, in one `UPDATE … RETURNING` on a one-row state table. A new revision takes one value as its `revision`; the statement then takes another as its `change_seq`, its place in the feed. The two are separate so a republish after a restore can move a statement in the feed without inventing a revision. Triggers draw both values, so no code path can skip the counter, and statement writes run at `READ COMMITTED`.
   - Writers commit in counter order, and Postgres makes a commit visible before it releases the lock, so a reader that has seen *n* has seen every change below it.
   - A timestamp alone can skip a row whose transaction commits late. A transaction-ID cursor doesn't survive a dump and restore. A bare sequence goes backwards when an older backup is restored, and so would a per-statement revision count. Then the ledger's stored cursor would skip new changes, or a revision number it already applied would come back with different content. The clock floor keeps every new value above anything handed out before a restore, as long as the server's clock doesn't run backwards.
-  - Writes are a handful a day from one worker, so the lock costs nothing. The receipts feed uses the same convention.
-- **Statement items are their own source type in `ingest_log`.** Rows carry `source_type = 'gdrive_statement'`, so the retry scheduler's fallback to "any source of the same type" never hands a statement to a receipt source, and `run_due_retries` dispatches by type.
-- **Each phase is its own watchdog step.** The check, the read, the first pass and each account call re-mark the item clock, and a statement lists at most 8 accounts. Each step then stays under `item_timeout_seconds` by the same sum-of-deadlines rule as receipts (U5).
+  - A restore can still leave a statement's restored `change_seq` below a cursor the ledger already holds. `statements republish` (U8), the restore runbook's last step, gives every statement a fresh `change_seq`, so nothing restored stays hidden behind the cursor.
+  - Writes are a handful a day from one worker, so the lock costs nothing. The receipts feed uses the same convention with its own state row; it doesn't share this one.
+- **Statement items are their own source type in `ingest_log`.** Rows carry `source_type = 'gdrive_statement'`, so the retry scheduler's fallback to "any source of the same type" never hands a statement to a receipt source, and `run_due_retries` dispatches by type. `sync_state` keeps `'gdrive'` for a statement source: it is keyed by source name, and its type only says which cursor columns apply. `ingest_log.source_type` has no check constraint, so no migration is needed for the new value. U5 lists every place the retry and requeue code assumes a receipt.
+- **Each phase is its own watchdog step.** The check, the read, the first pass and each account call re-mark the item clock through a new `RunControl.step(source_id)` method (U5), and a statement lists at most 8 accounts. Each step then stays under `item_timeout_seconds` by the same sum-of-deadlines rule as receipts (U5).
 - **Pages kept.** The statement read returns per-page text. The prompt marks pages, so the first pass can give page ranges and each line its page.
 - **Amount sign: the statement's own balance.** Decided in the origin document, agreed with the ledger with conditions (below).
+- **Held, never partial, with a reason at every level.** A held statement always carries a `hold_reason`, and an account keeps its own failure class even when the statement holds it, marked `held_by_statement`. A loan account counts as usable (`figures_only`) for the statement's status.
 - **No new dependency.** pdfplumber, pydantic-ai and weasyprint (for test fixtures) are already in the project.
 
 ---
 
-## The Read Contract (proposed, for the ledger's pre-review)
+## The Read Contract (pre-reviewed by the ledger; revised after the app review)
 
 Published at build time as `docs/engineering/designs/statement-read-contract.md`, the single source for its shapes. Summary:
 
 ### Versioning
 
 - Every response carries `contract_version` (integer, starts at 1).
-- **Additive, not breaking:** a new field, a new document type for a rejected document, a new failure class. The contract document notes each. The ledger ignores fields it doesn't know and treats an unknown failure class as held. A new field stays out of `content_digest` until a version change.
-- **The ledger's safe defaults:** it imports lines only from an account whose `status` is `clean` and whose `account_type` is `deposit`, `card` or `loan`. It treats any other status or type as held.
-- **Breaking:** removing or renaming a field, changing a field's meaning or sign, a new `account_type`, a new account `status` that carries lines, or a change to the digest's field list. A breaking change ships as new tools beside the old ones (for example `get_statement_v2`), and the old ones stay until the ledger has moved.
+- **Additive, not breaking:** a new field, a new document type for a rejected document, a new failure class or hold reason. The contract document notes each. The ledger ignores fields it doesn't know and treats an unknown failure class as held. A new field stays out of `content_digest` until a version change.
+- **The ledger's safe defaults:** it imports lines only from an account whose `status` is `clean`, whose `account_type` is `deposit`, `card` or `loan`, and whose `currency` is `USD`. It treats any other status, type or currency, a null currency included, as held. (The ledger is USD-only today.)
+- **Breaking:** removing or renaming a field, changing a field's meaning, sign or format, a new `account_type`, a new account `status` that carries lines, or a change to the digest's field list. A breaking change ships as new tools beside the old ones (for example `get_statement_v2`), and the old ones stay until the ledger has moved.
+
+### Formats
+
+- **Money:** a JSON string matching `^-?(0|[1-9][0-9]*)\.[0-9]{2}$`. Two places always, no `+`, no thousands separator, no currency sign. Zero is `"0.00"`, never `"-0.00"`.
+- **Currency:** an ISO 4217 code per account (below). Every money field on an account, its lines included, is in that account's currency.
+- **Dates:** `YYYY-MM-DD`, the calendar date as printed, no time zone.
+- **Timestamps** (`extracted_at`): RFC 3339 in UTC with a `Z` suffix and microseconds, for example `2026-11-10T18:37:50.123456Z`.
+- **Integers** (`revision`, `ordinal`, `page`, counts): JSON numbers. `revision` is a 64-bit integer. Its values are microseconds since the epoch, about 1.8 × 10^15 today: exact as a JSON number (below 2^53) until about the year 2255, but a consumer stores it as a 64-bit integer, never a 32-bit one or a float.
+- **Text:** UTF-8, as extracted (no Unicode normalisation), except the two normalised fields below.
+- **Normalised text:** `institution` is trimmed, with inner whitespace collapsed to one space, and case left alone. `section`, on lines and in totals alike, goes through one function: trimmed, inner whitespace collapsed, a trailing colon dropped, lower case. The same printed heading always gives the same `section` on a line and in a total.
 
 ### Tools (read-only, on the existing MCP server)
 
 | Tool | Returns |
 |---|---|
-| `list_statement_changes(cursor?, limit)` | Statements created or changed after `cursor`, oldest change first, each as `{statement_id, revision, status, document_type, source_sha256}`, plus `next_cursor`. No cursor means from the start. |
-| `get_statement(statement_id, revision?)` | One statement revision, with its accounts and the lines of clean accounts. The current revision unless one is named. |
-| `get_statement_file(statement_id, include_content?)` | The original PDF, access-logged like `get_receipt_file`. |
+| `list_statement_changes(cursor?, limit?)` | Statements created or changed after `cursor`, oldest change first, each as `{statement_id, revision, status, document_type, source_sha256}`, plus `next_cursor`. No cursor means from the start. `limit` defaults to 100, at most 200 (the server's existing page maximum). |
+| `get_statement(statement_id, revision?)` | One statement revision, with its accounts but not their lines. The current revision unless one is named. |
+| `get_statement_lines(statement_id, revision, account_ordinal, limit?, offset?)` | One account's lines, in `ordinal` order, in the server's existing page envelope (`total`, `limit`, `offset`, `next_offset`). `revision` is required, so every page comes from one revision. `limit` defaults to 500, at most 1,000. A held or loan account returns an empty page. |
+| `get_statement_file(statement_id, include_content?)` | The original PDF, access-logged like `get_receipt_file`, with the same content limit (10 MiB by default): over it, the call returns the metadata with `content_included: false` and `content_omitted_reason: "too_large"` rather than the bytes, as `get_receipt_file` does. |
+
+**Errors.** Every tool refuses bad input with a tool error whose message starts with a stable code, so a client can branch on it:
+- `invalid_cursor`: a cursor that doesn't parse, or whose prefix isn't one this server issues (anything but `s1:` today).
+- `invalid_id`: a statement ID that isn't a UUID.
+- `not_found`: no such statement, no such revision of it, or no such account ordinal in that revision.
+- `invalid_argument`: `limit` or `offset` out of range.
+
+A well-formed cursor ahead of everything the server has issued (possible after a restore) isn't an error: it returns no rows, and `next_cursor` is the request's cursor.
 
 ### Change feed
 
-- The cursor is opaque to the ledger (today `"s1:<change_seq>"`). It survives restarts, redeploys and database restores, and never goes backwards.
-- A statement appears once per revision. A later revision moves it, so the feed always shows its latest. Skipped revisions can still be fetched with `get_statement(id, revision)`.
-- Rejected documents are in the feed too, as revisions with no accounts, so a dropped file never vanishes silently.
+- The cursor is opaque to the ledger (today `"s1:<change_seq>"`). It survives restarts and redeploys, and never goes backwards.
+- `change_seq` is the statement's place in the feed. It takes a new value from the counter (below) whenever the statement gets a new current revision, and when the operator republishes it (below). It is separate from `revision`, which numbers content.
+- A statement appears once per change. A later change moves it, so the feed always shows its latest. Skipped revisions can still be fetched with `get_statement(id, revision)`.
+- Rejected documents are in the feed too, as revisions with no accounts, so a dropped file never vanishes silently. Model and schema errors are not: they make no revision (see Failure classes).
 - Every run is a new revision and a feed entry, even when its content is identical to the last one. The account digests then show that nothing changed.
 - `revision` numbers are increasing for a statement and never reused, even across a restore.
 - At-least-once delivery: the ledger applies by `(statement_id, revision)`, so a repeat is harmless.
 - `next_cursor` is the last row's cursor, or the request's cursor when no rows follow.
-- **After a restore from an older backup:** changes made after the backup are lost from shoebox. The Drive files are still in the folder (Drive sources don't archive), and the restored sync state lists them again. Statements first read after the backup are re-read and get new `statement_id`s, and statements re-run after the backup go back to their earlier revision. The ledger's rule: a new `statement_id` whose `source_sha256` matches a statement it knows is that statement, and its account digests are compared with what it imported.
+- **After a restore from an older backup:** changes made after the backup are lost from shoebox. The Drive files are still in the folder (Drive sources don't archive), and the restored sync state lists them again. Statements first read after the backup are re-read and get new `statement_id`s, and statements re-run after the backup go back to their earlier revision. That earlier revision keeps its old `change_seq`, which can be below the ledger's cursor, so on its own it would never reach the ledger. The restore runbook therefore ends with `receipt-index statements republish --all --yes`, which gives every statement a new `change_seq` without a new revision, so the whole set passes through the feed once more. The ledger's rules then apply: a new `statement_id` whose `source_sha256` matches a statement it knows is that statement; a revision lower than one it applied is never treated as newer; account digests are compared with what it imported, and a difference goes to review.
 
 ### Per statement (one revision)
 
 | Field | Meaning |
 |---|---|
 | `statement_id` | UUID, stable for the original's bytes within one database history (see the restore rule) |
-| `source_sha256` | Hex SHA-256 of the original PDF |
+| `source_sha256` | Hex SHA-256 of the original PDF, lower case |
 | `revision`, `extracted_at` | This revision's number and when it ran |
+| `is_current`, `current_revision` | Whether this is the statement's current revision, and the current revision's number |
 | `document_type` | `deposit`, `card`, `loan_statement`; or, for a rejected document, `loan_bill`, `tax_or_escrow_notice`, `not_statement`, `scan`, `unreadable` (not a PDF, encrypted, or one pdfplumber can't open), `over_bounds` |
 | `rejected_bound` | For `over_bounds`: `pages`, `size`, `text`, `memory` or `accounts`; else null |
 | `status` | `complete`, `incomplete`, `held` or `rejected` (below) |
-| `period_start`, `period_end` | As printed; null when not printed |
+| `hold_reason` | Why a `held` statement is held (below); null for every other status |
+| `period_start`, `period_end` | The document's own printed period; null when not printed. The date gate uses each account's period (below) |
 | `printed_account_count` | Accounts the document's own summary lists; null when it prints none |
 | `pages` | Page count |
 | `extractor` | `{model, prompt_version, first_pass_version}`; null fields for a rejection before any model call |
 | `accounts` | Below, in document order |
 
-Statement status:
-- `rejected`: not extracted; `document_type` says why.
-- `held`: a completeness failure (a listed account came back empty and isn't dormant, the printed account count disagrees, or a deposit, card or loan statement lists no accounts). Every account is held, with `dropped_account` or `account_count_mismatch`, since the account list itself can't be trusted. Also `held` when no account is clean.
-- `incomplete`: the list is complete, at least one account is held by its own gates and at least one is clean or figures-only. Clean accounts pass their lines.
-- `complete`: every account is clean or figures-only.
+**Statement status.** Exactly one applies, tested in this order:
+- `rejected`: not extracted; `document_type` says why. No accounts.
+- `held`, with a `hold_reason`:
+  - `no_accounts`: a deposit, card or loan statement whose first pass lists no account;
+  - `dropped_account`: a listed account came back empty (its own class is `empty_account`, below);
+  - `account_count_mismatch`: the printed account count disagrees with the accounts listed;
+  - `no_usable_account`: none of the above, but no account is `clean` or `figures_only`.
+
+  For the first three the account list itself can't be trusted, so every account is held and marked `held_by_statement`, whatever its own gates said.
+- `incomplete`: no hold reason, at least one account held by its own gates, and at least one `clean` or `figures_only`. Clean accounts pass their lines.
+- `complete`: no hold reason, and every account is `clean` or `figures_only`. A loan-only statement whose loan figures came back is `complete`.
 
 ### Per account
 
@@ -151,40 +181,55 @@ Statement status:
 |---|---|
 | `account_id` | UUID, stable within a revision only |
 | `ordinal` | 1-based position in the document |
-| `match_key` | `{account_type, institution, last4, occurrence}`, where `occurrence` counts accounts with the same type, institution and `last4` in document order. The key that pairs this account with itself in another revision. An account in one revision and not in the other is added or removed, for the ledger's review |
-| `institution` | As printed |
+| `match_key` | `{account_type, last4, occurrence}`, where `occurrence` counts accounts with the same type and `last4` in document order. Pairs this account with itself in another revision of the same statement. An account in one revision and not in the other is added or removed, for the ledger's review. `institution` is left out, since a re-extraction can give an institution's name in a short or a long form |
+| `institution` | As printed, normalised as above |
 | `last4` | Last four digits only, never a full number; null when none is printed |
 | `account_type` | `deposit`, `card`, `loan` |
+| `currency` | ISO 4217 code. Read from the statement: a printed code, or a currency sign the statement uses. In this version a bare `$` with no other currency named reads as `USD`. Null when the statement gives no currency at all |
+| `period_start`, `period_end` | The account's period: as printed for that account, else the document's. Null when neither is printed |
 | `status` | `clean`, `held`, or `figures_only` (loans) |
+| `held_by_statement` | True when the statement's hold reason holds this account; then `status` is `held` even if its own gates passed |
 | `beginning_balance`, `ending_balance` | As printed, on the statement-balance basis; null when not printed |
-| `section_totals` | `[{section, amount}]`: each printed section total, as an unsigned magnitude |
+| `section_totals` | `[{section, amount}]`: each printed section total, as an unsigned magnitude; `section` is never null here |
 | `column_totals` | `[{section, credits, debits}]`: a table's printed column totals, as unsigned magnitudes; `section` null for a table covering the whole account. Credits are the lines that raise a deposit balance or lower a card or loan balance |
 | `line_order` | `oldest_first` or `newest_first`, as printed |
+| `line_count` | Lines this account carries (0 for held and loan accounts) |
 | `date_grace_days` | Days before `period_start` a posted date may fall and still pass: 7 for a card, 0 otherwise |
-| `failure_class`, `difference`, `first_page`, `last_page` | For a held account: why, the ending balance less (beginning plus lines) where both are printed, and where to look |
+| `failure_class`, `difference`, `first_page`, `last_page` | For an account its own gates held: why, the ending balance less (beginning plus lines) where both are printed, and where to look. `failure_class` is null for a clean or figures-only account, and for one held only by the statement |
 | `loan` | For a loan: `principal_before` and `principal_after` on the statement-balance basis; `principal_paid`, `interest`, `escrow`, `fees` and `advances` as unsigned printed amounts. Each null when not printed |
-| `content_digest` | Hex SHA-256 of the account's canonical form (below) |
-| `lines` | Clean accounts only; empty for held and loan accounts |
+| `content_digest` | Hex SHA-256 of the account's canonical form (below), lower case |
 
-**Canonical form for `content_digest` (contract version 1).** A JSON object of exactly these fields: `account_type`, `institution`, `last4`, `status`, `failure_class`, `difference`, `beginning_balance`, `ending_balance`, `section_totals`, `column_totals`, `line_order`, `loan`, and `lines`, each line with exactly `posted_date`, `transaction_date`, `description`, `amount`, `running_balance`, `section` and `page`. Keys sorted, no insignificant whitespace, UTF-8 with no `\u` escapes beyond JSON's required ones, text as extracted (no Unicode normalisation), money and dates as the strings the contract gives, integers as JSON numbers, nulls kept. Ordinal and IDs are left out, so renumbering alone doesn't change a digest. The contract document gives a worked example, so the ledger can recompute it.
+**Held accounts carry no lines, by design.** The contract gives a held account's balances, totals, difference and pages, so the owner can act on it, but never its lines: a held extraction is not a fact to import, and it can't be re-footed from the response. The ledger shouldn't read the missing lines as a fault.
 
-Failure classes, for a held account: `no_beginning_balance`, `no_ending_balance`, `does_not_foot`, `date_out_of_period`, `balance_chain_break`, `totals_mismatch`, `dropped_account`, `account_count_mismatch`. A held account carries one: a completeness failure first, otherwise the first that applies in that order. A model or schema error makes no revision: the item is retried, and after `retry_max_attempts` it is a terminal failure in `ingest_log`, shown by `failures`, not in the feed.
+**Canonical form for `content_digest` (contract version 1).** A JSON object of exactly these fields: `account_type`, `institution`, `last4`, `currency`, `period_start`, `period_end`, `status`, `held_by_statement`, `failure_class`, `difference`, `beginning_balance`, `ending_balance`, `section_totals`, `column_totals`, `line_order`, `loan`, and `lines`, each line with exactly `posted_date`, `transaction_date`, `description`, `amount`, `running_balance`, `section` and `page`, in `ordinal` order. Keys sorted, no insignificant whitespace, UTF-8 with no `\u` escapes beyond JSON's required ones, text as the contract gives it, money and dates as the strings the contract gives, integers as JSON numbers, booleans as `true`/`false`, nulls kept. Ordinal and IDs are left out, so renumbering alone doesn't change a digest; the account's period is in, since the date gate depends on it. The contract document gives a worked example, so the ledger can recompute it from `get_statement` and `get_statement_lines`.
+
+**Failure classes**, for an account its own gates held, in the order they are tested (an account carries the first that applies):
+- `empty_account`: a deposit or card account with no lines that isn't dormant (beginning and ending balances printed and equal), or a loan account with no printed figure at all;
+- `no_beginning_balance`, `no_ending_balance`;
+- `too_many_lines`: the account's extraction hit the output cap (see U3) and was cut off;
+- `undated`: printed dates carry no year, and no period is printed to place them;
+- `does_not_foot`, with the difference;
+- `date_out_of_period`;
+- `balance_chain_break`;
+- `totals_mismatch`.
+
+A model or schema error makes no revision: the item is retried, and after `retry_max_attempts` it is a terminal failure in `ingest_log`, shown by `failures`, not in the feed.
 
 ### Per line (clean accounts only)
 
 | Field | Meaning |
 |---|---|
 | `line_id` | UUID, stable within a revision only |
-| `ordinal` | 1-based printed order within the account |
-| `posted_date` | Date posted |
-| `transaction_date` | Where printed, else null |
-| `description` | As printed, wrapped lines joined; any account or card number cut to its last four |
-| `amount` | Decimal string, signed by its effect on the statement's printed balance |
+| `ordinal` | 1-based position in the printed order within the account, across pages. For a `newest_first` account, ordinal 1 is the newest line |
+| `posted_date` | The date the line posted. When a line prints one date, it goes here, whatever the column is called |
+| `transaction_date` | A second, transaction date where printed, else null. Not gated |
+| `description` | Text as extracted, wrapped lines joined with one space. The model is told to cut any account or card number to its last four; nothing deterministic checks that it did (see Risks) |
+| `amount` | Signed by its effect on the statement's printed balance |
 | `running_balance` | As printed on the line, else null |
-| `section` | The printed heading it sits under, lower case |
+| `section` | The printed heading it sits under, normalised as above; null when it sits under none |
 | `page` | 1-based page |
 
-Money is a decimal string with two places (`"-1234.56"`), dates are `YYYY-MM-DD`.
+**Years.** A statement often prints dates without a year. The extraction gives every date a full year from the account's period: the year that puts the date inside the period, or for a card inside the grace window before it. A December to January period is the usual case where that matters. A date that can't be placed that way fails the date gate. An account with yearless dates and no printed period is held as `undated`.
 
 ### Sign basis
 
@@ -192,12 +237,13 @@ Balances, lines and running balances on an account, and a loan's principal befor
 
 To reach the ledger's debit-positive sign (like OFX `TRNAMT`), the ledger multiplies the signed figures of an account by +1 for `deposit` and −1 for `card` and `loan`. It doesn't flip unsigned magnitudes.
 
-### What the ledger can re-check from one response
+### What the ledger can re-check from one revision
 
 - Beginning plus the sum of the lines equals ending.
-- In `line_order`, each printed running balance equals the previous printed balance (or the beginning balance) plus the amounts of the lines since it, lines with no printed balance included.
-- Each section total equals the magnitude of the sum of that section's lines. Each column total equals the sum of the magnitudes of the lines on that side, within its section or the whole account.
-- Every posted date lies between `period_start − date_grace_days` and `period_end`. When the period isn't printed, there is nothing to check dates against, and shoebox skips the check.
+- The running-balance chain, walked in date order: in ascending `ordinal` for `oldest_first`, in descending `ordinal` for `newest_first`. Starting from the beginning balance, each printed running balance equals the previous printed balance (or the beginning balance) plus the amounts of the lines since it, lines with no printed balance included.
+- Each section total equals the magnitude of the sum of the lines with that `section`. Each column total equals the sum of the magnitudes of the lines on that side, within its section or the whole account. Totals are magnitudes, so they don't check direction; the footing check above does.
+- Every posted date lies between the account's `period_start − date_grace_days` and `period_end`. When the account has no period, there is nothing to check dates against, and shoebox skips the check.
+- `content_digest`, recomputed from the fields.
 
 Shoebox runs the same checks, so the ledger doesn't have to trust its status.
 
@@ -210,6 +256,10 @@ Asked of the ledger's session, one question at a time, on 2026-11-10:
 3. **Change feed semantics.** Fits the ledger's poller as proposed: latest revision only (the ledger compares digests, so skipped revisions don't matter), at-least-once, an opaque cursor that the ledger advances only after applying a page. Rejected documents stay in the feed, so the owner sees them. Conditions, adopted above: the cursor survives restarts, redeploys and backup restores and never goes backwards; the contract states whether an identical re-extraction makes a revision (it does).
 
 4. **Pre-review of this contract (on this plan's pull request, 2026-11-10).** Good to build, with no blocking changes. The document review's changes are accepted: revisions from the clock-floored counter, `match_key` with a digest over a fixed field list, unsigned totals and loan breakdown (the ledger flips only signed fields), and the restore rule. The ledger keys statements on `source_sha256` throughout and treats `statement_id` as shoebox's handle for fetching. After a restore it never treats a lower revision as newer: it compares digests. A statement that was clean and is now rejected, or an account present before and missing now, becomes a review item in the ledger if it imported anything, and never an automatic change. The ledger checks a loan's `principal_after`, negated, against its own balance.
+5. **Answers to the app review (2026-11-11).** Asked of the ledger's session through the lead:
+   - **Rejections in the feed:** they stay in the feed; model errors stay out. The pre-review's note saying otherwise was loose wording. Decision 3 and the two review cases in decision 4 stand as written.
+   - **Currency:** an ISO 4217 `currency` per account, and every money field on that account is in it. The ledger is USD-only today and holds any account that isn't `USD`; that is in its safe defaults.
+   - **`match_key`:** `institution` leaves the key, which becomes `{account_type, last4, occurrence}` within one statement, because a re-extraction can render an institution's name in a short or a long form. The printed `institution` field stays, and stays in `content_digest`, since the ledger maps accounts by it. It is normalised by trimming and collapsing inner whitespace, with case left alone.
 
 ---
 
@@ -229,7 +279,8 @@ The operator gave the go on this plan, after the ledger's pre-review of the cont
 - Schema: `receipt`. Migration numbers: 000023 and 000024 (main's last is 000022).
 - Store: the local backend, a copy of the Drive file under `originals/`.
 - Feed and revision numbers: the serialized, clock-floored counter above.
-- No printed period: the date gate is skipped, and `period_start` null tells the ledger.
+- No printed period: the date gate is skipped, and `period_start` null tells the ledger. Yearless dates with no printed period hold the account as `undated`.
+- Statement status after the app review: the four statuses are mutually exclusive, a held statement always has a `hold_reason`, and a loan's `figures_only` counts as usable (see Statement status).
 
 ### Deferred to implementation
 
@@ -249,13 +300,14 @@ Each unit is a pull request, merged in order. Every new check or fixture is seen
 **Files:** `src/receipt_index/pdf_validate.py`, `src/receipt_index/pdf_reader.py`, `tests/unit/test_pdf_reader.py`
 
 **Approach:**
-- `STATEMENT_BOUNDS = PdfBounds(check=PdfLimits(cpu_seconds=20, wall_seconds=60), read=PdfLimits(cpu_seconds=90, wall_seconds=270, memory_bytes=1 GiB), max_read_pages=60)`. Ceilings, not targets: a long statement is tens of pages. `RECEIPT_BOUNDS` doesn't change.
+- `STATEMENT_BOUNDS = PdfBounds(check=PdfLimits(cpu_seconds=20, wall_seconds=60, max_bytes=25 MiB, memory_bytes=512 MiB), read=PdfLimits(cpu_seconds=90, wall_seconds=270, max_bytes=25 MiB, memory_bytes=1 GiB), max_read_pages=60)`. Every field is set explicitly, so a later change to `PdfLimits`' defaults doesn't move the statement bounds. `max_bytes` is what gives the `size` reason. Ceilings, not targets: a long statement is tens of pages and a few megabytes. `RECEIPT_BOUNDS` doesn't change.
+- A new `read_pdf_pages(path, bounds)` takes its limits and page cap from the `PdfBounds` it is given. `read_pdf` keeps its `RECEIPT_BOUNDS` defaults (`pdf_reader.py`, `limits` and `max_pages`), and the statement path never calls it.
 - A statement read returns per-page text, or a reason: `pages` (from the page count `text_up_to_pages` already returns), `size`, `memory`, `unreadable`, or `timeout` (CPU or wall clock). The receipt path keeps returning None.
 - `timeout` is a retryable item error, not a rejection, since a timeout can be the host's load. The others are permanent rejections.
-- A text cap: a statement whose text is over 300,000 characters is rejected (`over_bounds`, `text`) before any model call. That keeps each prompt well under the 100,000-token point where Haiku's price rises.
-- A document whose text, across all pages, has fewer than 20 non-whitespace characters is a scan: rejected as `scan`.
+- **Text cap, in tokens.** `PdfBounds` stays about the PDF; the text cap is enforced in the statement pipeline (U5) after the read and before any model call. It counts estimated tokens, not characters: `ceil(characters / 2.5)` over the page-marked text, a conservative ratio for numeric, columnar text, which tokenises more densely than prose. Over 85,000 estimated tokens is rejected as `over_bounds`, `text`. With the prompt (about 1,500 tokens) on top, each call's input then stays under the 100,000-token point where Haiku's price rises. Every call's real `input_tokens` is recorded (U5); the `statement-eval` run reports the real characters-per-token ratio on the fixtures, and the build fails the unit if any fixture comes in under 2.5.
+- A document whose text, across all pages, has fewer than 20 non-whitespace characters is a scan: rejected as `scan`. A mixed document (a text cover page over scanned pages) passes this test and then fails the gates, so it is held rather than rejected. That is accepted for this version and stated in the user docs.
 
-**Tests:** a fixture over 60 pages is refused with `pages`; a CPU-bomb PDF stops with `timeout`; a non-PDF gives `unreadable`; receipts' bounds and return values are unchanged; per-page text keeps page order.
+**Tests:** a fixture over 60 pages is refused with `pages`; a file over `max_bytes` with `size`; a CPU-bomb PDF stops with `timeout`; a non-PDF gives `unreadable`; receipts' bounds and return values are unchanged; per-page text keeps page order; the token estimate rejects text just over the cap and passes text just under it.
 
 ### U2. Schema
 
@@ -269,15 +321,16 @@ Each unit is a pull request, merged in order. Every new check or fixture is seen
 CREATE TABLE receipt.statement_feed_state (   -- one row: the last value handed out
     id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id), last_value BIGINT NOT NULL
 );
+INSERT INTO receipt.statement_feed_state (id, last_value) VALUES (TRUE, 0);  -- seeded here
 
 CREATE TABLE receipt.statements (
     id                     UUID        NOT NULL DEFAULT uuidv7(),
     original_file_id       UUID        NOT NULL,   -- receipt.stored_files
     source_sha256          BYTEA       NOT NULL,
-    current_revision_id    UUID        NOT NULL,
+    current_revision_id    UUID        NOT NULL,   -- FK, DEFERRABLE INITIALLY DEFERRED
     document_type          TEXT        NOT NULL,   -- copy of the current revision's
     status                 TEXT        NOT NULL,   -- copy of the current revision's
-    change_seq             BIGINT      NOT NULL,   -- the current revision's number
+    change_seq             BIGINT      NOT NULL,   -- place in the feed; set by trigger
     created_at, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_statements_original UNIQUE (original_file_id),
     CONSTRAINT uq_statements_change_seq UNIQUE (change_seq),
@@ -289,13 +342,15 @@ CREATE TABLE receipt.statement_sources (    -- one row per source item, as prove
 );
 
 CREATE TABLE receipt.statement_revisions (  -- append-only, guarded like receipt.extractions
-    id, statement_id, revision BIGINT UNIQUE, document_type, status, rejected_bound,
+    id, statement_id /* FK, DEFERRABLE INITIALLY DEFERRED */, revision BIGINT UNIQUE,
+    document_type, status, hold_reason, rejected_bound,
     period_start, period_end, printed_account_count, pages,
     llm_model, prompt_version, first_pass_version, input_tokens, output_tokens, origin, created_at
 );
 
 CREATE TABLE receipt.statement_accounts (   -- append-only
-    id, revision_id, ordinal, institution, last4 CHECK (last4 ~ '^[0-9]{4}$'), account_type, status,
+    id, revision_id, ordinal, institution, last4 CHECK (last4 ~ '^[0-9]{4}$'), account_type,
+    currency CHECK (currency ~ '^[A-Z]{3}$'), period_start, period_end, status, held_by_statement,
     occurrence, line_order, date_grace_days,
     beginning_balance, ending_balance NUMERIC(14,2), section_totals JSONB, column_totals JSONB,
     failure_class, difference NUMERIC(14,2), first_page, last_page, content_digest BYTEA,
@@ -308,14 +363,15 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 );
 ```
 
-- A `BEFORE INSERT` trigger on `statement_revisions` takes `pg_advisory_xact_lock` on the feed key, then `UPDATE statement_feed_state SET last_value = greatest(last_value + 1, <microseconds since the epoch>) RETURNING last_value` and sets `revision` from it. Making the revision current sets `statements.change_seq` to the same value, inside the same transaction. A trigger on `statements` refuses a `status`, `document_type` or `change_seq` that doesn't match its current revision.
+- **The counter.** One function, `receipt.next_feed_value()`, takes `pg_advisory_xact_lock` on the feed key, then runs `UPDATE statement_feed_state SET last_value = greatest(last_value + 1, <microseconds since the epoch>) RETURNING last_value`. A `BEFORE INSERT` trigger on `statement_revisions` sets `revision` from it. A `BEFORE INSERT OR UPDATE` trigger on `statements` sets `change_seq` from it on insert, whenever `current_revision_id` changes, and on a republish (an update that only sets `updated_at`, through `statement_repository.republish`). Neither column can be written by hand: the triggers overwrite any value given.
+- **Insert order, in one transaction.** The two tables point at each other, so both foreign keys are `DEFERRABLE INITIALLY DEFERRED`, and the check that a statement's `status` and `document_type` match its current revision is a `CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` on `statements`, so it runs at commit. A new statement: take a statement ID (`SELECT uuidv7()`), insert the revision with it, then the accounts and lines, then the statement row pointing at the revision, then its `statement_sources` row and the `ingest_log` row. A re-run: insert the revision, its accounts and lines, then update the statement's `current_revision_id`, `status` and `document_type`. The foreign keys and the match check all run at commit, after both rows exist.
 - A trigger refuses a `statement_lines` row on an account that isn't `clean`.
 - No full account number anywhere: `last4` is four digits or null.
-- 000024 grants: `_write` gets `SELECT, INSERT` on the append-only tables and on `statement_sources`, `SELECT, INSERT, UPDATE (current_revision_id, status, document_type, change_seq, updated_at)` on `statements`, and `SELECT, UPDATE` on `statement_feed_state`. `_read` gets `SELECT` on all of them.
-- Down migrations drop the tables. See Rollback for the stored originals.
-- `_run_migrations()` mirrors 000023; `apply_migration_grants` applies 000024.
+- 000024 grants: `_write` gets `SELECT, INSERT` on the append-only tables and on `statement_sources`, `SELECT, INSERT, UPDATE (current_revision_id, status, document_type, change_seq, updated_at)` on `statements`, `SELECT, UPDATE` on `statement_feed_state`, and `EXECUTE` on `next_feed_value()`. `_read` gets `SELECT` on all of them.
+- Down migrations drop the tables and the function. See Rollback for the stored originals.
+- `_run_migrations()` mirrors 000023, the seed row included; `apply_migration_grants` applies 000024.
 
-**Tests:** up, down and up again on a scratch database; two concurrent writers get counter values in commit order; a counter value set below the last stays monotonic (the restore case); a line can't attach to a held account; `statements` can't take a status its revision doesn't have; `last4` rejects five digits.
+**Tests:** up, down and up again on a scratch database, with the seed row present after each up; a new statement and a re-run commit with the insert order above, and the same writes with a revision whose status differs from the statement's fail at commit; **the cursor-skip guarantee**: writer A inserts a revision and stops before committing (held at a barrier); writer B starts its own revision and blocks on the advisory lock; a reader lists the feed and sees neither; A commits, B proceeds and commits; the reader then sees A before B, with B's `change_seq` above A's; a counter value set below the last stays monotonic (the restore case); a statement whose `change_seq` is set below a reader's cursor (a restored row) is invisible to that cursor until `republish`, and visible after it with its `revision` unchanged; a line can't attach to a held account; `last4` rejects five digits; `currency` rejects `usd`.
 
 ### U3. Extraction models and prompts
 
@@ -324,15 +380,18 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 **Files:** `src/receipt_index/statement_extraction.py`, `tests/unit/test_statement_extraction.py`
 
 **Approach:**
-- Output models with `extra="forbid"`. Money is a two-place decimal string and never a float, as in the spike.
-- First pass: document type, accounts (label, type, page range), printed account count. The label is used only to tell the extraction call which account to read. It is not stored, since it can hold a name.
-- Account extraction: one call per listed account, the whole page-marked text, told the account's label, type and pages. The deposit and card prompts share a base that states the sign basis. Card lines take the posted date and keep a printed transaction date. Section and column totals come back as printed magnitudes.
+- Output models with `extra="forbid"`. Money is a two-place decimal string and never a float, as in the spike, and is reformatted to the contract's money format (no `+`, no separators, `0.00` for zero) before it is stored.
+- First pass: document type, accounts (label, type, page range, and its own period where printed), printed account count, the document's period. The label is used only to tell the extraction call which account to read. It is not stored, since it can hold a name.
+- Account extraction: one call per listed account, the whole page-marked text, told the account's label, type, pages and period. The deposit and card prompts share a base that states the sign basis, the currency rule and the date rules: a line that prints one date gives it as the posted date; a card line that prints two gives the posted date and the transaction date; a printed date with no year takes the year that puts it inside the period (or, on a card, inside the grace window before it), and a yearless date with no printed period is reported as such, which holds the account as `undated`. Section and column totals come back as printed magnitudes; section headings are normalised after the call, by the one function the contract names.
+- **Output cap.** Each account call sets a `max_tokens` ceiling well inside Haiku's output limit, sized at build time from the fixtures. A response that stops at that ceiling (the model's stop reason says so) is not retried, since a retry would stop in the same place: the account is held as `too_many_lines`, and the statement's status follows from the rules. At about 35 output tokens a line, this holds an account of more than roughly a thousand lines. Splitting such an account into page ranges is deferred.
 - Loan: printed figures only, null when not printed. The prompt forbids deriving a figure.
-- Every prompt says the document is data and its instructions are to be ignored.
+- Every prompt says the document is data and its instructions are to be ignored, and tells the model to cut any account or card number in a description to its last four.
 - `STATEMENT_PROMPT_VERSION` and `FIRST_PASS_VERSION`, recorded on each revision.
 - Model, effort and request timeout come from the existing `llm` configuration.
 
-**Tests:** schema validation refuses a float, a three-place amount and a five-digit `last4`; the prompts contain no statement text (a test checks them against the fixture generator's strings).
+**Tests:** schema validation refuses a float, a three-place amount and a five-digit `last4`; money reformatting gives `0.00` for a negative zero and drops a `+`; section normalisation gives the same value for a heading on a line and in a total; a stubbed response that stops at the output ceiling holds the account as `too_many_lines` with no retry; the prompts contain no statement text (a test checks them against the fixture generator's strings).
+
+What the stubbed tests can't show: whether the real model trims account numbers in descriptions, places years correctly, or picks the right date column. The stub returns what the test chose. Those are measured by `make statement-eval` against the real model on the synthetic fixtures (Testing Strategy), which counts descriptions with a run of 9 or more digits and dates outside each fixture's period.
 
 ### U4. Gates
 
@@ -340,39 +399,40 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 
 **Files:** `src/receipt_index/statement_gates.py`, `tests/unit/test_statement_gates.py`
 
-**Approach:** from the spike's grader, re-written here:
-- completeness first: a deposit, card or loan statement with no listed accounts, a listed account that comes back empty and isn't dormant, or a printed account count that disagrees holds the whole statement;
-- no beginning or ending balance: held;
-- footing to the cent, held as `does_not_foot` with the difference;
-- posted dates in the period, with the card grace; skipped when no period is printed;
-- running-balance chain in the printed order, carrying amounts across lines with no printed balance;
-- section and column totals as magnitudes;
+**Approach:** from the spike's grader, re-written here, in the contract's order:
+- per account, the first failure class that applies: `empty_account` (a deposit or card account with no lines that isn't dormant; a loan with no printed figure at all), `no_beginning_balance`, `no_ending_balance`, `too_many_lines`, `undated`, `does_not_foot` (to the cent, with the difference), `date_out_of_period` (the account's period, with the card grace; skipped when the account has no period), `balance_chain_break` (walked in date order, carrying amounts across lines with no printed balance), `totals_mismatch` (magnitudes);
 - dormant account: no lines and equal printed balances is clean;
+- statement: `rejected`, else the hold reasons in order (`no_accounts`, `dropped_account`, `account_count_mismatch`, `no_usable_account`), else `incomplete` or `complete`. The first three set `held_by_statement` on every account and keep each account's own class;
 - the canonical form and `content_digest`;
-- statement status from the completeness check and the account statuses.
+- a description with a run of 9 or more digits is logged (counts only, never the text) and counted in `statements show`. It is a flag, not a scrub and not a gate: reference numbers can be that long.
 
-**Tests:** one test per gate, failure class and statement status, each written to fail first against a stub that passes everything; a digest test against the contract document's worked example.
+**Tests:** one test per gate, failure class, hold reason and statement status, each written to fail first against a stub that passes everything. Named cases: a loan-only statement is `complete`; a loan beside a deposit account held by its own gates is `incomplete`; a statement with no accounts is `held` with `no_accounts`; an empty loan holds the statement as `dropped_account`, and every account, the clean ones included, is held and marked `held_by_statement` while a held one keeps its own class; a newest-first chain passes when walked in date order and fails when walked in printed order; a December to January card period with a line dated in late December passes, and one dated in the next December fails; a digest test against the contract document's worked example; the same account with its institution's whitespace varied keeps its `match_key` and its digest.
 
 ### U5. Statement pipeline and retries
 
 **Goal:** One statement item from fetch to commit, and its retries, kept apart from receipts.
 
-**Files:** `src/receipt_index/statements.py`, `src/receipt_index/pipeline.py` (`run_due_retries`), `src/receipt_index/repository.py` (`select_due`), `src/receipt_index/fetching.py`, `tests/integration/test_statement_pipeline.py`
+**Files:** `src/receipt_index/statements.py`, `src/receipt_index/pipeline.py` (`RunControl`, `run_due_retries`), `src/receipt_index/service.py` (the watchdog), `src/receipt_index/repository.py`, `src/receipt_index/fetching.py`, `src/receipt_index/requeue.py`, `tests/integration/test_statement_pipeline.py`
 
 **Approach:**
 1. `started` row in `ingest_log`, with `source_type = 'gdrive_statement'`.
 2. Store the original with `put(purpose="original", folder=StoreFolder.for_original(...))` through `_put_original`, so it is write-once under `originals/` like every other original. If a statement already has that file, add a `statement_sources` row and finish with no model call.
-3. Check and read the PDF under `STATEMENT_BOUNDS`. Scan, unreadable or over bounds: a `rejected` revision. A timeout: an item error, retried.
+3. Check and read the PDF under `STATEMENT_BOUNDS`, then the token cap. Scan, unreadable or over bounds: a `rejected` revision. A timeout: an item error, retried.
 4. First pass. A non-extractable type, or more than 8 accounts (`over_bounds`, `accounts`): a `rejected` revision.
 5. One call per account, then the gates.
-6. One transaction: the statement (if new), its source row, the revision, accounts, clean accounts' lines, and an `ingest_log` `success` row with the token totals.
+6. One transaction, in the U2 insert order: the revision, accounts, clean accounts' lines, the statement (new or updated), its source row, and an `ingest_log` `success` row with the token totals.
 
-- **Watchdog steps.** Steps 3, 4 and each account call re-mark the item clock through `RunControl`, so each is timed as its own step. The longest is one model call: the request timeout plus one output retry, about 360 seconds, well under `item_timeout_seconds` (1200).
-- **Errors.** A transient model or Drive error pauses the worker as today. A model or schema error on any call is an item error, retried with the existing backoff, and terminal after `retry_max_attempts`. It writes no revision. A held account is a successful outcome, not an error.
-- **Retries stay statements.** `select_due`'s fallback matches `source_type`, so a `gdrive_statement` row is only ever offered to statement sources, including after its source is removed from the config. `run_due_retries` sends `gdrive_statement` items to this pipeline. The "is this item new" check also looks at `statement_sources`.
+- **Watchdog steps.** `RunControl` gains `step(source_id)`, which re-marks the running item's clock: `serve`'s watchdog then times from the last step, not from the item's start. Steps 3, 4 and each account call call it. The receipt path doesn't, and the test doubles that implement `RunControl` get a no-op. The longest step is one model call: the request timeout plus one output retry, about 360 seconds, well under `item_timeout_seconds` (1200).
+- **Errors.** A transient model or Drive error pauses the worker as today. A model or schema error on any call is an item error, retried with the existing backoff, and terminal after `retry_max_attempts`. It writes no revision. A held account, a `too_many_lines` cut-off included, is a successful outcome, not an error.
+- **Retries stay statements.** Every place the retry and requeue code assumes a receipt changes:
+  - `select_due` is called with `source_type='gdrive_statement'` for a statement source. Its name match only ever finds that source's own rows (U6's validation refuses two sources with one name), and its fallback for a removed or unnamed source matches the type, so a statement row is never offered to a receipt source, and the reverse.
+  - `_NO_PROVENANCE` becomes `_NOT_DONE`: no `provenance` row and no `statement_sources` row for the item. It is used by `select_due`, `select_retry_candidates` and the other queries that use it today. `has_receipt` in the retry loop's "latest row still due" check becomes `item_done`, true for either. `get_processed_source_ids` also unions `statement_sources`.
+  - `fetching.SourcePool.candidates` compares an item's `source_type` with the config's `type` today. It compares with the source's ingest type instead (`gdrive_statement` for a Drive source with `documents: statements`, the config's `type` otherwise), so a statement item whose source is gone is re-fetched only through statement sources.
+  - `run_due_retries` sends `gdrive_statement` items to this pipeline, never to `process_item`.
+  - The `retry` command (`RetryFilter`, `apply_requeue`) writes its `queued` row with the item's own `source_type` already, so a requeued statement item stays a statement item and the next retry pass sends it here. `orphan_report` looks for renditions, which a statement item never has, so it reports none for one. `failures` lists statement items by their source name, and `failures --source` filters them.
 - `statements rerun` (U8) runs steps 3 to 6 from the stored original as a new revision.
 
-**Tests:** each fixture end to end with a stubbed model; a crash after the original is stored resumes without storing it twice; the same bytes from two drops give one statement; a due statement item, including one whose source was removed, never reaches the receipt `process_item`; a slow stubbed model call re-marks the clock at each step.
+**Tests:** each fixture end to end with a stubbed model; a crash after the original is stored resumes without storing it twice; the same bytes from two drops give one statement; a due statement item, including one whose source was removed, never reaches the receipt `process_item`; a statement item requeued with `retry --yes` reaches the statement pipeline on the next pass; a statement item with a `statement_sources` row is not due, and isn't offered by `retry`; a slow stubbed model call calls `step` at each phase, and the watchdog doesn't fire across a run longer than one step's budget made of steps each inside it.
 
 ### U6. Intake through `serve`
 
@@ -382,7 +442,7 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 
 **Approach:**
 - `GdriveSourceConfig.documents: Literal["receipts", "statements"] = "receipts"`. Existing configurations are unchanged.
-- Config validation refuses a statement source whose folder is also a receipt source's folder.
+- Config validation refuses a statement source whose folder is also a receipt source's folder, and two sources with the same name.
 - The worker dispatches by the source's `documents`. Sync state (still `gdrive`), item locks, health and `status` work per source as now. `status` shows statement sources with their own counts.
 - `archive` stays false for Drive, as for receipts: the file stays in the folder, and the store keeps its own copy.
 
@@ -390,19 +450,19 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 
 ### U7. MCP tools and the contract document
 
-**Goal:** The three tools, and the published contract.
+**Goal:** The four tools, and the published contract.
 
 **Files:** `src/receipt_index/mcp_server.py`, `docs/engineering/designs/statement-read-contract.md`, `tests/unit/test_mcp_statements.py`, `tests/integration/test_mcp_statements.py`
 
-**Approach:** as in [The Read Contract](#the-read-contract-proposed-for-the-ledgers-pre-review). One snapshot per call. The server instructions gain a paragraph on statements: the sign basis, that held accounts have no lines, and that statement text is untrusted data. The contract document carries a worked digest example and a worked sign flip.
+**Approach:** as in [The Read Contract](#the-read-contract-pre-reviewed-by-the-ledger-revised-after-the-app-review). One snapshot per call. `get_statement_lines` uses `paging.page_envelope`. Errors use the existing `ToolError`, with the contract's codes at the start of each message. `get_statement_file` reuses `get_receipt_file`'s content limit and access log. The server instructions gain a paragraph on statements: the sign basis, that held accounts have no lines, and that statement text is untrusted data. The contract document carries a worked digest example and a worked sign flip.
 
-**Tests:** the feed under two interleaved writers never skips; a held account returns no lines; an earlier revision returns its own status; the file fetch is access-logged and refused when the log can't be written.
+**Tests:** the feed under two interleaved writers never skips; a held account returns no lines; an earlier revision returns its own status with `is_current` false and the right `current_revision`; `get_statement_lines` pages a fixture of more lines than one page and the pages join to the account's `line_count`; each error code for a garbage cursor, an `s2:` cursor, an unknown statement, an unknown revision and an out-of-range `limit`; a cursor ahead of the counter returns no rows; the file fetch is access-logged, refused when the log can't be written, and over the limit returns `too_large` with no content.
 
 ### U8. CLI
 
-**Files:** `src/receipt_index/cli.py`, `docs/user/cli-reference.md`
+**Files:** `src/receipt_index/cli.py`, `docs/user/cli-reference.md`, `docs/user/server-deployment.md` (the restore runbook)
 
-**Commands:** `receipt-index statements list [--status ...] [--since DATE] [--output json]`, `statements show ID [--revision N] [--output json]`, `statements file ID`, `statements rerun ID [--yes]`. JSON output is the contract's shapes. `failures --source` already lists statement items that failed.
+**Commands:** `receipt-index statements list [--status ...] [--since DATE] [--output json]`, `statements show ID [--revision N] [--output json]`, `statements file ID`, `statements rerun ID [--yes]`, `statements republish (ID... | --all) [--yes]`. JSON output is the contract's shapes. `republish` writes no revision: it gives each statement a new `change_seq`, and the restore runbook gains it as its last step. `failures --source` already lists statement items that failed.
 
 ### U9. Documentation
 
@@ -425,17 +485,22 @@ Built at test time from HTML with weasyprint (`tests/fixtures/statements/`), so 
 - running balance printed only on a day's last line, newest-first order;
 - combined statement: two deposit accounts and a dormant third, with a printed account count;
 - statement with no beginning balance;
+- card over a December to January period, printing dates with no year, with a purchase in late December inside the grace window;
+- card that prints one date per line;
+- loan-only statement (complete), and a loan beside a deposit account that doesn't foot (incomplete);
+- statement whose summary lists two accounts, with only one present (held, `account_count_mismatch`);
+- a mixed document: a text cover page over image-only pages (held by the gates, not rejected);
 - loan statement with principal, interest and escrow printed, and no opening principal;
 - no-activity loan bill, escrow notice, a letter (rejected);
-- an image-only page set (scan), a 61-page PDF (over bounds) and a non-PDF file (unreadable).
+- an image-only page set (scan), a 61-page PDF (over bounds), a file over the size bound, text over the token cap, and a non-PDF file (unreadable).
 
 ### With a stubbed model
 
-pydantic-ai's `FunctionModel` returns a chosen extraction per call, so each gate is driven to pass and to fail on purpose: a dropped line, a flipped section, a duplicated page-break line, a date outside the grace, a broken chain, an empty account, a wrong account count, no accounts at all.
+pydantic-ai's `FunctionModel` returns a chosen extraction per call, so each gate is driven to pass and to fail on purpose: a dropped line, a flipped section, a duplicated page-break line, a date outside the grace, a date in the wrong year, a broken chain, an empty account, an empty loan, a wrong account count, no accounts at all, a response cut off at the output ceiling. The stub proves the gates and the plumbing, not the model: what the model does with a real layout is measured only by the real-model run below.
 
 ### Against the real model, by hand
 
-`make statement-eval` runs the fixtures against the configured model and prints a counts-only table. It isn't run in CI and costs a few cents.
+`make statement-eval` runs the fixtures against the configured model and prints a counts-only table: per fixture, the status and class against the expected ones, descriptions with a run of 9 or more digits, dates outside the period, and characters per input token. It isn't run in CI and costs a few cents. Its output on the synthetic fixtures goes in U3's and U4's pull requests.
 
 ### Integration
 
@@ -445,9 +510,9 @@ Pipeline, retry, feed and MCP tests run against the devtest Postgres under the s
 
 ## Cost
 
-Haiku 5.5 is $0.10 per million input tokens and $0.50 per million output tokens, for prompts under 100,000 tokens. The text cap (U1) keeps each prompt under that point.
+Haiku 5.5 is $0.10 per million input tokens and $0.50 per million output tokens, for prompts under 100,000 tokens. The token cap (U1: 85,000 estimated tokens of text, at 2.5 characters a token, plus about 1,500 of prompt) keeps each prompt under that point.
 
-Per statement: input ≈ (1 + accounts) × (document tokens + about 1,500 of prompt); output ≈ 35 tokens a line, plus thinking at medium effort. A text page is roughly 700 to 1,000 tokens.
+Per statement: input ≈ (1 + accounts) × (document tokens + about 1,500 of prompt); output ≈ 35 tokens a line, plus thinking at medium effort. A text page of prose is roughly 700 to 1,000 tokens; a dense numeric page can run higher, which is why the cap counts estimated tokens rather than pages.
 
 | Synthetic example | Input | Output | Cost |
 |---|---|---|---|
@@ -470,7 +535,7 @@ A backlog of 500 statements costs on the order of $5. A rerun costs the same aga
 
 **Rollback**
 - Stop intake: remove the statement source from the config and restart. Its due retries stay statement items and are skipped with no statement source configured. The receipt pipeline is untouched throughout.
-- Roll back the code: redeploy the previous image. The new tables are unused by it, and it ignores `gdrive_statement` rows, which no configured source matches.
+- Roll back the code: redeploy the previous image, **only after** the statement source is out of the config. The order matters: the previous image's `GdriveSourceConfig` ignores keys it doesn't know, so it would read a source with `documents: statements` as a receipt source and send statements down the receipt pipeline. With the source removed, the previous image's `select_due` can't match a `gdrive_statement` row by name (no source has that name) or by type (its fallback matches `gdrive` only), and its `retry` command would only write another `gdrive_statement` row that nothing selects. The new tables are unused by it.
 - Remove the data (only if wanted): the 000024 and 000023 down migrations. The stored originals stay in the store and in `stored_files` and `file_locations`. No command lists them today; they are listed from those tables by hand if they are ever to be removed.
 
 ---
@@ -482,7 +547,9 @@ A backlog of 500 statements costs on the order of $5. A rerun costs the same aga
 | A statement reconciles with a misdated or mis-described line | The date gate catches dates outside the period; the operator spot-checks a few after rollout. Descriptions aren't verifiable by arithmetic: stated in the contract. |
 | The first pass misses an account and nothing prints a count | An empty or missing account list holds the statement; a missed account with no printed count is undetectable in shoebox. The ledger's own balance check on the account is the backstop. Stated in the contract. |
 | The first pass flips between runs | Holds are safe; `statements rerun` by hand. Revisit an automatic retry after a month. |
-| A description carries a full account number | The prompt keeps last four; the contract says so; a unit test checks the prompt. A deterministic scrub is not added, since it would also cut reference numbers the ledger may want. |
+| A description carries a full account number | The prompt tells the model to keep the last four, and the contract says plainly that the model does the cutting and nothing checks it. A run of 9 or more digits is logged and counted (U4), and `statement-eval` counts them on the fixtures. A deterministic scrub is not added, since it would also cut reference numbers the ledger may want. |
+| An account too long for one call's output | The output ceiling holds it as `too_many_lines` with no retry; splitting by page range is deferred. |
+| A restore hides a statement behind the ledger's cursor | `statements republish --all --yes` is the restore runbook's last step (U8). |
 | Prompt injection in a statement | Prompts say the document is data; outputs are schema-bound; held results carry no lines; the MCP instructions say statement text is untrusted. |
 | The server's clock runs backwards | The counter takes the greater of the last value and the clock, so it stays monotonic within one database; only a restore combined with a clock set back past the backup could repeat a value. |
 | A long transaction holds the feed lock | Only revision writes take it, from one worker; `statement_timeout` bounds each. |
@@ -503,7 +570,7 @@ Run 2026-11-10 with four reviewers: coherence, feasibility, scope guardian, and 
 - Unknown `account_type` or status had no safe default: the ledger's defaults are stated, and a new type or line-bearing status is breaking.
 - `parse_failure` and `model_error` were listed as held classes but are item errors: removed from the contract, and the error path stated.
 - A count mismatch or dropped account had no clear effect on the other accounts: a completeness failure holds every account; the origin document's success criteria are aligned.
-- A deposit, card or loan statement with no accounts read as complete: held as `dropped_account`.
+- A deposit, card or loan statement with no accounts read as complete: held (since the app review, with the hold reason `no_accounts`).
 - No `document_type` for an unreadable file, and no record of which bound was hit: `unreadable` and `rejected_bound` added, and the statement read returns a reason.
 - A timeout became a permanent rejection although it can be the host's load: now a retryable item error.
 - Totals' sign, the loan breakdown's basis, the card grace and the balance chain's direction were unstated, so the ledger couldn't re-check: all stated in the contract.
@@ -523,7 +590,21 @@ Run 2026-11-10 with four reviewers: coherence, feasibility, scope guardian, and 
 **Answered in the ledger's pre-review**
 - The review cases the agreed rules didn't name (clean to rejected, and an account removed between revisions): review items in the ledger, never automatic changes. See decision 4.
 
-**Not changed**
+**App review on the pull request (2026-11-11)**
+
+Every point is answered on the pull request. Changes made:
+- Statuses contradicted each other for a loan-only statement and for a loan beside a held account: the four are now mutually exclusive and tested in order, and `figures_only` counts as usable. The requirements document's F1 and R13 are aligned.
+- A held statement could carry no reason, and a completeness failure overwrote an account's own class: a statement-level `hold_reason`, a `held_by_statement` mark on each account, and the account keeps its own class. An empty loan is defined (no printed figure at all) and has the class `empty_account`.
+- Contract gaps: `currency` per account; exact money, zero, timestamp and integer formats; a period per account, in the digest; `ordinal` follows printed order and the chain is walked in date order; one normalisation for `section` on lines and totals, null for a line under no heading; one printed date goes in `posted_date`, and `transaction_date` isn't gated; year inference and the `undated` class; held accounts carry no lines by design; `is_current` and `current_revision`; feed limits, error codes, a cursor ahead of the counter, and paged lines through a new `get_statement_lines`; `revision` as a 64-bit integer; `change_seq` separated from `revision`, and `statements republish` so a restored revision reaches the ledger.
+- `match_key` drops `institution`, and `institution` is normalised (the ledger's answer, decision 5).
+- Feasibility: the insert order with deferred foreign keys and a deferred match check, and the seeded counter row; every receipt assumption in the retry and requeue code (`select_due`'s type, `_NO_PROVENANCE`, `has_receipt`, `get_processed_source_ids`, `SourcePool.candidates`, `retry`, `failures`); a token-based text cap; an output ceiling and `too_many_lines`; every `STATEMENT_BOUNDS` field explicit and a `read_pdf_pages` that takes its bounds; `RunControl.step`; the rollback order; the file-content limit.
+- Tests and fixtures: a year boundary, a card printing one date, loan-only and loan-beside-held, an empty loan, a count mismatch, a mixed document, the barrier test for the cursor guarantee, a restored `change_seq` below the cursor, `match_key` stability, `is_current`, the error codes, and a statement of what the stubbed model can't show.
+
+Not changed:
+- Section totals stay unsigned magnitudes; the footing check pins direction. Stated in the contract.
+- No deterministic description scrub (see Risks).
+
+**Not changed (document review)**
 - Canonical JSON details (escaping, normalisation) are now stated; the worked example in the contract document settles the rest at build time.
 
 ---

@@ -22,7 +22,7 @@ The same change renames the roadmap's "Reconciliation" lane to document extracti
 - F1. Statement intake
   - **Trigger:** The operator drops a statement PDF into the statement folder.
   - **Steps:** `serve` sees the new file → stores the original in the evidence store → reads the text layer under statement bounds → first pass: document type and account list → rejects a non-statement, notice or no-activity bill without extracting → one extraction call per listed account → per-account gates → records the statement, its accounts and the lines of clean accounts.
-  - **Outcome:** The statement is `complete` (every account clean), `incomplete` (at least one account held), `held` (no account clean) or `rejected`. Each is visible in the CLI and over MCP.
+  - **Outcome:** The statement is `rejected`; `held`, with a reason (the account list failed, or no account is clean or, for a loan, figures-only); `incomplete` (at least one account held by its own checks, at least one clean or figures-only); or `complete` (every account clean or figures-only). Exactly one applies. Each is visible in the CLI and over MCP.
   - **Covered by:** R1–R14
 
 - F2. The ledger imports
@@ -56,7 +56,7 @@ The same change renames the roadmap's "Reconciliation" lane to document extracti
 
 **Extraction**
 - R8. Each listed account is extracted by its own call, from the whole text layer, with a prompt for its account type, told which account and pages. Every call goes to the configured extraction model (Haiku), with no deterministic parsing.
-- R9. A deposit or card account yields its institution, last four digits only, period, stated beginning and ending balances, printed totals, and its lines: posted date, transaction date where printed, description as printed, amount, running balance where printed, section heading and page.
+- R9. A deposit or card account yields its institution, last four digits only, currency, period (its own where printed, else the document's), stated beginning and ending balances, printed totals, and its lines: posted date (the line's one date when it prints only one), transaction date where a second is printed, description as printed, amount, running balance where printed, section heading and page. Dates printed without a year take the year that places them in the period.
 - R10. A loan account yields only figures printed on the statement (principal before and after, principal paid, interest, escrow, fees, advances), each null when not printed. Shoebox never computes one, and doesn't check them: the ledger does.
 
 **Gates**
@@ -66,17 +66,17 @@ The same change renames the roadmap's "Reconciliation" lane to document extracti
   - each printed running balance follows from the one before it;
   - each printed section or column total matches its lines;
   - it has lines, or it is dormant (no lines, and equal printed beginning and ending balances).
-- R12. An account that fails a gate is held with a failure class, the difference where there is one, and its page range. An account with no printed beginning balance is held. There is no override.
-- R13. A statement is complete only when every listed account is clean and, where the document prints an account count, the counts agree. A held account never contributes a line. A clean account on the same statement does, unless the account list itself fails (an empty account that isn't dormant, a count that disagrees, or no accounts at all): then every account is held.
+- R12. An account that fails a gate is held with a failure class, the difference where there is one, and its page range. An account with no printed beginning balance is held, and so is one too long to extract in one call. There is no override.
+- R13. A statement is complete only when every listed account is clean (or, for a loan, figures-only) and, where the document prints an account count, the counts agree. A held account never contributes a line. A clean account on the same statement does, unless the account list itself fails (an empty account that isn't dormant, a loan with no printed figure, a count that disagrees, or no accounts at all): then every account is held, the statement says why, and each account keeps its own failure class. A held statement always carries its reason.
 - R14. Every extraction records its model, prompt versions and token use, and keeps every earlier revision.
 
 **The read contract**
 - R15. The ledger reads statements over the MCP server, never the tables. The contract is published in this repository and versioned. Every response names its version.
-- R16. Per statement: a stable ID, the original's SHA-256, document type, period, status, page count, revision, extractor model and prompt versions.
-- R17. Per account: institution, last four digits, account type, stated balances and totals, status (clean, held or figures only), and for a held account its failure class, difference and page range.
+- R16. Per statement: a stable ID, the original's SHA-256, document type, period, status and the reason for a hold, page count, revision and whether it is current, extractor model and prompt versions.
+- R17. Per account: institution, last four digits, account type, currency, period, stated balances and totals, status (clean, held or figures only), and for a held account its failure class, difference and page range.
 - R18. Per line, clean accounts only: posted date, transaction date where printed, description, amount, running balance where printed, section and page. Amounts are signed by their effect on the statement's own balance, the sign the gate verified. The ledger converts to its own books' sign.
-- R19. Everything needed to re-check the arithmetic is in the response: balances, every line, section and column totals, and the period.
-- R20. A change feed lists statements new or changed since an opaque cursor, without skipping a statement whose transaction commits late. The receipts change feed follows the same cursor convention.
+- R19. Everything needed to re-check the arithmetic of a clean account is in the responses: balances, every line, section and column totals, the account's period and currency, and exact formats for money, dates and timestamps. A held account carries no lines, by design.
+- R20. A change feed lists statements new or changed since an opaque cursor, without skipping a statement whose transaction commits late, and with a way to put every statement back through the feed after a database restore. The receipts change feed follows the same cursor convention.
 - R21. The original PDF can be fetched over MCP, with each fetch access-logged, as `get_receipt_file` is.
 - R22. The CLI shows the same data, with `--output json` in the contract's shapes.
 
