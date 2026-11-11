@@ -303,7 +303,12 @@ def add_source(
     file_name: str | None,
     received_at: datetime | None,
 ) -> None:
-    """Record a source item that delivered a statement's bytes."""
+    """Record a source item that delivered a statement's bytes.
+
+    Takes the feed lock first: the insert's foreign key locks the statement
+    row, and a republish of it waits on that.
+    """
+    lock_feed(conn)
     conn.execute(
         """\
         INSERT INTO receipt.statement_sources (

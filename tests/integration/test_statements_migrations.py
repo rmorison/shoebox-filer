@@ -674,6 +674,64 @@ def test_a_committed_revision_takes_no_more_accounts_or_lines(
     conn.rollback()
 
 
+def test_an_account_or_line_on_an_unknown_parent_is_refused(
+    scratch: Scratch,  # noqa: F811
+) -> None:
+    # Missing, or another transaction's uncommitted revision: either way not
+    # one this transaction wrote.
+    conn, _ = scratch
+    with pytest.raises(psycopg.errors.RaiseException, match="not one this transaction"):
+        repo.insert_account(conn, uuid.uuid4(), _account())
+    conn.rollback()
+    with pytest.raises(psycopg.errors.RaiseException, match="not one this transaction"):
+        repo.insert_lines(conn, uuid.uuid4(), [_line()])
+    conn.rollback()
+
+
+def test_a_source_only_add_beside_a_republish_doesnt_deadlock(
+    scratch: Scratch,  # noqa: F811
+) -> None:
+    # The same bytes dropped twice add only a source, then (in the same
+    # transaction) draw a counter value. The source's foreign key locks the
+    # statement row, which a republish needs, so the add must take the feed
+    # lock before that row lock, as every other writer does.
+    conn, _ = scratch
+    made = _new_statement(conn)
+    other = _new_statement(conn)
+    dropper, operator = _connect(conn), _connect(conn)
+    try:
+        repo.add_source(
+            dropper,
+            statement_id=made["id"],
+            source_name="statements-drive",
+            source_id=f"drive-{uuid.uuid4().hex}",
+            file_name=None,
+            received_at=None,
+        )
+        result: dict[str, Any] = {}
+
+        def republish() -> None:
+            try:
+                result["seq"] = repo.republish(operator, made["id"])
+                operator.commit()
+            except Exception as exc:  # surfaced below
+                result["error"] = exc
+                operator.rollback()
+
+        thread = threading.Thread(target=republish)
+        thread.start()
+        _wait_for_lock_wait(conn, operator.info.backend_pid)
+        conn.commit()
+        repo.insert_revision(dropper, other["id"], _CLEAN)
+        dropper.rollback()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert "error" not in result, result.get("error")
+    finally:
+        dropper.close()
+        operator.close()
+
+
 def test_a_revisions_accounts_may_follow_a_savepoint(
     scratch: Scratch,  # noqa: F811
 ) -> None:

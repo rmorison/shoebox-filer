@@ -425,7 +425,10 @@ CREATE CONSTRAINT TRIGGER trg_statements_current_revision
 -- their lines, are written in the same transaction as the revision, so a
 -- later write can't change what the feed has already published. A row
 -- written in this transaction has created_at equal to the transaction's
--- start, which the triggers force (savepoints don't change it). A rejected
+-- start, which the triggers force (savepoints don't change it). Two
+-- transactions that start in the same microsecond share that value; one of
+-- them would also need the other's revision id, so the check accepts that
+-- remote case rather than store a transaction id on every row. A rejected
 -- revision has no accounts, and only a clean account has lines.
 CREATE OR REPLACE FUNCTION receipt.check_statement_account_revision()
 RETURNS TRIGGER AS $$
@@ -434,8 +437,11 @@ DECLARE
 BEGIN
     SELECT status, created_at INTO rev
     FROM receipt.statement_revisions WHERE id = NEW.revision_id;
+    -- A revision written in this transaction is always visible to it. One
+    -- that isn't is missing, or another transaction's still uncommitted.
     IF NOT FOUND THEN
-        RETURN NEW;  -- the foreign key reports it
+        RAISE EXCEPTION 'revision % is not one this transaction wrote',
+            NEW.revision_id;
     END IF;
     IF rev.created_at <> transaction_timestamp() THEN
         RAISE EXCEPTION 'revision % is committed and takes no more accounts',
@@ -462,7 +468,8 @@ BEGIN
     SELECT status, created_at INTO acct
     FROM receipt.statement_accounts WHERE id = NEW.account_id;
     IF NOT FOUND THEN
-        RETURN NEW;  -- the foreign key reports it
+        RAISE EXCEPTION 'account % is not one this transaction wrote',
+            NEW.account_id;
     END IF;
     IF acct.created_at <> transaction_timestamp() THEN
         RAISE EXCEPTION 'account % is committed and takes no more lines',
