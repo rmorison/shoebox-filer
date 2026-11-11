@@ -250,9 +250,24 @@ def _command(job: str, limits: PdfLimits, args: tuple[str, ...]) -> list[str]:
     ]
 
 
+# Signals that stop a child from outside: the CPU limit, a kill, and a
+# terminal or service stop (Ctrl-C, a hangup, a terminate). None of them is
+# the file's doing, so each reads as a timeout, which the caller retries.
+_TIMEOUT_SIGNALS = frozenset(
+    -s
+    for s in (
+        signal.SIGXCPU,
+        signal.SIGKILL,
+        signal.SIGINT,
+        signal.SIGTERM,
+        signal.SIGHUP,
+    )
+)
+
+
 def _stop_reason(returncode: int) -> StopReason:
     """The kind of stop a failed child's exit code shows."""
-    if returncode in (-signal.SIGXCPU, -signal.SIGKILL):
+    if returncode in _TIMEOUT_SIGNALS:
         return "timeout"
     if returncode == -signal.SIGXFSZ:
         return "output"

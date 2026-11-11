@@ -26,6 +26,7 @@ from receipt_index.pdf_validate import (
     STATEMENT_BOUNDS,
     PdfBounds,
     PdfLimits,
+    output_cap,
 )
 from tests.pdfs import child_that_writes, fake_child, filter_chain_pdf, make_pdf
 
@@ -283,11 +284,25 @@ _RESULT = (
     [
         (-9, "timeout"),
         (-24, "timeout"),
+        (-2, "timeout"),
+        (-15, "timeout"),
+        (-1, "timeout"),
         (3, "memory"),
+        (-11, "memory"),
         (-25, "text"),
         (1, "unreadable"),
     ],
-    ids=["killed", "cpu-limit", "out-of-memory", "output-cap", "failed"],
+    ids=[
+        "killed",
+        "cpu-limit",
+        "interrupted",
+        "terminated",
+        "hung-up",
+        "out-of-memory",
+        "crashed",
+        "output-cap",
+        "failed",
+    ],
 )
 def test_a_stopped_child_gives_its_reason(code: int, reason: str) -> None:
     # It wrote a result before it stopped: only the exit code tells. Python
@@ -325,6 +340,26 @@ def test_a_child_that_writes_no_result_is_unreadable(stdout: bytes) -> None:
     with fake_child(child_that_writes(stdout)):
         assert read_statement(make_pdf("Odd child")) == StatementRead(
             None, reason="unreadable"
+        )
+
+
+def test_a_child_that_exits_cleanly_past_the_output_cap_reads_as_text() -> None:
+    # The parent's own guard, for a child that doesn't limit itself.
+    bounds = _with_read(max_bytes=1024 * 1024)
+    over = output_cap(bounds.read) + 1
+    child = f"import sys; sys.stdout.buffer.write(b'x' * {over}); sys.stdout.flush()"
+    with fake_child(child):
+        assert read_statement(make_pdf("Chatty child"), bounds=bounds) == (
+            StatementRead(None, reason="text")
+        )
+
+
+def test_a_result_with_no_page_texts_is_over_the_page_cap() -> None:
+    # The child reads no text when the PDF is over the cap it was told.
+    result = b'{"pages": 3, "page_texts": null, "encrypted": false}'
+    with fake_child(child_that_writes(result)):
+        assert read_statement(make_pdf("No texts")) == StatementRead(
+            None, pages=3, reason="pages"
         )
 
 
