@@ -7,6 +7,7 @@ statement.
 from __future__ import annotations
 
 import io
+import json
 import time
 from dataclasses import fields, replace
 from typing import Any
@@ -184,15 +185,55 @@ def test_a_pdf_that_needs_a_password_is_unreadable() -> None:
 
 
 def test_a_pdf_with_only_an_owner_password_is_read() -> None:
-    # Many statements carry an owner password; pdfplumber opens them.
+    # Many statements carry an owner password; pdfplumber opens them, and
+    # the text must come back decrypted, not empty or scrambled.
     read = read_statement(make_pdf("Owner only synthetic statement", encrypted=True))
     assert read.reason is None
+    assert read.encrypted is True
+    assert read.page_texts == ("Owner only synthetic statement",)
+
+
+def test_an_unencrypted_pdf_says_so() -> None:
+    assert read_statement(make_pdf("Plain synthetic statement")).encrypted is False
 
 
 def test_a_page_set_with_no_text_is_a_scan() -> None:
     assert read_statement(make_pdf(pages=3)) == StatementRead(
         None, pages=3, reason="scan"
     )
+
+
+def _read_texts(*page_texts: str) -> StatementRead:
+    """read_statement of a child that found ``page_texts``."""
+    result = json.dumps(
+        {"pages": len(page_texts), "page_texts": list(page_texts), "encrypted": False}
+    ).encode()
+    with fake_child(child_that_writes(result)):
+        return read_statement(make_pdf("Glyphs"))
+
+
+@pytest.mark.parametrize(
+    ("page_texts", "reason"),
+    [
+        (("(cid:12)(cid:7)(cid:3) " * 40,), "scan"),
+        (("Page 1 " + "(cid:12)(cid:7) " * 40,), "scan"),
+        (("(cid:4)" * 10, "(cid:4)" * 10), "scan"),
+        (("Synthetic opening balance and card purchases (cid:3)",), None),
+        (("Synthetic statement text", "(cid:9)"), None),
+    ],
+    ids=["glyphs-only", "mostly-glyphs", "glyphs-on-every-page", "a-few", "one-page"],
+)
+def test_text_that_is_mostly_unmapped_glyphs_is_a_scan(
+    page_texts: tuple[str, ...], reason: str | None
+) -> None:
+    # A font with no text map gives (cid:N) runs, which would reach the
+    # model as noise.
+    assert _read_texts(*page_texts).reason == reason
+
+
+def test_unmapped_glyphs_dont_count_toward_the_minimum() -> None:
+    assert _read_texts("x" * 19 + "(cid:1)" * 2).reason == "scan"
+    assert _read_texts("x" * 20 + "(cid:1)" * 2).reason is None
 
 
 def test_a_statement_with_just_enough_text_is_not_a_scan() -> None:
@@ -248,13 +289,18 @@ def cpu_bomb() -> bytes:
     return filter_chain_pdf(64)
 
 
-def test_a_cpu_bomb_stops_with_timeout(cpu_bomb: bytes) -> None:
-    bounds = _with_read(cpu_seconds=2, wall_seconds=20.0)
-    start = time.monotonic()
-    assert read_statement(cpu_bomb, bounds=bounds) == StatementRead(
-        None, reason="timeout"
-    )
-    assert time.monotonic() - start < 20
+def test_a_cpu_bomb_stops_with_timeout_at_the_cpu_limit(
+    cpu_bomb: bytes, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The wall clock is far above the CPU limit, so only the CPU limit can
+    # stop it, however slow the runner; the log line shows which fired.
+    bounds = _with_read(cpu_seconds=2, wall_seconds=120.0)
+    with caplog.at_level("WARNING", logger="receipt_index.pdf_validate"):
+        assert read_statement(cpu_bomb, bounds=bounds) == StatementRead(
+            None, reason="timeout"
+        )
+    assert "PDF read stopped: hit the 2 s CPU limit" in caplog.text
+    assert "wall-clock" not in caplog.text
 
 
 def test_a_read_past_the_wall_clock_stops_with_timeout(cpu_bomb: bytes) -> None:
@@ -288,9 +334,10 @@ _RESULT = (
         (-15, "timeout"),
         (-1, "timeout"),
         (3, "memory"),
-        (-11, "memory"),
+        (-11, "crash"),
+        (-6, "crash"),
         (-25, "text"),
-        (1, "unreadable"),
+        (1, "failed"),
     ],
     ids=[
         "killed",
@@ -299,7 +346,8 @@ _RESULT = (
         "terminated",
         "hung-up",
         "out-of-memory",
-        "crashed",
+        "segfault",
+        "aborted",
         "output-cap",
         "failed",
     ],
@@ -325,6 +373,7 @@ def test_a_stopped_child_gives_its_reason(code: int, reason: str) -> None:
         b'{"pages": 1}',
         b'{"pages": 1, "page_texts": "not a list", "encrypted": false}',
         b'{"pages": 1, "page_texts": [1, 2], "encrypted": false}',
+        b'{"pages": 1, "page_texts": ["Synthetic text"], "encrypted": "no"}',
         b"[1, 2]",
     ],
     ids=[
@@ -333,6 +382,7 @@ def test_a_stopped_child_gives_its_reason(code: int, reason: str) -> None:
         "missing-keys",
         "texts-not-list",
         "texts-not-str",
+        "encrypted-not-bool",
         "list",
     ],
 )

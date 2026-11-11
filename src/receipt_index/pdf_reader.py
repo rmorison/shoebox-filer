@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -55,8 +56,19 @@ STATEMENT_TOKEN_CAP = 85_000
 _CHARS_PER_TOKEN_TENTHS = 25  # 2.5 characters a token, in integer tenths
 
 StatementReadReason = Literal[
-    "pages", "size", "memory", "unreadable", "timeout", "text", "scan"
+    "pages",
+    "size",
+    "memory",
+    "crash",
+    "unreadable",
+    "timeout",
+    "failed",
+    "text",
+    "scan",
 ]
+
+# What pdfplumber gives for a glyph whose font has no usable text map.
+_CID = re.compile(r"\(cid:\d+\)")
 
 # How a bounded child's stop reads for a statement. A child that wrote past
 # the output cap had more text than any statement under the token cap.
@@ -64,8 +76,9 @@ _STATEMENT_STOP: dict[StopReason, StatementReadReason] = {
     "size": "size",
     "timeout": "timeout",
     "memory": "memory",
+    "crash": "crash",
     "output": "text",
-    "failed": "unreadable",
+    "failed": "failed",
 }
 
 
@@ -76,20 +89,33 @@ class StatementRead:
     ``page_texts`` is set exactly when ``reason`` is None. ``pages`` is the
     page count when it is known. ``reason``:
 
-    - ``pages``, ``size``, ``memory``: over a bound of ``STATEMENT_BOUNDS``;
+    - ``pages``, ``size``, ``memory``: over a bound of ``STATEMENT_BOUNDS``.
+      A PDF with a huge page tree hits ``memory`` or ``timeout`` before its
+      page count is known, not ``pages``;
+    - ``crash``: the reader died of a signal, such as a parser segfault;
     - ``timeout``: the read hit its CPU or wall-clock limit or was killed;
       it can be the host's load, so the caller retries it;
+    - ``failed``: the reader exited with an error of its own (a full disk,
+      no file descriptors, a broken install), not a verdict on the file, so
+      the caller retries it too;
     - ``unreadable``: not a PDF, needs a password, or pdfplumber can't open
       it or failed reading it;
-    - ``scan``: fewer than 20 non-whitespace characters on every page
-      together;
+    - ``scan``: fewer than 20 usable non-whitespace characters on every page
+      together, where ``(cid:N)`` glyphs (fonts with no text map) don't
+      count; and text that is mostly such glyphs;
     - ``text``: the page-marked text is over :data:`STATEMENT_TOKEN_CAP`
-      estimated tokens.
+      estimated tokens. The cap is applied here, once; callers don't
+      apply it again.
+
+    ``encrypted``: the PDF has an encryption dictionary and opened without a
+    password (an owner password only). Such a PDF is read like any other,
+    whatever its permission flags say.
     """
 
     page_texts: tuple[str, ...] | None
     pages: int | None = None
     reason: StatementReadReason | None = None
+    encrypted: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +208,9 @@ def read_statement(
         if found is not None:
             pages = int(found["pages"])
             texts = found["page_texts"]
+            encrypted = found["encrypted"]
+            if not isinstance(encrypted, bool):
+                raise TypeError("encrypted")
             if texts is not None and not (
                 isinstance(texts, list) and all(isinstance(x, str) for x in texts)
             ):
@@ -196,10 +225,10 @@ def read_statement(
         logger.info(
             "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
         )
-        return StatementRead(None, pages=pages, reason="pages")
-    if not _is_sufficient_text("".join(texts)):
+        return StatementRead(None, pages=pages, reason="pages", encrypted=encrypted)
+    if not _is_usable_statement_text("".join(texts)):
         logger.info("Statement PDF has too little text: a scan (%d pages)", pages)
-        return StatementRead(None, pages=pages, reason="scan")
+        return StatementRead(None, pages=pages, reason="scan", encrypted=encrypted)
     tokens = estimate_tokens(page_marked_text(texts))
     if tokens > STATEMENT_TOKEN_CAP:
         logger.info(
@@ -207,8 +236,21 @@ def read_statement(
             tokens,
             STATEMENT_TOKEN_CAP,
         )
-        return StatementRead(None, pages=pages, reason="text")
-    return StatementRead(tuple(texts), pages=pages)
+        return StatementRead(None, pages=pages, reason="text", encrypted=encrypted)
+    return StatementRead(tuple(texts), pages=pages, encrypted=encrypted)
+
+
+def _is_usable_statement_text(text: str) -> bool:
+    """Whether a statement's text is enough to extract from.
+
+    At least 20 non-whitespace characters that aren't ``(cid:N)`` glyphs,
+    and more of those than of glyph runs: a font with no text map gives
+    runs like ``(cid:12)(cid:7)`` that would reach the model as noise.
+    """
+    total = len("".join(text.split()))
+    glyphs = sum(len("".join(m.split())) for m in _CID.findall(text))
+    usable = total - glyphs
+    return usable >= _MIN_TEXT_LENGTH and usable > glyphs
 
 
 def page_marked_text(page_texts: tuple[str, ...] | list[str]) -> str:

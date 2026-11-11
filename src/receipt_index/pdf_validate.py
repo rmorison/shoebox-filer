@@ -53,9 +53,10 @@ PdfStatus = Literal["ok", "repaired", "unparseable"]
 # Why a bounded child produced no output. ``size``: the input is over the
 # size cap, so no child ran. ``timeout``: the CPU or wall-clock limit, or a
 # kill (which can be the host's load, not the file). ``memory``: the
-# address-space limit. ``output``: the child wrote past the output cap.
-# ``failed``: any other exit.
-StopReason = Literal["size", "timeout", "memory", "output", "failed"]
+# address-space limit. ``crash``: any other signal, such as a parser's
+# segfault on a malformed file (sometimes the memory limit too). ``output``:
+# the child wrote past the output cap. ``failed``: any other exit.
+StopReason = Literal["size", "timeout", "memory", "crash", "output", "failed"]
 
 _MODULE = "receipt_index.pdf_validate"
 # Enough for one item's attachment and rendition; a repair can be 25 MB.
@@ -271,9 +272,10 @@ def _stop_reason(returncode: int) -> StopReason:
         return "timeout"
     if returncode == -signal.SIGXFSZ:
         return "output"
-    if returncode == _EXIT_MEMORY or returncode < 0:
-        # Another signal is most often the memory limit (see _stopped_by).
+    if returncode == _EXIT_MEMORY:
         return "memory"
+    if returncode < 0:
+        return "crash"
     return "failed"
 
 
