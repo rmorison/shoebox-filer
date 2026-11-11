@@ -11,6 +11,13 @@ through PDF validation's runner (:func:`receipt_index.pdf_validate.run_bounded`)
 under its own address-space, CPU, wall-clock and size limits, and reads
 no text from a PDF over a page cap (:data:`RECEIPT_BOUNDS`). A PDF that hits
 a limit or the cap reads as unreadable, the same as one pdfplumber can't open.
+
+A bank or card statement is read by :func:`read_statement` instead, under
+:data:`~receipt_index.pdf_validate.STATEMENT_BOUNDS`. It keeps each page's
+text apart, so a prompt can mark pages, and when it can't give text it says
+why: the statement pipeline rejects some of those reasons and retries
+others. It also applies the statement's text checks, which aren't PDF
+bounds: a scan (too little text) and a token cap on the page-marked text.
 """
 
 from __future__ import annotations
@@ -19,8 +26,17 @@ import io
 import json
 import logging
 from dataclasses import asdict, dataclass
+from typing import Literal
 
-from receipt_index.pdf_validate import RECEIPT_BOUNDS, PdfLimits, run_bounded
+from receipt_index.pdf_validate import (
+    RECEIPT_BOUNDS,
+    STATEMENT_BOUNDS,
+    PdfBounds,
+    PdfLimits,
+    StopReason,
+    run_bounded,
+    run_bounded_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +44,52 @@ logger = logging.getLogger(__name__)
 # A minimal receipt must contain at least a vendor name and amount; 20 chars
 # provides a buffer while catching truly empty extractions from image-only PDFs.
 _MIN_TEXT_LENGTH = 20
+
+
+# A statement's text is capped by an estimate of its tokens, not its
+# characters: numeric, columnar text tokenises more densely than prose, at
+# about 2.5 to 3 characters a token. Counting 2.5 keeps the estimate high.
+# With the prompt (about 1,500 tokens) on top, each model call's input stays
+# under the 100,000-token point where the model's price rises.
+STATEMENT_TOKEN_CAP = 85_000
+_CHARS_PER_TOKEN_TENTHS = 25  # 2.5 characters a token, in integer tenths
+
+StatementReadReason = Literal[
+    "pages", "size", "memory", "unreadable", "timeout", "text", "scan"
+]
+
+# How a bounded child's stop reads for a statement. A child that wrote past
+# the output cap had more text than any statement under the token cap.
+_STATEMENT_STOP: dict[StopReason, StatementReadReason] = {
+    "size": "size",
+    "timeout": "timeout",
+    "memory": "memory",
+    "output": "text",
+    "failed": "unreadable",
+}
+
+
+@dataclass(frozen=True)
+class StatementRead:
+    """A statement's text, page by page, or why there is none.
+
+    ``page_texts`` is set exactly when ``reason`` is None. ``pages`` is the
+    page count when it is known. ``reason``:
+
+    - ``pages``, ``size``, ``memory``: over a bound of ``STATEMENT_BOUNDS``;
+    - ``timeout``: the read hit its CPU or wall-clock limit or was killed;
+      it can be the host's load, so the caller retries it;
+    - ``unreadable``: not a PDF, needs a password, or pdfplumber can't open
+      it or failed reading it;
+    - ``scan``: fewer than 20 non-whitespace characters on every page
+      together;
+    - ``text``: the page-marked text is over :data:`STATEMENT_TOKEN_CAP`
+      estimated tokens.
+    """
+
+    page_texts: tuple[str, ...] | None
+    pages: int | None = None
+    reason: StatementReadReason | None = None
 
 
 @dataclass(frozen=True)
@@ -100,9 +162,81 @@ def read_pdf(
     return read
 
 
+def read_statement(
+    data: bytes, *, bounds: PdfBounds = STATEMENT_BOUNDS
+) -> StatementRead:
+    """A statement's per-page text under ``bounds``, or why there is none.
+
+    pdfplumber runs in a bounded child, as for :func:`read_pdf`, but the
+    limits, page cap and stop reasons are the statement's. No text from the
+    statement is logged.
+    """
+    max_pages = bounds.max_read_pages
+    run = run_bounded_job("read", data, bounds.read, str(max_pages), "pages")
+    if run.output is None:
+        reason = _STATEMENT_STOP[run.stop or "failed"]
+        logger.info("Statement PDF not read: %s (%d bytes)", reason, len(data))
+        return StatementRead(None, reason=reason)
+    try:
+        found = json.loads(run.output)
+        if found is not None:
+            pages = int(found["pages"])
+            texts = found["page_texts"]
+            if texts is not None and not (
+                isinstance(texts, list) and all(isinstance(x, str) for x in texts)
+            ):
+                raise TypeError("page_texts")
+    except (ValueError, TypeError, KeyError):
+        logger.warning("Statement PDF read gave no result (%d bytes)", len(data))
+        return StatementRead(None, reason="unreadable")
+    if found is None:
+        logger.info("pdfplumber can't read the statement PDF (%d bytes)", len(data))
+        return StatementRead(None, reason="unreadable")
+    if pages > max_pages or texts is None:
+        logger.info(
+            "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
+        )
+        return StatementRead(None, pages=pages, reason="pages")
+    if not _is_sufficient_text("".join(texts)):
+        logger.info("Statement PDF has too little text: a scan (%d pages)", pages)
+        return StatementRead(None, pages=pages, reason="scan")
+    tokens = estimate_tokens(page_marked_text(texts))
+    if tokens > STATEMENT_TOKEN_CAP:
+        logger.info(
+            "Statement text of about %d tokens is over the %d-token cap",
+            tokens,
+            STATEMENT_TOKEN_CAP,
+        )
+        return StatementRead(None, pages=pages, reason="text")
+    return StatementRead(tuple(texts), pages=pages)
+
+
+def page_marked_text(page_texts: tuple[str, ...] | list[str]) -> str:
+    """A statement's text with each page marked, as a prompt gives it."""
+    return "\n\n".join(
+        f"[Page {number}]\n{text}" for number, text in enumerate(page_texts, 1)
+    )
+
+
+def estimate_tokens(text: str) -> int:
+    """A high estimate of ``text``'s tokens: 2.5 characters a token, rounded up."""
+    return -(-len(text) * 10 // _CHARS_PER_TOKEN_TENTHS)
+
+
 def read_job(data: bytes, args: list[str]) -> bytes:
-    """The child's ``read`` job: :func:`_read_unbounded`, as JSON."""
+    """The child's ``read`` job, as JSON.
+
+    Arguments: the page cap, then ``pages`` for a statement's per-page read
+    (:func:`_read_pages`); otherwise :func:`_read_unbounded`.
+    """
     limit = int(args[0])
+    if args[1:] == ["pages"]:
+        found = _read_pages(data, text_up_to_pages=limit)
+        return json.dumps(
+            None
+            if found is None
+            else {"pages": found[0], "page_texts": found[1], "encrypted": found[2]}
+        ).encode()
     read = _read_unbounded(data, text_up_to_pages=limit)
     return json.dumps(None if read is None else asdict(read)).encode()
 
@@ -114,6 +248,23 @@ def _read_unbounded(
 
     Any failure, on opening or on a page, means unreadable, never a scan.
     """
+    found = _read_pages(data, text_up_to_pages=text_up_to_pages)
+    if found is None:
+        return None
+    pages, texts, encrypted = found
+    if texts is None:
+        return PdfRead(pages, None, encrypted)
+    return PdfRead(pages, "\n\n".join(texts).strip(), encrypted)
+
+
+def _read_pages(
+    data: bytes, *, text_up_to_pages: int | None = None
+) -> tuple[int, list[str] | None, bool] | None:
+    """Page count, each page's text and encryption. Unbounded: child only.
+
+    The text is None when the PDF has more pages than ``text_up_to_pages``.
+    Any failure, on opening or on a page, gives None.
+    """
     import pdfplumber
 
     try:
@@ -121,7 +272,7 @@ def _read_unbounded(
             pages = len(pdf.pages)
             encrypted = pdf.doc.encryption is not None
             if text_up_to_pages is not None and pages > text_up_to_pages:
-                return PdfRead(pages, None, encrypted)
+                return pages, None, encrypted
             texts = []
             for page in pdf.pages:
                 texts.append(page.extract_text() or "")
@@ -133,7 +284,7 @@ def _read_unbounded(
             raise MemoryError from exc  # the child reports the memory limit
         logger.debug("pdfplumber can't read the PDF", exc_info=True)
         return None
-    return PdfRead(pages, "\n\n".join(texts).strip(), encrypted)
+    return pages, texts, encrypted
 
 
 def _out_of_memory(exc: BaseException) -> bool:
