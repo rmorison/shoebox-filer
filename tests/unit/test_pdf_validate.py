@@ -363,7 +363,14 @@ def test_a_child_that_writes_past_the_output_cap_is_stopped_and_named(
 
 @pytest.mark.parametrize(
     ("code", "named"),
-    [(-signal.SIGRTMIN, "SIGRTMIN"), (-40, "signal 40"), (7, "exit code 7")],
+    [
+        (-signal.SIGRTMIN, "SIGRTMIN"),
+        (-40, "signal 40"),
+        (7, "exit code 7"),
+        (-signal.SIGINT, "was stopped by SIGINT"),
+        (-signal.SIGTERM, "was stopped by SIGTERM"),
+        (-signal.SIGHUP, "was stopped by SIGHUP"),
+    ],
 )
 def test_any_ending_is_named_without_failing(code: int, named: str) -> None:
     assert named in pdf_validate._stopped_by(code, RECEIPT_BOUNDS.read)

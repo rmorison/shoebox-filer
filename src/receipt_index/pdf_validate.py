@@ -287,6 +287,8 @@ def _stopped_by(returncode: int, limits: PdfLimits) -> str:
         return f"hit the {output_cap(limits)}-byte output limit"
     if returncode == _EXIT_MEMORY:
         return f"hit the {limits.memory_bytes // (1024 * 1024)} MB memory limit"
+    if returncode in (-signal.SIGINT, -signal.SIGTERM, -signal.SIGHUP):
+        return f"was stopped by {signal.Signals(-returncode).name}"
     if returncode < 0:
         try:
             name = signal.Signals(-returncode).name
