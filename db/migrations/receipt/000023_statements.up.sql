@@ -21,15 +21,41 @@ INSERT INTO receipt.statement_feed_state (id, last_value)
 VALUES (TRUE, 0)
 ON CONFLICT (id) DO NOTHING;
 
--- The next counter value: the greater of the last value plus one and the
--- current time in microseconds since the epoch. The transaction-level
--- advisory lock is held until commit, so writers commit in counter order: a
--- reader that has seen a value has seen every committed value below it. The
--- clock floor keeps a new value above anything handed out before a database
--- restore, as long as the server's clock doesn't run backwards.
+-- The feed lock: the counter's one row, locked until commit. Every writer
+-- that draws a counter value holds it, so writers commit in counter order:
+-- a reader that has seen a value has seen every committed value below it.
+-- A row lock rather than an advisory one, so only a role that may update
+-- the counter (through these functions) can take it; a reader can't stall
+-- the writers.
 --
--- SECURITY DEFINER, so a writer needs only EXECUTE on this function and no
--- privilege on statement_feed_state: no login can set the counter by hand.
+-- A writer that will also update a statements row takes this lock first,
+-- before the row lock, so a republish and a re-run of the same statement
+-- take the two locks in the same order and can't deadlock.
+--
+-- SECURITY DEFINER, here and in next_feed_value(), so a writer needs only
+-- EXECUTE and no privilege on statement_feed_state: no login can set the
+-- counter by hand.
+CREATE OR REPLACE FUNCTION receipt.lock_statement_feed()
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    PERFORM 1 FROM receipt.statement_feed_state WHERE id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'receipt.statement_feed_state has no row';
+    END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION receipt.lock_statement_feed() FROM PUBLIC;
+
+-- The next counter value: the greater of the last value plus one and the
+-- current time in microseconds since the epoch, under the feed lock (the
+-- UPDATE takes it). The clock floor keeps a new value above anything handed
+-- out before a database restore, as long as the server's clock doesn't run
+-- backwards.
 CREATE OR REPLACE FUNCTION receipt.next_feed_value()
 RETURNS BIGINT
 LANGUAGE plpgsql
@@ -39,8 +65,6 @@ AS $$
 DECLARE
     next_value BIGINT;
 BEGIN
-    -- The key is arbitrary and fixed: 'stmtfeed' read as a number.
-    PERFORM pg_advisory_xact_lock(8319394758361703780);
     UPDATE receipt.statement_feed_state
     SET last_value = greatest(
         last_value + 1,
@@ -278,6 +302,10 @@ CREATE TABLE IF NOT EXISTS receipt.statement_lines (
     CONSTRAINT ck_statement_lines_page CHECK (page >= 1)
 );
 
+-- The history tables, the sources and the counter have no updated_at (and
+-- the counter no id or created_at), an exception to the standard columns:
+-- none of their rows is ever updated, except the counter's one value.
+
 -- Revisions, accounts and lines are history: the guard refuses UPDATE,
 -- DELETE and TRUNCATE, for the owner too, which grants alone can't.
 CREATE OR REPLACE FUNCTION receipt.forbid_statement_history_change()
@@ -308,10 +336,13 @@ CREATE OR REPLACE TRIGGER trg_statement_lines_no_truncate
     FOR EACH STATEMENT EXECUTE FUNCTION receipt.forbid_statement_history_change();
 
 -- A revision's number comes from the counter, whatever the insert says.
+-- Its created_at is the transaction's start, so its accounts can tell that
+-- they are written in the same transaction (see below).
 CREATE OR REPLACE FUNCTION receipt.set_statement_revision_number()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.revision := receipt.next_feed_value();
+    NEW.created_at := transaction_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -338,8 +369,8 @@ BEGIN
        OR NEW.source_sha256 IS DISTINCT FROM OLD.source_sha256 THEN
         RAISE EXCEPTION 'statement %: its id and original never change', OLD.id;
     END IF;
-    IF NEW.publish_count < OLD.publish_count THEN
-        RAISE EXCEPTION 'statement %: publish_count only goes up', OLD.id;
+    IF NEW.publish_count NOT IN (OLD.publish_count, OLD.publish_count + 1) THEN
+        RAISE EXCEPTION 'statement %: publish_count only goes up by one', OLD.id;
     END IF;
     IF NEW.current_revision_id IS DISTINCT FROM OLD.current_revision_id
        OR NEW.publish_count IS DISTINCT FROM OLD.publish_count THEN
@@ -390,15 +421,31 @@ CREATE CONSTRAINT TRIGGER trg_statements_current_revision
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION receipt.check_statement_current_revision();
 
--- A rejected revision has no accounts, and only a clean account has lines.
+-- A revision is complete when its transaction commits: its accounts, and
+-- their lines, are written in the same transaction as the revision, so a
+-- later write can't change what the feed has already published. A row
+-- written in this transaction has created_at equal to the transaction's
+-- start, which the triggers force (savepoints don't change it). A rejected
+-- revision has no accounts, and only a clean account has lines.
 CREATE OR REPLACE FUNCTION receipt.check_statement_account_revision()
 RETURNS TRIGGER AS $$
+DECLARE
+    rev RECORD;
 BEGIN
-    IF (SELECT status FROM receipt.statement_revisions WHERE id = NEW.revision_id)
-       = 'rejected' THEN
+    SELECT status, created_at INTO rev
+    FROM receipt.statement_revisions WHERE id = NEW.revision_id;
+    IF NOT FOUND THEN
+        RETURN NEW;  -- the foreign key reports it
+    END IF;
+    IF rev.created_at <> transaction_timestamp() THEN
+        RAISE EXCEPTION 'revision % is committed and takes no more accounts',
+            NEW.revision_id;
+    END IF;
+    IF rev.status = 'rejected' THEN
         RAISE EXCEPTION 'revision % is a rejection and has no accounts',
             NEW.revision_id;
     END IF;
+    NEW.created_at := transaction_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -409,9 +456,19 @@ CREATE OR REPLACE TRIGGER trg_statement_accounts_revision
 
 CREATE OR REPLACE FUNCTION receipt.check_statement_line_account()
 RETURNS TRIGGER AS $$
+DECLARE
+    acct RECORD;
 BEGIN
-    IF (SELECT status FROM receipt.statement_accounts WHERE id = NEW.account_id)
-       IS DISTINCT FROM 'clean' THEN
+    SELECT status, created_at INTO acct
+    FROM receipt.statement_accounts WHERE id = NEW.account_id;
+    IF NOT FOUND THEN
+        RETURN NEW;  -- the foreign key reports it
+    END IF;
+    IF acct.created_at <> transaction_timestamp() THEN
+        RAISE EXCEPTION 'account % is committed and takes no more lines',
+            NEW.account_id;
+    END IF;
+    IF acct.status <> 'clean' THEN
         RAISE EXCEPTION 'account % is not clean and carries no lines',
             NEW.account_id;
     END IF;

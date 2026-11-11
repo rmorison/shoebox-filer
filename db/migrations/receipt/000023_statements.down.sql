@@ -21,3 +21,4 @@ DROP FUNCTION IF EXISTS receipt.set_statement_change_seq();
 DROP FUNCTION IF EXISTS receipt.set_statement_revision_number();
 DROP FUNCTION IF EXISTS receipt.forbid_statement_history_change();
 DROP FUNCTION IF EXISTS receipt.next_feed_value();
+DROP FUNCTION IF EXISTS receipt.lock_statement_feed();

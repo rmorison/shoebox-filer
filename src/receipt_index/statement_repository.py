@@ -14,6 +14,13 @@ re-run inserts the revision, accounts and lines, then calls
 :func:`set_current_revision`. The foreign keys and the check that a
 statement's status and type match its current revision run at commit. The
 caller commits, except in :func:`republish_all`.
+
+Locks: drawing a counter value takes the feed lock (the counter's row) until
+commit. A write that also updates a statement row takes the feed lock first
+(:func:`set_current_revision` and :func:`republish` do), so two writers to
+the same statement take the locks in one order and can't deadlock. Keep the
+transaction short: no model call or PDF read between the first write and
+the commit, since every other statement writer waits on the feed lock.
 """
 
 from __future__ import annotations
@@ -116,6 +123,11 @@ class StatementChange:
     change_seq: int
 
 
+def lock_feed(conn: psycopg.Connection[dict[str, Any]]) -> None:
+    """Take the feed lock, held until commit, before any statement row lock."""
+    conn.execute("SELECT receipt.lock_statement_feed()")
+
+
 def new_statement_id(conn: psycopg.Connection[dict[str, Any]]) -> UUID:
     """A fresh statement ID, taken before its first revision is written."""
     row = conn.execute("SELECT uuidv7() AS id").fetchone()
@@ -158,19 +170,34 @@ def insert_account(
     account: AccountRow,
 ) -> UUID:
     """Append one account to a revision; return its ID."""
-    values = {
-        **account.__dict__,
-        "section_totals": Jsonb(account.section_totals),
-        "column_totals": Jsonb(account.column_totals),
-    }
-    columns = list(values)
     row = conn.execute(
-        "INSERT INTO receipt.statement_accounts (revision_id, "
-        + ", ".join(columns)
-        + ") VALUES (%(revision_id)s, "
-        + ", ".join(f"%({c})s" for c in columns)
-        + ") RETURNING id",
-        {"revision_id": revision_id, **values},
+        """\
+        INSERT INTO receipt.statement_accounts (
+            revision_id, ordinal, occurrence, institution, last4, account_type,
+            currency, period_start, period_end, status, held_by_statement,
+            failure_class, difference, first_page, last_page, line_order,
+            date_grace_days, beginning_balance, ending_balance, section_totals,
+            column_totals, principal_before, principal_after, principal_paid,
+            interest, escrow, fees, advances, content_digest
+        ) VALUES (
+            %(revision_id)s, %(ordinal)s, %(occurrence)s, %(institution)s,
+            %(last4)s, %(account_type)s, %(currency)s, %(period_start)s,
+            %(period_end)s, %(status)s, %(held_by_statement)s,
+            %(failure_class)s, %(difference)s, %(first_page)s, %(last_page)s,
+            %(line_order)s, %(date_grace_days)s, %(beginning_balance)s,
+            %(ending_balance)s, %(section_totals)s, %(column_totals)s,
+            %(principal_before)s, %(principal_after)s, %(principal_paid)s,
+            %(interest)s, %(escrow)s, %(fees)s, %(advances)s,
+            %(content_digest)s
+        )
+        RETURNING id
+        """,
+        {
+            "revision_id": revision_id,
+            **account.__dict__,
+            "section_totals": Jsonb(account.section_totals),
+            "column_totals": Jsonb(account.column_totals),
+        },
     ).fetchone()
     assert row is not None
     account_id: UUID = row["id"]
@@ -206,7 +233,7 @@ def create_statement(
     original_file_id: UUID,
     source_sha256: bytes,
     revision_id: UUID,
-    status: str,
+    status: StatementStatus,
     document_type: str,
 ) -> int:
     """Write a new statement pointing at its first revision; return change_seq."""
@@ -240,10 +267,11 @@ def set_current_revision(
     *,
     statement_id: UUID,
     revision_id: UUID,
-    status: str,
+    status: StatementStatus,
     document_type: str,
 ) -> int:
     """Point a statement at a new revision; return its new change_seq."""
+    lock_feed(conn)
     row = conn.execute(
         """\
         UPDATE receipt.statements
@@ -301,6 +329,7 @@ def republish(conn: psycopg.Connection[dict[str, Any]], statement_id: UUID) -> i
     Increments ``publish_count``, which the trigger reads as a republish.
     Returns the new change_seq. The caller commits.
     """
+    lock_feed(conn)
     row = conn.execute(
         "UPDATE receipt.statements SET publish_count = publish_count + 1"
         " WHERE id = %s RETURNING change_seq",
