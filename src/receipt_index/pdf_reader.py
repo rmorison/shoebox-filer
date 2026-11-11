@@ -259,7 +259,9 @@ def read_statement(
     if found is None or pages < 1:
         logger.info("pdfplumber can't read the statement PDF (%d bytes)", len(data))
         return StatementRead(None, reason="unreadable")
-    del found  # its copy of the text isn't needed past here
+    # Drop the parsed result, so the raw page list goes as soon as the
+    # normalised one below replaces it.
+    del found
     if pages > max_pages or texts is None:
         logger.info(
             "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
