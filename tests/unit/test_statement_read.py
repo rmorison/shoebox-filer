@@ -218,10 +218,24 @@ def _read_texts(*page_texts: str) -> StatementRead:
         (("(cid:12)(cid:7)(cid:3) " * 40,), "scan"),
         (("Page 1 " + "(cid:12)(cid:7) " * 40,), "scan"),
         (("(cid:4)" * 10, "(cid:4)" * 10), "scan"),
+        (("Synthetic statement header text" + "(cid:12)" * 50,), "scan"),
+        (("x" * 30 + "(cid:5)" * 30,), "scan"),
+        (("x" * 31 + "(cid:5)" * 30,), None),
         (("Synthetic opening balance and card purchases (cid:3)",), None),
         (("Synthetic statement text", "(cid:9)"), None),
+        (("Synthetic transaction line " * 220, "(cid:8)" * 4000), None),
     ],
-    ids=["glyphs-only", "mostly-glyphs", "glyphs-on-every-page", "a-few", "one-page"],
+    ids=[
+        "glyphs-only",
+        "a-few-words",
+        "glyphs-on-every-page",
+        "header-then-glyphs",
+        "as-many-glyphs-as-text",
+        "one-more-character",
+        "a-few",
+        "one-page",
+        "disclosures-page",
+    ],
 )
 def test_text_that_is_mostly_unmapped_glyphs_is_a_scan(
     page_texts: tuple[str, ...], reason: str | None

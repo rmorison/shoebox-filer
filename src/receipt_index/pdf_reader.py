@@ -100,9 +100,10 @@ class StatementRead:
       the caller retries it too;
     - ``unreadable``: not a PDF, needs a password, or pdfplumber can't open
       it or failed reading it;
-    - ``scan``: fewer than 20 usable non-whitespace characters on every page
-      together, where ``(cid:N)`` glyphs (fonts with no text map) don't
-      count; and text that is mostly such glyphs;
+    - ``scan``: fewer than 20 readable non-whitespace characters on every
+      page together, ``(cid:N)`` glyphs (fonts with no text map) not
+      counting; or no more readable characters than glyphs, each glyph
+      counting as one;
     - ``text``: the page-marked text is over :data:`STATEMENT_TOKEN_CAP`
       estimated tokens. The cap is applied here, once; callers don't
       apply it again.
@@ -243,13 +244,15 @@ def read_statement(
 def _is_usable_statement_text(text: str) -> bool:
     """Whether a statement's text is enough to extract from.
 
-    At least 20 non-whitespace characters that aren't ``(cid:N)`` glyphs,
-    and more of those than of glyph runs: a font with no text map gives
-    runs like ``(cid:12)(cid:7)`` that would reach the model as noise.
+    At least 20 readable non-whitespace characters, and more readable
+    characters than unmapped glyphs, each ``(cid:N)`` counting as one glyph.
+    A font with no text map gives runs like ``(cid:12)(cid:7)`` that would
+    reach the model as noise; a disclosures page in such a font beside
+    readable transaction pages is still read.
     """
-    total = len("".join(text.split()))
-    glyphs = sum(len("".join(m.split())) for m in _CID.findall(text))
-    usable = total - glyphs
+    found = _CID.findall(text)
+    glyphs = len(found)
+    usable = len("".join(_CID.sub("", text).split()))
     return usable >= _MIN_TEXT_LENGTH and usable > glyphs
 
 

@@ -296,7 +296,7 @@ def _stopped_by(returncode: int, limits: PdfLimits) -> str:
             name = signal.Signals(-returncode).name
         except ValueError:
             name = f"signal {-returncode}"
-        return f"crashed with {name}, most often at the memory limit"
+        return f"crashed with {name} (possibly at the memory limit)"
     return f"failed with exit code {returncode}"
 
 
