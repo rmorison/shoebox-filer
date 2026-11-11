@@ -154,8 +154,8 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 | `source_sha256` | Hex SHA-256 of the original PDF, lower case |
 | `revision`, `extracted_at` | This revision's number and when it ran |
 | `is_current`, `current_revision` | Whether this is the statement's current revision, and the current revision's number |
-| `document_type` | `deposit`, `card`, `loan_statement`; or, for a rejected document, `loan_bill`, `tax_or_escrow_notice`, `not_statement`, `scan`, `unreadable` (not a PDF, encrypted, or one pdfplumber can't open), `over_bounds` |
-| `rejected_bound` | For `over_bounds`: `pages`, `size`, `text`, `memory` or `accounts`; else null |
+| `document_type` | `deposit`, `card`, `loan_statement`; or, for a rejected document, `loan_bill`, `tax_or_escrow_notice`, `not_statement`, `scan`, `unreadable` (not a PDF, one that needs a password to open, or one pdfplumber can't open), `over_bounds` |
+| `rejected_bound` | For `over_bounds`: `pages`, `size`, `text`, `memory`, `crash` (the PDF reader died of a signal, such as a parser segfault on a malformed file) or `accounts`; else null |
 | `status` | `complete`, `incomplete`, `held` or `rejected` (below) |
 | `hold_reason` | Why a `held` statement is held (below); null for every other status |
 | `period_start`, `period_end` | The document's own printed period; null when not printed. The date gate uses each account's period (below) |
@@ -298,6 +298,10 @@ The operator gave the go on this plan, after the ledger's pre-review of the cont
 3. **Clean accounts of an incomplete statement** pass their lines, and a completeness failure holds every account.
 4. **Automatic retry of a held statement:** none in this version; `statements rerun` by hand.
 
+### Answered by the operator (2026-11-11)
+
+5. **Encrypted statements:** a PDF with only an owner password is read, whatever its permission flags say, and its `encrypted` flag is kept. A PDF that needs a user password to open stays rejected as `unreadable`. This confirms the reading of "encrypted" that U1 was built on.
+
 ### Resolved during planning
 
 - Schema: `receipt`. Migration numbers: 000023 and 000024 (main's last is 000022).
@@ -321,17 +325,19 @@ Each unit is a pull request, merged in order. Every new check or fixture is seen
 
 **Goal:** Read a statement's text, page by page, under its own limits, and say why when it can't.
 
-**Files:** `src/receipt_index/pdf_validate.py`, `src/receipt_index/pdf_reader.py`, `tests/unit/test_pdf_reader.py`
+**Files:** `src/receipt_index/pdf_validate.py`, `src/receipt_index/pdf_reader.py`, `tests/unit/test_statement_read.py`, `tests/pdfs.py`
 
 **Approach:**
-- `STATEMENT_BOUNDS = PdfBounds(check=PdfLimits(cpu_seconds=20, wall_seconds=60, max_bytes=25 MiB, memory_bytes=512 MiB), read=PdfLimits(cpu_seconds=90, wall_seconds=270, max_bytes=25 MiB, memory_bytes=1 GiB), max_read_pages=60)`. Every field is set explicitly, so a later change to `PdfLimits`' defaults doesn't move the statement bounds. `max_bytes` is what gives the `size` reason. Ceilings, not targets: a long statement is tens of pages and a few megabytes. `RECEIPT_BOUNDS` doesn't change.
-- A new `read_pdf_pages(path, bounds)` takes its limits and page cap from the `PdfBounds` it is given. `read_pdf` keeps its `RECEIPT_BOUNDS` defaults (`pdf_reader.py`, `limits` and `max_pages`), and the statement path never calls it.
-- A statement read returns per-page text, or a reason: `pages` (from the page count `text_up_to_pages` already returns), `size`, `memory`, `unreadable`, or `timeout` (CPU or wall clock). The receipt path keeps returning None.
-- `timeout` is a retryable item error, not a rejection, since a timeout can be the host's load. The others are permanent rejections.
-- **Text cap, in tokens.** `PdfBounds` stays about the PDF; the text cap is enforced in the statement pipeline (U5) after the read and before any model call. It counts estimated tokens, not characters: `ceil(characters / 2.5)` over the page-marked text, a conservative ratio for numeric, columnar text, which tokenises more densely than prose. Over 85,000 estimated tokens is rejected as `over_bounds`, `text`. With the prompt (about 1,500 tokens) on top, each call's input then stays under the 100,000-token point where Haiku's price rises. Every call's real `input_tokens` is recorded (U5); the `statement-eval` run reports the real characters-per-token ratio on the fixtures, and the build fails the unit if any fixture comes in under 2.5.
-- A document whose text, across all pages, has fewer than 20 non-whitespace characters is a scan: rejected as `scan`. A mixed document (a text cover page over scanned pages) passes this test and then fails the gates, so it is held rather than rejected. That is accepted for this version and stated in the user docs.
+- `STATEMENT_BOUNDS = PdfBounds(check=PdfLimits(cpu_seconds=20, wall_seconds=60, max_bytes=25 MiB, memory_bytes=512 MiB), read=PdfLimits(cpu_seconds=90, wall_seconds=270, max_bytes=25 MiB, memory_bytes=1 GiB, max_output_bytes=4 MiB), max_read_pages=60)`. The read's own output cap holds the most text the token cap lets through, even escaped, so the parent never parses more: a small PDF whose font expands each glyph to many characters stops in the child as `text`. Every field is set explicitly, so a later change to `PdfLimits`' defaults doesn't move the statement bounds. `max_bytes` is what gives the `size` reason. Ceilings, not targets: a long statement is tens of pages and a few megabytes. `RECEIPT_BOUNDS` doesn't change.
+- `read_statement(data: bytes, *, bounds=STATEMENT_BOUNDS) -> StatementRead` in `pdf_reader.py` (built in U1; planned here as `read_pdf_pages(path, bounds)`) takes its limits and page cap from the `PdfBounds` it is given, and the PDF's bytes rather than a path. `read_pdf` keeps its `RECEIPT_BOUNDS` defaults (`pdf_reader.py`, `limits` and `max_pages`), and the statement path never calls it.
+- `read_statement` normalises each page's text once, before any check: a control character that breaks a line (carriage return, vertical tab, form feed, the file to unit separators, next line, the line and paragraph separators) becomes a newline, so the words on either side stay apart; NUL and every other C0 and C1 control except a tab, bidirectional overrides, isolates and marks, zero-width and other invisible characters, and Unicode tag characters are dropped. Then the token cap (a length check, measured without building the marked text) runs before the scan test, and nothing in the parent splits the text into words.
+- A PDF with no pages, including one whose damaged cross-reference table recovers to no pages, is `unreadable`, not `scan`. An empty page keeps its place, so page numbers stay true.
+- A statement read returns per-page text and whether the PDF is encrypted (an owner password only), or a reason: `pages` (from the page count `text_up_to_pages` already returns), `size`, `memory`, `crash` (any other signal), `unreadable`, `timeout` (CPU or wall clock, or a kill), `failed` (the reader's own error exit), `scan` or `text`. The receipt path keeps returning None. A PDF with a huge page tree surfaces as `memory` or `timeout`, not `pages`: pdfplumber builds every page object before the count is known, and the limits catch it.
+- `timeout` and `failed` are retryable item errors, not rejections, since either can be the host's doing. The others are permanent rejections.
+- **Text cap, in tokens.** `PdfBounds` stays about the PDF; the text cap is enforced once, in `read_statement`, after the child's read and before any model call. U5 takes the `text` reason from the read and never applies a cap of its own. It counts estimated tokens, not characters: `ceil(characters / 2.5)` over the page-marked text, a conservative ratio for numeric, columnar text, which tokenises more densely than prose. Over 85,000 estimated tokens is rejected as `over_bounds`, `text`. With the prompt (about 1,500 tokens) on top, each call's input then stays under the 100,000-token point where Haiku's price rises. Every call's real `input_tokens` is recorded (U5); the `statement-eval` run reports the real characters-per-token ratio on the fixtures, and the build fails the unit if any fixture comes in under 2.5.
+- A document whose text, across all pages, has fewer than 20 non-whitespace characters, not counting `(cid:N)` glyphs (a font with no text map), or with no more readable characters than glyphs (each glyph counting as one), is a scan: rejected as `scan`. `read_statement` decides it, and U5 doesn't check again. The test is over the whole document, not per page: a readable character is a non-whitespace character outside a glyph. So a mixed document (a text cover page over scanned pages, or readable headers over blank or glyph-only transaction pages) passes this test and then fails the gates, so it is held rather than rejected. That is accepted for this version and stated in the user docs.
 
-**Tests:** a fixture over 60 pages is refused with `pages`; a file over `max_bytes` with `size`; a CPU-bomb PDF stops with `timeout`; a non-PDF gives `unreadable`; receipts' bounds and return values are unchanged; per-page text keeps page order; the token estimate rejects text just over the cap and passes text just under it.
+**Tests:** a fixture over 60 pages is refused with `pages`; a file over `max_bytes` with `size`; a CPU-bomb PDF stops with `timeout`, at the CPU limit; a read past the wall clock stops with `timeout`, at the wall clock; a crash signal gives `crash` and the reader's own error exit `failed`; a non-PDF gives `unreadable`, and so does a PDF that needs a password; an owner-password PDF is read, with its text and `encrypted` set; the `(cid:N)` boundary (as many glyphs as readable characters is `scan`, one more readable character passes, a glyph-only disclosures page beside readable pages passes); receipts' bounds and return values are unchanged; per-page text keeps page order; the token estimate rejects text just over the cap and passes text just under it.
 
 ### U2. Schema
 
@@ -407,6 +413,7 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 **Approach:**
 - Output models with `extra="forbid"`. Money is a two-place decimal string and never a float, as in the spike, and is reformatted to the contract's money format (no `+`, no separators, `0.00` for zero) before it is stored.
 - First pass: document type, accounts (label, type, page range, and its own period where printed), printed account count, the document's period. The label is used only to tell the extraction call which account to read. It is not stored, since it can hold a name.
+- Every prompt's document text is built with `page_marked_text` from the `StatementRead`'s page texts, the same function the token cap measured, so the cap and the prompt agree.
 - Account extraction: one call per listed account, the whole page-marked text, told the account's label, type, pages and period. The deposit and card prompts share a base that states the sign basis, the currency rule and the date rules: a line that prints one date gives it as the posted date; a card line that prints two gives the posted date and the transaction date; each date comes back as printed parts, `{month, day, year}`, with `year` null when not printed; shoebox assigns missing years after the call (the contract's Years rule), and a null `year` on an account with no period holds it as `undated`. Section and column totals come back as printed magnitudes; section headings are normalised after the call, by the one function the contract names.
 - **Output cap.** Each account call sets a `max_tokens` ceiling well inside Haiku's output limit, sized at build time from the fixtures. A response that stops at that ceiling (the model's stop reason says so) is not retried, since a retry would stop in the same place: the account is held as `too_many_lines`, and the statement's status follows from the rules. At about 35 output tokens a line, this holds an account of more than roughly a thousand lines. Splitting such an account into page ranges is deferred.
 - Loan: printed figures only, null when not printed. The prompt forbids deriving a figure.
@@ -444,7 +451,14 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 **Approach:**
 1. `started` row in `ingest_log`, with `source_type = 'gdrive_statement'`.
 2. Store the original with `put(purpose="original", folder=StoreFolder.for_original(...))` through `_put_original`, so it is write-once under `originals/` like every other original. If a statement already has that file, add a `statement_sources` row and finish with no model call.
-3. Check and read the PDF under `STATEMENT_BOUNDS`, then the token cap. Scan, unreadable or over bounds: a `rejected` revision. A timeout: an item error, retried.
+3. Check and read the PDF with `read_statement` under `STATEMENT_BOUNDS`. It has already applied the scan test and the token cap; U5 maps its reason and applies neither again:
+   - `scan`, `unreadable`: a `rejected` revision with that `document_type`;
+   - `pages`, `size`, `memory`, `text`, `crash`: a `rejected` revision, `over_bounds`, with that `rejected_bound`. A crash is recorded as `crash`, never as `memory`, so a reader isn't misled about which limit applied;
+   - `timeout` (a CPU or wall-clock limit, or a `-9` kill, which can be the host's load or a host out-of-memory kill caused by the file) and `failed` (the reader's own error exit): an item error, retried with the existing backoff and terminal after `retry_max_attempts`. The bound matters: a file that really does exhaust the host is retried a fixed number of times, never forever.
+   - Log `StatementRead.encrypted` for each statement read.
+   - A parent-side `OSError` from starting the reader propagates out of `read_statement` rather than reading as `failed`. It can come from `Popen` (no processes or file descriptors left) or from the `TemporaryFile` the output goes to (a full or unwritable temporary directory). U5 catches it around the read and treats it as the same bounded, retried item error.
+   - A defensive check: `len(page_texts) == pages` for every read that returns text; a mismatch is an item error, not a rejection, since it would be a bug in the reader.
+   - To consider: a separate `cpu` reason for a read stopped at its CPU limit, rejected rather than retried, since a file that burns 90 s of CPU will burn it again. Today the CPU limit and the wall clock both read as `timeout` and are retried a bounded number of times.
 4. First pass. A non-extractable type, or more than 8 accounts (`over_bounds`, `accounts`): a `rejected` revision.
 5. One call per account, then the gates.
 6. One transaction, in the U2 insert order: the revision, accounts, clean accounts' lines, the statement (new or updated), its source row, and an `ingest_log` `success` row with the token totals.
@@ -494,6 +508,8 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 ### U9. Documentation
 
 **Files:** `docs/engineering/designs/statement-extraction.md` (the technical design, from this plan), `docs/user/server-deployment.md`, `docs/user/getting-started.md`, `README.md`
+
+The user docs say plainly that a statement with only an owner password is read, even when its permission flags forbid copying text, and that one needing a password to open is rejected as `unreadable`.
 
 ---
 

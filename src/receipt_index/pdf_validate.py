@@ -50,6 +50,14 @@ logger = logging.getLogger(__name__)
 
 PdfStatus = Literal["ok", "repaired", "unparseable"]
 
+# Why a bounded child produced no output. ``size``: the input is over the
+# size cap, so no child ran. ``timeout``: the CPU or wall-clock limit, or a
+# kill (which can be the host's load, not the file). ``memory``: the
+# address-space limit. ``crash``: any other signal, such as a parser's
+# segfault on a malformed file (sometimes the memory limit too). ``output``:
+# the child wrote past the output cap. ``failed``: any other exit.
+StopReason = Literal["size", "timeout", "memory", "crash", "output", "failed"]
+
 _MODULE = "receipt_index.pdf_validate"
 # Enough for one item's attachment and rendition; a repair can be 25 MB.
 _CACHE_SIZE = 4
@@ -68,13 +76,16 @@ class PdfLimits:
     """Bounds on one child job, checking or reading one PDF.
 
     The memory limit is the child's whole address space. The wall clock is
-    a small multiple of the CPU limit, for a loaded host.
+    a small multiple of the CPU limit, for a loaded host. ``max_output_bytes``
+    caps what the child may write back; None means :func:`output_cap`'s
+    default, room for a repaired PDF.
     """
 
     cpu_seconds: int
     wall_seconds: float
     max_bytes: int = 25 * 1024 * 1024
     memory_bytes: int = 512 * 1024 * 1024
+    max_output_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +109,33 @@ RECEIPT_BOUNDS = PdfBounds(
     check=PdfLimits(cpu_seconds=10, wall_seconds=30.0),
     read=PdfLimits(cpu_seconds=15, wall_seconds=45.0),
     max_read_pages=50,
+)
+
+# Statements are tens of pages, and kilobytes to a few megabytes. They get
+# their own bounds, every field set, so a change to PdfLimits' defaults
+# doesn't move them. Ceilings, not targets: each item step stays far below
+# item_timeout_seconds (statement-extraction plan, U1 and U5).
+STATEMENT_BOUNDS = PdfBounds(
+    check=PdfLimits(
+        cpu_seconds=20,
+        wall_seconds=60.0,
+        max_bytes=25 * 1024 * 1024,
+        memory_bytes=512 * 1024 * 1024,
+        max_output_bytes=None,
+    ),
+    # The read writes back the text as JSON. 4 MiB holds the most text the
+    # token cap lets through (about 212,500 characters) even at twelve bytes
+    # a character escaped (an astral character is a \\uXXXX pair), about
+    # 2.6 MB, so the parent never parses more than that: a small
+    # PDF whose fonts expand each glyph to many characters stops here.
+    read=PdfLimits(
+        cpu_seconds=90,
+        wall_seconds=270.0,
+        max_bytes=25 * 1024 * 1024,
+        memory_bytes=1024 * 1024 * 1024,
+        max_output_bytes=4 * 1024 * 1024,
+    ),
+    max_read_pages=60,
 )
 
 _UNPARSEABLE = PdfCheck(status="unparseable")
@@ -204,7 +242,10 @@ _STDERR_TAIL = 300
 
 
 def output_cap(limits: PdfLimits) -> int:
-    """The most a child may write: a repair is about the input's size."""
+    """The most a child may write: by default, room for a repair, which is
+    about the input's size."""
+    if limits.max_output_bytes is not None:
+        return limits.max_output_bytes
     return 2 * limits.max_bytes + 1024 * 1024
 
 
@@ -223,6 +264,34 @@ def _command(job: str, limits: PdfLimits, args: tuple[str, ...]) -> list[str]:
     ]
 
 
+# Signals that stop a child from outside: the CPU limit, a kill, and a
+# terminal or service stop (Ctrl-C, a hangup, a terminate). None of them is
+# the file's doing, so each reads as a timeout, which the caller retries.
+_TIMEOUT_SIGNALS = frozenset(
+    -s
+    for s in (
+        signal.SIGXCPU,
+        signal.SIGKILL,
+        signal.SIGINT,
+        signal.SIGTERM,
+        signal.SIGHUP,
+    )
+)
+
+
+def _stop_reason(returncode: int) -> StopReason:
+    """The kind of stop a failed child's exit code shows."""
+    if returncode in _TIMEOUT_SIGNALS:
+        return "timeout"
+    if returncode == -signal.SIGXFSZ:
+        return "output"
+    if returncode == _EXIT_MEMORY:
+        return "memory"
+    if returncode < 0:
+        return "crash"
+    return "failed"
+
+
 def _stopped_by(returncode: int, limits: PdfLimits) -> str:
     """Why a child that failed stopped, for the log."""
     if returncode == -signal.SIGXCPU:
@@ -233,12 +302,14 @@ def _stopped_by(returncode: int, limits: PdfLimits) -> str:
         return f"hit the {output_cap(limits)}-byte output limit"
     if returncode == _EXIT_MEMORY:
         return f"hit the {limits.memory_bytes // (1024 * 1024)} MB memory limit"
+    if returncode in (-signal.SIGINT, -signal.SIGTERM, -signal.SIGHUP):
+        return f"was stopped by {signal.Signals(-returncode).name}"
     if returncode < 0:
         try:
             name = signal.Signals(-returncode).name
         except ValueError:
             name = f"signal {-returncode}"
-        return f"crashed with {name}, most often at the memory limit"
+        return f"crashed with {name} (possibly at the memory limit)"
     return f"failed with exit code {returncode}"
 
 
@@ -252,11 +323,25 @@ _cache: OrderedDict[bytes, PdfCheck] = OrderedDict()
 _cache_lock = threading.Lock()
 
 
+@dataclass(frozen=True)
+class BoundedRun:
+    """A bounded child's output, or why it gave none."""
+
+    output: bytes | None
+    stop: StopReason | None = None
+
+
 def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes | None:
     """The output of ``job`` run on ``data`` in a bounded child process.
 
     None, with the reason logged, when ``data`` is over the size cap, or the
     child hits a limit, times out, crashes or fails.
+    """
+    return run_bounded_job(job, data, limits, *args).output
+
+
+def run_bounded_job(job: str, data: bytes, limits: PdfLimits, *args: str) -> BoundedRun:
+    """:func:`run_bounded`, with the kind of stop when there is no output.
 
     The child's output goes to unlinked temporary files, not pipes, so the
     parent never holds more of it than the output cap allows: stdout is read
@@ -269,7 +354,7 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
             limits.max_bytes,
             job,
         )
-        return None
+        return BoundedRun(None, "size")
     cap = output_cap(limits)
     with (
         tempfile.TemporaryFile() as out,
@@ -290,7 +375,7 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
                 limits.wall_seconds,
                 len(data),
             )
-            return None
+            return BoundedRun(None, "timeout")
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -303,7 +388,7 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
                 len(data),
                 _tail(err, err.seek(0, os.SEEK_END)),
             )
-            return None
+            return BoundedRun(None, _stop_reason(proc.returncode))
         size = out.seek(0, os.SEEK_END)
         # Our child is stopped at the cap; this guards against any child
         # that doesn't limit itself, so the parent never relies on it.
@@ -316,9 +401,9 @@ def run_bounded(job: str, data: bytes, limits: PdfLimits, *args: str) -> bytes |
                 cap,
                 len(data),
             )
-            return None
+            return BoundedRun(None, "output")
         out.seek(0)
-        return out.read()
+        return BoundedRun(out.read())
 
 
 def _run_check(data: bytes, limits: PdfLimits) -> PdfCheck | None:

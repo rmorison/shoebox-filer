@@ -192,6 +192,59 @@ def metadata_bomb_pdf(megabytes: int = 512) -> bytes:
     )
 
 
+def _plain_stream(body: bytes) -> bytes:
+    body = zlib.compress(body, 9)
+    return (
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(body)
+        + body
+        + b"\nendstream"
+    )
+
+
+def expanding_font_pdf(
+    *, glyphs_per_page: int, pages: int = 1, chars_per_glyph: int = 1000
+) -> bytes:
+    """A few kilobytes whose text is ``chars_per_glyph`` characters a glyph.
+
+    Its font's ToUnicode map turns the one code it draws into a long run of
+    text, so pdfplumber returns megabytes from a tiny file.
+    """
+    expansion = ("xy " * (chars_per_glyph // 3)).encode("utf-16-be").hex().encode()
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap "
+        b"/CMapName /Expand def 1 begincodespacerange <00> <FF> endcodespacerange "
+        b"1 beginbfchar <5A> <" + expansion + b"> endbfchar "
+        b"endcmap CMapName currentdict /CMap defineresource pop end end"
+    )
+    row = b"(" + b"Z" * 100 + b") Tj 0 -1 Td\n"
+    content = b"BT /F1 1 Tf 0 700 Td\n" + row * (glyphs_per_page // 100) + b"ET"
+    contents = 5 + pages
+    kids = " ".join(f"{5 + i} 0 R" for i in range(pages)).encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [" + kids + b"] /Count %d >>" % pages,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 4 0 R >>",
+        _plain_stream(cmap),
+    ]
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>" % contents
+    )
+    objects += [page] * pages
+    objects.append(_plain_stream(content))
+    return _raw_pdf(objects)
+
+
+def zero_page_pdf() -> bytes:
+    """A well-formed PDF whose page tree has no pages."""
+    return _raw_pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [] /Count 0 >>",
+        ]
+    )
+
+
 def filter_chain_pdf(megabytes: int = 256, *, streams: int = 1) -> bytes:
     """A PDF whose page content is a filter chain that takes seconds to decode.
 
