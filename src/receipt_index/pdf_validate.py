@@ -124,8 +124,9 @@ STATEMENT_BOUNDS = PdfBounds(
         max_output_bytes=None,
     ),
     # The read writes back the text as JSON. 4 MiB holds the most text the
-    # token cap lets through (about 212,500 characters) even at six bytes a
-    # character escaped, so the parent never parses more than that: a small
+    # token cap lets through (about 212,500 characters) even at twelve bytes
+    # a character escaped (an astral character is a \\uXXXX pair), about
+    # 2.6 MB, so the parent never parses more than that: a small
     # PDF whose fonts expand each glyph to many characters stops here.
     read=PdfLimits(
         cpu_seconds=90,

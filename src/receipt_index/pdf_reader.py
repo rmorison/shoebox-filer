@@ -70,26 +70,37 @@ StatementReadReason = Literal[
 # What pdfplumber gives for a glyph whose font has no usable text map.
 _CID = re.compile(r"\(cid:\d+\)")
 
-# Characters dropped from a statement's text before anything else: NUL and
-# the other C0 and C1 controls (but not a newline or a tab), bidirectional
-# overrides, isolates and marks, and zero-width characters. None carries
+# How a statement's text is normalised before anything else. Control
+# characters that break a line (carriage return, vertical tab, form feed,
+# the file, group, record and unit separators, next line, and the line and
+# paragraph separators) become a newline, so the words on either side stay
+# apart. NUL and every other C0 and C1 control (but not a tab) are dropped,
+# and so are bidirectional overrides, isolates and marks, zero-width and
+# other invisible characters, and Unicode tag characters. None carries
 # statement content; each can hide or reorder text for a reader or a model.
-_DROPPED = dict.fromkeys(
-    [
-        *(c for c in range(0x20) if c not in (0x09, 0x0A)),
-        *range(0x7F, 0xA0),
-        0x061C,
-        0x200E,
-        0x200F,
-        *range(0x202A, 0x202F),
-        *range(0x2066, 0x206A),
-        0x200B,
-        0x200C,
-        0x200D,
-        0x2060,
-        0xFEFF,
-    ]
-)
+_LINE_BREAKS = (0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x85, 0x2028, 0x2029)
+_NORMALISE: dict[int, str | None] = {
+    **dict.fromkeys(
+        [
+            *(c for c in range(0x20) if c not in (0x09, 0x0A)),
+            *range(0x7F, 0xA0),
+            0x034F,
+            0x061C,
+            0x180E,
+            0x200E,
+            0x200F,
+            *range(0x202A, 0x202F),
+            *range(0x2066, 0x206A),
+            0x200B,
+            0x200C,
+            0x200D,
+            *range(0x2060, 0x2065),
+            0xFEFF,
+            *range(0xE0000, 0xE0080),
+        ]
+    ),
+    **dict.fromkeys(_LINE_BREAKS, "\n"),
+}
 
 # How a bounded child's stop reads for a statement. A child that wrote past
 # the output cap had more text than any statement under the token cap.
@@ -248,6 +259,7 @@ def read_statement(
     if found is None or pages < 1:
         logger.info("pdfplumber can't read the statement PDF (%d bytes)", len(data))
         return StatementRead(None, reason="unreadable")
+    del found  # its copy of the text isn't needed past here
     if pages > max_pages or texts is None:
         logger.info(
             "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
@@ -256,7 +268,7 @@ def read_statement(
     texts = [normalise_statement_text(text) for text in texts]
     # The token cap is a length check, so it runs before anything that
     # looks at each character.
-    tokens = estimate_tokens(page_marked_text(texts))
+    tokens = _estimate_tokens_of_length(page_marked_length(texts))
     if tokens > STATEMENT_TOKEN_CAP:
         logger.info(
             "Statement text of about %d tokens is over the %d-token cap",
@@ -271,13 +283,16 @@ def read_statement(
 
 
 def normalise_statement_text(text: str) -> str:
-    """``text`` without control, bidirectional and zero-width characters.
+    """``text`` without control, bidirectional and invisible characters.
 
-    Drops NUL and the other C0 and C1 controls except a newline and a tab,
-    bidirectional overrides, isolates and marks, and zero-width characters.
+    A control character that breaks a line (``\\r``, ``\\v``, ``\\f``, the
+    file to unit separators, next line, and the line and paragraph
+    separators) becomes a newline. NUL and every other C0 and C1 control
+    except a tab, bidirectional overrides, isolates and marks, zero-width
+    and other invisible characters, and Unicode tag characters are dropped.
     Nothing else changes.
     """
-    return text.translate(_DROPPED)
+    return text.translate(_NORMALISE)
 
 
 def _non_space(text: str) -> int:
@@ -310,9 +325,20 @@ def page_marked_text(page_texts: tuple[str, ...] | list[str]) -> str:
     )
 
 
+def page_marked_length(page_texts: tuple[str, ...] | list[str]) -> int:
+    """``len(page_marked_text(page_texts))``, without building the text."""
+    markers = sum(len(f"[Page {number}]\n") for number in range(1, len(page_texts) + 1))
+    separators = 2 * max(len(page_texts) - 1, 0)
+    return sum(map(len, page_texts)) + markers + separators
+
+
 def estimate_tokens(text: str) -> int:
     """A high estimate of ``text``'s tokens: 2.5 characters a token, rounded up."""
-    return -(-len(text) * 10 // _CHARS_PER_TOKEN_TENTHS)
+    return _estimate_tokens_of_length(len(text))
+
+
+def _estimate_tokens_of_length(length: int) -> int:
+    return -(-length * 10 // _CHARS_PER_TOKEN_TENTHS)
 
 
 def read_job(data: bytes, args: list[str]) -> bytes:

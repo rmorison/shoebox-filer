@@ -20,6 +20,7 @@ from receipt_index.pdf_reader import (
     STATEMENT_TOKEN_CAP,
     StatementRead,
     estimate_tokens,
+    page_marked_length,
     page_marked_text,
     read_statement,
 )
@@ -125,11 +126,17 @@ def test_the_token_cap_is_85000() -> None:
 
 
 def test_the_read_output_cap_holds_the_most_text_the_token_cap_lets_through() -> None:
-    # 2.5 characters a token, every one escaped as \\uXXXX in the JSON.
+    # 2.5 characters a token, every one an astral character, which the
+    # JSON escapes as a \\uXXXX pair: twelve bytes a character.
     most = STATEMENT_TOKEN_CAP * 25 // 10
     worst = json.dumps(
-        {"pages": 60, "page_texts": ["\u00e9" * (most // 60)] * 60, "encrypted": True}
+        {
+            "pages": 60,
+            "page_texts": ["\U0001f600" * (most // 60)] * 60,
+            "encrypted": True,
+        }
     )
+    assert len(worst.encode()) > 12 * (most - 60)
     cap = STATEMENT_BOUNDS.read.max_output_bytes
     assert cap == 4 * 1024 * 1024
     assert len(worst.encode()) < cap
@@ -219,15 +226,46 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
     )
 
 
-def test_control_bidi_and_zero_width_characters_are_dropped() -> None:
-    raw = (
-        "\x00Syn\x07the\rtic \x85state\u202ement\u200b text\u2066\u2069"
-        "\ufeff\u200e\tcolumn\nnext line"
-    )
-    result = json.dumps({"pages": 1, "page_texts": [raw], "encrypted": False}).encode()
+@pytest.mark.parametrize(
+    ("raw", "normalised"),
+    [
+        (
+            "\x00Syn\x07the\x1btic \x9bstate\u202ement\u200b text",
+            "Synthetic statement text",
+        ),
+        ("tab\tkept\nnewline kept", "tab\tkept\nnewline kept"),
+        ("Total\r12.00", "Total\n12.00"),
+        ("a\x0bb\x0cc\x1cd\x1fe\x85f\u2028g\u2029h", "a\nb\nc\nd\ne\nf\ng\nh"),
+        ("pay\u2066ee\u2069\u202dlo\u202c\u061c\u200e\u200f", "payeelo"),
+        (
+            "zero\u200bwidth\u200c\u200d\u2060\u2061\u2064\ufeff\u034f\u180e",
+            "zerowidth",
+        ),
+        ("tag\U000e0049\U000e0067\U000e007f text", "tag text"),
+        ("caf\u00e9 \u00a0\u2013 \U0001f600", "caf\u00e9 \u00a0\u2013 \U0001f600"),
+    ],
+    ids=[
+        "controls",
+        "tab-and-newline",
+        "carriage-return",
+        "line-breaks",
+        "bidi",
+        "invisible",
+        "tags",
+        "ordinary-text",
+    ],
+)
+def test_statement_text_is_normalised_once(raw: str, normalised: str) -> None:
+    result = json.dumps(
+        {
+            "pages": 1,
+            "page_texts": [raw + " synthetic padding text"],
+            "encrypted": False,
+        }
+    ).encode()
     with fake_child(child_that_writes(result)):
         read = read_statement(make_pdf("Normalised"))
-    assert read.page_texts == ("Synthetic statement text\tcolumn\nnext line",)
+    assert read.page_texts == (normalised + " synthetic padding text",)
 
 
 def test_a_statement_at_the_page_cap_is_read() -> None:
@@ -360,6 +398,14 @@ def test_the_estimate_is_two_and_a_half_characters_a_token_rounded_up(
     chars: int, tokens: int
 ) -> None:
     assert estimate_tokens("x" * chars) == tokens
+
+
+@pytest.mark.parametrize(
+    "page_texts",
+    [[], ["one"], ["first", "", "third"], ["page text"] * 12, ["x" * 1000] * 60],
+)
+def test_the_marked_length_is_the_marked_texts_length(page_texts: list[str]) -> None:
+    assert page_marked_length(page_texts) == len(page_marked_text(page_texts))
 
 
 def test_pages_are_marked_in_order() -> None:
@@ -543,10 +589,12 @@ def test_a_small_pdf_that_expands_to_megabytes_of_text_stays_small_in_the_parent
     # million characters of text. The child's output cap stops it as
     # "text" before the parent parses it. Measured in a fresh process, as
     # the growth of its peak over its peak after imports, so nothing this
-    # test run has already allocated hides it. Before the fix it grew by
-    # about 240 MB on this PDF; the bound is loose because the figure
-    # varies with the allocator. The child's own log line pins the cap that
-    # stops it, which a parent-side check alone would not.
+    # test run has already allocated hides it. The growth bound catches the
+    # old parent, which split the text into words and grew by about 240 MB
+    # on this PDF; it is loose because the figure varies with the
+    # allocator. It doesn't catch a missing output cap on its own (without
+    # one the parent grows only about 25 MB here): the child's log line is
+    # what pins the cap.
     pdf = tmp_path / "expanding.pdf"
     pdf.write_bytes(expanding_font_pdf(glyphs_per_page=3000, chars_per_glyph=3000))
     run = subprocess.run(
