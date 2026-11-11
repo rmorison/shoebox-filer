@@ -122,7 +122,7 @@ Published at build time as `docs/engineering/designs/statement-read-contract.md`
 |---|---|
 | `list_statement_changes(cursor?, limit?)` | Statements created or changed after `cursor`, oldest change first, each as `{statement_id, revision, status, document_type, source_sha256}`, plus `next_cursor`. No cursor means from the start. `limit` defaults to 100, at most 200 (the server's existing page maximum). |
 | `get_statement(statement_id, revision?)` | One statement revision, with its accounts but not their lines. The current revision unless one is named. |
-| `get_statement_lines(statement_id, revision, account_ordinal, limit?, offset?)` | One account's lines, in `ordinal` order, in the server's existing page envelope (`total`, `limit`, `offset`, `next_offset`). `revision` is required, so every page comes from one revision. `limit` defaults to 500, at most 1,000. A held or loan account returns an empty page. |
+| `get_statement_lines(statement_id, revision, account_ordinal, limit?, offset?)` | One account's lines, in `ordinal` order, in the server's existing page envelope (`total`, `limit`, `offset`, `next_offset`). `revision` is required, so every page comes from one revision. `limit` defaults to 500, at most 1,000: a new constant, `MAX_LINE_PAGE_SIZE`, separate from the server's `MAX_PAGE_SIZE` (200), since lines are small and an account can have hundreds. A held or loan account returns an empty page. |
 | `get_statement_file(statement_id, include_content?)` | The original PDF, access-logged like `get_receipt_file`, with the same content limit (10 MiB by default): over it, the call returns the metadata with `content_included: false` and `content_omitted_reason: "too_large"` rather than the bytes, as `get_receipt_file` does. |
 
 **Errors.** Every tool refuses bad input with a tool error whose message starts with a stable code, so a client can branch on it:
@@ -142,7 +142,7 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 - Every run is a new revision and a feed entry, even when its content is identical to the last one. The account digests then show that nothing changed.
 - `revision` numbers are increasing for a statement and never reused, even across a restore.
 - At-least-once delivery: the ledger applies by `(statement_id, revision)`, so a repeat is harmless.
-- `next_cursor` is the last row's cursor, or the request's cursor when no rows follow.
+- Rows carry no cursor of their own. `next_cursor` is the only one: the position after the page's last row, or the request's cursor when no rows follow.
 - **After a restore from an older backup:** changes made after the backup are lost from shoebox. The Drive files are still in the folder (Drive sources don't archive), and the restored sync state lists them again. Statements first read after the backup are re-read and get new `statement_id`s, and statements re-run after the backup go back to their earlier revision. That earlier revision keeps its old `change_seq`, which can be below the ledger's cursor, so on its own it would never reach the ledger. The restore runbook therefore ends with `receipt-index statements republish --all --yes`, which gives every statement a new `change_seq` without a new revision, so the whole set passes through the feed once more. The ledger's rules then apply: a new `statement_id` whose `source_sha256` matches a statement it knows is that statement; a revision lower than one it applied is never treated as newer; account digests are compared with what it imported, and a difference goes to review.
 
 ### Per statement (one revision)
@@ -167,7 +167,7 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 - `rejected`: not extracted; `document_type` says why. No accounts.
 - `held`, with a `hold_reason`:
   - `no_accounts`: a deposit, card or loan statement whose first pass lists no account;
-  - `dropped_account`: a listed account came back empty (its own class is `empty_account`, below);
+  - `dropped_account`: a listed account came back empty (its own class is `empty_account`, below). An empty loan counts too, as a completeness failure under the operator's answer 3: the first pass listed a loan, and a no-activity loan bill is already rejected by document type, so a listed loan with no printed figure means the extraction lost an account, not that the loan had nothing to show;
   - `account_count_mismatch`: the printed account count disagrees with the accounts listed;
   - `no_usable_account`: none of the above, but no account is `clean` or `figures_only`.
 
@@ -181,11 +181,11 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 |---|---|
 | `account_id` | UUID, stable within a revision only |
 | `ordinal` | 1-based position in the document |
-| `match_key` | `{account_type, last4, occurrence}`, where `occurrence` counts accounts with the same type and `last4` in document order. Pairs this account with itself in another revision of the same statement. An account in one revision and not in the other is added or removed, for the ledger's review. `institution` is left out, since a re-extraction can give an institution's name in a short or a long form |
+| `match_key` | `{account_type, last4, occurrence}`, where `occurrence` counts accounts with the same type and `last4` in document order. Pairs this account with itself in another revision of the same statement. An account in one revision and not in the other is added or removed, for the ledger's review. `institution` is left out, since a re-extraction can give an institution's name in a short or a long form. Accounts of one type with a null `last4` pair by document order alone, so if a re-extraction drops one, the later ones pair with the wrong account; the digest comparison shows that as changes, for review |
 | `institution` | As printed, normalised as above |
 | `last4` | Last four digits only, never a full number; null when none is printed |
 | `account_type` | `deposit`, `card`, `loan` |
-| `currency` | ISO 4217 code. Read from the statement: a printed code, or a currency sign the statement uses. In this version a bare `$` with no other currency named reads as `USD`. Null when the statement gives no currency at all |
+| `currency` | ISO 4217 code. Read from the statement: a printed code, or a currency sign the statement uses. In this version a bare `$` with no other currency named reads as `USD`, since a null there would hold nearly every statement the ledger expects; a non-USD statement that prints only `$` is therefore labelled `USD` (see Risks). Null when the statement gives no currency at all |
 | `period_start`, `period_end` | The account's period: as printed for that account, else the document's. Null when neither is printed |
 | `status` | `clean`, `held`, or `figures_only` (loans) |
 | `held_by_statement` | True when the statement's hold reason holds this account; then `status` is `held` even if its own gates passed |
@@ -223,13 +223,15 @@ A model or schema error makes no revision: the item is retried, and after `retry
 | `ordinal` | 1-based position in the printed order within the account, across pages. For a `newest_first` account, ordinal 1 is the newest line |
 | `posted_date` | The date the line posted. When a line prints one date, it goes here, whatever the column is called |
 | `transaction_date` | A second, transaction date where printed, else null. Not gated |
-| `description` | Text as extracted, wrapped lines joined with one space. The model is told to cut any account or card number to its last four; nothing deterministic checks that it did (see Risks) |
+| `description` | Text as extracted, wrapped lines joined with one space, then masked: every run of 8 or more digits, counting single spaces and dashes between digits as part of the run, is replaced by its last four digits. The masking is deterministic and runs after extraction and before the gates and the digest, so the digest covers the masked text. The model is also told to cut account and card numbers, but the mask is the guarantee. Side effects in [Masking](#masking) |
 | `amount` | Signed by its effect on the statement's printed balance |
 | `running_balance` | As printed on the line, else null |
 | `section` | The printed heading it sits under, normalised as above; null when it sits under none |
 | `page` | 1-based page |
 
-**Years.** A statement often prints dates without a year. The extraction gives every date a full year from the account's period: the year that puts the date inside the period, or for a card inside the grace window before it. A December to January period is the usual case where that matters. A date that can't be placed that way fails the date gate. An account with yearless dates and no printed period is held as `undated`.
+**Years.** A statement often prints dates without a year. The model returns each date as printed parts (month, day, and the year only when printed), and shoebox assigns the year after extraction, from the account's period: the year that puts the date inside the period, or for a card inside the grace window before it. A December to January period is the usual case where that matters. A date that no year places that way takes `period_end`'s year, and then fails the date gate, holding the account as `date_out_of_period`. An account with a yearless date and no period is held as `undated`; it carries no lines, so no line needs a guessed year.
+
+<a id="masking"></a>**Masking.** The mask cuts any long digit run, not only account numbers. Known side effects: a reference or confirmation number of 8 or more digits keeps only its last four; a phone number printed with dashes (ten digits) keeps its last four; a date printed with no separators (`20261109`) becomes `1109`; two shorter numbers separated by a single space or dash (a store number then a terminal number) join into one run and are cut together. All of these are accepted for version 1. The description isn't used by any arithmetic check; the mask is deterministic, so the same input always gives the same description and the ledger's fingerprint stays stable across re-extractions; and the original PDF is one `get_statement_file` call away when a full reference is needed. A narrower rule (only runs next to words like "account" or "card") would miss numbers printed without such a word, and the point of the mask is that it misses none. Each masked run is counted in the log and in `statements show`, counts only.
 
 ### Sign basis
 
@@ -260,6 +262,7 @@ Asked of the ledger's session, one question at a time, on 2026-11-10:
    - **Rejections in the feed:** they stay in the feed; model errors stay out. The pre-review's note saying otherwise was loose wording. Decision 3 and the two review cases in decision 4 stand as written.
    - **Currency:** an ISO 4217 `currency` per account, and every money field on that account is in it. The ledger is USD-only today and holds any account that isn't `USD`; that is in its safe defaults.
    - **`match_key`:** `institution` leaves the key, which becomes `{account_type, last4, occurrence}` within one statement, because a re-extraction can render an institution's name in a short or a long form. The printed `institution` field stays, and stays in `content_digest`, since the ledger maps accounts by it. It is normalised by trimming and collapsing inner whitespace, with case left alone.
+6. **Review of the revised contract (2026-11-11).** Good to build, with one change: mask account numbers deterministically. After extraction and before the digest, any run of 8 or more digits, ignoring spaces and dashes inside the run, becomes its last four, tested against a stubbed model output that leaves a full number in. Adopted (contract, `description` and Masking). The ledger stores `revision` and the cursor's sequence as 64-bit integers, and a republish costs it only the reads.
 
 ---
 
@@ -331,6 +334,7 @@ CREATE TABLE receipt.statements (
     document_type          TEXT        NOT NULL,   -- copy of the current revision's
     status                 TEXT        NOT NULL,   -- copy of the current revision's
     change_seq             BIGINT      NOT NULL,   -- place in the feed; set by trigger
+    publish_count          INTEGER     NOT NULL DEFAULT 0,  -- incremented by republish
     created_at, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_statements_original UNIQUE (original_file_id),
     CONSTRAINT uq_statements_change_seq UNIQUE (change_seq),
@@ -363,15 +367,15 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 );
 ```
 
-- **The counter.** One function, `receipt.next_feed_value()`, takes `pg_advisory_xact_lock` on the feed key, then runs `UPDATE statement_feed_state SET last_value = greatest(last_value + 1, <microseconds since the epoch>) RETURNING last_value`. A `BEFORE INSERT` trigger on `statement_revisions` sets `revision` from it. A `BEFORE INSERT OR UPDATE` trigger on `statements` sets `change_seq` from it on insert, whenever `current_revision_id` changes, and on a republish (an update that only sets `updated_at`, through `statement_repository.republish`). Neither column can be written by hand: the triggers overwrite any value given.
+- **The counter.** One function, `receipt.next_feed_value()`, takes `pg_advisory_xact_lock` on the feed key, then runs `UPDATE statement_feed_state SET last_value = greatest(last_value + 1, <microseconds since the epoch>) RETURNING last_value`. A `BEFORE INSERT` trigger on `statement_revisions` sets `revision` from it. A `BEFORE INSERT OR UPDATE` trigger on `statements` sets `change_seq` from it on insert, when `current_revision_id` changes, and when `publish_count` (an integer, starting at 0) changes; on any other update it keeps the old `change_seq`. `statement_repository.republish` increments `publish_count`, so a republish is an explicit marker, never inferred from which columns an update touched. Neither `revision` nor `change_seq` can be written by hand: the triggers overwrite any value given. `statements republish --all` commits one transaction per statement, so the feed lock is held for one statement at a time and the worker isn't blocked for the whole run; an interrupted run is safe to repeat.
 - **Insert order, in one transaction.** The two tables point at each other, so both foreign keys are `DEFERRABLE INITIALLY DEFERRED`, and the check that a statement's `status` and `document_type` match its current revision is a `CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` on `statements`, so it runs at commit. A new statement: take a statement ID (`SELECT uuidv7()`), insert the revision with it, then the accounts and lines, then the statement row pointing at the revision, then its `statement_sources` row and the `ingest_log` row. A re-run: insert the revision, its accounts and lines, then update the statement's `current_revision_id`, `status` and `document_type`. The foreign keys and the match check all run at commit, after both rows exist.
 - A trigger refuses a `statement_lines` row on an account that isn't `clean`.
 - No full account number anywhere: `last4` is four digits or null.
-- 000024 grants: `_write` gets `SELECT, INSERT` on the append-only tables and on `statement_sources`, `SELECT, INSERT, UPDATE (current_revision_id, status, document_type, change_seq, updated_at)` on `statements`, `SELECT, UPDATE` on `statement_feed_state`, and `EXECUTE` on `next_feed_value()`. `_read` gets `SELECT` on all of them.
+- 000024 grants: `_write` gets `SELECT, INSERT` on the append-only tables and on `statement_sources`, `SELECT, INSERT, UPDATE (current_revision_id, status, document_type, change_seq, publish_count, updated_at)` on `statements`, `SELECT, UPDATE` on `statement_feed_state`, and `EXECUTE` on `next_feed_value()`. `_read` gets `SELECT` on all of them.
 - Down migrations drop the tables and the function. See Rollback for the stored originals.
 - `_run_migrations()` mirrors 000023, the seed row included; `apply_migration_grants` applies 000024.
 
-**Tests:** up, down and up again on a scratch database, with the seed row present after each up; a new statement and a re-run commit with the insert order above, and the same writes with a revision whose status differs from the statement's fail at commit; **the cursor-skip guarantee**: writer A inserts a revision and stops before committing (held at a barrier); writer B starts its own revision and blocks on the advisory lock; a reader lists the feed and sees neither; A commits, B proceeds and commits; the reader then sees A before B, with B's `change_seq` above A's; a counter value set below the last stays monotonic (the restore case); a statement whose `change_seq` is set below a reader's cursor (a restored row) is invisible to that cursor until `republish`, and visible after it with its `revision` unchanged; a line can't attach to a held account; `last4` rejects five digits; `currency` rejects `usd`.
+**Tests:** up, down and up again on a scratch database, with the seed row present after each up; a new statement and a re-run commit with the insert order above, and the same writes with a revision whose status differs from the statement's fail at commit; **the cursor-skip guarantee**: writer A inserts a revision and stops before committing (held at a barrier); writer B starts its own revision and blocks on the advisory lock; a reader lists the feed and sees neither; A commits, B proceeds and commits; the reader then sees A before B, with B's `change_seq` above A's; a counter value set below the last stays monotonic (the restore case); a statement whose `change_seq` is set below a reader's cursor (a restored row) is invisible to that cursor until `republish`, and visible after it with its `revision` unchanged (the fixture, connected as the `main` superuser, runs `ALTER TABLE receipt.statements DISABLE TRIGGER` for the `change_seq` trigger, sets the value, and enables it again, which is what a restore does in effect); an update that changes neither `current_revision_id` nor `publish_count` keeps `change_seq`; `republish --all` over three statements commits three transactions; a line can't attach to a held account; `last4` rejects five digits; `currency` rejects `usd`.
 
 ### U3. Extraction models and prompts
 
@@ -382,16 +386,18 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 **Approach:**
 - Output models with `extra="forbid"`. Money is a two-place decimal string and never a float, as in the spike, and is reformatted to the contract's money format (no `+`, no separators, `0.00` for zero) before it is stored.
 - First pass: document type, accounts (label, type, page range, and its own period where printed), printed account count, the document's period. The label is used only to tell the extraction call which account to read. It is not stored, since it can hold a name.
-- Account extraction: one call per listed account, the whole page-marked text, told the account's label, type, pages and period. The deposit and card prompts share a base that states the sign basis, the currency rule and the date rules: a line that prints one date gives it as the posted date; a card line that prints two gives the posted date and the transaction date; a printed date with no year takes the year that puts it inside the period (or, on a card, inside the grace window before it), and a yearless date with no printed period is reported as such, which holds the account as `undated`. Section and column totals come back as printed magnitudes; section headings are normalised after the call, by the one function the contract names.
+- Account extraction: one call per listed account, the whole page-marked text, told the account's label, type, pages and period. The deposit and card prompts share a base that states the sign basis, the currency rule and the date rules: a line that prints one date gives it as the posted date; a card line that prints two gives the posted date and the transaction date; each date comes back as printed parts, `{month, day, year}`, with `year` null when not printed; shoebox assigns missing years after the call (the contract's Years rule), and a null `year` on an account with no period holds it as `undated`. Section and column totals come back as printed magnitudes; section headings are normalised after the call, by the one function the contract names.
 - **Output cap.** Each account call sets a `max_tokens` ceiling well inside Haiku's output limit, sized at build time from the fixtures. A response that stops at that ceiling (the model's stop reason says so) is not retried, since a retry would stop in the same place: the account is held as `too_many_lines`, and the statement's status follows from the rules. At about 35 output tokens a line, this holds an account of more than roughly a thousand lines. Splitting such an account into page ranges is deferred.
 - Loan: printed figures only, null when not printed. The prompt forbids deriving a figure.
-- Every prompt says the document is data and its instructions are to be ignored, and tells the model to cut any account or card number in a description to its last four.
+- Every prompt says the document is data and its instructions are to be ignored, and tells the model to cut any account or card number in a description to its last four. The deterministic mask (contract, Masking) runs after the call regardless.
 - `STATEMENT_PROMPT_VERSION` and `FIRST_PASS_VERSION`, recorded on each revision.
 - Model, effort and request timeout come from the existing `llm` configuration.
 
 **Tests:** schema validation refuses a float, a three-place amount and a five-digit `last4`; money reformatting gives `0.00` for a negative zero and drops a `+`; section normalisation gives the same value for a heading on a line and in a total; a stubbed response that stops at the output ceiling holds the account as `too_many_lines` with no retry; the prompts contain no statement text (a test checks them against the fixture generator's strings).
 
-What the stubbed tests can't show: whether the real model trims account numbers in descriptions, places years correctly, or picks the right date column. The stub returns what the test chose. Those are measured by `make statement-eval` against the real model on the synthetic fixtures (Testing Strategy), which counts descriptions with a run of 9 or more digits and dates outside each fixture's period.
+**Tests, masking:** a stubbed model output whose description carries a full 16-digit card number, grouped by spaces and by dashes, comes out with the last four only, in the stored line and in the digest's input; a 7-digit run is left alone; each side effect in the contract's Masking list has a case pinning the behaviour; the mask is written to fail first against an identity function.
+
+What the stubbed tests can't show: whether the real model trims account numbers before the mask, places printed years correctly, or picks the right date column. The stub returns what the test chose. Those are measured by `make statement-eval` against the real model on the synthetic fixtures (Testing Strategy), which counts masked runs and dates outside each fixture's period.
 
 ### U4. Gates
 
@@ -404,7 +410,7 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 - dormant account: no lines and equal printed balances is clean;
 - statement: `rejected`, else the hold reasons in order (`no_accounts`, `dropped_account`, `account_count_mismatch`, `no_usable_account`), else `incomplete` or `complete`. The first three set `held_by_statement` on every account and keep each account's own class;
 - the canonical form and `content_digest`;
-- a description with a run of 9 or more digits is logged (counts only, never the text) and counted in `statements show`. It is a flag, not a scrub and not a gate: reference numbers can be that long.
+- the description mask runs before the gates and the digest (see the contract's Masking); masked runs are counted, never logged as text. Masking is not a gate.
 
 **Tests:** one test per gate, failure class, hold reason and statement status, each written to fail first against a stub that passes everything. Named cases: a loan-only statement is `complete`; a loan beside a deposit account held by its own gates is `incomplete`; a statement with no accounts is `held` with `no_accounts`; an empty loan holds the statement as `dropped_account`, and every account, the clean ones included, is held and marked `held_by_statement` while a held one keeps its own class; a newest-first chain passes when walked in date order and fails when walked in printed order; a December to January card period with a line dated in late December passes, and one dated in the next December fails; a digest test against the contract document's worked example; the same account with its institution's whitespace varied keeps its `match_key` and its digest.
 
@@ -500,7 +506,7 @@ pydantic-ai's `FunctionModel` returns a chosen extraction per call, so each gate
 
 ### Against the real model, by hand
 
-`make statement-eval` runs the fixtures against the configured model and prints a counts-only table: per fixture, the status and class against the expected ones, descriptions with a run of 9 or more digits, dates outside the period, and characters per input token. It isn't run in CI and costs a few cents. Its output on the synthetic fixtures goes in U3's and U4's pull requests.
+`make statement-eval` runs the fixtures against the configured model and prints a counts-only table: per fixture, the status and class against the expected ones, masked runs, dates outside the period, and characters per input token. It isn't run in CI and costs a few cents. Its output on the synthetic fixtures goes in U3's and U4's pull requests.
 
 ### Integration
 
@@ -547,7 +553,8 @@ A backlog of 500 statements costs on the order of $5. A rerun costs the same aga
 | A statement reconciles with a misdated or mis-described line | The date gate catches dates outside the period; the operator spot-checks a few after rollout. Descriptions aren't verifiable by arithmetic: stated in the contract. |
 | The first pass misses an account and nothing prints a count | An empty or missing account list holds the statement; a missed account with no printed count is undetectable in shoebox. The ledger's own balance check on the account is the backstop. Stated in the contract. |
 | The first pass flips between runs | Holds are safe; `statements rerun` by hand. Revisit an automatic retry after a month. |
-| A description carries a full account number | The prompt tells the model to keep the last four, and the contract says plainly that the model does the cutting and nothing checks it. A run of 9 or more digits is logged and counted (U4), and `statement-eval` counts them on the fixtures. A deterministic scrub is not added, since it would also cut reference numbers the ledger may want. |
+| A description carries a full account number | A deterministic mask cuts every run of 8 or more digits to its last four before the gates and the digest (the ledger's change, decision 6). It also cuts long reference numbers and separator-less dates, accepted (contract, Masking). |
+| A non-USD statement prints only `$` | It is labelled `USD` and passes the ledger's safe default, undetected here. Accepted for version 1, as the ledger's statements are US accounts; a statement that names another currency anywhere gets that code. |
 | An account too long for one call's output | The output ceiling holds it as `too_many_lines` with no retry; splitting by page range is deferred. |
 | A restore hides a statement behind the ledger's cursor | `statements republish --all --yes` is the restore runbook's last step (U8). |
 | Prompt injection in a statement | Prompts say the document is data; outputs are schema-bound; held results carry no lines; the MCP instructions say statement text is untrusted. |
@@ -602,7 +609,16 @@ Every point is answered on the pull request. Changes made:
 
 Not changed:
 - Section totals stay unsigned magnitudes; the footing check pins direction. Stated in the contract.
-- No deterministic description scrub (see Risks).
+
+**Second app review, and the ledger's change (2026-11-11)**
+- `get_statement_lines` has its own page maximum, `MAX_LINE_PAGE_SIZE` (1,000), separate from `MAX_PAGE_SIZE` (200).
+- Republish is an explicit `publish_count` increment, and the trigger redraws `change_seq` only on insert, a new current revision or that increment. `republish --all` commits per statement.
+- The restore test disables the `change_seq` trigger in its fixture to set a low value.
+- A bare `$` stays `USD` (the lead's call: a null would hold nearly every US statement); the undetectable non-USD case is in Risks.
+- An empty loan is a completeness failure under the operator's answer 3, stated.
+- Dates come back as `{month, day, year}` with `year` nullable; shoebox assigns years; an unplaceable date takes `period_end`'s year and fails the date gate.
+- Null-`last4` pairing by document order, and the feed's single `next_cursor`, are stated.
+- The ledger's change: a deterministic mask on descriptions, replacing the earlier "no scrub" decision and the 9-digit flag, with its side effects stated and accepted.
 
 **Not changed (document review)**
 - Canonical JSON details (escaping, normalisation) are now stated; the worked example in the contract document settles the rest at build time.
