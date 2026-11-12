@@ -250,3 +250,23 @@ def test_the_pydantic_ai_banner_is_off() -> None:
     import receipt_index.llm  # noqa: F401 -- importing it turns the banner off
 
     assert pydantic_ai.BANNER_ENABLED is False
+
+
+def test_a_child_logger_set_to_debug_by_hand_is_clamped_too() -> None:
+    import logging
+
+    from receipt_index.llm import quiet_payload_loggers
+
+    child = logging.getLogger("anthropic._base_client")
+    saved = child.level
+    try:
+        child.setLevel(logging.DEBUG)
+        quiet_payload_loggers()
+        assert not child.isEnabledFor(logging.DEBUG)
+        # A child left to inherit isn't given a level of its own.
+        quiet = logging.getLogger("httpcore2.connection")
+        if quiet.level == logging.NOTSET:
+            quiet_payload_loggers()
+            assert quiet.level == logging.NOTSET
+    finally:
+        child.setLevel(saved)

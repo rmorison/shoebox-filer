@@ -16,9 +16,9 @@ from typing import TYPE_CHECKING, Any
 from receipt_index.locks import item_lock
 from receipt_index.repository import (
     get_item_history,
-    has_receipt,
     insert_ingest_log,
     insert_retry_request,
+    item_done,
     orphaned_refs,
     set_retry_request_count,
 )
@@ -129,7 +129,7 @@ def apply_requeue(
                 if (
                     not history
                     or history[0].id != entry.id
-                    or has_receipt(conn, entry.source_id)
+                    or item_done(conn, entry.source_id)
                 ):
                     conn.commit()
                     outcome.not_requeued.append(

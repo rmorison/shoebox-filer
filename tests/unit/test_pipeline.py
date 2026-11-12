@@ -1082,7 +1082,7 @@ def history(monkeypatch: pytest.MonkeyPatch, repo: FakeRepo) -> dict[str, list[A
         lambda conn, source_id, limit=100: rows.get(source_id, []),
     )
     monkeypatch.setattr(
-        pipeline, "has_receipt", lambda conn, source_id: source_id in repo.receipts
+        pipeline, "item_done", lambda conn, source_id: source_id in repo.receipts
     )
     monkeypatch.setattr(pipeline, "orphaned_refs", lambda conn, ids: {})
     return rows
@@ -1499,6 +1499,9 @@ class StopAfter:
     def running(self, source_id: str) -> Iterator[None]:
         yield
         self.ran.append(source_id)
+
+    def step(self, source_id: str) -> None:
+        pass
 
 
 class TestRunControl:

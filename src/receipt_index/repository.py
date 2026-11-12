@@ -51,9 +51,12 @@ _WITH_NET = (
     " LEFT JOIN receipt.v_receipt_net n ON n.receipt_id = receipts.id"
 )
 
-# An ingest_log row (aliased l) whose item has no receipt: no provenance row.
-_NO_PROVENANCE = (
+# An ingest_log row (aliased l) whose item isn't done: no provenance row (a
+# receipt) and no statement_sources row (a statement).
+_NOT_DONE = (
     "NOT EXISTS (SELECT 1 FROM receipt.provenance p WHERE p.source_id = l.source_id)"
+    " AND NOT EXISTS (SELECT 1 FROM receipt.statement_sources s"
+    " WHERE s.source_id = l.source_id)"
 )
 
 
@@ -70,6 +73,8 @@ def get_processed_source_ids(
     cur = conn.execute(
         "SELECT source_id FROM receipt.provenance "
         "UNION "
+        "SELECT source_id FROM receipt.statement_sources "
+        "UNION "
         "SELECT source_id FROM receipt.ingest_log"
     )
     return {str(row["source_id"]) for row in cur.fetchall()}
@@ -85,6 +90,8 @@ def is_source_id_known(
     """
     cur = conn.execute(
         "SELECT EXISTS (SELECT 1 FROM receipt.provenance WHERE source_id = %(id)s) "
+        "OR EXISTS (SELECT 1 FROM receipt.statement_sources"
+        " WHERE source_id = %(id)s) "
         "OR EXISTS (SELECT 1 FROM receipt.ingest_log WHERE source_id = %(id)s) "
         "AS known",
         {"id": source_id},
@@ -668,7 +675,7 @@ def _failure_filters(
 ) -> tuple[str, dict[str, object]]:
     clauses = [
         _FAILURE_STATUS[status],
-        _NO_PROVENANCE,
+        _NOT_DONE,
     ]
     params: dict[str, object] = {}
     if since is not None:
@@ -721,7 +728,7 @@ def count_due_retries(conn: psycopg.Connection[dict[str, Any]]) -> int:
     cur = conn.execute(
         f"SELECT COUNT(*) AS n FROM ({_LATEST}) l "
         "WHERE l.status = 'failed' AND l.next_retry_at <= now() "
-        f"AND {_NO_PROVENANCE}"
+        f"AND {_NOT_DONE}"
     )
     row = cur.fetchone()
     return int(row["n"]) if row else 0
@@ -745,6 +752,18 @@ def get_item_history(
         {"id": source_id, "limit": limit},
     )
     return [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
+
+
+def item_done(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
+    """Whether an item is done: it evidences a receipt or delivered a statement."""
+    cur = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM receipt.provenance WHERE source_id = %(id)s)"
+        " OR EXISTS (SELECT 1 FROM receipt.statement_sources"
+        " WHERE source_id = %(id)s) AS done",
+        {"id": source_id},
+    )
+    row = cur.fetchone()
+    return bool(row and row["done"])
 
 
 def has_receipt(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
@@ -805,7 +824,7 @@ def select_due(
         " OR (%(configured)s::text[] IS NOT NULL"
         " AND l.source_name <> ALL(%(configured)s::text[])))"
         " AND l.source_type = %(type)s)) "
-        f"AND {_NO_PROVENANCE} "
+        f"AND {_NOT_DONE} "
         "ORDER BY created_at ASC, id ASC"
     )
     if limit is not None:
@@ -862,7 +881,7 @@ def select_retry_candidates(
     """The items ``retry`` would requeue: their latest rows, oldest first."""
     clauses = [
         _FAILURE_STATUS[spec.status],
-        _NO_PROVENANCE,
+        _NOT_DONE,
     ]
     params: dict[str, object] = {}
     if spec.status == "skipped":

@@ -54,10 +54,19 @@ PAYLOAD_LOGGERS: Final = ("anthropic", "httpx", "httpx2", "httpcore", "httpcore2
 
 
 def _payload_logger_names() -> set[str]:
-    present = {name.split(".")[0] for name in logging.root.manager.loggerDict}
-    return set(PAYLOAD_LOGGERS) | {
-        name for name in present if name.startswith(PAYLOAD_LOGGER_PREFIXES)
+    """The known names, and every logger already made under the prefixes.
+
+    Children are included: a child given its own level (say
+    ``anthropic._base_client`` set to DEBUG by hand) would otherwise log
+    below its clamped parent.
+    """
+    made = {
+        name
+        for name, logger in logging.root.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger)
+        and name.split(".")[0].startswith(PAYLOAD_LOGGER_PREFIXES)
     }
+    return set(PAYLOAD_LOGGERS) | made
 
 
 def quiet_payload_loggers() -> None:
@@ -65,13 +74,16 @@ def quiet_payload_loggers() -> None:
 
     Called when logging is configured and whenever an agent is built (by
     which time the HTTP stack is imported), so neither the app's DEBUG level
-    nor ``ANTHROPIC_LOG=debug`` can print a request. Clamping a top-level
-    logger covers its children, including ones created later. Debugging the
-    SDK takes raising these loggers by hand. A child logger given its own
-    level (``anthropic._base_client`` set to DEBUG) is not covered: setting
-    one is that by-hand step.
+    nor ``ANTHROPIC_LOG=debug`` can print a request. Every top-level logger
+    under the prefixes is clamped, which covers its children; a child that
+    was given its own level below INFO is clamped too, so there is no
+    by-hand way to make the SDK log a request in this process (a decision:
+    statements carry account numbers).
     """
     for name in _payload_logger_names():
         logger = logging.getLogger(name)
-        if logger.level < logging.INFO:  # NOTSET or DEBUG
+        top = "." not in name
+        if (top and logger.level < logging.INFO) or (
+            not top and logging.NOTSET < logger.level < logging.INFO
+        ):
             logger.setLevel(logging.INFO)

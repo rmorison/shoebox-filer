@@ -27,7 +27,7 @@ from receipt_index import duplicates
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
-from receipt_index.fetching import SourceDownError, fetch_item
+from receipt_index.fetching import STATEMENT_INGEST_TYPE, SourceDownError, fetch_item
 from receipt_index.locks import SourceLockLostError, item_lock
 from receipt_index.models import (
     MIN_RECEIPT_CONFIDENCE,
@@ -46,7 +46,6 @@ from receipt_index.repository import (
     get_item_history,
     get_processed_source_ids,
     get_sync_state,
-    has_receipt,
     insert_extraction,
     insert_ingest_log,
     insert_provenance,
@@ -54,6 +53,7 @@ from receipt_index.repository import (
     insert_receipt,
     is_due,
     is_source_id_known,
+    item_done,
     orphaned_refs,
     record_poll,
     record_rendition,
@@ -94,6 +94,7 @@ if TYPE_CHECKING:
         SyncState,
     )
     from receipt_index.originals import StoredEmail
+    from receipt_index.statements import StatementAgents
     from receipt_index.store import EvidenceStore, StoredFile
 
 logger = logging.getLogger(__name__)
@@ -111,12 +112,17 @@ class RunControl(Protocol):
 
     ``should_stop`` is asked before each item: the loops stop between items,
     so no item is left half-done and the cursor rule holds. ``running`` wraps
-    each item, so a watchdog can time it.
+    each item, so a watchdog can time it. ``step`` re-marks the running
+    item's clock: the statement pipeline calls it at each phase (the read,
+    the first pass, each account call), so the watchdog times each phase,
+    not the whole item. The receipt path doesn't call it.
     """
 
     def should_stop(self) -> bool: ...
 
     def running(self, source_id: str) -> AbstractContextManager[object]: ...
+
+    def step(self, source_id: str) -> None: ...
 
 
 def _running(
@@ -1188,6 +1194,7 @@ def run_due_retries(
     policy: RetryPolicy | None = None,
     own_source: str | None = None,
     control: RunControl | None = None,
+    statement_agents: StatementAgents | None = None,
 ) -> RetryResult:
     """Run the items that are due again, one at a time.
 
@@ -1200,7 +1207,10 @@ def run_due_retries(
       ``started``, so an unreachable source leaves no row and uses up no
       attempt, then process it as attempt ``n``.
 
-    ``agents`` maps ``"email"`` and ``"document"`` to their agents. The pass
+    ``agents`` maps ``"email"`` and ``"document"`` to their agents. A
+    statement item (``source_type`` ``gdrive_statement``) goes to the
+    statement pipeline with ``statement_agents``, never to ``process_item``;
+    without them it is left for a run that has them. The pass
     ends when ``own_source`` (the source it runs for) can't be reached, or
     on a transient or config failure. When another source of the type can't
     be reached, only the item being looked for there is left for later.
@@ -1224,7 +1234,7 @@ def run_due_retries(
             if (
                 latest is None
                 or not is_due(latest, _now())
-                or has_receipt(conn, entry.source_id)
+                or item_done(conn, entry.source_id)
             ):
                 conn.commit()
                 continue
@@ -1314,23 +1324,46 @@ def run_due_retries(
                 continue
 
             raw = fetched.raw
-            agent = agents["document" if raw.source_type == "gdrive" else "email"]
-            outcome = process_item(
-                conn,
-                raw,
-                store=store,
-                # Found, so the source that had it is known.
-                source_name=fetched.source_name or raw.source_name,
-                source_type=source_type,
-                agent=agent,
-                llm_model=llm_model,
-                policy=policy,
-                state=state,
-            )
+            if source_type == STATEMENT_INGEST_TYPE:
+                if statement_agents is None:
+                    logger.warning(
+                        "Retry of statement %s left for later: no statement agents",
+                        entry.source_id,
+                    )
+                    continue
+                from receipt_index.statements import process_statement
+
+                outcome = process_statement(
+                    conn,
+                    raw,
+                    store=store,
+                    source_name=fetched.source_name or raw.source_name,
+                    agents=statement_agents,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=state,
+                    control=control,
+                )
+            else:
+                agent = agents["document" if raw.source_type == "gdrive" else "email"]
+                outcome = process_item(
+                    conn,
+                    raw,
+                    store=store,
+                    # Found, so the source that had it is known.
+                    source_name=fetched.source_name or raw.source_name,
+                    source_type=source_type,
+                    agent=agent,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=state,
+                )
         if outcome.status == "success" and outcome.receipt is not None:
             result.processed += 1
             result.receipts.append(outcome.receipt)
             _warn_orphans(conn, entry.source_id)
+        elif outcome.status == "success":  # a statement
+            result.processed += 1
         elif outcome.status == "skipped":
             result.skipped += 1
         elif outcome.status == "failed":

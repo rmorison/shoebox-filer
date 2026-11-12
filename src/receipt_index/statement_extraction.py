@@ -457,6 +457,12 @@ def _dashes() -> re.Pattern[str]:
     return re.compile("[" + "".join(re.escape(ch) for ch in dashes) + "]")
 
 
+def warm_mask() -> None:
+    """Build the mask's patterns now, once per process (about a second)."""
+    _masked_run()
+    _dashes()
+
+
 def _fold_separators(text: str) -> str:
     """Unicode whitespace runs to one space, Unicode dashes to ``-``."""
     return _WHITESPACE.sub(" ", _dashes().sub("-", text))
