@@ -3116,7 +3116,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=2.1.0" },
+    { name = "anthropic", specifier = ">=2.1.0,<3" },
     { name = "click", specifier = ">=8.1" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "google-api-python-client", specifier = ">=2.0" },

@@ -1439,3 +1439,21 @@ def test_the_blind_reviews_shapes_are_cut_whole(number: str) -> None:
 )
 def test_amounts_side_by_side_and_plain_decimals_stay(text: str) -> None:
     assert mask_digits(text) == (text, 0)
+
+
+def test_spaced_groups_with_cents_are_cut_when_too_long_for_an_amount() -> None:
+    assert mask_digits("Ref 41,11 11,11 11,11 11,11 ok") == ("Ref 1111 ok", 1)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Purchase 12/31 $123.45",
+        "Paid 12,345.67 -8.00",
+        "USD 12345.67 @ 1.0876",
+        "At 12:30:45.123",
+        "At 12:30",
+    ],
+)
+def test_amounts_dates_and_times_beside_each_other_stay_apart(text: str) -> None:
+    assert mask_digits(text) == (text, 0)

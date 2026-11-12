@@ -487,21 +487,37 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         count += 1
         return _NON_DIGIT.sub("", match.group())[-4:]
 
-    def grouped(match: re.Match[str]) -> str:
+    def strict(match: re.Match[str]) -> str:
         nonlocal count
         run = match.group()
         digits = _NON_DIGIT.sub("", run)
-        if len(digits) < _MIN_MASKED_DIGITS or _is_amount(match, len(digits)):
+        if (
+            len(digits) < _MIN_MASKED_DIGITS
+            or _TIME.fullmatch(run)
+            or _is_amount(match, len(digits))
+        ):
             return run
         count += 1
         return digits[-4:]
+
+    def grouped(match: re.Match[str]) -> str:
+        run = match.group()
+        digits = _NON_DIGIT.sub("", run)
+        # A run joined by spaces or by more than one mark is cut whole only
+        # when it is already a long number; a shorter one is read again with
+        # single marks only, so "12/31 $123.45" or "12,345.67 -8.00" (an
+        # amount beside a date or another amount) stays apart.
+        if len(digits) < _LONG_NUMBER_DIGITS and _LOOSE_SEPARATOR.search(run):
+            return _STRICT_GROUPED_RUN.sub(strict, run)
+        return strict(match)
 
     def spaced(match: re.Match[str]) -> str:
         nonlocal count
         run = match.group()
         digits = _NON_DIGIT.sub("", run)
-        if len(digits) < _MIN_MASKED_DIGITS or any(
-            _ENDS_IN_CENTS.search(token) for token in run.split()
+        if len(digits) < _MIN_MASKED_DIGITS or (
+            len(digits) <= _MAX_AMOUNT_DIGITS
+            and any(_ENDS_IN_CENTS.search(token) for token in run.split())
         ):
             return run
         count += 1
@@ -544,6 +560,16 @@ _SPACED_RUN = re.compile(
     rf"(?<![0-9])[0-9]+(?:{_MARK}+[0-9]+)*(?: +[0-9]+(?:{_MARK}+[0-9]+)*)+(?![0-9])"
 )
 _ENDS_IN_CENTS = re.compile(r"[.,][0-9]{2}$")
+# Single marks only between groups: the strict reading of a short run.
+_STRICT_GROUPED_RUN = re.compile(
+    rf"(?<![0-9])[0-9]+(?:{_MARK}[0-9]{{2,}})+(?:{_MARK}[0-9])?(?![0-9])"
+)
+# A separator that is more than one mark: a space, or two marks or more.
+_LOOSE_SEPARATOR = re.compile(rf"[0-9](?:\s|{_MARK}{{2,}}|{_MARK}\s|\s{_MARK})")
+# A run this long is cut whole however its groups are joined.
+_LONG_NUMBER_DIGITS: Final = 13
+# A time of day, with seconds and a fraction: "12:30", "12:30:45.123".
+_TIME = re.compile(r"[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?(?:[.,][0-9]{1,6})?")
 
 
 # An amount's shape: thousands groups and an optional decimal part with the
