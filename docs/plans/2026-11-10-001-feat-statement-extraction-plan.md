@@ -245,14 +245,15 @@ What the mask is: a pattern guard for the ways institutions print account and ca
 - a number grouped by a mark institutions don't print inside numbers (`_ : # + | ~ ( ) " * ; = \`, a star, a bullet) passes, since those marks end a span;
 - amounts with cents side by side are never joined, so a number written as amounts (`41,11 11,11 11,11 11,11`) passes;
 - a number written as a short date or a date range passes;
-- a number one digit per group (`1,2,3,4,…`), spaced digits mixed with marks (`4 1 1 1.1 1 1 1.1 2 3 4`), any 13- or 14-digit number written in thousands groups as a twelve-digit amount with cents (`411,111,111,111.11`, or padded, `004,111,111,111.11`); a date-shaped first group beside a cut number stays (`12.11 3456 7890 1234` becomes `12.11 1234`); and a number written as a year range or a ZIP+4 pass.
+- a number one digit per group (`1,2,3,4,…`), spaced digits mixed with marks (`4 1 1 1.1 1 1 1.1 2 3 4`), any 13- or 14-digit number written in thousands groups as a twelve-digit amount with cents (`411,111,111,111.11`, or padded, `004,111,111,111.11`); a date-shaped first group beside a cut number stays (`12.11 3456 7890 1234` becomes `12.11 1234`); a number written as a year range or a ZIP+4; and a grouped number whose last group runs straight into cents, with no space before them, keeps that group as an amount beside the cut, showing seven or eight digits (`PMT 4111 1111 1111 1234.50` becomes `PMT 1111 1234.50`, `7585 1067 8621 414,996.76` becomes `8621 414,996.76`), a form not expected on statements, pass.
 
 Given up since the previous review round, in favour of ordinary shapes: numbers grouped by `_ : # + | ~ ( " ) * ; = \`, a star or a bullet (earlier cut); slashed and dotted eight-digit dates (earlier cut, now kept as dates); and the amount-tokens run (`41,11 11,11 11,11 11,11`, earlier cut).
 
 The mask cuts any account-like run, not only account numbers. Known side effects, all accepted for version 1:
 - a reference or confirmation number of 8 or more digits keeps only its last four;
 - a phone number printed with dashes or spaces (ten digits) keeps its last four (one printed with brackets, `(555) 123-4567`, stays);
-- a date printed with no separators (`20261109`) becomes `1109`, and a dashed date is a number: `2026-11-09` becomes `1109`;
+- a date printed with no separators (`20261109`) becomes `1109`, and a dashed date is a number: `2026-11-09` becomes `1109`, `11-09-2026` becomes `2026`, and `PERIOD 10-01-26 10-31-26` becomes `PERIOD 3126`;
+- a short date joined to a number by a dash is read as one number (`POS 11/09-4111` becomes `POS 4111`), and two short number tokens after a date join (`DEBIT CARD PURCHASE 11/09 0412 1234` becomes `DEBIT CARD PURCHASE 11/09 1234`). U5's trial on real statements counts how often each of these side effects occurs;
 - adjacent number tokens join and are cut together when they total 8 or more digits (`2026-11-09 4412` becomes `4412`);
 - a bare count over nine digits in thousands groups (`1,234,567,890 units`) is cut;
 - accepted over-cuts, since keeping them would reopen a must-cut case (two four-digit card groups, `1234-5678`, `411,111 111,111 1234`): two years side by side (`FY 2026 2027` becomes `FY 2027`), a range of document numbers (`Invoices 1001-1004` becomes `Invoices 1004`), and two bare thousands amounts side by side (`Fees 1,200 1,300` becomes `Fees 1300`).
