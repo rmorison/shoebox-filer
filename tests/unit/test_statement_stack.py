@@ -279,7 +279,10 @@ def test_the_sdk_exports_no_span_even_with_a_global_provider_and_content_mode(
         provider=AnthropicProvider(anthropic_client=AsyncAnthropic(api_key=_KEY)),
     )
     stub_api.tool_input = _FIRST_PASS
-    se.run_first_pass(se.create_first_pass_agent(control), _PAGES)
+    # The control runs outside the statement constructors, which refuse it.
+    from pydantic_ai import Agent
+
+    Agent(control, output_type=se.FirstPass).run_sync(se.first_pass_request(_PAGES))
     spans = exporter.get_finished_spans()
     assert spans, "the control exported nothing, so nothing was checked"
     exporter.clear()
@@ -375,3 +378,24 @@ def test_the_installed_anthropic_sdk_honours_the_tracing_option(
     resolved = llm.client._open_telemetry
     assert resolved["traces"]["enabled"] is False
     assert resolved["propagation"] is False
+
+
+def test_the_statement_constructors_refuse_a_model_that_could_be_traced() -> None:
+    from anthropic import AsyncAnthropic
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    default_client = AnthropicModel(
+        _MODEL,
+        provider=AnthropicProvider(anthropic_client=AsyncAnthropic(api_key=_KEY)),
+    )
+    for model, error in ((_MODEL, TypeError), (default_client, ValueError)):
+        with pytest.raises(error):
+            se.create_first_pass_agent(model)  # type: ignore[arg-type]
+        for kind in ("deposit", "card", "loan"):
+            with pytest.raises(error):
+                se.create_account_agent(kind, model)  # type: ignore[arg-type]
+    # The factory's model is accepted.
+    llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+    se.create_first_pass_agent(llm, settings)
+    se.create_account_agent("loan", llm, settings)

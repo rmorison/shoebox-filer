@@ -393,8 +393,12 @@ def test_an_institution_keeps_its_case_and_loses_extra_space(
         ("Call 800-555-0100", "Call 0100", 1),
         ("Dated 20261109", "Dated 1109", 1),
         # Amount and date shapes are left alone.
-        ("Dated 11/09/2026", "Dated 11/09/2026", 0),
         ("Total 1,234,567.89", "Total 1,234,567.89", 0),
+        # Slashed, dotted and dashed eight-digit dates are cut (posted_date
+        # carries a line's date apart from its text).
+        ("Dated 11/09/2026", "Dated 2026", 1),
+        ("Dated 11.09.2026", "Dated 2026", 1),
+        ("Dated 2026-11-09", "Dated 1109", 1),
         # Groups of three or more joined by any other separator, eight
         # digits in all, are cut.
         ("Ref 1234.5678", "Ref 5678", 1),
@@ -752,8 +756,10 @@ def test_a_schema_error_is_not_a_cap() -> None:
 
 
 def test_the_agents_set_their_output_ceilings() -> None:
-    first = se.create_first_pass_agent("test")
-    account = se.create_account_agent("deposit", "test", {"timeout": 10.0})
+    from pydantic_ai.models.test import TestModel
+
+    first = se.create_first_pass_agent(TestModel())
+    account = se.create_account_agent("deposit", TestModel(), {"timeout": 10.0})
     assert first.model_settings["max_tokens"] == se.FIRST_PASS_OUTPUT_TOKENS  # type: ignore[index]
     assert account.model_settings["max_tokens"] == se.ACCOUNT_OUTPUT_TOKENS  # type: ignore[index]
     assert se.ACCOUNT_OUTPUT_TOKENS < 128_000
@@ -1323,8 +1329,6 @@ def test_a_number_grouped_by_any_separator_is_cut(separator: str) -> None:
         "Gesamt 123.456.789,00",
         "Total 1'234'567.89",
         "Total 1\u2019234\u2019567.89",
-        "Dated 11/09/2026",
-        "Dated 09.11.2026",
         "At 12:30:45",
         "Ref 123.45",
     ],
@@ -1360,12 +1364,9 @@ def test_mixed_separators_are_cut_whole() -> None:
 def test_a_number_in_thousands_groups_beyond_an_amount_is_cut(number: str) -> None:
     masked, runs = mask_digits(f"Ref {number} ok")
     assert masked is not None
-    whole = number.rsplit(".", 1)[0] if number.endswith(".00") else number
-    whole = whole.rsplit(",", 1)[0] if whole.endswith(",45") else whole
+    # The run takes a decimal part too: only its last four digits remain.
     kept = "".join(ch for ch in masked if ch.isdigit())
-    tail = number[len(whole) :]
-    expected = "".join(ch for ch in whole if ch.isdigit())[-4:]
-    assert kept == expected + "".join(ch for ch in tail if ch.isdigit())
+    assert kept == "".join(ch for ch in number if ch.isdigit())[-4:]
     assert runs >= 1
 
 
@@ -1375,8 +1376,66 @@ def test_a_number_in_thousands_groups_beyond_an_amount_is_cut(number: str) -> No
         "Total 12,345,678.90",
         "Total 123,456,789,012.50",
         "Total 123,456,789",
-        "Paid 1,234.56 on 01/02/2026",
+        "Paid 1,234.56 at 12:30",
+        "Total 123456.78",
     ],
 )
 def test_amounts_that_occur_are_still_left_alone(text: str) -> None:
+    assert mask_digits(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    "number",
+    [
+        "41.11.11.11.11.11.11.12",
+        "41,11,11,11,11,11,11,12",
+        "41/11/11/11/11/11/11/12",
+        "4111.1111.1111.12",
+        "4111/1111/1111/1",
+    ],
+)
+def test_a_number_in_pairs_or_with_a_short_tail_is_cut_whole(number: str) -> None:
+    masked, runs = mask_digits(f"Card {number} ok")
+    digits = "".join(ch for ch in number if ch.isdigit())
+    assert masked == f"Card {digits[-4:]} ok"
+    assert runs >= 1
+
+
+def test_a_dashed_date_is_cut_by_design() -> None:
+    # Intended: an eight-digit date in a description is cut like any run;
+    # the line's posted_date carries the date.
+    assert mask_digits("Paid 2026-11-09") == ("Paid 1109", 1)
+    assert mask_digits("Paid 11/09/2026 at 12:30") == ("Paid 2026 at 12:30", 1)
+
+
+@pytest.mark.parametrize(
+    "number",
+    [
+        "4111....1111....1111....1234",  # more than three marks
+        "4111 . . 1111 . . 1111 . . 1234",  # spaces between marks
+        "411,111 111,111 1234",  # exempt-looking groups joined by spaces
+        "123.45.6789",
+        "123/45/6789",
+        "41.11.11.11.11.11.12.34",
+        "123,456,789.12.34",
+        "4111.11.11.1111.1234",
+    ],
+)
+def test_the_blind_reviews_shapes_are_cut_whole(number: str) -> None:
+    masked, runs = mask_digits(f"Ref {number} ok")
+    digits = "".join(ch for ch in number if ch.isdigit())
+    assert masked == f"Ref {digits[-4:]} ok"
+    assert runs >= 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Paid 5,678.90 1,234.56",
+        "CHECK 1234 5,678.90",
+        "Total 123456.78",
+        "Total 1234567.89",
+    ],
+)
+def test_amounts_side_by_side_and_plain_decimals_stay(text: str) -> None:
     assert mask_digits(text) == (text, 0)

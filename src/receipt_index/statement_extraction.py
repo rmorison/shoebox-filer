@@ -43,7 +43,6 @@ from pydantic import (
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.messages import ModelResponse
-from pydantic_ai.models import infer_model
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.usage import UsageLimits
 
@@ -497,7 +496,18 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         count += 1
         return digits[-4:]
 
-    # Both cuts, until neither changes anything: a number grouped by mixed
+    def spaced(match: re.Match[str]) -> str:
+        nonlocal count
+        run = match.group()
+        digits = _NON_DIGIT.sub("", run)
+        if len(digits) < _MIN_MASKED_DIGITS or any(
+            _ENDS_IN_CENTS.search(token) for token in run.split()
+        ):
+            return run
+        count += 1
+        return digits[-4:]
+
+    # Every cut, until none changes anything: a number grouped by mixed
     # separators ("4111 1111.1111 1234") leaves a part one cut joins only
     # after the other has run.
     masked = _fold_separators(text)
@@ -505,25 +515,46 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         before = masked
         masked = _masked_run().sub(last_four, masked)
         masked = _GROUPED_RUN.sub(grouped, masked)
+        masked = _SPACED_RUN.sub(spaced, masked)
         if masked == before:
             break
     return masked, count
 
 
-# The second cut: digit groups (of three or more after the first) joined by any other
-# separator (". , / _ ' : # + | ~ ( \" and the rest of punctuation and
-# symbols, with a space either side), totalling eight or more digits. An
-# amount or count grouped in thousands ("123,456,789", "1.234.567",
-# "1'234'567") is left alone, and a date's groups are too short to join, so
-# "4111.1111.1111.1234" is cut and "1,234,567.89" or "11/09/2026" isn't.
+# The second cut: digit groups joined by any other separator (". , / _ ' :
+# # + | ~ ( \" and the rest of punctuation and symbols, with a space either
+# side), totalling eight or more digits. After the first group, a group has
+# two digits or more, and a last group may have one, so a number in pairs
+# ("41.11.11.11.11.11.11.12") or with a short tail ("4111.1111.1111.12") is
+# cut whole. An amount that can occur is left alone (see _is_amount); dotted
+# and slashed eight-digit dates are cut, as dashed ones are.
 _MIN_MASKED_DIGITS: Final = 8
 _MAX_MASK_PASSES: Final = 8
+# One or more marks, with any spaces around and between them.
+_MARK = r"(?:[^\w\s]|_)"
+_SEPARATOR = rf"\s*(?:{_MARK}\s*)+"
 _GROUPED_RUN = re.compile(
-    r"(?<![0-9])[0-9]+(?:\s?(?:[^\w\s]|_){1,3}\s?[0-9]{3,})+(?![0-9])"
+    rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]{{2,}})+(?:{_SEPARATOR}[0-9])?(?![0-9])"
 )
-_THOUSANDS = re.compile(r"[0-9]{1,3}(?:([,.'\u2019])[0-9]{3})(?:\1[0-9]{3})*")
-# A decimal part right after a thousands-grouped run: ".89" after commas,
-# ",89" after dots or apostrophes.
+# The third cut: digit groups (each possibly with marks inside) joined only
+# by spaces, totalling eight or more digits with no decimal part anywhere:
+# "411,111 111,111 1234". With a decimal part they are amounts side by side
+# ("5,678.90 1,234.56", "CHECK 1234 5,678.90") and stay.
+_SPACED_RUN = re.compile(
+    rf"(?<![0-9])[0-9]+(?:{_MARK}+[0-9]+)*(?: +[0-9]+(?:{_MARK}+[0-9]+)*)+(?![0-9])"
+)
+_ENDS_IN_CENTS = re.compile(r"[.,][0-9]{2}$")
+
+
+# An amount's shape: thousands groups and an optional decimal part with the
+# other separator ("1,234,567.89", "1.234.567,89", "1'234'567.89"), or
+# plain digits with a decimal part ("123456.78").
+_THOUSANDS = re.compile(
+    r"(?P<whole>[0-9]{1,3}(?:(?P<group>[,.'\u2019])[0-9]{3})(?:(?P=group)[0-9]{3})*)"
+    r"(?:(?P<point>[.,])(?P<cents>[0-9]{2}))?"
+)
+_PLAIN = re.compile(r"(?P<whole>[0-9]{1,12})[.,](?P<cents>[0-9]{2})")
+# A decimal part right after a thousands-grouped run.
 _DECIMALS = re.compile(r"[.,][0-9]{2}(?![0-9])")
 # Amounts that occur: up to nine digits bare, up to twelve with decimals.
 # Thirteen or more digits are cut whatever their grouping.
@@ -532,19 +563,28 @@ _MAX_AMOUNT_DIGITS: Final = 12
 
 
 def _is_amount(match: re.Match[str], digits: int) -> bool:
-    """Whether a grouped run is a thousands-grouped amount, left alone.
+    """Whether a grouped run is an amount that can occur, left alone.
 
-    Only an amount that can occur: at most twelve digits in thousands
-    groups, and over nine only when a decimal part follows (with the other
-    separator). "4,111,111,111,111,234" is a number, not an amount.
+    Thousands groups with at most twelve whole digits and a decimal part (in
+    the run or right after it, with the other separator), or at most nine
+    whole digits bare; or plain digits, at most twelve, with a decimal
+    part. "4,111,111,111,111,234" is a number, not an amount.
     """
-    shape = _THOUSANDS.fullmatch(match.group())
-    if shape is None or digits > _MAX_AMOUNT_DIGITS:
-        return False
-    decimals = _DECIMALS.match(match.string, match.end())
-    if decimals is not None and decimals.group()[0] != shape.group(1):
+    run = match.group()
+    if _PLAIN.fullmatch(run):
         return True
-    return digits <= _MAX_BARE_AMOUNT_DIGITS
+    shape = _THOUSANDS.fullmatch(run)
+    if shape is None:
+        return False
+    whole = len(_NON_DIGIT.sub("", shape.group("whole")))
+    if whole > _MAX_AMOUNT_DIGITS:
+        return False
+    if shape.group("cents") is not None:
+        return shape.group("point") != shape.group("group")
+    after = _DECIMALS.match(match.string, match.end())
+    if after is not None and after.group()[0] != shape.group("group"):
+        return True
+    return whole <= _MAX_BARE_AMOUNT_DIGITS
 
 
 class PeriodIssue(enum.Enum):
@@ -941,14 +981,51 @@ def _untraced(agent: _AgentT) -> _AgentT:
     return agent
 
 
+def _untraced_model(model: Model) -> Model:
+    """``model``, if nothing it sends can be traced; refused otherwise.
+
+    A statement agent takes a model object, never a name: a name would
+    build a client with the SDK's defaults, whose own OpenTelemetry tracing
+    exports spans holding the page text. An Anthropic model must come from
+    ``llm.anthropic_model`` (its client resolves traces and propagation
+    off); pydantic-ai's test models send nothing; any other model is
+    refused, since its SDK's tracing hasn't been checked.
+    """
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.models.test import TestModel
+
+    if isinstance(model, str):
+        msg = "a statement agent needs a model from llm.anthropic_model, not a name"
+        raise TypeError(msg)
+    if isinstance(model, FunctionModel | TestModel):
+        return model
+    if isinstance(model, AnthropicModel):
+        resolved = getattr(model.client, "_open_telemetry", None) or {}
+        traces = resolved.get("traces")
+        if (
+            isinstance(traces, dict)
+            and traces.get("enabled") is False
+            and resolved.get("propagation") is False
+        ):
+            return model
+        msg = (
+            "a statement agent's Anthropic client must have tracing off: "
+            "build the model with llm.anthropic_model"
+        )
+        raise ValueError(msg)
+    msg = "a statement agent needs an Anthropic model from llm.anthropic_model"
+    raise TypeError(msg)
+
+
 def create_first_pass_agent(
-    model: Model | str, settings: ModelSettings | None = None
+    model: Model, settings: ModelSettings | None = None
 ) -> Agent[None, FirstPass]:
     """The first-pass agent, with its output ceiling."""
     quiet_payload_loggers()
     return _untraced(
         Agent(
-            _StopAtCeiling(infer_model(model)),
+            _StopAtCeiling(_untraced_model(model)),
             output_type=FirstPass,
             system_prompt=FIRST_PASS_PROMPT,
             model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
@@ -960,12 +1037,12 @@ def create_first_pass_agent(
 
 def create_account_agent(
     account_type: AccountType,
-    model: Model | str,
+    model: Model,
     settings: ModelSettings | None = None,
 ) -> Agent[None, AccountExtraction] | Agent[None, LoanExtraction]:
     """The agent for one account call of ``account_type``."""
     quiet_payload_loggers()
-    wrapped = _StopAtCeiling(infer_model(model))
+    wrapped = _StopAtCeiling(_untraced_model(model))
     model_settings = _with_ceiling(
         settings, ACCOUNT_OUTPUT_TOKENS, ACCOUNT_REQUEST_TIMEOUT_SECONDS
     )
