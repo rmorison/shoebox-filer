@@ -96,13 +96,65 @@ def test_a_signed_two_place_amount_is_accepted(amount: str) -> None:
     assert StatementLine.model_validate({**_LINE, "amount": amount}).amount == amount
 
 
-def test_totals_and_a_loans_breakdown_are_unsigned() -> None:
+@pytest.mark.parametrize("printed", ["-12.50", "(12.50)", " -12.50 "])
+def test_a_total_printed_as_a_credit_is_kept_as_its_magnitude(printed: str) -> None:
+    account = AccountExtraction.model_validate(
+        {
+            **_ACCOUNT,
+            "section_totals": [{"section": "payments", "amount": printed}],
+            "column_totals": [{"credits": printed, "debits": printed}],
+        }
+    )
+    assert account.section_totals[0].amount == "12.50"
+    assert account.column_totals[0].credits == "12.50"
+    assert account.column_totals[0].debits == "12.50"
+
+
+@pytest.mark.parametrize(
+    "field", ["principal_paid", "interest", "escrow", "fees", "advances"]
+)
+@pytest.mark.parametrize("printed", ["-25.00", "(25.00)"])
+def test_a_loan_breakdown_printed_as_a_credit_comes_back_null(
+    field: str, printed: str
+) -> None:
+    loan = LoanExtraction.model_validate(
+        {field: printed, "principal_before": "-3.00", "principal_after": "100.00"}
+    )
+    assert getattr(loan, field) is None
+    assert loan.principal_before == "-3.00"
+
+
+@pytest.mark.parametrize(
+    "printed", ["+1.00", "-1.0", "(1.00", "1.00-", "--1.00", "abc"]
+)
+def test_totals_and_a_loans_breakdown_still_refuse_what_isnt_an_amount(
+    printed: str,
+) -> None:
     with pytest.raises(ValidationError):
         AccountExtraction.model_validate(
-            {**_ACCOUNT, "section_totals": [{"section": "x", "amount": "-1.00"}]}
+            {**_ACCOUNT, "section_totals": [{"section": "x", "amount": printed}]}
         )
     with pytest.raises(ValidationError):
-        LoanExtraction.model_validate({"interest": "-5.00"})
+        LoanExtraction.model_validate({"fees": printed})
+
+
+def test_a_description_has_a_length_limit() -> None:
+    StatementLine.model_validate({**_LINE, "description": "x" * 1000})
+    with pytest.raises(ValidationError):
+        StatementLine.model_validate({**_LINE, "description": "x" * 1001})
+
+
+def test_the_first_pass_leaves_its_accounts_to_the_gates() -> None:
+    # A rejected type with accounts, and a statement type with none, both
+    # validate: U4 ignores the first and holds the second as no_accounts.
+    listed = {"label": "x", "account_type": "loan", "first_page": 1, "last_page": 1}
+    rejected = FirstPass.model_validate(
+        {"document_type": "not_statement", "accounts": [listed]}
+    )
+    assert rejected.accounts
+    assert not FirstPass.model_validate({"document_type": "deposit"}).accounts
+    mixed = FirstPass.model_validate({"document_type": "deposit", "accounts": [listed]})
+    assert mixed.accounts[0].account_type == "loan"
 
 
 @pytest.mark.parametrize("last4", ["12345", "123", "12a4", "1234 "])
@@ -190,6 +242,37 @@ def test_a_section_heading_is_normalised(
     heading: str | None, section: str | None
 ) -> None:
     assert normalise_section(heading) == section
+
+
+@pytest.mark.parametrize(
+    ("line", "total"),
+    [
+        ("With\u200bdrawals:", "Withdrawals\uff1a"),
+        ("Withdrawals\u00ad", "Withdrawals \ufe55"),
+        ("\u202eWithdrawals\u202c", "withdrawals\ufe0f"),
+        ("Fees\r\nCharged", "fees charged\u2060:"),
+    ],
+)
+def test_a_heading_agrees_on_a_line_and_in_a_total_across_hidden_characters(
+    line: str, total: str
+) -> None:
+    account = AccountExtraction.model_validate(
+        {
+            **_ACCOUNT,
+            "lines": [{**_LINE, "section": line}],
+            "section_totals": [{"section": total, "amount": "10.00"}],
+        }
+    )
+    on_line = normalise_section(account.lines[0].section)
+    assert on_line == normalise_section(account.section_totals[0].section)
+    assert on_line is not None
+    assert on_line.isascii()
+
+
+def test_an_institution_loses_hidden_characters() -> None:
+    assert normalise_institution("Synthetic\u200b Savings\u00a0Bank\u200e") == (
+        "Synthetic Savings Bank"
+    )
 
 
 def test_a_heading_on_a_line_and_in_a_total_normalise_alike() -> None:
@@ -386,10 +469,13 @@ def test_the_first_pass_reads_the_page_marked_text() -> None:
             },
         }
     )
-    first, usage = se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+    run = se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+    assert not run.capped
+    first = run.output
+    assert first is not None
     assert first.document_type == "deposit"
     assert first.accounts[0].label == "Checking ending 1234"
-    assert usage == se.CallUsage(input_tokens=1000, output_tokens=200, requests=1)
+    assert run.usage == se.CallUsage(input_tokens=1000, output_tokens=200, requests=1)
     sent = calls[0][-1].parts[-1].content
     assert page_marked_text(list(_PAGES)) in sent
 
@@ -437,6 +523,50 @@ def test_a_response_with_no_output_at_the_ceiling_is_capped() -> None:
     run = se.run_account(
         se.create_account_agent("deposit", FunctionModel(reply)), _PAGES, _LISTED, None
     )
+    assert run.capped
+
+
+def test_a_first_pass_cut_off_at_the_ceiling_is_capped_and_not_retried() -> None:
+    truncated = '{"document_type": "deposit", "accounts": [{"label": "Che'
+    model, calls = _reply(truncated, finish_reason="length")
+    run = se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+    assert run.capped
+    assert run.output is None
+    assert len(calls) == 1
+    assert run.usage == se.CallUsage(input_tokens=1000, output_tokens=200, requests=1)
+
+
+def _context_window_stop() -> Any:
+    def reply(_: list[ModelMessage], __: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[],
+            finish_reason="length",
+            provider_details={"finish_reason": "model_context_window_exceeded"},
+            usage=RequestUsage(input_tokens=1000, output_tokens=200),
+        )
+
+    return FunctionModel(reply)
+
+
+def test_a_context_window_stop_is_an_error_not_a_cap() -> None:
+    model = _context_window_stop()
+    with pytest.raises(se.ContextWindowExceededError) as raised:
+        se.run_account(se.create_account_agent("deposit", model), _PAGES, _LISTED, None)
+    assert se.call_usage(raised.value) == se.CallUsage(
+        input_tokens=1000, output_tokens=200, requests=1
+    )
+    with pytest.raises(se.ContextWindowExceededError) as raised:
+        se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+    assert se.call_usage(raised.value) == se.CallUsage(
+        input_tokens=1000, output_tokens=200, requests=1
+    )
+
+
+def test_a_ceiling_stop_with_the_providers_reason_is_still_a_cap() -> None:
+    model, _ = _reply(
+        "{", finish_reason="length", provider_details={"finish_reason": "max_tokens"}
+    )
+    run = se.run_account(se.create_account_agent("card", model), _PAGES, _LISTED, None)
     assert run.capped
 
 

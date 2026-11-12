@@ -13,9 +13,11 @@ them the same way: the money format, section and institution normalisation,
 the digit mask, and placing a printed date in its year. The gates (U4) and
 the pipeline (U5) build on them.
 
-An account call that stops at its output ceiling is not retried, since a
-retry would stop in the same place: :func:`run_account` reports it as
-capped, and the gates hold the account as ``too_many_lines``.
+A call that stops at its output ceiling is not retried, since a retry would
+stop in the same place: :func:`run_account` reports it as capped, and the
+gates hold the account as ``too_many_lines``; :func:`run_first_pass` reports
+it too, and the statement is rejected as ``over_bounds``, ``accounts``. A
+stop at the context window is neither: it is an item error.
 """
 
 from __future__ import annotations
@@ -28,7 +30,14 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import infer_model
@@ -94,6 +103,45 @@ UnsignedMoney = Annotated[str, StringConstraints(pattern=r"^[0-9]{1,12}\.[0-9]{2
 Last4 = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}$")]
 Currency = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
 ShortText = Annotated[str, StringConstraints(max_length=200)]
+# A line's description, wrapped lines joined: long enough for any printed
+# line, short enough that a runaway output fails the call.
+Description = Annotated[str, StringConstraints(max_length=1000)]
+
+# A printed amount the model gave as a credit: a minus sign or parentheses.
+_CREDIT = re.compile(
+    r"^\s*(?:-([0-9]{1,12}\.[0-9]{2})|\(([0-9]{1,12}\.[0-9]{2})\))\s*$"
+)
+
+
+def _magnitude(value: object) -> object:
+    """A total printed as a credit, as its magnitude.
+
+    Totals are printed magnitudes (the gates compare magnitudes), but a card
+    statement often prints its payments total with a minus sign or in
+    parentheses. Taking the magnitude keeps a valid statement from failing
+    as an item error.
+    """
+    if isinstance(value, str) and (match := _CREDIT.match(value)):
+        return match.group(1) or match.group(2)
+    return value
+
+
+def _credit_to_null(value: object) -> object:
+    """A loan breakdown figure printed as a credit, as null.
+
+    Contract v1 carries a loan's breakdown as unsigned amounts, and a
+    refund's magnitude would read as a charge. So a fee refund or an escrow
+    reversal comes back null, as if not printed; the ledger's own check of
+    ``principal_after`` against its balance is the backstop. A signed
+    breakdown would be a contract change.
+    """
+    if isinstance(value, str) and _CREDIT.match(value):
+        return None
+    return value
+
+
+TotalMoney = Annotated[UnsignedMoney, BeforeValidator(_magnitude)]
+BreakdownMoney = Annotated[UnsignedMoney | None, BeforeValidator(_credit_to_null)]
 # A statement is read only up to the page cap, so no page is beyond it.
 Page = Annotated[int, Field(ge=1, le=STATEMENT_BOUNDS.max_read_pages)]
 
@@ -141,7 +189,15 @@ class ListedAccount(_Output):
 
 
 class FirstPass(_Output):
-    """The document's type, its accounts, and what it prints about both."""
+    """The document's type, its accounts, and what it prints about both.
+
+    Nothing here ties ``accounts`` to ``document_type``; the gates (U4) own
+    that. A rejected type's accounts are ignored. A statement type with no
+    accounts is the ``no_accounts`` hold, not a schema error, so it is
+    recorded rather than retried. An account's type may differ from the
+    document's (a deposit statement can carry a card or a loan); each
+    account's own type picks its call.
+    """
 
     document_type: FirstPassDocumentType
     accounts: list[ListedAccount] = Field(default_factory=list, max_length=50)
@@ -151,13 +207,13 @@ class FirstPass(_Output):
 
 class SectionTotal(_Output):
     section: ShortText
-    amount: UnsignedMoney
+    amount: TotalMoney
 
 
 class ColumnTotal(_Output):
     section: ShortText | None = None
-    credits: UnsignedMoney | None = None
-    debits: UnsignedMoney | None = None
+    credits: TotalMoney | None = None
+    debits: TotalMoney | None = None
 
 
 class StatementLine(_Output):
@@ -165,7 +221,7 @@ class StatementLine(_Output):
 
     posted: DateParts
     transacted: DateParts | None = None
-    description: str
+    description: Description
     amount: SignedMoney
     running_balance: SignedMoney | None = None
     section: ShortText | None = None
@@ -196,11 +252,11 @@ class LoanExtraction(_Output):
     period: PrintedPeriod | None = None
     principal_before: SignedMoney | None = None
     principal_after: SignedMoney | None = None
-    principal_paid: UnsignedMoney | None = None
-    interest: UnsignedMoney | None = None
-    escrow: UnsignedMoney | None = None
-    fees: UnsignedMoney | None = None
-    advances: UnsignedMoney | None = None
+    principal_paid: BreakdownMoney = None
+    interest: BreakdownMoney = None
+    escrow: BreakdownMoney = None
+    fees: BreakdownMoney = None
+    advances: BreakdownMoney = None
 
 
 # ---------------------------------------------------------------------------
@@ -225,24 +281,31 @@ def format_money(value: str) -> str:
 _WHITESPACE = re.compile(r"\s+")
 
 
+# A colon ending a heading: ASCII, full-width, or the small form.
+_COLONS = ":\uff1a\ufe55"
+
+
 def normalise_section(heading: str | None) -> str | None:
     """A section heading, as lines and totals both carry it.
 
-    Trimmed, inner whitespace collapsed, a trailing colon dropped, lower
-    case; None when nothing is left. The same printed heading always gives
-    the same value, on a line or in a total.
+    Normalised as the statement's text was (so a hidden character can't make
+    two headings differ), then trimmed, inner whitespace collapsed, a
+    trailing colon (ASCII or full-width) dropped, lower case; None when
+    nothing is left. The same printed heading always gives the same value,
+    on a line or in a total.
     """
     if heading is None:
         return None
-    text = _WHITESPACE.sub(" ", heading).strip().rstrip(":").strip().lower()
+    text = _WHITESPACE.sub(" ", normalise_statement_text(heading))
+    text = text.strip().rstrip(_COLONS).strip().lower()
     return text or None
 
 
 def normalise_institution(name: str | None) -> str | None:
-    """An institution as printed: trimmed, inner whitespace collapsed."""
+    """An institution as printed: normalised, trimmed, inner whitespace collapsed."""
     if name is None:
         return None
-    text = _WHITESPACE.sub(" ", name).strip()
+    text = _WHITESPACE.sub(" ", normalise_statement_text(name)).strip()
     return text or None
 
 
@@ -492,7 +555,9 @@ out.
 principal_before and principal_after: the principal balance printed before \
 and after this statement's activity, as money owed (positive); a credit \
 balance is negative. principal_paid, interest, escrow, fees and advances: \
-the amounts the statement prints for this period, as unsigned amounts."""
+the amounts the statement prints for this period, as unsigned amounts. A \
+breakdown figure printed as a credit (a refund or reversal, with a minus sign \
+or in parentheses) is given as null."""
 
 
 def account_prompt(account_type: AccountType) -> str:
@@ -576,24 +641,35 @@ def _with_ceiling(
     return merged
 
 
-def create_first_pass_agent(
-    model: Model | str, settings: ModelSettings | None = None
-) -> Agent[None, FirstPass]:
-    """The first-pass agent, with its output ceiling."""
-    return Agent(
-        model,
-        output_type=FirstPass,
-        system_prompt=FIRST_PASS_PROMPT,
-        model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
-    )
-
-
 class OutputCeilingReachedError(Exception):
-    """The model stopped at the output ceiling; the response is incomplete."""
+    """The model stopped at the output ceiling; the response is incomplete.
+
+    ``response`` holds the model's cut-off output, which can carry
+    statement text: never log it.
+    """
 
     def __init__(self, response: ModelResponse) -> None:
         super().__init__("the model stopped at its output token ceiling")
         self.response = response
+
+
+class ContextWindowExceededError(Exception):
+    """The model stopped because input and output filled its context window.
+
+    pydantic-ai reports this stop as ``length``, like the output ceiling,
+    but it isn't a long account, so it is never read as ``too_many_lines``
+    or a capped first pass. U1's token cap keeps every input far inside the
+    window, so this means a bug or a changed model; it propagates as an
+    item error. ``response`` is never logged.
+    """
+
+    def __init__(self, response: ModelResponse) -> None:
+        super().__init__("the model stopped at its context window")
+        self.response = response
+
+
+# The provider's own stop reason, where pydantic-ai keeps it.
+_CONTEXT_WINDOW_STOPS: Final = frozenset({"model_context_window_exceeded"})
 
 
 # pre-commit's mypy runs without pydantic-ai installed, where the base is Any.
@@ -614,8 +690,23 @@ class _StopAtCeiling(WrapperModel):  # type: ignore[misc,unused-ignore]
             messages, model_settings, model_request_parameters
         )
         if response.finish_reason == "length":
+            raw = (response.provider_details or {}).get("finish_reason")
+            if raw in _CONTEXT_WINDOW_STOPS:
+                raise ContextWindowExceededError(response)
             raise OutputCeilingReachedError(response)
         return response
+
+
+def create_first_pass_agent(
+    model: Model | str, settings: ModelSettings | None = None
+) -> Agent[None, FirstPass]:
+    """The first-pass agent, with its output ceiling."""
+    return Agent(
+        _StopAtCeiling(infer_model(model)),
+        output_type=FirstPass,
+        system_prompt=FIRST_PASS_PROMPT,
+        model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
+    )
 
 
 def create_account_agent(
@@ -650,6 +741,21 @@ class CallUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     requests: int = 0
+
+
+@dataclass(frozen=True)
+class FirstPassRun:
+    """The first pass's outcome.
+
+    ``capped`` is true when the response stopped at the output ceiling; then
+    ``output`` is None. A retry would stop in the same place, so U5 records
+    the statement as rejected, ``over_bounds`` with ``accounts``: its
+    account list doesn't fit the first pass.
+    """
+
+    output: FirstPass | None
+    capped: bool
+    usage: CallUsage
 
 
 @dataclass(frozen=True)
@@ -691,21 +797,29 @@ def call_usage(exc: BaseException) -> CallUsage | None:
 
 def run_first_pass(
     agent: Agent[None, FirstPass], page_texts: Sequence[str]
-) -> tuple[FirstPass, CallUsage]:
+) -> FirstPassRun:
     """The first pass over a statement's pages.
 
-    Any model or schema error propagates, unchanged, for the caller to treat
-    as an item error; :func:`call_usage` reads the tokens it had used.
+    A stop at the output ceiling is reported as capped, not retried. Any
+    other model or schema error propagates, unchanged, for the caller to
+    treat as an item error; :func:`call_usage` reads the tokens it had used.
     """
     with capture_run_messages() as messages:
         try:
             result = agent.run_sync(
                 first_pass_request(page_texts), usage_limits=_LIMITS
             )
+        except OutputCeilingReachedError as exc:
+            # The cut-off response isn't in the run's messages; count it too.
+            usage = _usage([*messages, exc.response])
+            return FirstPassRun(output=None, capped=True, usage=usage)
+        except ContextWindowExceededError as exc:
+            _attach_usage(exc, _usage([*messages, exc.response]))
+            raise
         except Exception as exc:
             _attach_usage(exc, _usage(messages))
             raise
-    return result.output, _usage(messages)
+    return FirstPassRun(output=result.output, capped=False, usage=_usage(messages))
 
 
 def run_account(
@@ -726,6 +840,9 @@ def run_account(
             # The cut-off response isn't in the run's messages; count it too.
             usage = _usage([*messages, exc.response])
             return AccountRun(output=None, capped=True, usage=usage)
+        except ContextWindowExceededError as exc:
+            _attach_usage(exc, _usage([*messages, exc.response]))
+            raise
         except Exception as exc:
             _attach_usage(exc, _usage(messages))
             raise
