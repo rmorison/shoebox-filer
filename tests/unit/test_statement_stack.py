@@ -196,3 +196,57 @@ def test_every_agent_clamps_the_payload_loggers(build: str) -> None:
     finally:
         for name, level in saved.items():
             logging.getLogger(name).setLevel(level)
+
+
+def test_statement_calls_export_no_spans_even_when_tracing_is_on(
+    stub_api: StubAnthropic,
+) -> None:
+    # A span holds the request (statement text) and the response (model
+    # output); one global instrument_all() anywhere would export them.
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic_ai import Agent
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+    from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        # The control: an ordinary agent is traced, so the exporter works.
+        def reply(_: Any, __: AgentInfo) -> Any:
+            from pydantic_ai.messages import ModelResponse, TextPart
+
+            return ModelResponse(parts=[TextPart("ok")])
+
+        Agent(FunctionModel(reply)).run_sync("hello")
+        assert exporter.get_finished_spans()
+        exporter.clear()
+
+        stub_api.tool_input = _FIRST_PASS
+        se.run_first_pass(_first_pass_agent(), _PAGES)
+        stub_api.tool_input = _ACCOUNT
+        se.run_account(_account_agent(), _PAGES, _LISTED, None)
+        loan = se.ListedAccount(
+            label="Loan", account_type="loan", first_page=1, last_page=1
+        )
+        stub_api.tool_input = {"interest": "1.00"}
+        llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+        se.run_account(
+            se.create_account_agent("loan", llm, settings), _PAGES, loan, None
+        )
+        assert exporter.get_finished_spans() == ()
+    finally:
+        Agent.instrument_all(False)
+
+
+def test_the_pydantic_ai_banner_is_off() -> None:
+    import pydantic_ai
+
+    import receipt_index.llm  # noqa: F401 -- importing it turns the banner off
+
+    assert pydantic_ai.BANNER_ENABLED is False

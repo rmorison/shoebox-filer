@@ -30,7 +30,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -865,18 +865,36 @@ class _StopAtCeiling(WrapperModel):  # type: ignore[misc,unused-ignore]
         return response
 
 
+_AgentT = TypeVar("_AgentT", bound=Agent[Any, Any])
+
+
+def _untraced(agent: _AgentT) -> _AgentT:
+    """``agent`` with tracing off, whatever turns it on globally.
+
+    A span carries the request (the statement's text) and the response (the
+    model's output), and one ``Agent.instrument_all()`` or
+    ``logfire.instrument_pydantic_ai()`` anywhere in the process would
+    export them. The agent's own setting outranks the global one, and there
+    is no constructor argument for it.
+    """
+    agent.instrument = False
+    return agent
+
+
 def create_first_pass_agent(
     model: Model | str, settings: ModelSettings | None = None
 ) -> Agent[None, FirstPass]:
     """The first-pass agent, with its output ceiling."""
     quiet_payload_loggers()
-    return Agent(
-        _StopAtCeiling(infer_model(model)),
-        output_type=FirstPass,
-        system_prompt=FIRST_PASS_PROMPT,
-        model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
-        # A refusal ends the run as a ContentFilterError: kind "refused".
-        capabilities=[RaiseContentFilterError()],
+    return _untraced(
+        Agent(
+            _StopAtCeiling(infer_model(model)),
+            output_type=FirstPass,
+            system_prompt=FIRST_PASS_PROMPT,
+            model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
+            # A refusal ends the run as a ContentFilterError: kind "refused".
+            capabilities=[RaiseContentFilterError()],
+        )
     )
 
 
@@ -892,19 +910,23 @@ def create_account_agent(
         settings, ACCOUNT_OUTPUT_TOKENS, ACCOUNT_REQUEST_TIMEOUT_SECONDS
     )
     if account_type == "loan":
-        return Agent(
+        return _untraced(
+            Agent(
+                wrapped,
+                output_type=LoanExtraction,
+                system_prompt=account_prompt(account_type),
+                model_settings=model_settings,
+                capabilities=[RaiseContentFilterError()],
+            )
+        )
+    return _untraced(
+        Agent(
             wrapped,
-            output_type=LoanExtraction,
+            output_type=AccountExtraction,
             system_prompt=account_prompt(account_type),
             model_settings=model_settings,
             capabilities=[RaiseContentFilterError()],
         )
-    return Agent(
-        wrapped,
-        output_type=AccountExtraction,
-        system_prompt=account_prompt(account_type),
-        model_settings=model_settings,
-        capabilities=[RaiseContentFilterError()],
     )
 
 
