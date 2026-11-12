@@ -1346,3 +1346,53 @@ def test_a_difference_beyond_the_columns_range_is_stored_as_unknown() -> None:
     edge = _balance([_line(5, "-0.01")], beginning="999999999999.99", ending="0.00")
     held = _gate(("deposit", edge), ("deposit", _clean())).accounts[0]
     assert held.difference == "-999999999999.98"
+
+
+# ---------------------------------------------------------------------------
+# Edges the blind review's mutants survived
+# ---------------------------------------------------------------------------
+
+
+def test_with_both_balances_missing_the_beginning_is_named_first() -> None:
+    run = _balance([_line(5, "-10.00")], beginning=None, ending=None)
+    account = _gate(("deposit", run), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "no_beginning_balance"
+
+
+def test_a_blank_headed_total_of_zero_still_holds_the_account() -> None:
+    # Its sum would match (no lines, 0.00), but it can't be matched to lines.
+    run = _balance(
+        [_line(5, "-10.00", "90.00")],
+        ending="90.00",
+        section_totals=[{"section": ":", "amount": "0.00"}],
+    )
+    account = _gate(("deposit", run), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "totals_mismatch"
+
+
+def test_a_printed_count_below_the_listed_accounts_holds_every_account() -> None:
+    statement = _gate(("deposit", _clean()), ("deposit", _clean()), printed=1)
+    assert (statement.status, statement.hold_reason) == (
+        "held",
+        "account_count_mismatch",
+    )
+
+
+def test_occurrence_counts_each_last4_on_its_own() -> None:
+    def card(last4: str) -> AccountRun:
+        lines = [_line(5, "-10.00", "90.00"), _line(9, "25.00", "115.00")]
+        return _balance(lines, ending="115.00", last4=last4)
+
+    statement = _gate(
+        ("card", card("1234")),
+        ("card", card("5678")),
+        ("card", card("1234")),
+        document_type="card",
+    )
+    assert [a.occurrence for a in statement.accounts] == [1, 1, 2]
+
+
+def test_a_loan_whose_only_printed_figure_is_zero_is_figures_only() -> None:
+    statement = _gate(("loan", _loan(fees="0.00")), document_type="loan_statement")
+    assert statement.accounts[0].status == "figures_only"
+    assert statement.status == "complete"

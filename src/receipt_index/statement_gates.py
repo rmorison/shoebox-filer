@@ -199,9 +199,9 @@ class _Masker:
         return masked
 
     def section(self, heading: str | None) -> str | None:
-        # Normalised before the mask, so the mask sees the folded text, and
-        # after it, since a cut run can leave a trailing colon or a space.
-        return normalise_section(self.text(normalise_section(heading)))
+        # Normalised, then masked: the mask only turns digit runs into their
+        # last four digits, so the result needs no second normalising.
+        return self.text(normalise_section(heading))
 
 
 @dataclass(frozen=True)
