@@ -162,7 +162,7 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 | `printed_account_count` | Accounts the document's own summary lists; null when it prints none |
 | `pages` | Page count |
 | `extractor` | `{model, prompt_version, first_pass_version}`; null fields for a rejection before any model call |
-| `masked_runs` | How many digit runs the mask cut in the text this revision stores: every account's `institution` and section-total headings, and the `description` and `section` of each stored line. A held account's lines are never stored, so their text isn't counted. 0 for a rejection. Not in any digest |
+| `masked_runs` | How many digit runs the mask cut in the text this revision stores: every account's `institution` and section-total and column-total headings, and the `description` and `section` of each stored line. A held account's lines are never stored, so their text isn't counted. 0 for a rejection. Not in any digest |
 | `accounts` | Below, in document order |
 
 **Statement status.** Exactly one applies, tested in this order:
@@ -448,7 +448,8 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 - per account, the first failure class that applies: `empty_account` (a deposit or card account with no lines that isn't dormant; a loan with no printed figure at all), `no_beginning_balance`, `no_ending_balance`, `too_many_lines`, `undated`, `does_not_foot` (to the cent, with the difference), `date_out_of_period` (the account's period, with the card grace; skipped when the account has no period), `balance_chain_break` (walked in date order, carrying amounts across lines with no printed balance), `totals_mismatch` (magnitudes);
 - dormant account: no lines and equal printed balances is clean;
 - statement: `rejected`, else the hold reasons in order (`no_accounts`, `dropped_account`, `account_count_mismatch`, `no_usable_account`), else `incomplete` or `complete`. The first three set `held_by_statement` on every account and keep each account's own class;
-- the canonical form and `content_digest`;
+- the canonical form and `content_digest`. The worked example is pinned in U4's tests (its canonical JSON and digest); U7's contract document copies it;
+- a posted date that doesn't exist (a misread 30 February) fails `date_out_of_period`, with or without a period, so its line can't drop out of a clean account; a yearless date with no period is `undated` first. A transaction date that can't be placed is null, since it isn't gated;
 - the mask on `description`, `section` and `institution` runs before the gates and the digest (see the contract's Masking); masked runs are counted into the revision's `masked_runs`, never logged as text. Masking is not a gate. It covers every free-text field the contract carries: a line's `description` and `section`, the `section` of section totals and column totals, and `institution`. (`ListedAccount.label` is never stored; U3 masks it before it goes into the account request.)
 - a rejected `document_type` gives a rejected statement with no accounts, whatever the first pass listed.
 - section keys: a line's `section` and a total's `section` go through the same normalisation and mask, so the same printed heading gives the same key. `None` is the same key on both sides and means no heading: a line with none counts toward no section total, since a section total's section is never `None`, and a column total with none covers the whole account, as the contract says.
