@@ -1532,6 +1532,9 @@ _MUST_STAY = {
     "Transfer 11/09 Ref 0412 $1,250.00": "Transfer 11/09 Ref 0412 $1,250.00",
     "CARD 4111-1111-1111-1234 $12.50": "CARD 1234 $12.50",
     "PAYMENT 4111 1111 1111 1234 12.50": "PAYMENT 1234 12.50",
+    "TUITION 2025-2026": "TUITION 2025-2026",
+    "SHIP TO 94105-1234": "SHIP TO 94105-1234",
+    "Total 1234567.89": "Total 1234567.89",
 }
 
 
@@ -1569,6 +1572,9 @@ _MUST_CUT = [
     "2026-11-09",
     "20261109",
     "800-555-0100",
+    "1234567890.12",  # a number with a check suffix, not an amount
+    "123456789.12",
+    "10/12/1234",  # no such year: not a date
 ]
 
 
@@ -1586,7 +1592,21 @@ def test_a_number_beside_a_date_is_cut_and_the_date_kept() -> None:
 
 
 @pytest.mark.parametrize(
-    "shape", ["1,", "1,234.", "1 ", "1 . ", "1-", "12/", "1.1 ", "$1.00 ", "4111 "]
+    "shape",
+    [
+        "1,",
+        "1,234.",
+        "1 ",
+        "1 . ",
+        "1-",
+        "12/",
+        "1.1 ",
+        "$1.00 ",
+        "4111 ",
+        # A digit, invisible characters, then a letter: the drop's lookahead.
+        "1" + "\ue000" * 998 + "a",
+        "1" + "\u0301" * 998 + "a",
+    ],
 )
 def test_the_worst_shapes_mask_quickly_at_the_field_cap(shape: str) -> None:
     import time
@@ -1603,3 +1623,19 @@ def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
         1,
     )
     assert mask_digits("Card 4111 1111 1111 1234. Thanks") == ("Card 1234. Thanks", 1)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Accepted over-cuts: keeping them would reopen a must-cut case
+        # (two four-digit groups, "1234-5678", "411,111 111,111 1234").
+        ("FY 2026 2027", "FY 2027"),
+        ("Invoices 1001-1004", "Invoices 1004"),
+        ("Fees 1,200 1,300", "Fees 1300"),
+        # A date-shaped first group stays beside the cut (a known limit).
+        ("Ref 12.11 3456 7890 1234", "Ref 12.11 1234"),
+    ],
+)
+def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
+    assert mask_digits(text)[0] == expected

@@ -235,8 +235,9 @@ A model or schema error makes no revision: the item is retried, and after `retry
 
 <a id="masking"></a>**Masking.** One deterministic function masks `description`, `section` and `institution`, after normalisation and before the gates and the digest. It first applies the statement text's own normalisation to the field (built in U3), since the model's output can carry characters the read already removed from the page text: control, bidirectional, zero-width and other invisible characters are dropped, so none can sit between two digit groups and hide a number. It then folds separators in the whole field: every Unicode whitespace character (a non-breaking space, a tab, a thin space, a line break, and the rest of Python's `str.isspace` set) and every run of them becomes one ASCII space, and every Unicode dash (category `Pd`, and the minus sign U+2212) becomes an ASCII `-`. Nothing else in the text changes, apart from what the mask cuts. It works over ASCII digits only (no Unicode digit classes). It then drops invisible characters (format characters, combining marks, private-use, unassigned code points and lone surrogates, and the letters and symbols that render blank) wherever they sit inside a number, so none can split one. Then it reads each span of digits joined only by spaces and the marks an institution prints inside a number: `-` (any Unicode dash, folded), `.`, `,`, `/`, `'` and `’`, `·`, and `⁄`, any number of them, with spaces around or between. Every other mark ends a span: `$ # % = @ +`, brackets, quotes, `:`, `_` and the rest. A span is split at its spaces into tokens, and two kinds of token are set aside:
 
-- an amount with cents: plain (`123456.78`) or in thousands groups with the other separator for the point (`1,234,567.89`, `1.234.567,89`), at most twelve whole digits;
-- a short date, or a range of two: month and day in either order with `/` or `.`, and an optional two- or four-digit year (`11/09`, `11/09/2026`, `11.09.2026`, `11/09-11/12`, `10/01/26-10/31/26`).
+- an amount with cents: plain with at most seven whole digits (`1234567.89`; a longer one, `123456789.12`, reads as a number with a check suffix and is cut), or in thousands groups with the other separator for the point (`1,234,567.89`, `1.234.567,89`), at most twelve whole digits;
+- a short date, or a range of two: month and day in either order with `/` or `.`, and an optional two-digit year or a four-digit one from 1900 to 2099 (`11/09`, `11/09/2026`, `11.09.2026`, `11/09-11/12`, `10/01/26-10/31/26`; `10/12/1234` isn't a date, and is cut);
+- a range of years (`2025-2026`) and a ZIP+4 code (`94105-1234`).
 
 Each run of the remaining tokens between set-aside ones is cut to its last four digits when it totals 8 or more digits; a lone bare amount in thousands groups of nine digits or fewer (`123,456,789`) stays. So the account number in `CARD 4111-1111-1111-1234 $12.50` becomes `1234` with the amount intact, and `AMZN 11/09 $45.99`, `STORE #0412 11/09`, `HOTEL 11/09-11/12` and `2 x $12.50 = $25.00` are left exactly as printed. A test holds a table of ordinary description shapes that must stay, beside a table of numbers that must be cut.
 
@@ -244,7 +245,7 @@ What the mask is: a pattern guard for the ways institutions print account and ca
 - a number grouped by a mark institutions don't print inside numbers (`_ : # + | ~ ( ) " * ; = \`, a star, a bullet) passes, since those marks end a span;
 - amounts with cents side by side are never joined, so a number written as amounts (`41,11 11,11 11,11 11,11`) passes;
 - a number written as a short date or a date range passes;
-- a number one digit per group (`1,2,3,4,…`), spaced digits mixed with marks (`4 1 1 1.1 1 1 1.1 2 3 4`), and any 13- or 14-digit number written as a twelve-digit amount with cents (`411,111,111,111.11`, or padded, `004,111,111,111.11`) pass.
+- a number one digit per group (`1,2,3,4,…`), spaced digits mixed with marks (`4 1 1 1.1 1 1 1.1 2 3 4`), any 13- or 14-digit number written in thousands groups as a twelve-digit amount with cents (`411,111,111,111.11`, or padded, `004,111,111,111.11`); a date-shaped first group beside a cut number stays (`12.11 3456 7890 1234` becomes `12.11 1234`); and a number written as a year range or a ZIP+4 pass.
 
 Given up since the previous review round, in favour of ordinary shapes: numbers grouped by `_ : # + | ~ ( " ) * ; = \`, a star or a bullet (earlier cut); slashed and dotted eight-digit dates (earlier cut, now kept as dates); and the amount-tokens run (`41,11 11,11 11,11 11,11`, earlier cut).
 
@@ -253,7 +254,8 @@ The mask cuts any account-like run, not only account numbers. Known side effects
 - a phone number printed with dashes or spaces (ten digits) keeps its last four (one printed with brackets, `(555) 123-4567`, stays);
 - a date printed with no separators (`20261109`) becomes `1109`, and a dashed date is a number: `2026-11-09` becomes `1109`;
 - adjacent number tokens join and are cut together when they total 8 or more digits (`2026-11-09 4412` becomes `4412`);
-- a bare count over nine digits in thousands groups (`1,234,567,890 units`) is cut.
+- a bare count over nine digits in thousands groups (`1,234,567,890 units`) is cut;
+- accepted over-cuts, since keeping them would reopen a must-cut case (two four-digit card groups, `1234-5678`, `411,111 111,111 1234`): two years side by side (`FY 2026 2027` becomes `FY 2027`), a range of document numbers (`Invoices 1001-1004` becomes `Invoices 1004`), and two bare thousands amounts side by side (`Fees 1,200 1,300` becomes `Fees 1300`).
 
 Digits outside ASCII (full-width ones, for example) are not matched; see Risks.
 

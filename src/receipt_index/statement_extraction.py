@@ -502,9 +502,11 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
 _JOINERS = "-./,'\u2019\u00b7\u2044"
 _SPAN = re.compile(rf"[0-9]+(?:(?:(?: *[{_JOINERS}])+ *| +)[0-9]+)*")
 _TOKEN = re.compile(r"\S+")
-# An amount with cents: plain ("123456.78") or in thousands groups with the
-# other separator for the point ("1,234,567.89", "1.234.567,89").
-_PLAIN_CENTS = re.compile(r"[0-9]{1,12}[.,][0-9]{2}")
+# An amount with cents: plain, at most seven whole digits ("1234567.89"),
+# or in thousands groups with the other separator for the point
+# ("1,234,567.89", "1.234.567,89"). A longer plain one ("123456789.12") is
+# read as a number with a suffix, and cut.
+_PLAIN_CENTS = re.compile(r"[0-9]{1,7}[.,][0-9]{2}")
 _THOUSANDS_CENTS = re.compile(
     r"(?P<whole>[0-9]{1,3}(?P<group>[,.'\u2019])[0-9]{3}(?:(?P=group)[0-9]{3})*)"
     r"(?P<point>[.,])[0-9]{2}"
@@ -516,8 +518,12 @@ _MIN_MASKED_DIGITS: Final = 8
 # A short date, or a range of two: month and day (either order) with "/" or
 # ".", and an optional two- or four-digit year.
 _DATE = re.compile(
-    r"(?P<a>[0-9]{1,2})(?P<s>[/.])(?P<b>[0-9]{1,2})(?:(?P=s)(?:[0-9]{2}|[0-9]{4}))?"
+    r"(?P<a>[0-9]{1,2})(?P<s>[/.])(?P<b>[0-9]{1,2})"
+    r"(?:(?P=s)(?:[0-9]{2}|(?:19|20)[0-9]{2}))?"
 )
+# A range of years ("2025-2026") and a ZIP+4 code ("94105-1234").
+_YEAR_RANGE = re.compile(r"(?P<a>(?:19|20)[0-9]{2})-(?P<b>(?:19|20)[0-9]{2})")
+_ZIP_PLUS_FOUR = re.compile(r"[0-9]{5}-[0-9]{4}")
 
 
 def _is_cents_amount(token: str) -> bool:
@@ -545,10 +551,20 @@ def _is_date(token: str) -> bool:
     return 1 <= len(parts) <= 2 and all(_is_one_date(part) for part in parts)
 
 
+def _is_year_range(token: str) -> bool:
+    shape = _YEAR_RANGE.fullmatch(token)
+    return shape is not None and int(shape.group("a")) < int(shape.group("b"))
+
+
 def _set_aside(token: str) -> bool:
-    """An amount with cents or a short date: not part of a number."""
+    """An amount, a short date, a year range or a ZIP+4: not part of a number."""
     core = token.strip(_JOINERS)
-    return bool(core) and (_is_cents_amount(core) or _is_date(core))
+    return bool(core) and (
+        _is_cents_amount(core)
+        or _is_date(core)
+        or _is_year_range(core)
+        or _ZIP_PLUS_FOUR.fullmatch(core) is not None
+    )
 
 
 def _cut_tokens(span: str) -> tuple[str, int]:
