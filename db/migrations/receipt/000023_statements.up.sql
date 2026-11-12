@@ -278,8 +278,30 @@ CREATE TABLE IF NOT EXISTS receipt.statement_accounts (
                OR num_nulls(principal_before, principal_after, principal_paid,
                             interest, escrow, fees, advances) = 7),
     CONSTRAINT ck_statement_accounts_content_digest
-        CHECK (octet_length(content_digest) = 32)
+        CHECK (octet_length(content_digest) = 32),
+    -- A backstop for the application's mask: no run of eight digits (a full
+    -- account or card number) in the institution or a total's section name.
+    CONSTRAINT ck_statement_accounts_masked
+        CHECK (institution !~ '[0-9]{8}'
+               AND NOT jsonb_path_exists(section_totals,
+                   '$[*].section ? (@ like_regex "[0-9]{8}")')
+               AND NOT jsonb_path_exists(column_totals,
+                   '$[*].section ? (@ like_regex "[0-9]{8}")')),
+    -- NUMERIC accepts NaN; no money figure on a statement is one.
+    CONSTRAINT ck_statement_accounts_not_nan
+        CHECK (difference <> 'NaN' AND beginning_balance <> 'NaN'
+               AND ending_balance <> 'NaN' AND principal_before <> 'NaN'
+               AND principal_after <> 'NaN' AND principal_paid <> 'NaN'
+               AND interest <> 'NaN' AND escrow <> 'NaN' AND fees <> 'NaN'
+               AND advances <> 'NaN')
 );
+
+-- match_key pairs an account with itself across revisions, so it must be
+-- unique within one: an account with no printed last four counts as one
+-- key (NULLS NOT DISTINCT), told apart by its occurrence.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_statement_accounts_match_key
+    ON receipt.statement_accounts (revision_id, account_type, last4, occurrence)
+    NULLS NOT DISTINCT;
 
 CREATE TABLE IF NOT EXISTS receipt.statement_lines (
     id                UUID          NOT NULL DEFAULT uuidv7(),
@@ -299,7 +321,12 @@ CREATE TABLE IF NOT EXISTS receipt.statement_lines (
     CONSTRAINT fk_statement_lines_account FOREIGN KEY (account_id)
         REFERENCES receipt.statement_accounts (id),
     CONSTRAINT ck_statement_lines_ordinal CHECK (ordinal >= 1),
-    CONSTRAINT ck_statement_lines_page CHECK (page >= 1)
+    CONSTRAINT ck_statement_lines_page CHECK (page >= 1),
+    -- A backstop for the application's mask: no run of eight digits.
+    CONSTRAINT ck_statement_lines_masked
+        CHECK (description !~ '[0-9]{8}' AND section !~ '[0-9]{8}'),
+    CONSTRAINT ck_statement_lines_not_nan
+        CHECK (amount <> 'NaN' AND running_balance <> 'NaN')
 );
 
 -- The history tables, the sources and the counter have no updated_at (and
@@ -397,7 +424,7 @@ RETURNS TRIGGER AS $$
 DECLARE
     rev RECORD;
 BEGIN
-    SELECT statement_id, status, document_type INTO rev
+    SELECT statement_id, revision, status, document_type INTO rev
     FROM receipt.statement_revisions
     WHERE id = NEW.current_revision_id;
     IF NOT FOUND THEN
@@ -412,9 +439,74 @@ BEGIN
             'statement %: status % and type % don''t match its current revision (% and %)',
             NEW.id, NEW.status, NEW.document_type, rev.status, rev.document_type;
     END IF;
+    -- The current revision only moves forward: it is the statement's newest.
+    -- (A restore brings back earlier revisions with the rows themselves,
+    -- not through an update.)
+    IF rev.revision < (SELECT max(revision) FROM receipt.statement_revisions
+                       WHERE statement_id = NEW.id) THEN
+        RAISE EXCEPTION 'statement %: current revision % is not its newest',
+            NEW.id, NEW.current_revision_id;
+    END IF;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+
+-- At commit, a new revision is its statement's current revision: every run
+-- is published, and none is left behind that would make the statement's
+-- current revision look older than its newest.
+CREATE OR REPLACE FUNCTION receipt.check_statement_revision_is_current()
+RETURNS TRIGGER AS $$
+DECLARE
+    current_id UUID;
+BEGIN
+    SELECT current_revision_id INTO current_id
+    FROM receipt.statements WHERE id = NEW.statement_id;
+    IF NOT FOUND THEN
+        RETURN NULL;  -- the deferred foreign key reports it
+    END IF;
+    IF current_id <> NEW.id THEN
+        RAISE EXCEPTION 'revision % of statement % was written but not made current',
+            NEW.id, NEW.statement_id;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_statement_revisions_current
+    AFTER INSERT ON receipt.statement_revisions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION receipt.check_statement_revision_is_current();
+
+-- At commit, a held or rejected revision passes no usable account, and only
+-- a held revision has accounts held by the statement. The ledger imports a
+-- clean account's lines whatever the statement's status, so these are the
+-- rules a wrong status could break silently. Whether a usable revision is
+-- complete or incomplete is the gates' decision (U4), not checked here.
+CREATE OR REPLACE FUNCTION receipt.check_statement_revision_accounts()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status IN ('held', 'rejected') AND EXISTS (
+        SELECT 1 FROM receipt.statement_accounts
+        WHERE revision_id = NEW.id AND status IN ('clean', 'figures_only')
+    ) THEN
+        RAISE EXCEPTION 'revision % is % but has a usable account',
+            NEW.id, NEW.status;
+    END IF;
+    IF NEW.status <> 'held' AND EXISTS (
+        SELECT 1 FROM receipt.statement_accounts
+        WHERE revision_id = NEW.id AND held_by_statement
+    ) THEN
+        RAISE EXCEPTION 'revision % is % but has an account held by the statement',
+            NEW.id, NEW.status;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_statement_revisions_accounts
+    AFTER INSERT ON receipt.statement_revisions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION receipt.check_statement_revision_accounts();
 
 CREATE CONSTRAINT TRIGGER trg_statements_current_revision
     AFTER INSERT OR UPDATE ON receipt.statements

@@ -16,6 +16,8 @@ DROP TABLE IF EXISTS receipt.statement_feed_state;
 
 DROP FUNCTION IF EXISTS receipt.check_statement_line_account();
 DROP FUNCTION IF EXISTS receipt.check_statement_account_revision();
+DROP FUNCTION IF EXISTS receipt.check_statement_revision_accounts();
+DROP FUNCTION IF EXISTS receipt.check_statement_revision_is_current();
 DROP FUNCTION IF EXISTS receipt.check_statement_current_revision();
 DROP FUNCTION IF EXISTS receipt.set_statement_change_seq();
 DROP FUNCTION IF EXISTS receipt.set_statement_revision_number();

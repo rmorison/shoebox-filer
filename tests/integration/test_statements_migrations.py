@@ -148,6 +148,13 @@ def _new_statement(
     }
 
 
+def _revision(conn: Conn, statement_id: Any, revision: RevisionRow = _CLEAN) -> Any:
+    """A revision of ``statement_id`` with one clean account, as a run writes."""
+    revision_id, _ = repo.insert_revision(conn, statement_id, revision)
+    repo.insert_account(conn, revision_id, _account())
+    return revision_id
+
+
 def _open_revision(conn: Conn, revision: RevisionRow = _CLEAN) -> Any:
     """A revision written in the open transaction, so it still takes accounts.
 
@@ -185,6 +192,8 @@ _FUNCTIONS = (
     "set_statement_revision_number",
     "set_statement_change_seq",
     "check_statement_current_revision",
+    "check_statement_revision_is_current",
+    "check_statement_revision_accounts",
     "check_statement_account_revision",
     "check_statement_line_account",
 )
@@ -272,7 +281,7 @@ def test_a_status_that_doesnt_match_the_revision_fails_at_commit(
     conn, _ = scratch
     file_id, sha = _stored_file(conn)
     statement_id = repo.new_statement_id(conn)
-    revision_id, _ = repo.insert_revision(conn, statement_id, _CLEAN)
+    revision_id = _revision(conn, statement_id)
     repo.create_statement(
         conn,
         statement_id=statement_id,
@@ -298,7 +307,7 @@ def test_a_rerun_that_doesnt_match_its_revision_fails_at_commit(
 ) -> None:
     conn, _ = scratch
     made = _new_statement(conn)
-    revision_id, _ = repo.insert_revision(conn, made["id"], _CLEAN)
+    revision_id = _revision(conn, made["id"])
     repo.set_current_revision(
         conn,
         statement_id=made["id"],
@@ -308,6 +317,130 @@ def test_a_rerun_that_doesnt_match_its_revision_fails_at_commit(
     )
     with pytest.raises(psycopg.errors.RaiseException, match="don't match"):
         conn.commit()
+
+
+def test_the_current_revision_never_points_back(scratch: Scratch) -> None:  # noqa: F811
+    conn, _ = scratch
+    made = _new_statement(conn)
+    rerun_id = _revision(conn, made["id"])
+    repo.set_current_revision(
+        conn,
+        statement_id=made["id"],
+        revision_id=rerun_id,
+        status="complete",
+        document_type="deposit",
+    )
+    conn.commit()
+    repo.set_current_revision(
+        conn,
+        statement_id=made["id"],
+        revision_id=made["revision_id"],
+        status="complete",
+        document_type="deposit",
+    )
+    with pytest.raises(psycopg.errors.RaiseException, match="is not its newest"):
+        conn.commit()
+
+
+def test_a_revision_left_behind_fails_at_commit(scratch: Scratch) -> None:  # noqa: F811
+    # A run that writes a revision publishes it: a revision that never
+    # becomes current would leave the statement pointing at an older one.
+    conn, _ = scratch
+    made = _new_statement(conn)
+    _revision(conn, made["id"])
+    with pytest.raises(psycopg.errors.RaiseException, match="not made current"):
+        conn.commit()
+
+
+def _held(reason: str) -> RevisionRow:
+    return RevisionRow(
+        origin="ingest", document_type="deposit", status="held", hold_reason=reason
+    )
+
+
+_INCOMPLETE = RevisionRow(origin="ingest", document_type="deposit", status="incomplete")
+_HELD_OWN = {"status": "held", "failure_class": "does_not_foot"}
+_HELD_BY_STATEMENT = {"status": "held", "held_by_statement": True}
+
+
+@pytest.mark.parametrize(
+    ("revision", "accounts", "message"),
+    [
+        (_held("no_usable_account"), [_HELD_OWN, {}], "held but has a usable account"),
+        (
+            _held("dropped_account"),
+            [{"account_type": "loan", "status": "figures_only", "line_order": None}],
+            "held but has a usable account",
+        ),
+        (_INCOMPLETE, [{}, _HELD_BY_STATEMENT], "incomplete but has an account held"),
+        (_CLEAN, [_HELD_BY_STATEMENT], "complete but has an account held"),
+    ],
+    ids=["held-with-clean", "held-with-figures-only", "incomplete", "complete"],
+)
+def test_a_revision_status_that_disagrees_with_its_accounts_fails_at_commit(
+    scratch: Scratch,  # noqa: F811
+    revision: RevisionRow,
+    accounts: list[dict[str, Any]],
+    message: str,
+) -> None:
+    conn, _ = scratch
+    made = _new_statement(conn)
+    revision_id, _ = repo.insert_revision(conn, made["id"], revision)
+    for ordinal, changes in enumerate(accounts, 1):
+        repo.insert_account(
+            conn, revision_id, _account(ordinal=ordinal, occurrence=ordinal, **changes)
+        )
+    repo.set_current_revision(
+        conn,
+        statement_id=made["id"],
+        revision_id=revision_id,
+        status=revision.status,
+        document_type="deposit",
+    )
+    with pytest.raises(psycopg.errors.RaiseException, match=message):
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("revision", "accounts"),
+    [
+        (_INCOMPLETE, [{}, _HELD_OWN]),
+        (_held("no_accounts"), []),
+        (_held("dropped_account"), [_HELD_BY_STATEMENT, _HELD_BY_STATEMENT]),
+        (_held("no_usable_account"), [_HELD_OWN]),
+        # Complete versus incomplete is the gates' decision, not checked here.
+        (_INCOMPLETE, [{}, {}]),
+        (_CLEAN, [{}, _HELD_OWN]),
+    ],
+    ids=[
+        "incomplete",
+        "no-accounts",
+        "dropped",
+        "no-usable",
+        "incomplete-unchecked",
+        "complete-unchecked",
+    ],
+)
+def test_a_revision_status_that_agrees_with_its_accounts_commits(
+    scratch: Scratch,  # noqa: F811
+    revision: RevisionRow,
+    accounts: list[dict[str, Any]],
+) -> None:
+    conn, _ = scratch
+    made = _new_statement(conn)
+    revision_id, _ = repo.insert_revision(conn, made["id"], revision)
+    for ordinal, changes in enumerate(accounts, 1):
+        repo.insert_account(
+            conn, revision_id, _account(ordinal=ordinal, occurrence=ordinal, **changes)
+        )
+    repo.set_current_revision(
+        conn,
+        statement_id=made["id"],
+        revision_id=revision_id,
+        status=revision.status,
+        document_type="deposit",
+    )
+    conn.commit()
 
 
 def test_a_revision_of_another_statement_fails_at_commit(
@@ -381,6 +514,7 @@ def test_revision_and_change_seq_ignore_the_values_given(
     ).fetchone()
     assert row is not None
     assert row["revision"] > made["change_seq"]
+    repo.insert_account(conn, row["id"], _account())
     conn.execute(
         "INSERT INTO receipt.statements (id, original_file_id, source_sha256,"
         " current_revision_id, document_type, status, change_seq, publish_count)"
@@ -590,7 +724,7 @@ def test_a_republish_beside_a_rerun_of_the_same_statement_doesnt_deadlock(
     made = _new_statement(conn)
     worker, operator = _connect(conn), _connect(conn)
     try:
-        revision_id, _ = repo.insert_revision(worker, made["id"], _CLEAN)
+        revision_id = _revision(worker, made["id"])
         result: dict[str, Any] = {}
 
         def republish() -> None:
@@ -757,6 +891,65 @@ def test_a_revisions_accounts_may_follow_a_savepoint(
     conn.commit()
 
 
+def test_match_key_is_unique_within_a_revision(scratch: Scratch) -> None:  # noqa: F811
+    conn, _ = scratch
+    revision_id = _open_revision(conn)
+    repo.insert_account(conn, revision_id, _account(ordinal=1))
+    with pytest.raises(psycopg.errors.UniqueViolation) as raised:
+        repo.insert_account(conn, revision_id, _account(ordinal=2))
+    assert raised.value.diag.constraint_name == "uq_statement_accounts_match_key"
+    conn.rollback()
+    # With no last four printed, the occurrence tells accounts apart.
+    revision_id = _open_revision(conn)
+    repo.insert_account(conn, revision_id, _account(ordinal=1, last4=None))
+    repo.insert_account(
+        conn, revision_id, _account(ordinal=2, last4=None, occurrence=2)
+    )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        repo.insert_account(conn, revision_id, _account(ordinal=3, last4=None))
+    conn.rollback()
+
+
+@pytest.mark.parametrize(
+    ("line", "constraint"),
+    [
+        ({"description": "Card 4111111111111111 payment"}, "ck_statement_lines_masked"),
+        ({"description": "Ref 20261109 transfer"}, "ck_statement_lines_masked"),
+        ({"section": "account 12345678"}, "ck_statement_lines_masked"),
+        ({"amount": Decimal("NaN")}, "ck_statement_lines_not_nan"),
+        ({"running_balance": Decimal("NaN")}, "ck_statement_lines_not_nan"),
+    ],
+    ids=["card-number", "eight-digit-date", "section", "amount-nan", "balance-nan"],
+)
+def test_a_line_refuses_an_unmasked_number_or_nan(
+    scratch: Scratch,  # noqa: F811
+    line: dict[str, Any],
+    constraint: str,
+) -> None:
+    # The database backstop for the application's mask: a run of eight
+    # digits never reaches the table, nor does a NaN amount.
+    conn, _ = scratch
+    account_id = repo.insert_account(conn, _open_revision(conn), _account())
+    with pytest.raises(psycopg.errors.CheckViolation) as raised:
+        repo.insert_lines(conn, account_id, [_line(**line)])
+    assert raised.value.diag.constraint_name == constraint
+    conn.rollback()
+
+
+def test_a_masked_line_is_accepted(scratch: Scratch) -> None:  # noqa: F811
+    conn, _ = scratch
+    account_id = repo.insert_account(conn, _open_revision(conn), _account())
+    repo.insert_lines(
+        conn,
+        account_id,
+        [
+            _line(1, description="Card 1111 payment, ref 1234567", section="purchases"),
+            _line(2, description="Phone 555-0100, store 1234 5678"),
+        ],
+    )
+    conn.rollback()
+
+
 @pytest.mark.parametrize(
     ("changes", "constraint"),
     [
@@ -775,6 +968,26 @@ def test_a_revisions_accounts_may_follow_a_savepoint(
         (
             {"section_totals": {"not": "a list"}},
             "ck_statement_accounts_totals_are_arrays",
+        ),
+        ({"institution": "Bank 123456789"}, "ck_statement_accounts_masked"),
+        (
+            {"section_totals": [{"section": "card 12345678", "amount": "1.00"}]},
+            "ck_statement_accounts_masked",
+        ),
+        (
+            {"column_totals": [{"section": "acct 87654321", "credits": "1.00"}]},
+            "ck_statement_accounts_masked",
+        ),
+        ({"beginning_balance": Decimal("NaN")}, "ck_statement_accounts_not_nan"),
+        ({"difference": Decimal("NaN")}, "ck_statement_accounts_not_nan"),
+        (
+            {
+                "account_type": "loan",
+                "status": "figures_only",
+                "line_order": None,
+                "escrow": Decimal("NaN"),
+            },
+            "ck_statement_accounts_not_nan",
         ),
     ],
 )

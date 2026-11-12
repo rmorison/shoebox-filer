@@ -400,6 +400,12 @@ CREATE TABLE receipt.statement_lines (      -- append-only; written only for cle
 - No full account number anywhere: `last4` is four digits or null.
 - 000024 grants (built in U2, stricter than first planned): `_write` gets `SELECT` on the statement tables, `INSERT` on their business columns only (no ids, timestamps, revision numbers or `change_seq`, except a statement's `id`, which the writer draws first), `UPDATE (current_revision_id, status, document_type, publish_count)` on `statements`, `EXECUTE` on `lock_statement_feed()` and `next_feed_value()`, and nothing on `statement_feed_state`, so no login can set the counter by hand. `_read` gets `SELECT` on all of them, and no `EXECUTE` on the counter's functions.
 - A revision is complete when its transaction commits: a trigger refuses an account on a revision written by an earlier transaction, and a line on an earlier account, so nothing the feed has published changes in place. `publish_count` only steps by one.
+- Database backstops, from the ledger's pre-review of U2 (2026-11-11):
+  - a statement's current revision only moves forward: at commit it is the statement's newest, and every revision written becomes current in its transaction (a restore brings earlier revisions back with the rows, not through an update);
+  - no run of eight digits in a line's `description` or `section`, an account's `institution`, or a total's section name (`!~ '[0-9]{8}'`), behind the application's mask, which stays the main guard;
+  - no `NaN` in any money column;
+  - `match_key` is unique within a revision (`revision_id, account_type, last4, occurrence`, nulls not distinct);
+  - at commit a `held` or `rejected` revision has no `clean` or `figures_only` account, and `held_by_statement` appears only in a `held` revision, since the ledger imports a clean account's lines whatever the statement's status. Whether a usable revision is `complete` or `incomplete` is U4's gates' decision, not checked by the database.
 - Down migrations drop the tables and the function. See Rollback for the stored originals.
 - `_run_migrations()` mirrors 000023, the seed row included; `apply_migration_grants` applies 000024.
 
