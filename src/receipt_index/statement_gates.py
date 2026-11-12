@@ -26,6 +26,8 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Literal
 
+from pydantic import BaseModel, ValidationError
+
 from receipt_index.statement_extraction import (
     AccountExtraction,
     AccountRun,
@@ -623,7 +625,90 @@ def _hold_reason(
     return None
 
 
+def _plain(value: Any) -> Any:
+    """A model as plain data, so validating it again checks every field.
+
+    pydantic doesn't validate a model instance it is given again, and one
+    built with ``model_construct`` was never validated.
+    """
+    if isinstance(value, BaseModel):
+        return {
+            name: _plain(getattr(value, name, None))
+            for name in type(value).model_fields
+        }
+    if isinstance(value, list | tuple):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _validated(first_pass: Any, runs: Any) -> tuple[FirstPass, list[AccountRun]]:
+    """The inputs, checked: their kinds, then every field of every model."""
+    if not isinstance(first_pass, FirstPass):
+        msg = "the first pass isn't a FirstPass"
+        raise ValueError(msg)
+    if not isinstance(runs, list | tuple) or not all(
+        isinstance(run, AccountRun) for run in runs
+    ):
+        msg = "an account result isn't an AccountRun"
+        raise ValueError(msg)
+    checked_first = FirstPass.model_validate(_plain(first_pass))
+    checked: list[AccountRun] = []
+    for run in runs:
+        output = run.output
+        if output is not None and not isinstance(
+            output, AccountExtraction | LoanExtraction
+        ):
+            msg = "an account call's output is of no known kind"
+            raise ValueError(msg)
+        checked.append(
+            AccountRun(
+                output=None
+                if output is None
+                else type(output).model_validate(_plain(output)),
+                capped=bool(run.capped),
+                usage=run.usage,
+            )
+        )
+    return checked_first, checked
+
+
 def gate_statement(first_pass: FirstPass, runs: Sequence[AccountRun]) -> GatedStatement:
+    """A statement's status, hold reason and accounts, from its calls.
+
+    ``runs`` holds one account call's result per account the first pass
+    listed, in its order. A rejected document type gives a rejected
+    statement with no accounts, whatever the first pass listed.
+
+    Every input is validated again first, so one built without validation
+    (``model_construct``) is checked too. Any failure raises one
+    ``ValueError`` with a fixed message and no cause: an error must never
+    quote the model's output, which can hold an account number.
+    """
+    try:
+        checked_first, checked_runs = _validated(first_pass, runs)
+    except ValidationError:
+        msg = "a statement call's output failed validation"
+        raise ValueError(msg) from None
+    except ValueError as exc:
+        msg = (
+            str(exc)
+            if str(exc).startswith(("the first pass", "an account"))
+            else ("the statement's input is invalid")
+        )
+        raise ValueError(msg) from None
+    try:
+        return _gate_statement(checked_first, checked_runs)
+    except ValueError as exc:
+        # The gates' own messages are fixed; keep them, without a cause.
+        raise ValueError(str(exc)) from None
+    except Exception:
+        msg = "the statement couldn't be gated"
+        raise ValueError(msg) from None
+
+
+def _gate_statement(
+    first_pass: FirstPass, runs: Sequence[AccountRun]
+) -> GatedStatement:
     """A statement's status, hold reason and accounts, from its calls.
 
     ``runs`` holds one account call's result per account the first pass

@@ -853,7 +853,7 @@ def test_a_total_that_isnt_a_finite_amount_is_refused() -> None:
     for bad in ("NaN", "Infinity", "-Infinity", "sNaN"):
         output.section_totals = [SectionTotal.model_construct(section="x", amount=bad)]
         run = AccountRun(output=output, capped=False, usage=CallUsage())
-        with pytest.raises(ValueError, match="finite"):
+        with pytest.raises(ValueError, match="failed validation"):
             _gate(("deposit", run))
 
 
@@ -1080,7 +1080,7 @@ def test_a_column_total_that_isnt_a_finite_amount_is_refused(
     figures[side] = bad
     output.column_totals = [ColumnTotal.model_construct(**figures)]
     run = AccountRun(output=output, capped=False, usage=CallUsage())
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValueError, match="failed validation"):
         _gate(("deposit", run))
 
 
@@ -1094,7 +1094,7 @@ def test_an_amount_that_isnt_a_decimal_is_a_value_error() -> None:
     )
     output.section_totals = [SectionTotal.model_construct(section="x", amount="abc")]
     run = AccountRun(output=output, capped=False, usage=CallUsage())
-    with pytest.raises(ValueError, match="account 1: an amount that isn't a decimal"):
+    with pytest.raises(ValueError, match="failed validation"):
         _gate(("deposit", run))
 
 
@@ -1180,3 +1180,154 @@ def test_a_number_grouped_by_punctuation_is_masked_in_every_field(
     assert "4111" not in raw
     assert "3456" in raw
     assert statement.masked_runs >= 1
+
+
+# ---------------------------------------------------------------------------
+# Input built without validation (model_construct)
+# ---------------------------------------------------------------------------
+
+
+def _constructed_line(**fields: Any) -> Any:
+    from receipt_index.statement_extraction import DateParts, StatementLine
+
+    base: dict[str, Any] = {
+        "posted": DateParts(month=1, day=5),
+        "transacted": None,
+        "description": "Synthetic purchase",
+        "amount": "-10.00",
+        "running_balance": None,
+        "section": None,
+        "page": 1,
+    }
+    return StatementLine.model_construct(**{**base, **fields})
+
+
+def _constructed(lines: list[Any] | None = None, **fields: Any) -> AccountRun:
+    base: dict[str, Any] = {
+        "institution": "Synthetic Savings Bank",
+        "last4": "1234",
+        "currency": "USD",
+        "period": None,
+        "beginning_balance": "100.00",
+        "ending_balance": "90.00",
+        "line_order": "oldest_first",
+        "section_totals": [],
+        "column_totals": [],
+        "lines": [_constructed_line()] if lines is None else lines,
+    }
+    output = AccountExtraction.model_construct(**{**base, **fields})
+    return AccountRun(output=output, capped=False, usage=CallUsage())
+
+
+_SECRET = "5274910386254173"
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(
+            _constructed([_constructed_line(amount="1.005")]), id="three-places"
+        ),
+        pytest.param(_constructed([_constructed_line(amount=1.5)]), id="float"),
+        pytest.param(
+            _constructed([_constructed_line(amount="1_0.00")]), id="underscore"
+        ),
+        pytest.param(
+            _constructed([_constructed_line(amount="\u0661\u0660.\u0660\u0660")]),
+            id="arabic-indic",
+        ),
+        pytest.param(_constructed([_constructed_line(amount="-10")]), id="no-places"),
+        pytest.param(_constructed([_constructed_line(amount=None)]), id="none-amount"),
+        pytest.param(_constructed(line_order="sideways"), id="line-order"),
+        pytest.param(_constructed(currency="usd"), id="currency"),
+        pytest.param(_constructed(last4=_SECRET), id="last4"),
+        pytest.param(_constructed([{"posted": None}]), id="raw-dict-line"),
+        pytest.param(_constructed([_constructed_line(posted=None)]), id="none-date"),
+        pytest.param(
+            _constructed([_constructed_line(description=7)]), id="int-description"
+        ),
+        pytest.param(
+            _constructed(
+                period={
+                    "start": {"month": 1, "day": 1, "year": 1},
+                    "end": {"month": 1, "day": 31, "year": 1},
+                }
+            ),
+            id="year-one-period",
+        ),
+        pytest.param(
+            _constructed(
+                institution=f"Bank {_SECRET}", beginning_balance=f"{_SECRET}.0"
+            ),
+            id="value-in-error",
+        ),
+    ],
+)
+def test_input_built_without_validation_is_refused_with_a_fixed_message(
+    run: AccountRun,
+) -> None:
+    with pytest.raises(ValueError) as raised:
+        _gate(("card", run))
+    error = raised.value
+    assert type(error) is ValueError
+    assert error.__cause__ is None
+    assert error.__suppress_context__
+    assert _SECRET not in str(error)
+    assert "1.005" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(None, id="none-run"),
+        pytest.param(
+            AccountRun(output="not an extraction", capped=False, usage=CallUsage()),  # type: ignore[arg-type]
+            id="string-output",
+        ),
+    ],
+)
+def test_an_input_of_the_wrong_kind_is_refused(run: Any) -> None:
+    first = FirstPass.model_validate(
+        {
+            "document_type": "deposit",
+            "accounts": [
+                {
+                    "label": "x",
+                    "account_type": "deposit",
+                    "first_page": 1,
+                    "last_page": 1,
+                }
+            ],
+        }
+    )
+    with pytest.raises(ValueError) as raised:
+        gate_statement(first, [run])
+    assert type(raised.value) is ValueError
+    assert raised.value.__cause__ is None
+
+
+def test_format_money_never_quotes_the_value() -> None:
+    from receipt_index.statement_extraction import format_money
+
+    for bad in ("NaN", f"x{_SECRET}", "Infinity"):
+        with pytest.raises(ValueError) as raised:
+            format_money(bad)
+        assert _SECRET not in str(raised.value)
+        assert bad not in str(raised.value)
+
+
+def test_an_unexpected_error_in_the_gates_becomes_a_bare_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from receipt_index import statement_gates
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise AttributeError(f"Bank {_SECRET}")
+
+    monkeypatch.setattr(statement_gates, "_read_balance_account", broken)
+    with pytest.raises(ValueError) as raised:
+        _one("deposit", _clean())
+    assert type(raised.value) is ValueError
+    assert _SECRET not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__

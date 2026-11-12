@@ -29,7 +29,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, TypeVar
 
 from pydantic import (
@@ -352,9 +352,14 @@ def format_money(value: str) -> str:
 
     ``value`` is a two-place decimal string from an output model.
     """
-    amount = Decimal(value)
+    # Fixed messages: the value itself never goes into an error.
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        msg = "not a decimal amount"
+        raise ValueError(msg) from None
     if not amount.is_finite():
-        msg = f"not a finite amount: {value!r}"
+        msg = "not a finite amount"
         raise ValueError(msg)
     if amount.is_zero():
         return "0.00"
