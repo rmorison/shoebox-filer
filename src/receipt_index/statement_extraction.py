@@ -483,8 +483,40 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         count += 1
         return _NON_DIGIT.sub("", match.group())[-4:]
 
-    masked = _masked_run().sub(last_four, _fold_separators(text))
+    def grouped(match: re.Match[str]) -> str:
+        nonlocal count
+        run = match.group()
+        digits = _NON_DIGIT.sub("", run)
+        if len(digits) < _MIN_MASKED_DIGITS or _THOUSANDS.fullmatch(run):
+            return run
+        count += 1
+        return digits[-4:]
+
+    # Both cuts, until neither changes anything: a number grouped by mixed
+    # separators ("4111 1111.1111 1234") leaves a part one cut joins only
+    # after the other has run.
+    masked = _fold_separators(text)
+    for _ in range(_MAX_MASK_PASSES):
+        before = masked
+        masked = _masked_run().sub(last_four, masked)
+        masked = _GROUPED_RUN.sub(grouped, masked)
+        if masked == before:
+            break
     return masked, count
+
+
+# The second cut: digit groups of three or more joined by any other
+# separator (". , / _ ' : # + | ~ ( \" and the rest of punctuation and
+# symbols, with a space either side), totalling eight or more digits. An
+# amount or count grouped in thousands ("123,456,789", "1.234.567",
+# "1'234'567") is left alone, and a date's groups are too short to join, so
+# "4111.1111.1111.1234" is cut and "1,234,567.89" or "11/09/2026" isn't.
+_MIN_MASKED_DIGITS: Final = 8
+_MAX_MASK_PASSES: Final = 8
+_GROUPED_RUN = re.compile(
+    r"(?<![0-9])[0-9]{3,}(?:\s?(?:[^\w\s]|_){1,3}\s?[0-9]{3,})+(?![0-9])"
+)
+_THOUSANDS = re.compile(r"[0-9]{1,3}(?:([,.'\u2019])[0-9]{3})(?:\1[0-9]{3})*")
 
 
 class PeriodIssue(enum.Enum):

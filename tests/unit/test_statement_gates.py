@@ -939,12 +939,12 @@ def _text_paths(hint: Any, path: str) -> list[str]:
     return paths
 
 
-def _with_number(knob: str, account_type: str) -> AccountRun:
+def _with_number(knob: str, account_type: str, number: str = _NUMBER) -> AccountRun:
     if account_type == "loan":
-        return _loan(institution=f"Synthetic {_NUMBER}", interest="1.00")
-    section = f"Fees {_NUMBER}" if knob == "section" else "Fees"
-    description = f"Fee {_NUMBER}" if knob == "description" else "Fee"
-    institution = f"Synthetic {_NUMBER}" if knob == "institution" else "Synthetic"
+        return _loan(institution=f"Synthetic {number}", interest="1.00")
+    section = f"Fees {number}" if knob == "section" else "Fees"
+    description = f"Fee {number}" if knob == "description" else "Fee"
+    institution = f"Synthetic {number}" if knob == "institution" else "Synthetic"
     return _balance(
         [_line(5, "-10.00", "90.00", section=section, description=description)],
         ending="90.00",
@@ -1162,3 +1162,21 @@ def test_a_date_mid_way_through_an_inclusive_one_year_period_is_placed_once() ->
     account = _one("deposit", run)
     assert account.status == "clean"
     assert account.lines[0].posted_date == date(2026, 7, 1)
+
+
+@pytest.mark.parametrize(
+    "separator", [".", ",", "/", "_", "'", ":", "#", "+", "|", "~", "(", '"', "\u00b7"]
+)
+@pytest.mark.parametrize("knob", ["description", "section", "institution"])
+def test_a_number_grouped_by_punctuation_is_masked_in_every_field(
+    separator: str, knob: str
+) -> None:
+    # Sections reach the totals' headings too (section and column totals).
+    number = separator.join(["4111", "1111", "1111", "3456"])
+    statement = _gate(("deposit", _with_number(knob, "deposit", number)))
+    account = statement.accounts[0]
+    assert account.status == "clean"
+    raw = canonical_json(account).decode("utf-8")
+    assert "4111" not in raw
+    assert "3456" in raw
+    assert statement.masked_runs >= 1

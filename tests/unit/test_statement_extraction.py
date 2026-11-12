@@ -392,10 +392,12 @@ def test_an_institution_keeps_its_case_and_loses_extra_space(
         ("2026-11-09 4412 store", "4412 store", 1),
         ("Call 800-555-0100", "Call 0100", 1),
         ("Dated 20261109", "Dated 1109", 1),
-        # Separators that break a run.
+        # Amount and date shapes are left alone.
         ("Dated 11/09/2026", "Dated 11/09/2026", 0),
         ("Total 1,234,567.89", "Total 1,234,567.89", 0),
-        ("Ref 1234.5678", "Ref 1234.5678", 0),
+        # Groups of three or more joined by any other separator, eight
+        # digits in all, are cut.
+        ("Ref 1234.5678", "Ref 5678", 1),
         # ASCII digits only, by decision.
         (
             "Card \uff14\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11",
@@ -1254,9 +1256,12 @@ def test_every_blank_named_letter_or_symbol_is_joined_or_listed_as_visible() -> 
     assert not unclassified
 
 
-def test_a_visible_letter_or_symbol_breaks_a_run() -> None:
-    # The recorded decision: like any letter, a visible one ends a run.
-    assert mask_digits("Ref 1234\u26055678") == ("Ref 1234\u26055678", 0)
+def test_a_letter_breaks_a_run_but_a_symbol_joins_groups() -> None:
+    # A letter (visible, of any script) ends a run; a symbol between groups
+    # of three or more joins them, as punctuation does.
+    assert mask_digits("Ref 1234x5678") == ("Ref 1234x5678", 0)
+    assert mask_digits("Ref 1234\u30425678") == ("Ref 1234\u30425678", 0)
+    assert mask_digits("Ref 1234\u26055678") == ("Ref 5678", 1)
 
 
 def test_a_call_error_has_no_context_even_inside_a_callers_handler() -> None:
@@ -1269,3 +1274,68 @@ def test_a_call_error_has_no_context_even_inside_a_callers_handler() -> None:
             se.run_account(agent, _PAGES, _LISTED, None)
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__
+
+
+_SEPARATORS = [
+    ".",
+    ",",
+    "/",
+    "_",
+    "'",
+    "\u00b7",
+    "\u2022",
+    ":",
+    "#",
+    "+",
+    "|",
+    "~",
+    "\u2044",
+    "(",
+    '"',
+    ")",
+    "*",
+    ";",
+    "=",
+    "\\",
+    "\u2605",
+    ". ",
+    " / ",
+]
+
+
+@pytest.mark.parametrize("separator", _SEPARATORS)
+def test_a_number_grouped_by_any_separator_is_cut(separator: str) -> None:
+    number = separator.join(["4111", "1111", "1111", "3456"])
+    masked, runs = mask_digits(f"Card {number} ok")
+    assert masked is not None
+    assert "4111" not in masked
+    assert "".join(ch for ch in masked if ch.isdigit()) == "3456"
+    assert runs >= 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Total 1,234,567.89",
+        "Total 123,456,789.00",
+        "Total 1,234,567,890.12",
+        "Gesamt 1.234.567,89",
+        "Gesamt 123.456.789,00",
+        "Total 1'234'567.89",
+        "Total 1\u2019234\u2019567.89",
+        "Dated 11/09/2026",
+        "Dated 09.11.2026",
+        "At 12:30:45",
+        "Ref 123.45",
+    ],
+)
+def test_amount_and_date_shapes_are_left_alone(text: str) -> None:
+    assert mask_digits(text) == (text, 0)
+
+
+def test_mixed_separators_are_cut_whole() -> None:
+    masked, _ = mask_digits("Card 4111 1111.1111 1234 and 4111.1111 1111/5678")
+    assert masked == "Card 1234 and 5678"
+    # The grouped cut leaves "1234 2345", which only a second space-run
+    # cut joins.
+    assert mask_digits("Card 1234 567.8901.2345 ok")[0] == "Card 2345 ok"
