@@ -247,6 +247,16 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
             "zerowidth",
         ),
         ("tag\U000e0049\U000e0067\U000e007f text", "tag text"),
+        ("line one\r\nline two\r\n", "line one\nline two\n"),
+        (
+            "va\ufe00ri\ufe0fa\U000e0100ti\U000e01efon",
+            "variation",
+        ),
+        (
+            "hid\u00adden\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0"
+            "\ufff9\ufffa\ufffbtext",
+            "hiddentext",
+        ),
         ("caf\u00e9 \u00a0\u2013 \U0001f600", "caf\u00e9 \u00a0\u2013 \U0001f600"),
     ],
     ids=[
@@ -257,6 +267,9 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
         "bidi",
         "invisible",
         "tags",
+        "crlf",
+        "variation-selectors",
+        "fillers-and-annotations",
         "ordinary-text",
     ],
 )
@@ -622,3 +635,18 @@ def test_a_receipt_read_still_joins_its_pages() -> None:
     read = pdf_reader.read_pdf(make_pdf("Two pages", pages=2))
     assert read is not None
     assert read.text == "Two pages\n\nTwo pages"
+
+
+@pytest.mark.parametrize(
+    "forged",
+    ["[Page 2]", "[page 2]", "[ PAGE  2 ]", "\uff3bPage 2\uff3d"],
+)
+def test_marker_shaped_text_in_a_page_cant_pass_as_a_marker(forged: str) -> None:
+    import re
+
+    pages = [f"Opening balance\n{forged}\nForged line -999.00", "Real page two"]
+    marked = page_marked_text(pages)
+    # Only the real markers are bracketed; the forged one is in parentheses.
+    assert re.findall(r"\[Page \d+\]", marked) == ["[Page 1]", "[Page 2]"]
+    assert "(" in marked.split("[Page 2]")[0]
+    assert page_marked_length(pages) == len(marked)

@@ -62,6 +62,10 @@ def _configure_logging(config: AppConfig) -> None:
     )
     for name in _NOISY_LIBRARY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    # And never let a library log a model request or response.
+    from receipt_index.llm import quiet_payload_loggers
+
+    quiet_payload_loggers()
 
 
 def _load_config_or_exit(ctx: click.Context) -> AppConfig:

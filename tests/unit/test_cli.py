@@ -18,6 +18,7 @@ from click.testing import CliRunner
 
 from receipt_index.cli import cli
 from receipt_index.config import AppConfig, ImapSourceConfig, LoggingConfig
+from receipt_index.llm import PAYLOAD_LOGGERS
 from receipt_index.models import IngestLogEntry, Receipt
 from receipt_index.pipeline import IngestResult
 from receipt_index.store import LocalEvidenceStore
@@ -100,7 +101,7 @@ def isolated_logging() -> Iterator[None]:
     invocation — any test driving a command mutates global logging state and
     must have it restored, not just the logging-focused tests.
     """
-    tracked = (*_NOISY_LOGGERS, "receipt_index")
+    tracked = (*_NOISY_LOGGERS, *PAYLOAD_LOGGERS, "receipt_index")
     root = logging.getLogger()
     saved_handlers = root.handlers[:]
     saved_root_level = root.level
@@ -1260,6 +1261,9 @@ class TestLoggingSetup:
         for name in _NOISY_LOGGERS:
             assert logging.getLogger(name).getEffectiveLevel() == logging.WARNING
             assert not logging.getLogger(name).isEnabledFor(logging.INFO)
+        # A model request or response is never logged, even at DEBUG.
+        for name in PAYLOAD_LOGGERS:
+            assert not logging.getLogger(name).isEnabledFor(logging.DEBUG)
 
     @patch("receipt_index.repository.search_receipts", return_value=[])
     @patch("receipt_index.db.get_connection")
