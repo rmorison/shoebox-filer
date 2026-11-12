@@ -278,6 +278,47 @@ def test_the_pydantic_record_variable_alone_is_refused(configure: bool) -> None:
     assert "pydantic plugin" in _last_line(result)
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        # Record only pydantic-ai's validators: the check's own isn't wrapped.
+        {"LOGFIRE_PYDANTIC_PLUGIN_INCLUDE": r"pydantic_ai\..*"},
+        # Or skip this package's.
+        {"LOGFIRE_PYDANTIC_PLUGIN_EXCLUDE": r"receipt_index\..*"},
+    ],
+)
+def test_pydantic_recording_filtered_away_from_the_check_is_refused(
+    filters: dict[str, str],
+) -> None:
+    result = _run(
+        _IMPORT_APP + _VERDICT,
+        env_extra={"LOGFIRE_PYDANTIC_PLUGIN_RECORD": "all", **filters},
+    )
+    assert _last_line(result).startswith("REFUSED")
+    assert "pydantic plugin" in _last_line(result)
+
+
+def test_a_logfire_plugin_setting_that_cant_be_read_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A logfire release that renames the setting fails closed.
+    monkeypatch.setitem(
+        sys.modules, statements._LOGFIRE_PYDANTIC_PLUGIN, ModuleType("renamed")
+    )
+    with pytest.raises(InstrumentationLoadedError, match="pydantic plugin"):
+        refuse_instrumentation([])
+
+
+def test_a_logfire_plugin_set_to_off_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    plugin = ModuleType("plugin")
+    plugin.get_pydantic_plugin_config = lambda: SimpleNamespace(record="off")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, statements._LOGFIRE_PYDANTIC_PLUGIN, plugin)
+    refuse_instrumentation([])
+    plugin.get_pydantic_plugin_config = lambda: SimpleNamespace(record="failure")  # type: ignore[attr-defined]
+    with pytest.raises(InstrumentationLoadedError):
+        refuse_instrumentation([])
+
+
 def test_the_statement_models_tell_the_logfire_plugin_not_to_record() -> None:
     from receipt_index import statement_extraction as se
 

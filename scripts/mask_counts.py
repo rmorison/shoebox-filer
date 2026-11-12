@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 
 HEADER = (
     "# statement mask counts (plan U5): fixed labels and counts only",
+    "# effect.*, overcut.* and limit.* count shapes: upper bounds, since a",
+    "# real account number can have the same shape as a side effect",
     "# label<TAB>count",
 )
 
@@ -233,13 +235,14 @@ def _count_span(
     for index, (what, value) in enumerate(items):
         if what != "run":
             continue
-        before, before_core = items[index - 1][1] if index > 0 else (None, "")
+        before = items[index - 1][1] if index > 0 else None
         after = items[index + 1][1][0] if index + 1 < len(items) else None
-        if _count_run(mask, span, value, before, counts):
+        # Date-shaped by its look, whatever it was set aside as ("12.11"
+        # and "11.09" read as amounts with cents first).
+        after_date = before is not None and mask.is_date(before[1])
+        if _count_run(mask, span, value, after_date=after_date, counts=counts):
             cuts += 1
-            # Date-shaped by its look, whatever it was set aside as
-            # ("12.11" reads as an amount with cents first).
-            if before is not None and mask.is_date(before_core):
+            if after_date:
                 counts["limit.date_shaped_group_before_a_cut"] += 1
             if after == "amount_with_cents":
                 counts["limit.amount_right_after_a_cut"] += 1
@@ -251,7 +254,8 @@ def _count_run(
     mask: _Mask,
     span: str,
     run: list[re.Match[str]],
-    before: str | None,
+    *,
+    after_date: bool,
     counts: Counter[str],
 ) -> bool:
     """Count one run's effects; True when the mask cuts it."""
@@ -302,9 +306,7 @@ def _count_run(
             counts["overcut.two_group_dash_number"] += 1
     else:
         counts["effect.adjacent_tokens_joined_cut"] += 1
-        if before in ("short_date", "short_date_range") and all(
-            len(mask.digits(g)) <= 4 for g in groups
-        ):
+        if after_date and all(len(mask.digits(g)) <= 4 for g in groups):
             counts["effect.short_tokens_after_a_date_cut"] += 1
         if all(mask.is_bare_thousands(c) for c in cores):
             counts["overcut.two_bare_thousands_side_by_side"] += 1

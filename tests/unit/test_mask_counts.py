@@ -85,6 +85,14 @@ _CASES: list[tuple[str, dict[str, int]]] = [
             "limit.date_shaped_group_before_a_cut": 1,
         },
     ),
+    # A dotted date reads as an amount first; still date-shaped.
+    (
+        "DEBIT 11.09 0412 1234",
+        {
+            "effect.short_tokens_after_a_date_cut": 1,
+            "set_aside.amount_with_cents": 1,
+        },
+    ),
     ("1,234,567,890 units", {"effect.bare_thousands_over_nine_digits_cut": 1}),
     ("FY 2026 2027", {"overcut.two_years_side_by_side": 1}),
     ("FY 2025 - 2026", {"overcut.spaced_year_range": 1}),

@@ -144,6 +144,10 @@ _LOGFIRE_BASELINE: Final = frozenset(
 )
 
 
+# logfire's pydantic plugin, whose setting says whether validations record.
+_LOGFIRE_PYDANTIC_PLUGIN: Final = "logfire.integrations.pydantic"
+
+
 class InstrumentationLoadedError(RuntimeError):
     """Tracing instrumentation is loaded: statement work is refused."""
 
@@ -171,12 +175,27 @@ def _pydantic_records() -> bool:
     ``logfire.instrument_pydantic()``, or ``LOGFIRE_PYDANTIC_PLUGIN_RECORD``
     with no code at all, wraps every validator built after it, the
     TypeAdapters pydantic-ai builds included, and exports the validated
-    values. No module name shows it, so the check builds a validator and
-    looks: pydantic-core's own methods are builtins, a plugin's wrappers are
-    Python functions.
+    values. No module name shows it, so two checks, either of which refuses:
+
+    - logfire's plugin setting: anything but ``record`` off. Its include and
+      exclude filters can skip this module's validators while recording
+      pydantic-ai's, so the setting decides, not one validator. The plugin
+      module is read from ``sys.modules`` (every process loads it through
+      pydantic's plugin entry point), never imported here; if it is loaded
+      but its setting can't be read, a logfire change, the check refuses.
+    - a validator built here: pydantic-core's own methods are builtins, a
+      plugin's wrappers are Python functions. That catches another plugin.
     """
     from pydantic import TypeAdapter
 
+    plugin = sys.modules.get(_LOGFIRE_PYDANTIC_PLUGIN)
+    if plugin is not None:
+        try:
+            record = plugin.get_pydantic_plugin_config().record
+        except Exception:
+            return True
+        if record != "off":
+            return True
     validator = TypeAdapter(dict[str, str]).validator
     return not all(
         isinstance(getattr(validator, method, None), BuiltinMethodType)

@@ -441,6 +441,87 @@ class TestRetries:
         )
         assert not select_retry_candidates(pg_conn, RetryFilter(status="failed"))
 
+    def test_an_item_whose_source_was_removed_is_fetched_by_a_statement_source(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Its source is gone from the config: the retry falls back to the
+        # configured sources of its ingest type, so a statement Drive source
+        # re-fetches it and a receipt Drive source (same config type) never
+        # sees it.
+        raw = _raw(make_pdf(_PAGE))
+        insert_ingest_log(
+            pg_conn,
+            source_id=raw.source_id,
+            source_type=STATEMENT_SOURCE_TYPE,
+            source_name="removed-statements",
+            status="failed",
+            error_message="earlier failure",
+            error_class="content",
+            next_retry_at=datetime(2000, 1, 1, tzinfo=UTC),
+        )
+
+        def no_receipts(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a statement item reached process_item")
+
+        monkeypatch.setattr(pipeline, "process_item", no_receipts)
+        fetched_by: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                fetched_by.append(self.name)
+                if self.name != "statements-drive":
+                    raise AssertionError("a receipt source fetched a statement")
+                return raw
+
+        configs = [
+            SimpleNamespace(name="receipts-drive", type="gdrive"),
+            SimpleNamespace(
+                name="statements-drive", type="gdrive", documents="statements"
+            ),
+        ]
+        configured = [c.name for c in configs]
+        # Offered to the statement source, never to the receipt one.
+        assert not select_due(
+            pg_conn,
+            source_name="receipts-drive",
+            source_type="gdrive",
+            configured=configured,
+        )
+        due = select_due(
+            pg_conn,
+            source_name="statements-drive",
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=configured,
+        )
+        assert [entry.source_id for entry in due] == [raw.source_id]
+        with ExitStack() as stack:
+            pool = SourcePool(configs, lambda c: Adapter(c.name), stack)  # type: ignore[arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source="statements-drive",
+                statement_agents=Replies().agents(),
+            )
+        assert result.processed == 1
+        assert fetched_by == ["statements-drive"]
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+
     def test_an_item_that_delivered_a_statement_is_never_due_again(
         self,
         pg_conn: psycopg.Connection[dict[str, Any]],
