@@ -47,6 +47,7 @@ from pydantic_ai.models import infer_model
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.usage import UsageLimits
 
+from receipt_index.llm import quiet_payload_loggers
 from receipt_index.pdf_reader import normalise_statement_text, page_marked_text
 from receipt_index.pdf_validate import STATEMENT_BOUNDS
 
@@ -107,7 +108,10 @@ def _ascii_leading_sign(value: object) -> object:
     """A leading Unicode dash or minus sign, and surrounding spaces, folded.
 
     The model sometimes copies a minus as printed (U+2212, an en dash); the
-    pattern wants ASCII.
+    pattern wants ASCII. A signed amount (a line, a balance, a loan's
+    principal) takes a leading sign only: unlike a total, a trailing minus,
+    "CR" or parentheses still fail its schema, since the prompt asks the
+    model to sign it by the statement-balance basis.
     """
     if isinstance(value, str):
         stripped = value.strip()
@@ -397,12 +401,19 @@ def normalise_institution(name: str | None) -> str | None:
 # those, but not all (an Arabic number sign, a Mongolian selector, a
 # combining accent), and none may hide a number. ASCII digits only, by
 # decision.
-_IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn"})
+_IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
+# Letters and symbols that render as blank space. The normaliser drops the
+# Hangul and halfwidth fillers and the blank Braille pattern; the mask joins
+# across them all anyway. Every other letter or symbol (Lo, Lm, So, Sk) is
+# visible, and breaks a run as a letter does: a decision.
+_BLANK_GLYPHS: Final = frozenset(
+    "\u115f\u1160\u2800\u303f\u3164\uffa0\U0001d159\U0001da7f\U0001da80"
+)
 _NON_DIGIT = re.compile(r"[^0-9]")
 
 
 def _is_ignorable(ch: str) -> bool:
-    return unicodedata.category(ch) in _IGNORABLE_CATEGORIES
+    return ch in _BLANK_GLYPHS or unicodedata.category(ch) in _IGNORABLE_CATEGORIES
 
 
 @functools.cache
@@ -410,8 +421,8 @@ def _masked_run() -> re.Pattern[str]:
     """The run pattern, built once: about 850 ranges of ignorable characters."""
     ranges: list[list[int]] = []
     for code in range(sys.maxunicode + 1):
-        if 0xD800 <= code <= 0xDFFF:  # surrogates are never in decoded text
-            continue
+        # Lone surrogates (Cs) included: pydantic refuses them in model
+        # output, but a run never ends on one either way.
         if _is_ignorable(chr(code)):
             if ranges and ranges[-1][1] == code - 1:
                 ranges[-1][1] = code
@@ -855,6 +866,7 @@ def create_first_pass_agent(
     model: Model | str, settings: ModelSettings | None = None
 ) -> Agent[None, FirstPass]:
     """The first-pass agent, with its output ceiling."""
+    quiet_payload_loggers()
     return Agent(
         _StopAtCeiling(infer_model(model)),
         output_type=FirstPass,
@@ -871,6 +883,7 @@ def create_account_agent(
     settings: ModelSettings | None = None,
 ) -> Agent[None, AccountExtraction] | Agent[None, LoanExtraction]:
     """The agent for one account call of ``account_type``."""
+    quiet_payload_loggers()
     wrapped = _StopAtCeiling(infer_model(model))
     model_settings = _with_ceiling(
         settings, ACCOUNT_OUTPUT_TOKENS, ACCOUNT_REQUEST_TIMEOUT_SECONDS
@@ -1044,8 +1057,9 @@ def run_first_pass(
         except Exception as exc:
             failure = _call_error("first pass", exc, _usage(messages))
     if failure is not None:
-        # Raised outside the handler, so it has no context to print either.
-        raise failure
+        # Raised outside the handler, and from None, so even a caller's own
+        # except block can't attach a context to print.
+        raise failure from None
     return FirstPassRun(output=result.output, capped=False, usage=_usage(messages))
 
 
@@ -1074,5 +1088,5 @@ def run_account(
         except Exception as exc:
             failure = _call_error("account call", exc, _usage(messages))
     if failure is not None:
-        raise failure
+        raise failure from None
     return AccountRun(output=result.output, capped=False, usage=_usage(messages))

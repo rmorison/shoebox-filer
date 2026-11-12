@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Final, Literal
 
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
@@ -34,3 +35,22 @@ def anthropic_model(
     if llm.profile.get("anthropic_supports_effort", False):
         settings["anthropic_effort"] = EXTRACTION_EFFORT
     return llm, settings
+
+
+# Loggers that print a whole request or response at DEBUG: the anthropic
+# SDK logs each request's options, which hold the document text (a
+# statement's account numbers) and, on a retry, the model's earlier output.
+PAYLOAD_LOGGERS: Final = ("anthropic", "httpx", "httpcore")
+
+
+def quiet_payload_loggers() -> None:
+    """Hold the payload loggers at INFO or above, whatever the app's level.
+
+    Called when logging is configured and when a statement agent is built,
+    so neither the app's DEBUG level nor ``ANTHROPIC_LOG=debug`` can print
+    a request. Debugging the SDK takes raising these loggers by hand.
+    """
+    for name in PAYLOAD_LOGGERS:
+        logger = logging.getLogger(name)
+        if logger.level < logging.INFO:  # NOTSET or DEBUG
+            logger.setLevel(logging.INFO)

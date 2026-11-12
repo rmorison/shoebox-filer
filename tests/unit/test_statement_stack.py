@@ -129,3 +129,34 @@ def test_a_refusal_through_the_locked_stack_is_refused(
         se.run_account(_account_agent(), _PAGES, _LISTED, None)
     assert (raised.value.kind, raised.value.error_class) == ("refused", "content")
     assert len(stub_api.requests) == 1
+
+
+def test_a_failing_call_logs_no_model_output(
+    stub_api: StubAnthropic, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An invalid output that quotes a full card number. Every record any
+    # library logs during the call (pydantic-ai, anthropic, httpx), at any
+    # level, must hold no run of eight or more digits.
+    import logging
+    import re
+    import traceback
+
+    stub_api.tool_input = {
+        **_ACCOUNT,
+        "institution": "Bank 4111111111113456",
+        "last4": "not-four-digits",
+    }
+    # The app at DEBUG, as `logging.level: DEBUG` sets it; the payload
+    # loggers stay clamped (llm.quiet_payload_loggers).
+    caplog.set_level(logging.DEBUG)
+    agent = _account_agent()
+    with pytest.raises(se.StatementCallError) as raised:
+        se.run_account(agent, _PAGES, _LISTED, None)
+    assert raised.value.kind == "schema"
+    assert caplog.records, "nothing was logged, so nothing was checked"
+    long_run = re.compile(r"[0-9]{8,}")
+    for record in caplog.records:
+        text = record.getMessage()
+        if record.exc_info:
+            text += "".join(traceback.format_exception(*record.exc_info))
+        assert not long_run.search(text), (record.name, text[:200])

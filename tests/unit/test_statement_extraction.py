@@ -1102,12 +1102,11 @@ def _code_points(categories: frozenset[str]) -> list[str]:
     return [
         chr(code)
         for code in range(sys.maxunicode + 1)
-        if not 0xD800 <= code <= 0xDFFF
-        and unicodedata.category(chr(code)) in categories
+        if unicodedata.category(chr(code)) in categories
     ]
 
 
-@pytest.mark.parametrize("category", ["Cf", "Mn", "Me", "Co", "Cn"])
+@pytest.mark.parametrize("category", ["Cf", "Mn", "Me", "Co", "Cn", "Cs"])
 def test_no_invisible_or_combining_character_hides_a_number(category: str) -> None:
     # Every code point in the category sits between two digits of a 16-digit
     # number, 15 to a number, each number fenced by a letter: only the last
@@ -1181,3 +1180,87 @@ def test_a_page_number_is_never_a_boolean() -> None:
 )
 def test_a_heading_loses_every_trailing_colon(heading: str) -> None:
     assert normalise_section(heading) == "payments and credits"
+
+
+@pytest.mark.parametrize("field", ["institution", "description"])
+@pytest.mark.parametrize("mode", ["python", "json"])
+def test_model_output_with_a_lone_surrogate_is_refused(field: str, mode: str) -> None:
+    import json
+
+    if field == "institution":
+        data: dict[str, Any] = {**_ACCOUNT, "institution": "Bank 4111\ud8001111"}
+    else:
+        data = {**_ACCOUNT, "lines": [{**_LINE, "description": "x\udfff1"}]}
+    with pytest.raises(ValidationError):
+        if mode == "python":
+            AccountExtraction.model_validate(data)
+        else:
+            AccountExtraction.model_validate_json(json.dumps(data, ensure_ascii=True))
+    # The same output without the surrogate is valid.
+    AccountExtraction.model_validate(_ACCOUNT)
+
+
+# Letters and symbols (Lo, Lm, So, Sk) whose names say they are blank. Those
+# that render as blank space join a run; the rest are visible and break it,
+# as a letter does (a recorded decision).
+_BLANK_JOINS = [
+    "\u115f",
+    "\u1160",
+    "\u2800",
+    "\u303f",
+    "\u3164",
+    "\uffa0",
+    "\U0001d159",
+    "\U0001da7f",
+    "\U0001da80",
+]
+_BLANK_NAMED_BUT_VISIBLE = {
+    "\u2400",
+    "\u2408",
+    "\u2420",
+    "\u2422",
+    "\U0001f5c5",
+    "\U0001f5c6",
+    "\U0001f5c7",
+    "\U0001f5cb",
+    "\U0001f5cc",
+    "\U0001f5cd",
+    "\U0001fab9",
+}
+
+
+@pytest.mark.parametrize("blank", _BLANK_JOINS)
+def test_a_blank_glyph_between_digit_groups_doesnt_hide_a_number(blank: str) -> None:
+    number = blank.join(["4111", "1111", "1111", "3456"])
+    assert mask_digits(f"Card {number}") == ("Card 3456", 1)
+
+
+def test_every_blank_named_letter_or_symbol_is_joined_or_listed_as_visible() -> None:
+    import sys
+    import unicodedata
+
+    words = ("FILLER", "BLANK", "SPACE", "INVISIBLE", "EMPTY", "NULL")
+    found = {
+        chr(code)
+        for code in range(sys.maxunicode + 1)
+        if unicodedata.category(chr(code)) in {"Lo", "Lm", "So", "Sk"}
+        and any(word in unicodedata.name(chr(code), "") for word in words)
+    }
+    assert found == set(_BLANK_JOINS) | _BLANK_NAMED_BUT_VISIBLE
+
+
+def test_a_visible_letter_or_symbol_breaks_a_run() -> None:
+    # The recorded decision: like any letter, a visible one ends a run.
+    assert mask_digits("Ref 1234\u26055678") == ("Ref 1234\u26055678", 0)
+
+
+def test_a_call_error_has_no_context_even_inside_a_callers_handler() -> None:
+    model, _ = _reply({**_ACCOUNT, "last4": "x"})
+    agent = se.create_account_agent("deposit", model)
+    try:
+        raise KeyError("the caller's own error")
+    except KeyError:
+        with pytest.raises(se.StatementCallError) as raised:
+            se.run_account(agent, _PAGES, _LISTED, None)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__
