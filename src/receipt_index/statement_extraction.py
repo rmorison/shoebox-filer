@@ -573,7 +573,16 @@ def _set_aside(token: str, *, alone: bool) -> bool:
 def _cut_tokens(span: str) -> tuple[str, int]:
     """One span with every run of number tokens of eight digits or more cut."""
     tokens = list(_TOKEN.finditer(span))
-    alone = sum(1 for t in tokens if _NON_DIGIT.sub("", t.group())) == 1
+    # "Alone": once amounts and dates are set aside, the only token with
+    # digits left in the span. A span ends at any mark that isn't a joiner.
+    alone = (
+        sum(
+            1
+            for t in tokens
+            if _NON_DIGIT.sub("", t.group()) and not _set_aside(t.group(), alone=False)
+        )
+        == 1
+    )
     runs: list[list[re.Match[str]]] = [[]]
     for token in tokens:
         if _set_aside(token.group(), alone=alone):

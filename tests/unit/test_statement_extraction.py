@@ -1578,6 +1578,16 @@ _MUST_CUT = [
     # A year range or ZIP+4 is set aside only alone in its span.
     "1999-2000 3456 7890 1234",
     "94105-1234 5678 9012",
+    # Neighbours of a year range or ZIP+4 make it part of a number.
+    "ACCT 12345-6789 0123",
+    "ACCT 0123 12345-6789",
+    "ACCT 1985-2014 1234",
+    "ACCT 12 1985-2014 34",
+    "4111 2025-2026 1234",
+    "4111 1111 12345-6789 1234",
+    # Repeats are neighbours too.
+    "12345-6789 12345-6789",
+    "1985-2014 1986-2015 1987-2016",
 ]
 
 
@@ -1642,3 +1652,23 @@ def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
 )
 def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
     assert mask_digits(text)[0] == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # "Whole span": once amounts and dates are set aside, the year range
+        # or ZIP+4 is the only token with digits left in its span.
+        "SEATTLE WA 98101-1234 11/09 45.99",  # a date and an amount peeled
+        "ZIP 98101-1234, 11/09",  # a joiner, then a date
+        "ACCT 12345-6789 $12.50",  # "$" ends the span
+        "ACCT 12345-6789 #0412",  # "#" ends the span
+        "TUITION 2025-2026 FALL",  # letters end it
+        # Accepted, recorded as passing: a lone one is set aside even when
+        # it is really an account number.
+        "ACCT 12345-6789",
+        "ACCT 1985-2014",
+    ],
+)
+def test_a_year_range_or_zip_alone_in_its_span_stays(text: str) -> None:
+    assert mask_digits(text) == (text, 0)
