@@ -420,7 +420,7 @@ class TestRetries:
         adapter = Adapter()
         config = SimpleNamespace(name=_SOURCE, type="gdrive")
         with ExitStack() as stack:
-            pool = SourcePool([config], lambda _: adapter, stack)  # type: ignore[list-item]
+            pool = SourcePool([config], lambda _: adapter, stack)  # type: ignore[list-item, arg-type, return-value]
             result = pipeline.run_due_retries(
                 pg_conn,
                 due,
@@ -524,7 +524,7 @@ class TestRetriesWithoutAgents:
         config = SimpleNamespace(name=_SOURCE, type="gdrive")
         for _ in range(2):
             with ExitStack() as stack:
-                pool = SourcePool([config], lambda _: NoFetch(), stack)  # type: ignore[list-item]
+                pool = SourcePool([config], lambda _: NoFetch(), stack)  # type: ignore[list-item, arg-type, return-value]
                 result = pipeline.run_due_retries(
                     pg_conn,
                     due,
@@ -541,7 +541,7 @@ class TestRetriesWithoutAgents:
 def _read(reason: str | None, pages: int = 1) -> Any:
     from receipt_index.pdf_reader import StatementRead
 
-    return StatementRead(None, pages=pages, reason=reason, encrypted=False)
+    return StatementRead(None, pages=pages, reason=reason, encrypted=False)  # type: ignore[arg-type]
 
 
 class TestErrorPaths:
@@ -565,6 +565,65 @@ class TestErrorPaths:
         assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
         (latest, *_) = get_item_history(pg_conn, raw.source_id)
         assert (latest.status, latest.counts_attempt) == ("failed", True)
+
+    def test_a_reader_that_couldnt_start_is_a_retried_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A parent-side OSError (no processes, or a full temporary directory)
+        # propagates out of read_statement; U5 retries it like a stopped read.
+        import errno
+
+        from receipt_index import statements
+
+        def no_reader(*_a: object, **_k: object) -> None:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(statements, "read_statement", no_reader)
+        replies = Replies()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert replies.calls == []
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.counts_attempt) == ("failed", True)
+        assert latest.next_retry_at is not None
+        assert latest.error_message == (
+            "the statement reader couldn't start: "
+            "BlockingIOError: Resource temporarily unavailable"
+        )
+
+    @pytest.mark.parametrize("reason", ["timeout", "failed"])
+    def test_a_stopped_read_is_terminal_at_the_last_attempt(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+    ) -> None:
+        # Bounded: a file that really does exhaust the host is retried a
+        # fixed number of times, never forever.
+        from receipt_index import statements
+        from receipt_index.retries import AttemptState, RetryPolicy
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        policy = RetryPolicy()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(
+            pg_conn,
+            raw,
+            store,
+            Replies(),
+            policy=policy,
+            state=AttemptState(policy.max_attempts),
+        )
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert latest.attempt == policy.max_attempts
+        assert latest.counts_attempt
+        assert latest.next_retry_at is None
 
     @pytest.mark.parametrize(
         ("reason", "document_type", "bound"),

@@ -107,7 +107,7 @@ def test_an_item_whose_source_is_gone_is_looked_for_in_sources_of_its_type() -> 
         _source("other-statements", "gdrive", "statements"),
     ]
     with ExitStack() as stack:
-        pool = SourcePool(sources, lambda _: None, stack)  # type: ignore[arg-type]
+        pool = SourcePool(sources, lambda _: None, stack)  # type: ignore[arg-type, return-value]
         assert pool.candidates("removed", STATEMENT_INGEST_TYPE) == [
             "statements-drive",
             "other-statements",
