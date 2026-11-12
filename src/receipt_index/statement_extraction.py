@@ -408,8 +408,8 @@ _IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
 # visible, and breaks a run as a letter does: a decision.
 _BLANK_GLYPHS: Final = frozenset(
     "\u115f\u1160\u2800\u303f\u3164\uffa0\U0001d159\U0001da7f\U0001da80"
-    # Egyptian hieroglyph full and half blank: letters from Unicode 15 (the
-    # Python 3.13 database), unassigned and so already joined before it.
+    # Egyptian hieroglyph full and half blank: letters from Unicode 15.0
+    # (Python 3.12 and later), unassigned and so already joined before it.
     "\U00013441\U00013442"
 )
 _NON_DIGIT = re.compile(r"[^0-9]")

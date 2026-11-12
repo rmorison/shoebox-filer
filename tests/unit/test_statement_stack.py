@@ -160,3 +160,29 @@ def test_a_failing_call_logs_no_model_output(
         if record.exc_info:
             text += "".join(traceback.format_exception(*record.exc_info))
         assert not long_run.search(text), (record.name, text[:200])
+
+
+@pytest.mark.parametrize("build", ["receipt", "first_pass", "account"])
+def test_every_agent_clamps_the_payload_loggers(build: str) -> None:
+    # Without relying on the CLI: building any agent holds the loggers that
+    # print a whole request at INFO or above.
+    import logging
+
+    from receipt_index.extraction import create_extraction_agent
+    from receipt_index.llm import PAYLOAD_LOGGERS
+
+    saved = {name: logging.getLogger(name).level for name in PAYLOAD_LOGGERS}
+    try:
+        for name in PAYLOAD_LOGGERS:
+            logging.getLogger(name).setLevel(logging.DEBUG)
+        if build == "receipt":
+            create_extraction_agent(api_key=_KEY, model=_MODEL)
+        elif build == "first_pass":
+            _first_pass_agent()
+        else:
+            _account_agent()
+        for name in PAYLOAD_LOGGERS:
+            assert not logging.getLogger(name).isEnabledFor(logging.DEBUG), name
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
