@@ -60,13 +60,13 @@ def _payload_logger_names() -> set[str]:
     ``anthropic._base_client`` set to DEBUG by hand) would otherwise log
     below its clamped parent.
     """
-    made = {
-        name
-        for name, logger in logging.root.manager.loggerDict.items()
-        if isinstance(logger, logging.Logger)
-        and name.split(".")[0].startswith(PAYLOAD_LOGGER_PREFIXES)
-    }
-    return set(PAYLOAD_LOGGERS) | made
+    registry = logging.root.manager.loggerDict
+    under = [n for n in registry if n.split(".")[0].startswith(PAYLOAD_LOGGER_PREFIXES)]
+    # Every top-level name, even one only a placeholder for its children so
+    # far, and every child that is a real logger (it may have its own level).
+    tops = {n.split(".")[0] for n in under}
+    made = {n for n in under if isinstance(registry[n], logging.Logger)}
+    return set(PAYLOAD_LOGGERS) | tops | made
 
 
 def quiet_payload_loggers() -> None:

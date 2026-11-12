@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model, ModelRequestParameters
     from pydantic_ai.settings import ModelSettings
 
+    from receipt_index.errors import ErrorClass
+
 # Recorded on every revision. Raise one when its prompt or output model
 # changes in a way that could change what comes back.
 FIRST_PASS_VERSION: Final = 1
@@ -1017,7 +1019,11 @@ class StatementCallError(Exception):
     """
 
     def __init__(
-        self, call: str, kind: CallErrorKind, error_class: str, usage: CallUsage
+        self,
+        call: str,
+        kind: CallErrorKind,
+        error_class: ErrorClass,
+        usage: CallUsage,
     ) -> None:
         super().__init__(f"statement {call} failed: {kind} ({error_class})")
         self.call = call

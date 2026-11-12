@@ -491,3 +491,171 @@ def test_the_synthetic_pdf_reads_as_text() -> None:
         hashlib.sha256(make_pdf(_PAGE)).digest()
         == hashlib.sha256(make_pdf(_PAGE)).digest()
     )
+
+
+class TestRetriesWithoutAgents:
+    def test_a_pass_without_statement_agents_leaves_the_item_untouched(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        # No fetch, no started row: a started row would be closed next pass
+        # as a counted failure, using up the item's attempts.
+        raw = _raw(make_pdf(_PAGE))
+        TestRetries()._failed_statement(pg_conn, raw)
+        before = get_item_history(pg_conn, raw.source_id)
+
+        class NoFetch:
+            def __enter__(self) -> NoFetch:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                raise AssertionError("fetched without statement agents")
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive")
+        for _ in range(2):
+            with ExitStack() as stack:
+                pool = SourcePool([config], lambda _: NoFetch(), stack)  # type: ignore[list-item]
+                result = pipeline.run_due_retries(
+                    pg_conn,
+                    due,
+                    pool=pool,
+                    store=store,
+                    agents={},
+                    llm_model="test-model",
+                    own_source=_SOURCE,
+                )
+            assert (result.processed, result.failed) == (0, 0)
+        assert get_item_history(pg_conn, raw.source_id) == before
+
+
+def _read(reason: str | None, pages: int = 1) -> Any:
+    from receipt_index.pdf_reader import StatementRead
+
+    return StatementRead(None, pages=pages, reason=reason, encrypted=False)
+
+
+class TestErrorPaths:
+    @pytest.mark.parametrize("reason", ["timeout", "failed"])
+    def test_a_read_that_stopped_is_a_retried_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+    ) -> None:
+        from receipt_index import statements
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        replies = Replies()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert not outcome.stops_source
+        assert replies.calls == []
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.counts_attempt) == ("failed", True)
+
+    @pytest.mark.parametrize(
+        ("reason", "document_type", "bound"),
+        [
+            ("unreadable", "unreadable", None),
+            ("pages", "over_bounds", "pages"),
+            ("size", "over_bounds", "size"),
+            ("memory", "over_bounds", "memory"),
+            ("text", "over_bounds", "text"),
+            ("crash", "over_bounds", "crash"),
+        ],
+    )
+    def test_a_read_over_a_bound_is_a_rejected_revision(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+        document_type: str,
+        bound: str | None,
+    ) -> None:
+        from receipt_index import statements
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        replies = Replies()
+        assert _run(pg_conn, _raw(make_pdf(_PAGE)), store, replies).status == "success"
+        row = _one(
+            pg_conn,
+            "SELECT status, document_type, rejected_bound"
+            " FROM receipt.statement_revisions",
+        )
+        assert (row["status"], row["document_type"], row["rejected_bound"]) == (
+            "rejected",
+            document_type,
+            bound,
+        )
+        assert replies.calls == []
+
+    @pytest.mark.parametrize(
+        ("status", "error_class"), [(503, "transient"), (401, "config")]
+    )
+    def test_a_provider_error_stops_the_source_and_writes_nothing(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        status: int,
+        error_class: str,
+    ) -> None:
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        def fail() -> dict[str, Any]:
+            raise ModelHTTPError(status, "test-model")
+
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, Replies(account=fail))
+        assert (outcome.status, outcome.error_class) == ("failed", error_class)
+        assert outcome.stops_source
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert latest.status == "failed"
+
+    def test_an_item_with_no_file_content_is_an_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        import dataclasses
+
+        raw = dataclasses.replace(_raw(b""), raw_bytes=None, file_content=None)
+        outcome = _run(pg_conn, raw, store, Replies())
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+
+    def test_a_failed_call_logs_no_number_and_no_traceback(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        number = "5274910386254173"
+        caplog.set_level(logging.DEBUG)
+        raw = _raw(make_pdf(_PAGE), name=f"Statement {number}.pdf")
+        replies = Replies(
+            account={**_ACCOUNT, "institution": f"Bank {number}", "last4": "x"}
+        )
+        assert _run(pg_conn, raw, store, replies).status == "failed"
+        windows = {number[i : i + 8] for i in range(len(number) - 7)}
+        assert caplog.records
+        for record in caplog.records:
+            text = record.getMessage()
+            assert not any(w in text for w in windows), (record.name, text[:200])
+            if record.name.startswith("receipt_index"):
+                assert record.exc_info is None, record.name

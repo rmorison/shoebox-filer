@@ -766,15 +766,6 @@ def item_done(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
     return bool(row and row["done"])
 
 
-def has_receipt(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> bool:
-    """Whether a receipt exists for this source ID (it has a provenance row)."""
-    cur = conn.execute(
-        "SELECT 1 FROM receipt.provenance WHERE source_id = %(id)s",
-        {"id": source_id},
-    )
-    return cur.fetchone() is not None
-
-
 # Due for the retry scheduler, over the latest row: requeued, a failure whose
 # time has come, or a started row (whose lock the caller then tries).
 _DUE = (

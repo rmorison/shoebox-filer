@@ -69,3 +69,61 @@ def test_a_call_error_keeps_its_own_message() -> None:
 )
 def test_a_file_name_is_masked(name: str | None, masked: str | None) -> None:
     assert masked_file_name(name) == masked
+
+
+# ---------------------------------------------------------------------------
+# Ingest types: statement items are never offered to a receipt source
+# ---------------------------------------------------------------------------
+
+
+def _source(name: str, kind: str, documents: str | None = None) -> object:
+    from types import SimpleNamespace
+
+    fields = {"name": name, "type": kind}
+    if documents is not None:
+        fields["documents"] = documents
+    return SimpleNamespace(**fields)
+
+
+def test_a_statement_drive_source_logs_its_own_ingest_type() -> None:
+    from receipt_index.fetching import STATEMENT_INGEST_TYPE, ingest_type
+
+    statements = _source("statements-drive", "gdrive", "statements")
+    receipts = _source("receipts-drive", "gdrive")
+    mail = _source("mail", "imap")
+    assert ingest_type(statements) == STATEMENT_INGEST_TYPE  # type: ignore[arg-type]
+    assert ingest_type(receipts) == "gdrive"  # type: ignore[arg-type]
+    assert ingest_type(mail) == "imap"  # type: ignore[arg-type]
+
+
+def test_an_item_whose_source_is_gone_is_looked_for_in_sources_of_its_type() -> None:
+    from contextlib import ExitStack
+
+    from receipt_index.fetching import STATEMENT_INGEST_TYPE, SourcePool
+
+    sources = [
+        _source("receipts-drive", "gdrive"),
+        _source("statements-drive", "gdrive", "statements"),
+        _source("other-statements", "gdrive", "statements"),
+    ]
+    with ExitStack() as stack:
+        pool = SourcePool(sources, lambda _: None, stack)  # type: ignore[arg-type]
+        assert pool.candidates("removed", STATEMENT_INGEST_TYPE) == [
+            "statements-drive",
+            "other-statements",
+        ]
+        assert pool.candidates("removed", "gdrive") == ["receipts-drive"]
+        # Its own source, while configured, whatever the type.
+        assert pool.candidates("statements-drive", STATEMENT_INGEST_TYPE) == [
+            "statements-drive"
+        ]
+
+
+def test_warm_mask_builds_the_patterns() -> None:
+    from receipt_index import statement_extraction as se
+
+    se._masked_run.cache_clear()
+    se._dashes.cache_clear()
+    se.warm_mask()
+    assert se._masked_run.cache_info().currsize == 1
+    assert se._dashes.cache_info().currsize == 1

@@ -1243,6 +1243,15 @@ def run_due_retries(
             source_name = latest.source_name
             source_type = latest.source_type
             email_date = latest.email_date
+            if source_type == STATEMENT_INGEST_TYPE and statement_agents is None:
+                # Left for a pass that has the statement agents, before any
+                # fetch or row: a started row here would be closed next pass
+                # as a counted failure, using up the item's attempts.
+                logger.warning(
+                    "Retry of statement %s left for later: no statement agents",
+                    entry.source_id,
+                )
+                continue
 
             if latest.status == "started":
                 logger.warning(
@@ -1325,12 +1334,7 @@ def run_due_retries(
 
             raw = fetched.raw
             if source_type == STATEMENT_INGEST_TYPE:
-                if statement_agents is None:
-                    logger.warning(
-                        "Retry of statement %s left for later: no statement agents",
-                        entry.source_id,
-                    )
-                    continue
+                assert statement_agents is not None  # checked before the fetch
                 from receipt_index.statements import process_statement
 
                 outcome = process_statement(

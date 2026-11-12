@@ -147,7 +147,7 @@ def _present(store: EvidenceStore, ref: str, size: int) -> bool:
         return False
 
 
-def _put_original(
+def put_original(
     conn: psycopg.Connection[dict[str, Any]],
     store: EvidenceStore,
     data: bytes,
@@ -199,7 +199,7 @@ def store_email_original(
     def put(data: bytes, media_type: str, name: str) -> StoredFile:
         digest = hashlib.sha256(data).digest()
         if digest not in stored:
-            file = _put_original(
+            file = put_original(
                 conn, store, data, media_type=media_type, folder=folder, name=name
             )
             # A PDF is stored as received, whatever its state (design §9).

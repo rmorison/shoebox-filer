@@ -38,7 +38,8 @@ from typing import TYPE_CHECKING, Any, Final
 import psycopg
 
 from receipt_index.errors import classify
-from receipt_index.originals import _put_original
+from receipt_index.fetching import STATEMENT_INGEST_TYPE
+from receipt_index.originals import put_original
 from receipt_index.pdf_reader import StatementRead, read_statement
 from receipt_index.pdf_validate import STATEMENT_BOUNDS
 from receipt_index.pipeline import ItemOutcome, RunControl
@@ -96,7 +97,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # The source type of a statement item in ingest_log, apart from receipts.
-STATEMENT_SOURCE_TYPE: Final = "gdrive_statement"
+STATEMENT_SOURCE_TYPE: Final = STATEMENT_INGEST_TYPE
 
 # The most accounts a statement may list; more is rejected as over_bounds,
 # accounts. Each account is its own watchdog step and model call.
@@ -477,7 +478,7 @@ def _error_class(exc: BaseException) -> ErrorClass:
     if isinstance(exc, StatementCallError):
         if exc.kind == "timeout":
             return "content"
-        return exc.error_class  # type: ignore[return-value]
+        return exc.error_class
     if isinstance(exc, StatementItemError):
         return "content"
     return classify(exc)
@@ -539,7 +540,7 @@ def process_statement(
             return ItemOutcome("success")
         conn.commit()
 
-        stored = _put_original(
+        stored = put_original(
             conn,
             store,
             data,
@@ -547,6 +548,8 @@ def process_statement(
             folder=StoreFolder.for_original(received_at, source_name, digest),
             name=file_name or "statement.pdf",
         )
+        # End the read transaction before the PDF read and the model calls.
+        conn.commit()
         extracted = extract_statement(
             data,
             agents=agents,

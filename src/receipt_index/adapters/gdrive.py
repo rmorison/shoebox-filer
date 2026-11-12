@@ -479,17 +479,18 @@ class GdriveAdapter:
         Returns (content_bytes, mime_type) or None if the file type
         is unsupported.
         """
+        # Logged by its Drive ID only: a file's name can carry an account
+        # number (a statement dropped as "Statement 4111....pdf").
         file_id: str = file_meta["id"]
-        file_name: str = file_meta["name"]
         mime_type: str = file_meta["mimeType"]
 
         if mime_type in _SUPPORTED_MIME_TYPES:
-            logger.debug("Downloading file %s (%s)", file_name, mime_type)
+            logger.debug("Downloading file %s (%s)", file_id, mime_type)
             content: bytes = service.files().get_media(fileId=file_id).execute()
             return content, mime_type
 
         if mime_type == _GOOGLE_DOCS_MIME_TYPE:
-            logger.debug("Exporting Google Doc %s as PDF", file_name)
+            logger.debug("Exporting Google Doc %s as PDF", file_id)
             content = (
                 service.files()
                 .export_media(fileId=file_id, mimeType="application/pdf")
@@ -498,9 +499,6 @@ class GdriveAdapter:
             return content, "application/pdf"
 
         logger.warning(
-            "Skipping unsupported file type %s for file %s (%s)",
-            mime_type,
-            file_name,
-            file_id,
+            "Skipping unsupported file type %s for file %s", mime_type, file_id
         )
         return None
