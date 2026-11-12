@@ -13,6 +13,8 @@ dependencies = [
     "Pillow>=10.0",
     "pydantic>=2.0",
     "pydantic-ai>=2.60",
+    # Its own OpenTelemetry option (open_telemetry) is turned off in llm.py.
+    "anthropic>=2.1.0,<3",
     "psycopg[binary]>=3.1",
     "pdfplumber>=0.10",
     "playwright>=1.40",
@@ -85,7 +87,7 @@ warn_unused_configs = true
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "yaml.*", "imapclient.*", "httplib2.*"]
+module = ["google.auth.*", "google.oauth2.*", "google_auth_oauthlib.*", "googleapiclient.*", "pdfplumber.*", "PIL.*", "playwright.*", "slugify.*", "weasyprint.*", "pydantic_ai.*", "anthropic.*", "yaml.*", "imapclient.*", "httplib2.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

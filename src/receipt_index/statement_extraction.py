@@ -29,8 +29,8 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -43,7 +43,6 @@ from pydantic import (
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.messages import ModelResponse
-from pydantic_ai.models import infer_model
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.usage import UsageLimits
 
@@ -352,9 +351,14 @@ def format_money(value: str) -> str:
 
     ``value`` is a two-place decimal string from an output model.
     """
-    amount = Decimal(value)
+    # Fixed messages: the value itself never goes into an error.
+    try:
+        amount = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError):
+        msg = "not a decimal amount"
+        raise ValueError(msg) from None
     if not amount.is_finite():
-        msg = f"not a finite amount: {value!r}"
+        msg = "not a finite amount"
         raise ValueError(msg)
     if amount.is_zero():
         return "0.00"
@@ -421,7 +425,7 @@ def _is_ignorable(ch: str) -> bool:
 
 @functools.cache
 def _masked_run() -> re.Pattern[str]:
-    """The run pattern, built once: about 850 ranges of ignorable characters."""
+    """Invisible characters inside a number, built once (about 850 ranges)."""
     ranges: list[list[int]] = []
     for code in range(sys.maxunicode + 1):
         # Lone surrogates (Cs) included: pydantic refuses them in model
@@ -437,7 +441,10 @@ def _masked_run() -> re.Pattern[str]:
         else f"{re.escape(chr(low))}-{re.escape(chr(high))}"
         for low, high in ranges
     )
-    return re.compile(rf"[0-9](?:[ \-{ignorable}]*[0-9]){{7,}}")
+    # Invisible characters between two characters of a number: dropped, so
+    # none can split one.
+    context = r"[0-9 \-./,'\u2019\u00b7\u2044]"
+    return re.compile(rf"(?<={context})[{ignorable}]+(?={context})")
 
 
 def _is_dash(ch: str) -> bool:
@@ -463,28 +470,154 @@ def _fold_separators(text: str) -> str:
 
 
 def mask_digits(text: str | None) -> tuple[str | None, int]:
-    """``text`` with every long digit run cut to its last four, and the count.
+    """``text`` with every account-like number cut to its last four, and the count.
 
-    The model's text is normalised first, as the statement's was (control,
-    bidirectional and invisible characters dropped), so a zero-width
-    character between two digit groups can't hide a number from the mask.
-    Then separators are folded (whitespace to one space, dashes to ``-``),
-    so a number grouped by non-breaking spaces, tabs or en dashes is caught.
-    A format character, combining mark, private-use or unassigned character
-    that normalisation keeps doesn't break a run either.
+    The text is normalised as the statement's was, separators are folded
+    (whitespace to one space, Unicode dashes to ``-``), and invisible
+    characters inside a number are dropped. Then each span of digits joined
+    only by spaces and the marks institutions print inside a number
+    (``- . / , ' \u2019 \u00b7 \u2044``) is split at its spaces into tokens.
+    An amount with cents and a short date (``11/09``, ``11/09/2026``, or a
+    range of them) are set aside and break a run. So are a range of years
+    (``2025-2026``) and a ZIP+4 (``94105-1234``), but only when, once
+    amounts and dates are set aside, one is the only token with digits left
+    in its span; beside any other digit group either is part of a number.
+    Every run of the other tokens that totals eight digits or more is cut to
+    its last four digits.
+    A lone bare amount in thousands groups (nine digits or fewer,
+    ``123,456,789``) stays. Any other mark (``$ # % = @ +``, brackets) ends
+    a span, so an amount beside a store number or a date stays readable.
     """
     if text is None:
         return None, 0
-    text = normalise_statement_text(text)
+    text = _masked_run().sub("", _fold_separators(normalise_statement_text(text)))
     count = 0
 
-    def last_four(match: re.Match[str]) -> str:
+    def cut_span(span: re.Match[str]) -> str:
         nonlocal count
-        count += 1
-        return _NON_DIGIT.sub("", match.group())[-4:]
+        masked, cuts = _cut_tokens(span.group())
+        count += cuts
+        return masked
 
-    masked = _masked_run().sub(last_four, _fold_separators(text))
-    return masked, count
+    return _SPAN.sub(cut_span, text), count
+
+
+# Marks an institution prints inside a number; any other ends one.
+_JOINERS = "-./,'\u2019\u00b7\u2044"
+_SPAN = re.compile(rf"[0-9]+(?:(?:(?: *[{_JOINERS}])+ *| +)[0-9]+)*")
+_TOKEN = re.compile(r"\S+")
+# An amount with cents: plain, at most seven whole digits ("1234567.89"),
+# or in thousands groups with the other separator for the point
+# ("1,234,567.89", "1.234.567,89"). A longer plain one ("123456789.12") is
+# read as a number with a suffix, and cut.
+_PLAIN_CENTS = re.compile(r"[0-9]{1,7}[.,][0-9]{2}")
+_THOUSANDS_CENTS = re.compile(
+    r"(?P<whole>[0-9]{1,3}(?P<group>[,.'\u2019])[0-9]{3}(?:(?P=group)[0-9]{3})*)"
+    r"(?P<point>[.,])[0-9]{2}"
+)
+_BARE_THOUSANDS = re.compile(r"[0-9]{1,3}([,.'\u2019])[0-9]{3}(?:\1[0-9]{3})*")
+_MAX_AMOUNT_DIGITS: Final = 12
+_MAX_BARE_AMOUNT_DIGITS: Final = 9
+_MIN_MASKED_DIGITS: Final = 8
+# A short date, or a range of two: month and day (either order) with "/" or
+# ".", and an optional two- or four-digit year.
+_DATE = re.compile(
+    r"(?P<a>[0-9]{1,2})(?P<s>[/.])(?P<b>[0-9]{1,2})"
+    r"(?:(?P=s)(?:[0-9]{2}|(?:19|20)[0-9]{2}))?"
+)
+# A range of years ("2025-2026") and a ZIP+4 code ("94105-1234").
+_YEAR_RANGE = re.compile(r"(?P<a>(?:19|20)[0-9]{2})-(?P<b>(?:19|20)[0-9]{2})")
+_ZIP_PLUS_FOUR = re.compile(r"[0-9]{5}-[0-9]{4}")
+
+
+def _is_cents_amount(token: str) -> bool:
+    if _PLAIN_CENTS.fullmatch(token):
+        return True
+    shape = _THOUSANDS_CENTS.fullmatch(token)
+    return (
+        shape is not None
+        and shape.group("point") != shape.group("group")
+        and len(_NON_DIGIT.sub("", shape.group("whole"))) <= _MAX_AMOUNT_DIGITS
+    )
+
+
+def _is_one_date(token: str) -> bool:
+    shape = _DATE.fullmatch(token)
+    if shape is None:
+        return False
+    a, b = int(shape.group("a")), int(shape.group("b"))
+    return (1 <= a <= 12 and 1 <= b <= 31) or (1 <= a <= 31 and 1 <= b <= 12)
+
+
+def _is_date(token: str) -> bool:
+    """A short date, or a range of two joined by a dash."""
+    parts = token.split("-")
+    return 1 <= len(parts) <= 2 and all(_is_one_date(part) for part in parts)
+
+
+def _is_year_range(token: str) -> bool:
+    shape = _YEAR_RANGE.fullmatch(token)
+    return shape is not None and int(shape.group("a")) < int(shape.group("b"))
+
+
+def _set_aside(token: str, *, alone: bool) -> bool:
+    """An amount or a short date, not part of a number; and, when ``alone``
+    in its span, a year range or a ZIP+4. Beside other digit groups those
+    two could be groups of a longer number ("1999-2000 3456 7890 1234")."""
+    core = token.strip(_JOINERS)
+    if not core:
+        return False
+    if _is_cents_amount(core) or _is_date(core):
+        return True
+    return alone and (
+        _is_year_range(core) or _ZIP_PLUS_FOUR.fullmatch(core) is not None
+    )
+
+
+def _cut_tokens(span: str) -> tuple[str, int]:
+    """One span with every run of number tokens of eight digits or more cut."""
+    tokens = list(_TOKEN.finditer(span))
+    # "Alone": once amounts and dates are set aside, the only token with
+    # digits left in the span. A span ends at any mark that isn't a joiner.
+    alone = (
+        sum(
+            1
+            for t in tokens
+            if _NON_DIGIT.sub("", t.group()) and not _set_aside(t.group(), alone=False)
+        )
+        == 1
+    )
+    runs: list[list[re.Match[str]]] = [[]]
+    for token in tokens:
+        if _set_aside(token.group(), alone=alone):
+            runs.append([])
+        elif _NON_DIGIT.sub("", token.group()):
+            runs[-1].append(token)
+        # A token of marks alone (" - ", " . ") neither counts nor breaks.
+    pieces: list[str] = []
+    position = 0
+    cuts = 0
+    for run in runs:
+        if not run:
+            continue
+        digits = "".join(_NON_DIGIT.sub("", t.group()) for t in run)
+        lone_amount = (
+            len(run) == 1
+            and _BARE_THOUSANDS.fullmatch(run[0].group().strip(_JOINERS))
+            and len(digits) <= _MAX_BARE_AMOUNT_DIGITS
+        )
+        if len(digits) < _MIN_MASKED_DIGITS or lone_amount:
+            continue
+        start, end = run[0].start(), run[-1].end()
+        # Keep a mark the run's first token starts with ("-4111 ..."); a
+        # span always ends on a digit, so its last token never ends on one.
+        lead = len(run[0].group()) - len(run[0].group().lstrip(_JOINERS))
+        pieces.append(span[position : start + lead])
+        pieces.append(digits[-4:])
+        position = end
+        cuts += 1
+    pieces.append(span[position:])
+    return "".join(pieces), cuts
 
 
 class PeriodIssue(enum.Enum):
@@ -865,46 +998,105 @@ class _StopAtCeiling(WrapperModel):  # type: ignore[misc,unused-ignore]
         return response
 
 
+_AgentT = TypeVar("_AgentT", bound=Agent[Any, Any])
+
+
+def _untraced(agent: _AgentT) -> _AgentT:
+    """``agent`` with tracing off, whatever turns it on globally.
+
+    A span carries the request (the statement's text) and the response (the
+    model's output), and one ``Agent.instrument_all`` or
+    ``logfire.instrument_pydantic_ai`` anywhere in the process would
+    export them. The agent's own setting outranks the global one, and there
+    is no constructor argument for it.
+    """
+    agent.instrument = False
+    return agent
+
+
+def _untraced_model(model: Model) -> Model:
+    """``model``, if nothing it sends can be traced; refused otherwise.
+
+    A statement agent takes a model object, never a name: a name would
+    build a client with the SDK's defaults, whose own OpenTelemetry tracing
+    exports spans holding the page text. An Anthropic model must come from
+    ``llm.anthropic_model`` (its client resolves traces and propagation
+    off); pydantic-ai's test models send nothing; any other model is
+    refused, since its SDK's tracing hasn't been checked.
+    """
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.models.test import TestModel
+
+    if isinstance(model, str):
+        msg = "a statement agent needs a model from llm.anthropic_model, not a name"
+        raise TypeError(msg)
+    if isinstance(model, FunctionModel | TestModel):
+        return model
+    if isinstance(model, AnthropicModel):
+        resolved = getattr(model.client, "_open_telemetry", None) or {}
+        traces = resolved.get("traces")
+        if (
+            isinstance(traces, dict)
+            and traces.get("enabled") is False
+            and resolved.get("propagation") is False
+        ):
+            return model
+        msg = (
+            "a statement agent's Anthropic client must have tracing off: "
+            "build the model with llm.anthropic_model"
+        )
+        raise ValueError(msg)
+    msg = "a statement agent needs an Anthropic model from llm.anthropic_model"
+    raise TypeError(msg)
+
+
 def create_first_pass_agent(
-    model: Model | str, settings: ModelSettings | None = None
+    model: Model, settings: ModelSettings | None = None
 ) -> Agent[None, FirstPass]:
     """The first-pass agent, with its output ceiling."""
     quiet_payload_loggers()
-    return Agent(
-        _StopAtCeiling(infer_model(model)),
-        output_type=FirstPass,
-        system_prompt=FIRST_PASS_PROMPT,
-        model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
-        # A refusal ends the run as a ContentFilterError: kind "refused".
-        capabilities=[RaiseContentFilterError()],
+    return _untraced(
+        Agent(
+            _StopAtCeiling(_untraced_model(model)),
+            output_type=FirstPass,
+            system_prompt=FIRST_PASS_PROMPT,
+            model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
+            # A refusal ends the run as a ContentFilterError: kind "refused".
+            capabilities=[RaiseContentFilterError()],
+        )
     )
 
 
 def create_account_agent(
     account_type: AccountType,
-    model: Model | str,
+    model: Model,
     settings: ModelSettings | None = None,
 ) -> Agent[None, AccountExtraction] | Agent[None, LoanExtraction]:
     """The agent for one account call of ``account_type``."""
     quiet_payload_loggers()
-    wrapped = _StopAtCeiling(infer_model(model))
+    wrapped = _StopAtCeiling(_untraced_model(model))
     model_settings = _with_ceiling(
         settings, ACCOUNT_OUTPUT_TOKENS, ACCOUNT_REQUEST_TIMEOUT_SECONDS
     )
     if account_type == "loan":
-        return Agent(
+        return _untraced(
+            Agent(
+                wrapped,
+                output_type=LoanExtraction,
+                system_prompt=account_prompt(account_type),
+                model_settings=model_settings,
+                capabilities=[RaiseContentFilterError()],
+            )
+        )
+    return _untraced(
+        Agent(
             wrapped,
-            output_type=LoanExtraction,
+            output_type=AccountExtraction,
             system_prompt=account_prompt(account_type),
             model_settings=model_settings,
             capabilities=[RaiseContentFilterError()],
         )
-    return Agent(
-        wrapped,
-        output_type=AccountExtraction,
-        system_prompt=account_prompt(account_type),
-        model_settings=model_settings,
-        capabilities=[RaiseContentFilterError()],
     )
 
 

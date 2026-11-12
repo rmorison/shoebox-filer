@@ -5,8 +5,14 @@ from __future__ import annotations
 import logging
 from typing import Final, Literal
 
+import pydantic_ai
+from anthropic import AsyncAnthropic
 from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.providers.anthropic import AnthropicProvider
+
+# pydantic-ai prints a first-run banner to the console. It carries no
+# payload, but it is noise in a service's container logs.
+pydantic_ai.BANNER_ENABLED = False
 
 DEFAULT_MODEL = "claude-haiku-5-5"
 
@@ -30,7 +36,14 @@ def anthropic_model(
     The effort is set only on models that take one: an older model rejects it.
     No sampling parameters are set; Haiku 5.5 rejects non-default ones.
     """
-    llm = AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
+    # The SDK traces every request with OpenTelemetry by default, following
+    # the global tracer provider and ANTHROPIC_OPEN_TELEMETRY_* variables; a
+    # span can carry the request (a statement's text) and the reply. Off,
+    # whatever the environment says, and no trace headers sent either.
+    client = AsyncAnthropic(
+        api_key=api_key, open_telemetry={"traces": False, "propagation": False}
+    )
+    llm = AnthropicModel(model, provider=AnthropicProvider(anthropic_client=client))
     settings = AnthropicModelSettings(request_timeout=LLM_REQUEST_TIMEOUT_SECONDS)
     if llm.profile.get("anthropic_supports_effort", False):
         settings["anthropic_effort"] = EXTRACTION_EFFORT
@@ -62,7 +75,9 @@ def quiet_payload_loggers() -> None:
     which time the HTTP stack is imported), so neither the app's DEBUG level
     nor ``ANTHROPIC_LOG=debug`` can print a request. Clamping a top-level
     logger covers its children, including ones created later. Debugging the
-    SDK takes raising these loggers by hand.
+    SDK takes raising these loggers by hand. A child logger given its own
+    level (``anthropic._base_client`` set to DEBUG) is not covered: setting
+    one is that by-hand step.
     """
     for name in _payload_logger_names():
         logger = logging.getLogger(name)
