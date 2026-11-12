@@ -1494,6 +1494,13 @@ The clone now sits on a detached commit, and stays there until you take one of t
 
 ---
 
+### 8.10 Error reporters and debug logging
+
+Statements carry full account numbers in their text, and the model's output can repeat one before the mask runs. The service keeps both out of its own logs and errors, and two rules keep them out of everything else in the `ingest` container:
+
+- **No error reporter that captures frame locals.** While a statement is extracted, its page text, the model request and the model's replies sit in local variables. An error reporter that records frame locals would copy them out of the process: Sentry's default (`include_local_variables`), rich's `show_locals`, or a debugger's post-mortem dump. Don't add one to this container unless it is configured not to capture locals.
+- **Debug logging stays out of the model stack.** Setting the app's `logging.level` to `DEBUG` is safe. The service holds the `anthropic`, `httpx` and `httpcore` loggers (and their `httpx2` and `httpcore2` forks) at `INFO` or above, including any child logger given its own level, because at `DEBUG` the SDK logs each request in full. To debug the SDK itself, do it on a development machine with synthetic files, not here.
+
 ## 9. Searching from the laptop
 
 `scripts/receipt-search` runs the CLI inside the server's scheduler container over SSH and passes every argument straight through:
