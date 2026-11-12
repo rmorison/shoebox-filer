@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -83,7 +84,7 @@ from receipt_index.statement_repository import (
 from receipt_index.store import StoreFolder
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from uuid import UUID
 
     from pydantic_ai import Agent
@@ -111,6 +112,55 @@ _REJECTED_TYPES: Final = {"scan": "scan", "unreadable": "unreadable"}
 _REJECTED_BOUNDS: Final = frozenset({"pages", "size", "memory", "text", "crash"})
 
 
+# The modules that tracing instrumentation loads, and that a plain import of
+# pydantic-ai or logfire never does (measured against the locked versions):
+# any OpenTelemetry instrumentor, and logfire's integrations that patch the
+# HTTP transport, the Anthropic client or pydantic-ai. `logfire` itself is
+# no sign: pydantic-ai's logfire extra imports it in every process. The
+# logfire names are private, so a test runs each instrument call for real
+# and fails if a release renames the module it loads.
+_INSTRUMENTATION_PACKAGE: Final = "opentelemetry.instrumentation"
+_PATCHING_MODULES: Final = frozenset(
+    {
+        "logfire._internal.integrations.httpx",
+        "logfire._internal.integrations.llm_providers.anthropic",
+        "logfire._internal.integrations.pydantic_ai",
+    }
+)
+
+
+class InstrumentationLoadedError(RuntimeError):
+    """Tracing instrumentation is loaded: statement work is refused."""
+
+
+def refuse_instrumentation(modules: Iterable[str] | None = None) -> None:
+    """Refuse statement work if tracing instrumentation is loaded.
+
+    An instrumentor patches the client or its transport and exports what it
+    sends: the statement's text and the model's output. Raises
+    :class:`InstrumentationLoadedError` naming the modules found (module
+    names, never data). ``modules`` defaults to ``sys.modules``.
+
+    A heuristic: an instrumentor that loads none of these modules isn't
+    seen. The tests and the deployment rule stay the guard (plan U5,
+    Tracing).
+    """
+    names = list(sys.modules if modules is None else modules)
+    found = sorted(
+        name
+        for name in names
+        if name == _INSTRUMENTATION_PACKAGE
+        or name.startswith(f"{_INSTRUMENTATION_PACKAGE}.")
+        or name in _PATCHING_MODULES
+    )
+    if found:
+        msg = (
+            "statement work is refused: tracing instrumentation is loaded "
+            f"({', '.join(found)}), and it would export statement text"
+        )
+        raise InstrumentationLoadedError(msg)
+
+
 @dataclass(frozen=True)
 class StatementAgents:
     """The first-pass agent and one agent per account type."""
@@ -120,8 +170,16 @@ class StatementAgents:
 
     @classmethod
     def create(
-        cls, model: Model | str, settings: ModelSettings | None = None
+        cls, model: Model, settings: ModelSettings | None = None
     ) -> StatementAgents:
+        """Every statement agent, built only through the guarded constructors.
+
+        ``model`` must be a model object from ``llm.anthropic_model`` (or a
+        pydantic-ai test model): the constructors refuse a name or an
+        Anthropic model whose client could trace. Refuses to build anything
+        while tracing instrumentation is loaded.
+        """
+        refuse_instrumentation()
         return cls(
             first_pass=create_first_pass_agent(model, settings),
             accounts={
@@ -312,7 +370,14 @@ def extract_statement(
         usage.add(run.usage)
         runs.append(run)
 
-    gated = gate_statement(first, runs)
+    try:
+        gated = gate_statement(first, runs)
+    except Exception as exc:
+        # The gates raise one GateInputError with a fixed message; anything
+        # else is a bug. Either way an item error, kept by its class alone,
+        # so no message can quote the model's output.
+        msg = f"the gates refused the statement: {type(exc).__name__}"
+        raise StatementItemError(msg) from None
     period = period_dates(first.period)
     start, end = period if isinstance(period, tuple) else (None, None)
     revision = RevisionRow(

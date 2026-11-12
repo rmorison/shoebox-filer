@@ -817,10 +817,14 @@ class Service:
         statement_agents: StatementAgents | None = None,
     ) -> None:
         if statement_agents is not None:
+            from receipt_index.statement_extraction import warm_mask
+            from receipt_index.statements import refuse_instrumentation
+
+            # Fail loud at start, not on the first statement, if tracing
+            # instrumentation is loaded (it would export statement text).
+            refuse_instrumentation()
             # Build the mask's pattern now, not inside a statement's first
             # watchdog step (about a second).
-            from receipt_index.statement_extraction import warm_mask
-
             warm_mask()
         self.timings = timings
         self._watching = [s.name for s in sources]
