@@ -501,14 +501,25 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         return digits[-4:]
 
     def grouped(match: re.Match[str]) -> str:
+        nonlocal count
         run = match.group()
         digits = _NON_DIGIT.sub("", run)
-        # A run joined by spaces or by more than one mark is cut whole only
-        # when it is already a long number; a shorter one is read again with
-        # single marks only, so "12/31 $123.45" or "12,345.67 -8.00" (an
-        # amount beside a date or another amount) stays apart.
+        # A short run joined by spaces or by more than one mark may be an
+        # amount beside a date or another amount ("12/31 $123.45",
+        # "12,345.67 -8.00"). Its single-mark pieces decide: amounts and
+        # times are set aside, and if what's left still totals eight digits
+        # or more the whole run is cut, so no number stands in parts
+        # ("1234.5678 . 9012" is cut whole).
         if len(digits) < _LONG_NUMBER_DIGITS and _LOOSE_SEPARATOR.search(run):
-            return _STRICT_GROUPED_RUN.sub(strict, run)
+            unknown = sum(
+                len(_NON_DIGIT.sub("", piece))
+                for piece in _PIECE.findall(run)
+                if not _is_amount_text(piece)
+            )
+            if unknown < _MIN_MASKED_DIGITS:
+                return run
+            count += 1
+            return digits[-4:]
         return strict(match)
 
     def spaced(match: re.Match[str]) -> str:
@@ -560,14 +571,12 @@ _SPACED_RUN = re.compile(
     rf"(?<![0-9])[0-9]+(?:{_MARK}+[0-9]+)*(?: +[0-9]+(?:{_MARK}+[0-9]+)*)+(?![0-9])"
 )
 _ENDS_IN_CENTS = re.compile(r"[.,][0-9]{2}$")
-# Single marks only between groups: the strict reading of a short run.
-_STRICT_GROUPED_RUN = re.compile(
-    rf"(?<![0-9])[0-9]+(?:{_MARK}[0-9]{{2,}})+(?:{_MARK}[0-9])?(?![0-9])"
-)
 # A separator that is more than one mark: a space, or two marks or more.
 _LOOSE_SEPARATOR = re.compile(rf"[0-9](?:\s|{_MARK}{{2,}}|{_MARK}\s|\s{_MARK})")
 # A run this long is cut whole however its groups are joined.
 _LONG_NUMBER_DIGITS: Final = 13
+# A piece of a loose run: digits joined by single marks.
+_PIECE = re.compile(rf"[0-9]+(?:{_MARK}[0-9]+)*")
 # A time of day, with seconds and a fraction: "12:30", "12:30:45.123".
 _TIME = re.compile(r"[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?(?:[.,][0-9]{1,6})?")
 
@@ -586,6 +595,21 @@ _DECIMALS = re.compile(r"[.,][0-9]{2}(?![0-9])")
 # Thirteen or more digits are cut whatever their grouping.
 _MAX_BARE_AMOUNT_DIGITS: Final = 9
 _MAX_AMOUNT_DIGITS: Final = 12
+
+
+def _is_amount_text(text: str) -> bool:
+    """Whether a piece of text on its own is an amount that occurs, or a time."""
+    if _PLAIN.fullmatch(text) or _TIME.fullmatch(text):
+        return True
+    shape = _THOUSANDS.fullmatch(text)
+    if shape is None:
+        return False
+    whole = len(_NON_DIGIT.sub("", shape.group("whole")))
+    if shape.group("cents") is not None:
+        return whole <= _MAX_AMOUNT_DIGITS and shape.group("point") != shape.group(
+            "group"
+        )
+    return whole <= _MAX_BARE_AMOUNT_DIGITS
 
 
 def _is_amount(match: re.Match[str], digits: int) -> bool:

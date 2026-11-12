@@ -1457,3 +1457,17 @@ def test_spaced_groups_with_cents_are_cut_when_too_long_for_an_amount() -> None:
 )
 def test_amounts_dates_and_times_beside_each_other_stay_apart(text: str) -> None:
     assert mask_digits(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Ref 1234.5678 . 9012", "Ref 1234 . 5678 . 9012", "Ref 12/31 4111.1111"],
+)
+def test_a_loosely_joined_short_number_is_never_left_standing_in_parts(
+    text: str,
+) -> None:
+    # What isn't an amount or a time totals eight digits or more: cut whole.
+    masked, runs = mask_digits(text)
+    assert masked is not None
+    assert len("".join(ch for ch in masked if ch.isdigit())) == 4
+    assert runs >= 1
