@@ -1139,3 +1139,26 @@ def test_a_newest_first_account_with_no_printed_balances_is_clean_if_it_foots() 
     assert _one("deposit", newest).status == "clean"
     off = _balance(lines, ending="115.01", line_order="newest_first")
     assert _one("deposit", off).failure_class == "does_not_foot"
+
+
+def test_a_capped_run_that_still_has_an_output_is_too_many_lines() -> None:
+    # `capped` is checked before the output: a cut-off response is never read,
+    # even if something parsed from it.
+    capped = AccountRun(output=_clean().output, capped=True, usage=CallUsage())
+    account = _gate(("deposit", capped), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "too_many_lines"
+    assert account.beginning_balance is None
+    assert account.ending_balance is None
+    assert account.lines == ()
+
+
+def test_a_date_mid_way_through_an_inclusive_one_year_period_is_placed_once() -> None:
+    # Only the shared end date is ambiguous; a mid-year date has one year.
+    year = {
+        "start": {"month": 1, "day": 15, "year": 2026},
+        "end": {"month": 1, "day": 15, "year": 2027},
+    }
+    run = _balance([_line(1, "-10.00", month=7)], ending="90.00", period=year)
+    account = _one("deposit", run)
+    assert account.status == "clean"
+    assert account.lines[0].posted_date == date(2026, 7, 1)
