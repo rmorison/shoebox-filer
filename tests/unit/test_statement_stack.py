@@ -270,3 +270,152 @@ def test_a_child_logger_set_to_debug_by_hand_is_clamped_too() -> None:
             assert quiet.level == logging.NOTSET
     finally:
         child.setLevel(saved)
+
+
+def test_the_sdk_exports_no_span_even_with_a_global_provider_and_content_mode(
+    stub_api: StubAnthropic, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # anthropic traces every request by default, through the global tracer
+    # provider, and with the content mode on a span holds the page text.
+    from anthropic import AsyncAnthropic
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content")
+
+    # The control: a client left to its defaults is traced, with content.
+    control = AnthropicModel(
+        _MODEL,
+        provider=AnthropicProvider(anthropic_client=AsyncAnthropic(api_key=_KEY)),
+    )
+    stub_api.tool_input = _FIRST_PASS
+    # The control runs outside the statement constructors, which refuse it.
+    from pydantic_ai import Agent
+
+    Agent(control, output_type=se.FirstPass).run_sync(se.first_pass_request(_PAGES))
+    spans = exporter.get_finished_spans()
+    assert spans, "the control exported nothing, so nothing was checked"
+    exporter.clear()
+
+    se.run_first_pass(_first_pass_agent(), _PAGES)
+    stub_api.tool_input = _ACCOUNT
+    se.run_account(_account_agent(), _PAGES, _LISTED, None)
+    llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+    loan = se.ListedAccount(
+        label="Loan", account_type="loan", first_page=1, last_page=1
+    )
+    stub_api.tool_input = {"interest": "1.00"}
+    se.run_account(se.create_account_agent("loan", llm, settings), _PAGES, loan, None)
+    stub_api.tool_input = {**_ACCOUNT, "last4": "x"}
+    with pytest.raises(se.StatementCallError):
+        se.run_account(_account_agent(), _PAGES, _LISTED, None)
+    assert exporter.get_finished_spans() == ()
+
+
+# Calls and imports that patch the client or its transport, or wrap the
+# process: their spans carry statement text. Matched as patterns, so an
+# aliased import ("from opentelemetry import instrumentation") is caught.
+_NEVER_IN_THIS_PROCESS = (
+    r"instrument_anthropic\s*\(",
+    r"instrument_httpx\s*\(",
+    r"instrument_pydantic_ai\s*\(",
+    r"instrument_all\s*\(",
+    r"\bimport\s+logfire\b",
+    r"\bfrom\s+logfire\b",
+    r"opentelemetry\s*\.\s*instrumentation",
+    r"from\s+opentelemetry\s+import\s+[^\n]*\binstrumentation\b",
+    r"__import__\(\s*[\"']opentelemetry",
+    r"\bsitecustomize\b",
+)
+# Settings and launchers in the deployment that would turn tracing on.
+_NEVER_IN_THE_DEPLOYMENT = (
+    r"opentelemetry-instrument",
+    r"opentelemetry-bootstrap",
+    r"\bOTEL_[A-Z_]+",
+    r"ANTHROPIC_OPEN_TELEMETRY",
+    r"\bsitecustomize\b",
+)
+
+
+def _repo() -> Any:
+    from pathlib import Path
+
+    return Path(se.__file__).parents[2]
+
+
+def test_no_tracing_instrumentation_is_called_in_the_package() -> None:
+    import re
+    from pathlib import Path
+
+    root = Path(se.__file__).parent
+    modules = list(root.rglob("*.py"))
+    assert len(modules) > 10, "the package glob found too little to check"
+    assert not list(root.rglob("sitecustomize.py"))
+    found = [
+        f"{path.relative_to(root)}: {pattern}"
+        for path in modules
+        for pattern in _NEVER_IN_THIS_PROCESS
+        if re.search(pattern, path.read_text(encoding="utf-8"))
+    ]
+    assert found == []
+
+
+def test_the_deployment_never_turns_tracing_on() -> None:
+    import re
+
+    repo = _repo()
+    files = [p for p in (repo / "deploy").rglob("*") if p.is_file()]
+    files += [p for p in (repo / "Dockerfile", repo / "example.env") if p.exists()]
+    assert len(files) > 3, "no deployment files found to check"
+    assert not [p for p in files if p.name == "sitecustomize.py"]
+    found = [
+        f"{p.relative_to(repo)}: {pattern}"
+        for p in files
+        for pattern in _NEVER_IN_THE_DEPLOYMENT
+        if re.search(pattern, p.read_text(encoding="utf-8", errors="ignore"))
+    ]
+    assert found == []
+
+
+def test_the_installed_anthropic_sdk_honours_the_tracing_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pyproject pins anthropic>=2.1.0, the release with `open_telemetry`.
+    # The client resolves the option when built: tracing off, even with the
+    # environment asking for content, and no trace headers.
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content")
+    llm, _ = anthropic_model(api_key=_KEY, model=_MODEL)
+    resolved = llm.client._open_telemetry
+    assert resolved["traces"]["enabled"] is False
+    assert resolved["propagation"] is False
+
+
+def test_the_statement_constructors_refuse_a_model_that_could_be_traced() -> None:
+    from anthropic import AsyncAnthropic
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    default_client = AnthropicModel(
+        _MODEL,
+        provider=AnthropicProvider(anthropic_client=AsyncAnthropic(api_key=_KEY)),
+    )
+    for model, error in ((_MODEL, TypeError), (default_client, ValueError)):
+        with pytest.raises(error):
+            se.create_first_pass_agent(model)  # type: ignore[arg-type]
+        for kind in ("deposit", "card", "loan"):
+            with pytest.raises(error):
+                se.create_account_agent(kind, model)  # type: ignore[arg-type]
+    # The factory's model is accepted.
+    llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+    se.create_first_pass_agent(llm, settings)
+    se.create_account_agent("loan", llm, settings)
