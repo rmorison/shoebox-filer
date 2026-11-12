@@ -633,12 +633,13 @@ def test_the_ceiling_timeout_and_caller_settings_reach_the_model() -> None:
         seen.append(info.model_settings)
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, _ACCOUNT)])
 
-    agent = se.create_account_agent(
-        "deposit", FunctionModel(reply), {"temperature": 0.0}
-    )
+    # The settings production passes (llm.anthropic_model): a shorter
+    # request deadline the account call must replace.
+    production: Any = {"request_timeout": 180.0, "temperature": 0.0}
+    agent = se.create_account_agent("deposit", FunctionModel(reply), production)
     se.run_account(agent, _PAGES, _LISTED, None)
     assert seen[0]["max_tokens"] == se.ACCOUNT_OUTPUT_TOKENS
-    assert seen[0]["timeout"] == se.ACCOUNT_REQUEST_TIMEOUT_SECONDS
+    assert seen[0]["request_timeout"] == se.ACCOUNT_REQUEST_TIMEOUT_SECONDS
     assert seen[0]["temperature"] == 0.0
 
 
@@ -646,7 +647,7 @@ def test_an_account_calls_worst_case_fits_one_watchdog_step() -> None:
     from receipt_index.config import IngestConfig
 
     step = IngestConfig.model_fields["item_timeout_seconds"].default
-    worst_case = (1 + se.OUTPUT_RETRIES) * se.ACCOUNT_REQUEST_TIMEOUT_SECONDS
+    worst_case = se.MAX_REQUESTS * se.ACCOUNT_REQUEST_TIMEOUT_SECONDS
     assert step > worst_case
 
 
@@ -660,7 +661,7 @@ def test_a_failed_call_still_reports_its_usage() -> None:
         output_tokens=200 * len(calls),
         requests=len(calls),
     )
-    assert usage.requests == 1 + se.OUTPUT_RETRIES
+    assert usage.requests == se.MAX_REQUESTS
 
 
 def test_usage_sums_across_an_output_retry() -> None:
@@ -677,3 +678,50 @@ def test_usage_sums_across_an_output_retry() -> None:
     )
     assert run.output is not None
     assert run.usage == se.CallUsage(input_tokens=2000, output_tokens=400, requests=2)
+
+
+def test_a_call_makes_at_most_max_requests_whatever_the_retry_kind() -> None:
+    # Text with no output, a bad output, a call to an unknown tool: each
+    # would draw on a different retry budget; the request cap stops them all.
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    from pydantic_ai.messages import TextPart
+
+    calls: list[int] = []
+
+    def reply(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls.append(1)
+        tool = info.output_tools[0].name
+        kinds = [
+            ModelResponse(parts=[TextPart("no output yet")]),
+            ModelResponse(parts=[ToolCallPart(tool, {**_ACCOUNT, "last4": "x"})]),
+            ModelResponse(parts=[ToolCallPart("no_such_tool", {})]),
+            ModelResponse(parts=[ToolCallPart(tool, _ACCOUNT)]),
+        ]
+        return kinds[len(calls) - 1]
+
+    agent = se.create_account_agent("deposit", FunctionModel(reply))
+    with pytest.raises(UsageLimitExceeded) as raised:
+        se.run_account(agent, _PAGES, _LISTED, None)
+    assert len(calls) == se.MAX_REQUESTS
+    usage = se.call_usage(raised.value)
+    assert usage is not None
+    assert usage.requests == se.MAX_REQUESTS
+
+
+def test_a_label_with_curly_quotes_cant_close_its_quote() -> None:
+    label = "Card \u201cx\u201d \u00abmore\u00bb \u2018y\u2019"
+    account = ListedAccount(label=label, account_type="card", first_page=1, last_page=1)
+    first_line = se.account_request(_PAGES, account, None).splitlines()[0]
+    assert "described as \"Card 'x' 'more' 'y'\"" in first_line
+
+
+def test_usage_on_an_exception_that_takes_no_attributes_keeps_the_error() -> None:
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class FrozenError(Exception):
+        detail: str
+
+    error = FrozenError("model failed")
+    se._attach_usage(error, se.CallUsage(requests=1))
+    assert se.call_usage(error) is None

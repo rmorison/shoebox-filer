@@ -20,6 +20,7 @@ capped, and the gates hold the account as ``too_many_lines``.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import infer_model
 from pydantic_ai.models.wrapper import WrapperModel
+from pydantic_ai.usage import UsageLimits
 
 from receipt_index.pdf_reader import normalise_statement_text, page_marked_text
 from receipt_index.pdf_validate import STATEMENT_BOUNDS
@@ -56,13 +58,18 @@ STATEMENT_PROMPT_VERSION: Final = 1
 FIRST_PASS_OUTPUT_TOKENS: Final = 8_000
 ACCOUNT_OUTPUT_TOKENS: Final = 32_000
 
-# An account call's own request deadline, sized for its ceiling: 32,000
-# output tokens at a conservative 80 tokens a second, with room for the
-# input. One output retry is allowed, so a call can take twice this; that
-# stays under item_timeout_seconds (1200), which serve's watchdog applies to
-# each step. statement-eval measures the real time of a full response.
+# An account call's own request deadline (pydantic-ai's request_timeout, a
+# deadline over one model request, the SDK's own retries included), sized
+# for its ceiling: 32,000 output tokens at a conservative 80 tokens a
+# second, with room for the input. It replaces the caller's shorter
+# deadline. statement-eval measures the real time of a full response.
 ACCOUNT_REQUEST_TIMEOUT_SECONDS: Final = 420.0
-OUTPUT_RETRIES: Final = 1
+
+# The most model requests one call makes, every kind of retry included (an
+# invalid output, a reply with no output, a call to an unknown tool). So a
+# call takes at most MAX_REQUESTS deadlines, which stays under
+# item_timeout_seconds (1200), the time serve's watchdog allows each step.
+MAX_REQUESTS: Final = 2
 
 AccountType = Literal["deposit", "card", "loan"]
 FirstPassDocumentType = Literal[
@@ -507,6 +514,10 @@ def _period_text(period: PrintedPeriod | None) -> str:
     return f"from {one(period.start)} to {one(period.end)}"
 
 
+# Any quotation mark: the ASCII ones and Unicode's opening and closing ones.
+_QUOTES = re.compile('["\u00ab\u00bb\u2018-\u201f\u2039\u203a\u300c-\u300f\uff02]')
+
+
 def _clean_label(label: str) -> str:
     """A first-pass label, safe to quote in an account request.
 
@@ -519,7 +530,7 @@ def _clean_label(label: str) -> str:
         " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
         for ch in label
     )
-    text = _WHITESPACE.sub(" ", "".join(chars).replace('"', "'")).strip()
+    text = _WHITESPACE.sub(" ", _QUOTES.sub("'", "".join(chars))).strip()
     masked, _ = mask_digits(text)
     return masked or "(no label)"
 
@@ -561,7 +572,7 @@ def _with_ceiling(
 ) -> ModelSettings:
     merged: ModelSettings = {**(settings or {}), "max_tokens": ceiling}
     if timeout is not None:
-        merged["timeout"] = timeout
+        merged["request_timeout"] = timeout
     return merged
 
 
@@ -574,7 +585,6 @@ def create_first_pass_agent(
         output_type=FirstPass,
         system_prompt=FIRST_PASS_PROMPT,
         model_settings=_with_ceiling(settings, FIRST_PASS_OUTPUT_TOKENS),
-        retries={"output": OUTPUT_RETRIES},
     )
 
 
@@ -624,14 +634,12 @@ def create_account_agent(
             output_type=LoanExtraction,
             system_prompt=account_prompt(account_type),
             model_settings=model_settings,
-            retries={"output": OUTPUT_RETRIES},
         )
     return Agent(
         wrapped,
         output_type=AccountExtraction,
         system_prompt=account_prompt(account_type),
         model_settings=model_settings,
-        retries={"output": OUTPUT_RETRIES},
     )
 
 
@@ -666,6 +674,15 @@ def _usage(messages: Sequence[Any]) -> CallUsage:
     )
 
 
+_LIMITS = UsageLimits(request_limit=MAX_REQUESTS)
+
+
+def _attach_usage(exc: BaseException, usage: CallUsage) -> None:
+    """Record a failed call's usage on its exception, if it takes attributes."""
+    with contextlib.suppress(Exception):
+        exc.statement_call_usage = usage  # type: ignore[attr-defined]
+
+
 def call_usage(exc: BaseException) -> CallUsage | None:
     """The tokens a failed call used, when it was a statement call."""
     usage = getattr(exc, "statement_call_usage", None)
@@ -682,9 +699,11 @@ def run_first_pass(
     """
     with capture_run_messages() as messages:
         try:
-            result = agent.run_sync(first_pass_request(page_texts))
+            result = agent.run_sync(
+                first_pass_request(page_texts), usage_limits=_LIMITS
+            )
         except Exception as exc:
-            exc.statement_call_usage = _usage(messages)  # type: ignore[attr-defined]
+            _attach_usage(exc, _usage(messages))
             raise
     return result.output, _usage(messages)
 
@@ -702,12 +721,12 @@ def run_account(
     request = account_request(page_texts, account, document_period)
     with capture_run_messages() as messages:
         try:
-            result = agent.run_sync(request)
+            result = agent.run_sync(request, usage_limits=_LIMITS)
         except OutputCeilingReachedError as exc:
             # The cut-off response isn't in the run's messages; count it too.
             usage = _usage([*messages, exc.response])
             return AccountRun(output=None, capped=True, usage=usage)
         except Exception as exc:
-            exc.statement_call_usage = _usage(messages)  # type: ignore[attr-defined]
+            _attach_usage(exc, _usage(messages))
             raise
     return AccountRun(output=result.output, capped=False, usage=_usage(messages))
