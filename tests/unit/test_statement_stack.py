@@ -250,3 +250,93 @@ def test_the_pydantic_ai_banner_is_off() -> None:
     import receipt_index.llm  # noqa: F401 -- importing it turns the banner off
 
     assert pydantic_ai.BANNER_ENABLED is False
+
+
+def test_the_sdk_exports_no_span_even_with_a_global_provider_and_content_mode(
+    stub_api: StubAnthropic, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # anthropic traces every request by default, through the global tracer
+    # provider, and with the content mode on a span holds the page text.
+    from anthropic import AsyncAnthropic
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content")
+
+    # The control: a client left to its defaults is traced, with content.
+    control = AnthropicModel(
+        _MODEL,
+        provider=AnthropicProvider(anthropic_client=AsyncAnthropic(api_key=_KEY)),
+    )
+    stub_api.tool_input = _FIRST_PASS
+    se.run_first_pass(se.create_first_pass_agent(control), _PAGES)
+    spans = exporter.get_finished_spans()
+    assert spans, "the control exported nothing, so nothing was checked"
+    exporter.clear()
+
+    se.run_first_pass(_first_pass_agent(), _PAGES)
+    stub_api.tool_input = _ACCOUNT
+    se.run_account(_account_agent(), _PAGES, _LISTED, None)
+    llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+    loan = se.ListedAccount(
+        label="Loan", account_type="loan", first_page=1, last_page=1
+    )
+    stub_api.tool_input = {"interest": "1.00"}
+    se.run_account(se.create_account_agent("loan", llm, settings), _PAGES, loan, None)
+    stub_api.tool_input = {**_ACCOUNT, "last4": "x"}
+    with pytest.raises(se.StatementCallError):
+        se.run_account(_account_agent(), _PAGES, _LISTED, None)
+    assert exporter.get_finished_spans() == ()
+
+
+# Calls and imports that patch the client or its transport, or wrap the
+# process: their spans carry statement text.
+_NEVER_IN_THIS_PROCESS = (
+    "instrument_anthropic(",
+    "instrument_httpx(",
+    "instrument_pydantic_ai(",
+    "instrument_all(",
+    "import logfire",
+    "from logfire",
+    "opentelemetry.instrumentation",
+)
+
+
+def test_no_tracing_instrumentation_is_called_in_the_package() -> None:
+    from pathlib import Path
+
+    root = Path(se.__file__).parent
+    found = [
+        f"{path.relative_to(root)}: {needle}"
+        for path in root.rglob("*.py")
+        for needle in _NEVER_IN_THIS_PROCESS
+        if needle in path.read_text(encoding="utf-8")
+    ]
+    assert found == []
+
+
+def test_the_deployment_never_wraps_the_service_in_auto_instrumentation() -> None:
+    from pathlib import Path
+
+    deploy = Path(se.__file__).parents[2] / "deploy"
+    files = [p for p in deploy.rglob("*") if p.is_file()] if deploy.exists() else []
+    dockerfile = Path(se.__file__).parents[2] / "Dockerfile"
+    if dockerfile.exists():
+        files.append(dockerfile)
+    assert files, "no deployment files found to check"
+    wrapped = [
+        str(p)
+        for p in files
+        if "opentelemetry-instrument" in p.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert wrapped == []

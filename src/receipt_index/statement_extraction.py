@@ -872,8 +872,8 @@ def _untraced(agent: _AgentT) -> _AgentT:
     """``agent`` with tracing off, whatever turns it on globally.
 
     A span carries the request (the statement's text) and the response (the
-    model's output), and one ``Agent.instrument_all()`` or
-    ``logfire.instrument_pydantic_ai()`` anywhere in the process would
+    model's output), and one ``Agent.instrument_all`` or
+    ``logfire.instrument_pydantic_ai`` anywhere in the process would
     export them. The agent's own setting outranks the global one, and there
     is no constructor argument for it.
     """
