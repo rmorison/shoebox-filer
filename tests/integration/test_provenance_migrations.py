@@ -87,8 +87,12 @@ class TestUpAndDown:
         _backfill_again(conn)
         assert len(_provenance(conn)) == 2
 
-        # Newest first, as golang-migrate rolls back: 000021's tables
-        # reference provenance. (000019 and 000020 hold grants only.)
+        # Newest first, as golang-migrate rolls back: 000023's statements
+        # reference stored_files, and 000021's tables reference provenance.
+        # (000019, 000020, 000022 and 000024 hold grants only; 000024's
+        # down goes with its tables.)
+        _run(conn, _migration("000024", "down"))
+        _run(conn, _migration("000023", "down"))
         _run(conn, _migration("000021", "down"))
         _run(conn, _migration("000018", "down"))
         assert _provenance(conn) == []
@@ -105,6 +109,8 @@ class TestUpAndDown:
         _run(conn, _migration("000017", "up"))
         _run(conn, _migration("000018", "up"))
         _run(conn, _migration("000021", "up"))
+        _run(conn, _migration("000023", "up"))
+        _run(conn, _migration("000024", "up"))
         assert _tables(conn) == set(_TABLES)
         assert _nullable(conn) == dict.fromkeys(_LEGACY, "YES")
         assert len(_provenance(conn)) == 2

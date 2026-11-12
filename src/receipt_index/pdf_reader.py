@@ -275,7 +275,9 @@ def read_statement(
     if found is None or pages < 1:
         logger.info("pdfplumber can't read the statement PDF (%d bytes)", len(data))
         return StatementRead(None, reason="unreadable")
-    del found  # its copy of the text isn't needed past here
+    # Drop the parsed result, so the raw page list goes as soon as the
+    # normalised one below replaces it.
+    del found
     if pages > max_pages or texts is None:
         logger.info(
             "Statement PDF of %d pages is over the %d-page cap", pages, max_pages
@@ -335,10 +337,26 @@ def _is_usable_statement_text(text: str) -> bool:
     return usable >= _MIN_TEXT_LENGTH and usable > glyphs
 
 
+# Text in a page shaped like a page marker ("[Page 3]", any case or
+# spacing, ASCII or full-width brackets). A statement could print one to
+# make the model misplace its lines, so its brackets become parentheses,
+# one character for one, which keeps page_marked_length exact.
+_FORGED_MARKER = re.compile(r"[\[\uff3b](\s*page\s*\d+\s*)[\]\uff3d]", re.IGNORECASE)
+
+
+def _neutralise_markers(text: str) -> str:
+    return _FORGED_MARKER.sub(r"(\1)", text)
+
+
 def page_marked_text(page_texts: tuple[str, ...] | list[str]) -> str:
-    """A statement's text with each page marked, as a prompt gives it."""
+    """A statement's text with each page marked, as a prompt gives it.
+
+    Only these markers are bracketed: marker-shaped text inside a page is
+    shown in parentheses.
+    """
     return "\n\n".join(
-        f"[Page {number}]\n{text}" for number, text in enumerate(page_texts, 1)
+        f"[Page {number}]\n{_neutralise_markers(text)}"
+        for number, text in enumerate(page_texts, 1)
     )
 
 

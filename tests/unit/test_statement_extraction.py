@@ -450,12 +450,30 @@ def test_a_period_takes_its_years_and_crosses_a_year_end() -> None:
 
 
 @pytest.mark.parametrize(
-    "period",
-    [None, _period((1, 1, None), (1, 31, None)), _period((2, 30, 2026), (3, 1, 2026))],
-    ids=["none", "no-year", "no-such-day"],
+    ("period", "issue"),
+    [
+        (None, se.PeriodIssue.NOT_PRINTED),
+        (_period((1, 1, None), (1, 31, None)), se.PeriodIssue.YEARLESS),
+        # 29 February takes the end's year, 2027, which has none.
+        (_period((2, 29, None), (3, 1, 2027)), se.PeriodIssue.INVALID),
+        (_period((3, 1, 2027), (2, 1, 2027)), se.PeriodIssue.INVALID),
+    ],
+    ids=["not-printed", "yearless", "no-such-day", "reversed"],
 )
-def test_a_period_that_cant_be_placed_is_none(period: Any) -> None:
-    assert period_dates(period) is None
+def test_a_period_that_cant_be_placed_says_why(period: Any, issue: Any) -> None:
+    assert period_dates(period) is issue
+
+
+def test_a_period_whose_ends_share_a_month_and_day_is_one_day_or_one_year() -> None:
+    # The year rule compares (month, day): equal ends take the same year.
+    assert period_dates(_period((1, 5, None), (1, 5, 2027))) == (
+        date(2027, 1, 5),
+        date(2027, 1, 5),
+    )
+    assert period_dates(_period((1, 5, 2027), (1, 5, None))) == (
+        date(2027, 1, 5),
+        date(2027, 1, 5),
+    )
 
 
 _DEC_JAN = (date(2026, 12, 15), date(2027, 1, 14))
@@ -482,13 +500,59 @@ def test_a_printed_date_takes_the_year_that_places_it(
 
 
 def test_a_yearless_date_with_no_period_is_undated() -> None:
-    assert place_date(DateParts(month=1, day=5), None) is None
+    assert place_date(DateParts(month=1, day=5), None) is se.DateIssue.UNDATED
     assert place_date(DateParts(month=1, day=5, year=2027), None) == date(2027, 1, 5)
 
 
-def test_a_date_that_doesnt_exist_is_none() -> None:
-    assert place_date(DateParts(month=2, day=30), _DEC_JAN) is None
-    assert place_date(DateParts(month=2, day=29, year=2027), None) is None
+@pytest.mark.parametrize(
+    "parts",
+    [
+        {"month": 2, "day": 30},
+        {"month": 4, "day": 31},
+        {"month": 2, "day": 29, "year": 2027},
+    ],
+)
+def test_a_date_that_doesnt_exist_is_refused(parts: dict[str, int]) -> None:
+    with pytest.raises(ValidationError, match="no such date"):
+        DateParts.model_validate(parts)
+
+
+def test_a_yearless_leap_day_is_allowed_but_may_be_unplaceable() -> None:
+    leap_day = DateParts(month=2, day=29)
+    # No year in the window has a 29 February, and nor does the fallback.
+    assert place_date(leap_day, _DEC_JAN) is se.DateIssue.UNPLACEABLE
+    assert place_date(leap_day, _DEC_JAN, gated=False) is se.DateIssue.UNPLACEABLE
+
+
+_LONG = (date(2025, 1, 15), date(2026, 2, 14))
+
+
+@pytest.mark.parametrize(
+    ("parts", "placed"),
+    [
+        # 20 January fits 2025 and 2026: ambiguous, whichever is tried first.
+        (DateParts(month=1, day=20), se.DateIssue.AMBIGUOUS),
+        (DateParts(month=2, day=10), se.DateIssue.AMBIGUOUS),
+        # Each of these fits one year only.
+        (DateParts(month=1, day=10), date(2026, 1, 10)),
+        (DateParts(month=2, day=20), date(2025, 2, 20)),
+        (DateParts(month=7, day=4), date(2025, 7, 4)),
+    ],
+    ids=["jan-20", "feb-10", "jan-10", "feb-20", "jul-4"],
+)
+def test_a_period_of_a_year_or_more_tries_every_year(
+    parts: DateParts, placed: Any
+) -> None:
+    assert place_date(parts, _LONG) == placed
+    assert place_date(parts, _LONG, gated=False) == placed
+
+
+def test_a_period_of_several_years_tries_every_year_in_it() -> None:
+    period = (date(2023, 3, 1), date(2026, 2, 28))
+    assert place_date(DateParts(month=6, day=1), period) is se.DateIssue.AMBIGUOUS
+    # A card's grace reaches back into another year.
+    short = (date(2027, 1, 3), date(2027, 1, 31))
+    assert place_date(DateParts(month=12, day=28), short, 7) == date(2026, 12, 28)
 
 
 def test_a_leap_day_is_placed_in_a_leap_year() -> None:
@@ -629,7 +693,7 @@ def test_a_ceiling_stop_after_an_output_retry_is_an_error_not_a_cap(call: str) -
         return response
 
     model = FunctionModel(reply)
-    with pytest.raises(se.OutputCeilingReachedError) as raised:
+    with pytest.raises(se.StatementCallError, match="schema") as raised:
         if call == "first_pass":
             se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
         else:
@@ -656,12 +720,12 @@ def _context_window_stop() -> Any:
 
 def test_a_context_window_stop_is_an_error_not_a_cap() -> None:
     model = _context_window_stop()
-    with pytest.raises(se.ContextWindowExceededError) as raised:
+    with pytest.raises(se.StatementCallError, match="context_window") as raised:
         se.run_account(se.create_account_agent("deposit", model), _PAGES, _LISTED, None)
     assert se.call_usage(raised.value) == se.CallUsage(
         input_tokens=1000, output_tokens=200, requests=1
     )
-    with pytest.raises(se.ContextWindowExceededError) as raised:
+    with pytest.raises(se.StatementCallError, match="context_window") as raised:
         se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
     assert se.call_usage(raised.value) == se.CallUsage(
         input_tokens=1000, output_tokens=200, requests=1
@@ -680,7 +744,7 @@ def test_a_schema_error_is_not_a_cap() -> None:
     # An invalid but complete output is retried and then raises, as an item
     # error the pipeline retries; it is never mistaken for a cut-off.
     model, calls = _reply({**_ACCOUNT, "last4": "12345"})
-    with pytest.raises(Exception, match="retries"):
+    with pytest.raises(se.StatementCallError, match="schema"):
         se.run_account(se.create_account_agent("deposit", model), _PAGES, _LISTED, None)
     assert len(calls) > 1
 
@@ -850,7 +914,7 @@ def test_an_ungated_date_takes_the_latest_year_on_or_before_the_period_end() -> 
     [
         (_period((1, 1, 2027), (1, 31, None)), (date(2027, 1, 1), date(2027, 1, 31))),
         (_period((1, 1, None), (1, 31, 2027)), (date(2027, 1, 1), date(2027, 1, 31))),
-        (_period((3, 1, 2027), (2, 1, 2027)), None),
+        (_period((3, 1, 2027), (2, 1, 2027)), se.PeriodIssue.INVALID),
     ],
     ids=["end-year-missing", "start-year-missing", "inverted"],
 )
@@ -889,7 +953,7 @@ def test_an_account_calls_worst_case_fits_one_watchdog_step() -> None:
 
 def test_a_failed_call_still_reports_its_usage() -> None:
     model, calls = _reply({**_ACCOUNT, "last4": "12345"})
-    with pytest.raises(Exception, match="retries") as raised:
+    with pytest.raises(se.StatementCallError, match="schema") as raised:
         se.run_account(se.create_account_agent("deposit", model), _PAGES, _LISTED, None)
     usage = se.call_usage(raised.value)
     assert usage == se.CallUsage(
@@ -919,7 +983,7 @@ def test_usage_sums_across_an_output_retry() -> None:
 def test_a_call_makes_at_most_max_requests_whatever_the_retry_kind() -> None:
     # Text with no output, a bad output, a call to an unknown tool: each
     # would draw on a different retry budget; the request cap stops them all.
-    from pydantic_ai.exceptions import UsageLimitExceeded
+
     from pydantic_ai.messages import TextPart
 
     calls: list[int] = []
@@ -936,7 +1000,7 @@ def test_a_call_makes_at_most_max_requests_whatever_the_retry_kind() -> None:
         return kinds[len(calls) - 1]
 
     agent = se.create_account_agent("deposit", FunctionModel(reply))
-    with pytest.raises(UsageLimitExceeded) as raised:
+    with pytest.raises(se.StatementCallError, match="schema") as raised:
         se.run_account(agent, _PAGES, _LISTED, None)
     assert len(calls) == se.MAX_REQUESTS
     usage = se.call_usage(raised.value)
@@ -951,13 +1015,169 @@ def test_a_label_with_curly_quotes_cant_close_its_quote() -> None:
     assert "described as \"Card 'x' 'more' 'y'\"" in first_line
 
 
-def test_usage_on_an_exception_that_takes_no_attributes_keeps_the_error() -> None:
-    from dataclasses import dataclass
+def test_only_a_statement_call_error_carries_usage() -> None:
+    assert se.call_usage(ValueError("model failed")) is None
 
-    @dataclass(frozen=True)
-    class FrozenError(Exception):
-        detail: str
 
-    error = FrozenError("model failed")
-    se._attach_usage(error, se.CallUsage(requests=1))
-    assert se.call_usage(error) is None
+_FULL_NUMBER = "4111111111113456"
+
+
+@pytest.mark.parametrize("call", ["first_pass", "account"])
+def test_a_failed_call_prints_no_model_output_in_its_traceback(call: str) -> None:
+    import traceback
+
+    # Invalid outputs that quote a full card number in a free-text field.
+    if call == "first_pass":
+        bad: dict[str, Any] = {
+            "document_type": "card",
+            "accounts": [
+                {
+                    "label": f"Card {_FULL_NUMBER}",
+                    "account_type": "x",
+                    "first_page": 1,
+                    "last_page": 1,
+                }
+            ],
+        }
+    else:
+        bad = {**_ACCOUNT, "institution": f"Bank {_FULL_NUMBER}", "last4": "x"}
+    model, _ = _reply(bad)
+    with pytest.raises(se.StatementCallError) as raised:
+        if call == "first_pass":
+            se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+        else:
+            se.run_account(
+                se.create_account_agent("card", model), _PAGES, _LISTED, None
+            )
+    error = raised.value
+    assert error.kind == "schema"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    printed = "".join(traceback.format_exception(error)) + repr(error) + str(error)
+    for run in (_FULL_NUMBER, "41111111", "1111111111113456"):
+        assert run not in printed
+
+
+@pytest.mark.parametrize(
+    ("raised", "kind", "error_class"),
+    [
+        ("timeout", "timeout", "transient"),
+        ("connection-timeout", "timeout", "transient"),
+        ("server", "provider", "transient"),
+        ("auth", "provider", "config"),
+        ("refused", "refused", "content"),
+    ],
+)
+def test_a_call_error_names_its_kind_and_class(
+    raised: str, kind: str, error_class: str
+) -> None:
+    from pydantic_ai import exceptions as pe
+
+    errors: dict[str, Exception] = {
+        "timeout": pe.ModelRequestTimeout("test-model", 420.0),
+        "connection-timeout": pe.ModelTimeoutError("test-model", "slow"),
+        "server": pe.ModelHTTPError(503, "test-model"),
+        "auth": pe.ModelHTTPError(401, "test-model"),
+        "refused": pe.ContentFilterError("filtered"),
+    }
+
+    def reply(_: list[ModelMessage], __: AgentInfo) -> ModelResponse:
+        raise errors[raised]
+
+    with pytest.raises(se.StatementCallError) as caught:
+        se.run_account(
+            se.create_account_agent("deposit", FunctionModel(reply)),
+            _PAGES,
+            _LISTED,
+            None,
+        )
+    assert (caught.value.kind, caught.value.error_class) == (kind, error_class)
+    assert caught.value.__context__ is None
+
+
+def _code_points(categories: frozenset[str]) -> list[str]:
+    import sys
+    import unicodedata
+
+    return [
+        chr(code)
+        for code in range(sys.maxunicode + 1)
+        if not 0xD800 <= code <= 0xDFFF
+        and unicodedata.category(chr(code)) in categories
+    ]
+
+
+@pytest.mark.parametrize("category", ["Cf", "Mn", "Me", "Co", "Cn"])
+def test_no_invisible_or_combining_character_hides_a_number(category: str) -> None:
+    # Every code point in the category sits between two digits of a 16-digit
+    # number, 15 to a number, each number fenced by a letter: only the last
+    # four digits of each may survive.
+    characters = _code_points(frozenset({category}))
+    assert characters
+    digits = "4111111111113456"
+    entries = []
+    for start in range(0, len(characters), 15):
+        between = characters[start : start + 15]
+        between += [" "] * (15 - len(between))
+        entries.append(
+            "".join(d + c for d, c in zip(digits, [*between, ""], strict=True))
+        )
+    for batch_start in range(0, len(entries), 2000):
+        batch = entries[batch_start : batch_start + 2000]
+        masked, runs = mask_digits(" x ".join(batch))
+        assert masked is not None
+        assert runs == len(batch)
+        pieces = masked.split(" x ")
+        assert len(pieces) == len(batch)
+        for piece, entry in zip(pieces, batch, strict=True):
+            kept = "".join(ch for ch in piece if "0" <= ch <= "9")
+            assert kept == "3456", repr(entry)
+
+
+def test_the_cto_reproducers_are_masked() -> None:
+    for separator in [
+        "\u0600",
+        "\u06dd",
+        "\u070f",
+        "\u180b",
+        "\u180f",
+        "\u0301",
+        "\U000110bd",
+    ]:
+        number = separator.join(["4111", "1111", "1111", "3456"])
+        assert mask_digits(f"Card {number}") == ("Card 3456", 1), repr(separator)
+
+
+@pytest.mark.parametrize(
+    ("printed", "amount"),
+    [
+        ("\u221212.50", "-12.50"),
+        ("\u201312.50", "-12.50"),
+        ("\uff0d12.50", "-12.50"),
+        ("\u2212 12.50", "-12.50"),
+        (" -12.50 ", "-12.50"),
+        ("12.50", "12.50"),
+    ],
+)
+def test_a_signed_amount_takes_a_leading_unicode_minus(
+    printed: str, amount: str
+) -> None:
+    line = StatementLine.model_validate({**_LINE, "amount": printed})
+    assert line.amount == amount
+
+
+def test_a_page_number_is_never_a_boolean() -> None:
+    with pytest.raises(ValidationError, match="not a boolean"):
+        StatementLine.model_validate({**_LINE, "page": True})
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "Payments and Credits: :",
+        "Payments and Credits ::",
+        "Payments and Credits:\uff1a ",
+    ],
+)
+def test_a_heading_loses_every_trailing_colon(heading: str) -> None:
+    assert normalise_section(heading) == "payments and credits"
