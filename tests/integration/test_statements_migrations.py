@@ -936,6 +936,47 @@ def test_a_line_refuses_an_unmasked_number_or_nan(
     conn.rollback()
 
 
+@pytest.mark.parametrize(
+    ("file_name", "refused"),
+    [
+        ("statement-4111111111111111.pdf", True),
+        ("statement-20261109.pdf", True),
+        ("statement-1111.pdf", False),
+        ("statement-2026-11.pdf", False),
+        (None, False),
+    ],
+    ids=["card-number", "eight-digit-date", "masked", "short-date", "none"],
+)
+def test_a_source_file_name_refuses_an_unmasked_number(
+    scratch: Scratch,  # noqa: F811
+    file_name: str | None,
+    refused: bool,
+) -> None:
+    conn, _ = scratch
+    made = _new_statement(conn)
+
+    def add() -> None:
+        repo.add_source(
+            conn,
+            statement_id=made["id"],
+            source_name="statements-drive",
+            source_id=f"drive-{uuid.uuid4().hex}",
+            file_name=file_name,
+            received_at=None,
+        )
+
+    if refused:
+        with pytest.raises(psycopg.errors.CheckViolation) as raised:
+            add()
+        assert (
+            raised.value.diag.constraint_name == "ck_statement_sources_file_name_masked"
+        )
+        conn.rollback()
+    else:
+        add()
+        conn.commit()
+
+
 def test_a_masked_line_is_accepted(scratch: Scratch) -> None:  # noqa: F811
     conn, _ = scratch
     account_id = repo.insert_account(conn, _open_revision(conn), _account())

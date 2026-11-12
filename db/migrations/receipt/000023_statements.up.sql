@@ -194,7 +194,11 @@ CREATE TABLE IF NOT EXISTS receipt.statement_sources (
     CONSTRAINT pk_statement_sources PRIMARY KEY (id),
     CONSTRAINT uq_statement_sources_source_id UNIQUE (source_id),
     CONSTRAINT fk_statement_sources_statement FOREIGN KEY (statement_id)
-        REFERENCES receipt.statements (id)
+        REFERENCES receipt.statements (id),
+    -- A dropped file's name can carry an account number; the writer masks
+    -- it, and this is the backstop: no run of eight ASCII digits.
+    CONSTRAINT ck_statement_sources_file_name_masked
+        CHECK (file_name !~ '[0-9]{8}')
 );
 
 CREATE INDEX IF NOT EXISTS idx_statement_sources_statement_id
