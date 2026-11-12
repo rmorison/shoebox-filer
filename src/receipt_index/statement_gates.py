@@ -95,6 +95,23 @@ class GatedLine:
 
 
 @dataclass(frozen=True)
+class SectionTotalFigure:
+    """A printed section total: the heading's key and the magnitude."""
+
+    section: str
+    amount: str
+
+
+@dataclass(frozen=True)
+class ColumnTotalFigure:
+    """A table's printed column totals; ``section`` None is the whole account."""
+
+    section: str | None
+    credits: str | None
+    debits: str | None
+
+
+@dataclass(frozen=True)
 class LoanFigures:
     """A loan's printed figures, in the contract's formats."""
 
@@ -129,8 +146,8 @@ class GatedAccount:
     last_page: int | None
     line_order: str | None
     date_grace_days: int
-    section_totals: tuple[dict[str, str | None], ...]
-    column_totals: tuple[dict[str, str | None], ...]
+    section_totals: tuple[SectionTotalFigure, ...]
+    column_totals: tuple[ColumnTotalFigure, ...]
     loan: LoanFigures | None
     lines: tuple[GatedLine, ...]
     content_digest: str
@@ -206,10 +223,13 @@ class _Read:
     beginning: str | None = None
     ending: str | None = None
     line_order: str | None = None
-    section_totals: tuple[dict[str, str | None], ...] = ()
-    column_totals: tuple[dict[str, str | None], ...] = ()
+    section_totals: tuple[SectionTotalFigure, ...] = ()
+    column_totals: tuple[ColumnTotalFigure, ...] = ()
     loan: LoanFigures | None = None
     lines: list[_Line] = field(default_factory=list)
+    # A total whose printed heading normalises and masks to nothing: it
+    # can't be matched to lines, so the account fails its totals.
+    blank_heading: bool = False
     # Runs cut in text the contract always carries (institution, totals'
     # sections), and in the lines' text, carried only for a clean account.
     header_runs: int = 0
@@ -245,18 +265,25 @@ def _read_balance_account(
         ending=_money(output.ending_balance),
         line_order=output.line_order,
     )
-    read.section_totals = tuple(
-        {"section": header.section(t.section), "amount": format_money(t.amount)}
-        for t in output.section_totals
-    )
-    read.column_totals = tuple(
-        {
-            "section": header.section(t.section),
-            "credits": _money(t.credits),
-            "debits": _money(t.debits),
-        }
-        for t in output.column_totals
-    )
+    section_totals = []
+    for printed_total in output.section_totals:
+        section = header.section(printed_total.section)
+        read.blank_heading |= section is None
+        # A section total's section is never null in the contract.
+        section_totals.append(
+            SectionTotalFigure(section or "", format_money(printed_total.amount))
+        )
+    read.section_totals = tuple(section_totals)
+    column_totals = []
+    for printed_column in output.column_totals:
+        section = header.section(printed_column.section)
+        read.blank_heading |= printed_column.section is not None and section is None
+        column_totals.append(
+            ColumnTotalFigure(
+                section, _money(printed_column.credits), _money(printed_column.debits)
+            )
+        )
+    read.column_totals = tuple(column_totals)
     body = _Masker()
     for ordinal, printed in enumerate(output.lines, 1):
         posted = place_date(printed.posted, read.period, grace_days)
@@ -372,22 +399,23 @@ def _is_credit(account_type: str, amount: Decimal) -> bool:
 
 
 def _totals_match(read: _Read, account_type: str) -> bool:
+    if read.blank_heading:
+        return False
     for total in read.section_totals:
-        lines = [x.amount for x in read.lines if x.section == total["section"]]
-        assert total["amount"] is not None
-        if abs(_sum(lines)) != Decimal(total["amount"]):
+        lines = [x.amount for x in read.lines if x.section == total.section]
+        if abs(_sum(lines)) != Decimal(total.amount):
             return False
-    for total in read.column_totals:
+    for column in read.column_totals:
         scope = [
             x.amount
             for x in read.lines
-            if total["section"] is None or x.section == total["section"]
+            if column.section is None or x.section == column.section
         ]
         credits = _sum([abs(a) for a in scope if _is_credit(account_type, a)])
         debits = _sum([abs(a) for a in scope if not _is_credit(account_type, a)])
-        if total["credits"] is not None and credits != Decimal(total["credits"]):
+        if column.credits is not None and credits != Decimal(column.credits):
             return False
-        if total["debits"] is not None and debits != Decimal(total["debits"]):
+        if column.debits is not None and debits != Decimal(column.debits):
             return False
     return True
 
@@ -448,8 +476,8 @@ def canonical_form(account: GatedAccount) -> dict[str, Any]:
         "difference": account.difference,
         "beginning_balance": account.beginning_balance,
         "ending_balance": account.ending_balance,
-        "section_totals": [dict(t) for t in account.section_totals],
-        "column_totals": [dict(t) for t in account.column_totals],
+        "section_totals": [asdict(t) for t in account.section_totals],
+        "column_totals": [asdict(t) for t in account.column_totals],
         "line_order": account.line_order,
         "loan": None if account.loan is None else asdict(account.loan),
         "lines": [
@@ -505,8 +533,16 @@ def _gate_account(
     is_loan = listed.account_type == "loan"
     grace = CARD_GRACE_DAYS if listed.account_type == "card" else 0
     failure: FailureClass | None
-    if run.capped or run.output is None:
-        read, failure = _Read(), "too_many_lines"
+    if run.capped:
+        # Nothing was read, but the period is known from the first pass.
+        read = _Read(period=_period(listed.period, document_period))
+        failure = "too_many_lines"
+    elif run.output is None:
+        # Only a capped call has no output. An account that isn't called
+        # (U5: its pages lie past the document's) is passed as an empty
+        # extraction, which gates as empty_account.
+        msg = "an account call with no output that wasn't capped"
+        raise ValueError(msg)
     elif isinstance(run.output, LoanExtraction):
         if not is_loan:
             msg = f"a loan's figures for a {listed.account_type} account"

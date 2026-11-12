@@ -26,6 +26,7 @@ from receipt_index.statement_gates import (
     CARD_GRACE_DAYS,
     GatedAccount,
     GatedStatement,
+    SectionTotalFigure,
     canonical_json,
     content_digest,
     gate_statement,
@@ -303,16 +304,73 @@ def test_a_held_account_gives_its_difference_balances_and_totals() -> None:
     assert account.difference == "5.00"
     assert account.beginning_balance == "100.00"
     assert account.ending_balance == "95.00"
-    assert account.section_totals == ({"section": "fees", "amount": "10.00"},)
+    assert account.section_totals == (SectionTotalFigure("fees", "10.00"),)
     assert account.lines == ()
 
 
-def test_a_capped_account_has_no_figures() -> None:
+def test_a_capped_account_has_no_figures_but_keeps_its_period() -> None:
     account = _gate(("card", _CAPPED), ("deposit", _clean())).accounts[0]
     assert account.failure_class == "too_many_lines"
     assert account.difference is None
     assert account.beginning_balance is None
     assert account.date_grace_days == CARD_GRACE_DAYS
+    assert (account.period_start, account.period_end) == (
+        date(2027, 1, 1),
+        date(2027, 1, 31),
+    )
+
+
+def test_a_call_with_no_output_that_wasnt_capped_is_refused() -> None:
+    uncapped = AccountRun(output=None, capped=False, usage=CallUsage())
+    with pytest.raises(ValueError, match="no output"):
+        _gate(("deposit", uncapped))
+
+
+def test_an_account_passed_as_an_empty_extraction_drops_the_statement() -> None:
+    # How U5 passes an account it doesn't call (its pages lie past the
+    # document's): an empty extraction, gated as empty_account.
+    empty = _balance([], beginning=None, ending=None)
+    statement = _gate(("deposit", _clean()), ("card", empty))
+    assert (statement.status, statement.hold_reason) == ("held", "dropped_account")
+    assert statement.accounts[1].failure_class == "empty_account"
+    assert all(a.held_by_statement for a in statement.accounts)
+
+
+@pytest.mark.parametrize("heading", [":", "  ", "\uff1a"])
+def test_a_total_whose_heading_is_blank_holds_the_account(heading: str) -> None:
+    section = _balance(
+        [_line(5, "-10.00", "90.00")],
+        ending="90.00",
+        section_totals=[{"section": heading, "amount": "10.00"}],
+    )
+    account = _gate(("deposit", section), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "totals_mismatch"
+    assert account.section_totals[0].section == ""
+    column = _balance(
+        [_line(5, "-10.00", "90.00")],
+        ending="90.00",
+        column_totals=[{"section": heading, "debits": "10.00"}],
+    )
+    account = _gate(("deposit", column), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "totals_mismatch"
+
+
+def test_a_column_total_with_neither_side_printed_checks_nothing() -> None:
+    run = _balance(
+        [_line(5, "-10.00", "90.00")], ending="90.00", column_totals=[{"section": "x"}]
+    )
+    assert _one("deposit", run).status == "clean"
+
+
+def test_a_loans_masked_institution_counts_toward_masked_runs() -> None:
+    statement = _gate(
+        ("loan", _loan(institution=f"Synthetic {_NUMBER}", interest="1.00")),
+        ("deposit", _masked_line_run()),
+        document_type="loan_statement",
+    )
+    assert statement.status == "complete"
+    assert statement.accounts[0].institution == "Synthetic 3456"
+    assert statement.masked_runs == 2
 
 
 def test_a_chain_carries_amounts_across_lines_with_no_printed_balance() -> None:
@@ -752,7 +810,7 @@ def test_masked_runs_count_only_the_text_the_revision_stores() -> None:
     statement = _gate(("deposit", held), ("deposit", _masked_line_run()))
     assert statement.status == "incomplete"
     assert statement.accounts[0].institution == "Synthetic Bank 3456"
-    assert statement.accounts[0].section_totals[0]["section"] == "card 3456"
+    assert statement.accounts[0].section_totals[0].section == "card 3456"
     assert statement.masked_runs == 3
 
 
