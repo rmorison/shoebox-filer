@@ -33,7 +33,6 @@ from receipt_index.statement_extraction import (
     FirstPass,
     ListedAccount,
     LoanExtraction,
-    PeriodIssue,
     PrintedPeriod,
     format_money,
     mask_digits,
@@ -250,7 +249,9 @@ def _period(*periods: PrintedPeriod | None) -> tuple[date, date] | None:
     """
     for period in periods:
         placed = period_dates(period)
-        if not isinstance(placed, PeriodIssue):
+        # The outcome is the dates or a PeriodIssue, whose members are
+        # truthy: test the type, never truthiness.
+        if isinstance(placed, tuple):
             return placed
     return None
 
@@ -302,14 +303,15 @@ def _read_balance_account(
         # of a long period, is undated; one no year places (a 29 February
         # with no leap year to put it in) fails the date gate.
         undated = placed in (DateIssue.UNDATED, DateIssue.AMBIGUOUS)
-        posted = None if isinstance(placed, DateIssue) else placed
+        # DateIssue members are truthy: test for a date, never truthiness.
+        posted = placed if isinstance(placed, date) else None
         transacted_at = (
             None
             if printed.transacted is None
             else place_date(printed.transacted, read.period, grace_days, gated=False)
         )
         # A transaction date isn't gated: one that can't be placed is null.
-        transacted = None if isinstance(transacted_at, DateIssue) else transacted_at
+        transacted = transacted_at if isinstance(transacted_at, date) else None
         section = body.section(printed.section)
         description = body.text(printed.description) or ""
         amount = format_money(printed.amount)

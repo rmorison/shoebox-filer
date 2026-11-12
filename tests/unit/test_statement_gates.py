@@ -555,6 +555,20 @@ def test_a_date_that_fits_two_years_of_a_long_period_is_undated() -> None:
     assert _one("deposit", placed).status == "clean"
 
 
+def test_a_date_on_both_ends_of_an_inclusive_one_year_period_is_undated() -> None:
+    # 15 January 2026 to 15 January 2027 includes 15 January twice.
+    year = {
+        "start": {"month": 1, "day": 15, "year": 2026},
+        "end": {"month": 1, "day": 15, "year": 2027},
+    }
+    run = _balance([_line(15, "-10.00")], ending="90.00", period=year)
+    account = _gate(("deposit", run), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "undated"
+    # A day one side of the shared date is in one year only.
+    one = _balance([_line(16, "-10.00")], ending="90.00", period=year)
+    assert _one("deposit", one).lines[0].posted_date == date(2026, 1, 16)
+
+
 def test_a_transaction_date_no_year_places_is_null() -> None:
     line = {**_line(3, "40.00"), "transacted": {"month": 2, "day": 29, "year": None}}
     account = _one("card", _balance([line, _line(4, "-40.00")]))
