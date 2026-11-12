@@ -1646,6 +1646,11 @@ def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
         ("FY 2026 2027", "FY 2027"),
         ("Invoices 1001-1004", "Invoices 1004"),
         ("Fees 1,200 1,300", "Fees 1300"),
+        # Sentence punctuation after a year range or ZIP+4 is a joiner, so
+        # the next number joins it; a spaced year range is two numbers.
+        ("TUITION 2025-2026. 3 CREDITS", "TUITION 0263 CREDITS"),
+        ("ZIP 98101-1234, 5 ITEMS", "ZIP 2345 ITEMS"),
+        ("FY 2025 - 2026", "FY 2026"),
         # A date-shaped first group stays beside the cut (a known limit).
         ("Ref 12.11 3456 7890 1234", "Ref 12.11 1234"),
     ],

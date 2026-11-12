@@ -256,7 +256,7 @@ The mask cuts any account-like run, not only account numbers. Known side effects
 - a short date joined to a number by a dash is read as one number (`POS 11/09-4111` becomes `POS 4111`), and two short number tokens after a date join (`DEBIT CARD PURCHASE 11/09 0412 1234` becomes `DEBIT CARD PURCHASE 11/09 1234`). U5's trial on real statements counts how often each of these side effects occurs;
 - adjacent number tokens join and are cut together when they total 8 or more digits (`2026-11-09 4412` becomes `4412`);
 - a bare count over nine digits in thousands groups (`1,234,567,890 units`) is cut;
-- accepted over-cuts, since keeping them would reopen a must-cut case (two four-digit card groups, `1234-5678`, `411,111 111,111 1234`): two years side by side (`FY 2026 2027` becomes `FY 2027`), a range of document numbers (`Invoices 1001-1004` becomes `Invoices 1004`), and two bare thousands amounts side by side (`Fees 1,200 1,300` becomes `Fees 1300`).
+- accepted over-cuts, since keeping them would reopen a must-cut case (two four-digit card groups, `1234-5678`, `411,111 111,111 1234`): two years side by side (`FY 2026 2027` becomes `FY 2027`), a range of document numbers (`Invoices 1001-1004` becomes `Invoices 1004`), two bare thousands amounts side by side (`Fees 1,200 1,300` becomes `Fees 1300`); sentence punctuation after a year range or ZIP+4, a joiner, which joins the next number (`TUITION 2025-2026. 3 CREDITS` becomes `TUITION 0263 CREDITS`, `ZIP 98101-1234, 5 ITEMS` becomes `ZIP 2345 ITEMS`); and a year range printed with spaces round its dash, read as two numbers (`FY 2025 - 2026` becomes `FY 2026`).
 
 Digits outside ASCII (full-width ones, for example) are not matched; see Risks.
 

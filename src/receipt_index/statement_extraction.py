@@ -478,8 +478,12 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     only by spaces and the marks institutions print inside a number
     (``- . / , ' \u2019 \u00b7 \u2044``) is split at its spaces into tokens.
     An amount with cents and a short date (``11/09``, ``11/09/2026``, or a
-    range of them) are set aside and break a run; every run of the other
-    tokens that totals eight digits or more is cut to its last four digits.
+    range of them) are set aside and break a run. So are a range of years
+    (``2025-2026``) and a ZIP+4 (``94105-1234``), but only when, once
+    amounts and dates are set aside, one is the only token with digits left
+    in its span; beside any other digit group either is part of a number.
+    Every run of the other tokens that totals eight digits or more is cut to
+    its last four digits.
     A lone bare amount in thousands groups (nine digits or fewer,
     ``123,456,789``) stays. Any other mark (``$ # % = @ +``, brackets) ends
     a span, so an amount beside a store number or a date stays readable.
