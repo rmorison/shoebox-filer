@@ -556,23 +556,27 @@ def _is_year_range(token: str) -> bool:
     return shape is not None and int(shape.group("a")) < int(shape.group("b"))
 
 
-def _set_aside(token: str) -> bool:
-    """An amount, a short date, a year range or a ZIP+4: not part of a number."""
+def _set_aside(token: str, *, alone: bool) -> bool:
+    """An amount or a short date, not part of a number; and, when ``alone``
+    in its span, a year range or a ZIP+4. Beside other digit groups those
+    two could be groups of a longer number ("1999-2000 3456 7890 1234")."""
     core = token.strip(_JOINERS)
-    return bool(core) and (
-        _is_cents_amount(core)
-        or _is_date(core)
-        or _is_year_range(core)
-        or _ZIP_PLUS_FOUR.fullmatch(core) is not None
+    if not core:
+        return False
+    if _is_cents_amount(core) or _is_date(core):
+        return True
+    return alone and (
+        _is_year_range(core) or _ZIP_PLUS_FOUR.fullmatch(core) is not None
     )
 
 
 def _cut_tokens(span: str) -> tuple[str, int]:
     """One span with every run of number tokens of eight digits or more cut."""
     tokens = list(_TOKEN.finditer(span))
+    alone = sum(1 for t in tokens if _NON_DIGIT.sub("", t.group())) == 1
     runs: list[list[re.Match[str]]] = [[]]
     for token in tokens:
-        if _set_aside(token.group()):
+        if _set_aside(token.group(), alone=alone):
             runs.append([])
         elif _NON_DIGIT.sub("", token.group()):
             runs[-1].append(token)

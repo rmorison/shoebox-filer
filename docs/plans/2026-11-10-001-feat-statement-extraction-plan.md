@@ -237,7 +237,7 @@ A model or schema error makes no revision: the item is retried, and after `retry
 
 - an amount with cents: plain with at most seven whole digits (`1234567.89`; a longer one, `123456789.12`, reads as a number with a check suffix and is cut), or in thousands groups with the other separator for the point (`1,234,567.89`, `1.234.567,89`), at most twelve whole digits;
 - a short date, or a range of two: month and day in either order with `/` or `.`, and an optional two-digit year or a four-digit one from 1900 to 2099 (`11/09`, `11/09/2026`, `11.09.2026`, `11/09-11/12`, `10/01/26-10/31/26`; `10/12/1234` isn't a date, and is cut);
-- a range of years (`2025-2026`) and a ZIP+4 code (`94105-1234`).
+- a range of years (`2025-2026`) and a ZIP+4 code (`94105-1234`), but only when it is the whole span: beside other digit groups either could be part of a longer number (`1999-2000 3456 7890 1234` is cut whole).
 
 Each run of the remaining tokens between set-aside ones is cut to its last four digits when it totals 8 or more digits; a lone bare amount in thousands groups of nine digits or fewer (`123,456,789`) stays. So the account number in `CARD 4111-1111-1111-1234 $12.50` becomes `1234` with the amount intact, and `AMZN 11/09 $45.99`, `STORE #0412 11/09`, `HOTEL 11/09-11/12` and `2 x $12.50 = $25.00` are left exactly as printed. A test holds a table of ordinary description shapes that must stay, beside a table of numbers that must be cut.
 

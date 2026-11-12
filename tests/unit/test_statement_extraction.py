@@ -1575,6 +1575,9 @@ _MUST_CUT = [
     "1234567890.12",  # a number with a check suffix, not an amount
     "123456789.12",
     "10/12/1234",  # no such year: not a date
+    # A year range or ZIP+4 is set aside only alone in its span.
+    "1999-2000 3456 7890 1234",
+    "94105-1234 5678 9012",
 ]
 
 
