@@ -1339,3 +1339,44 @@ def test_mixed_separators_are_cut_whole() -> None:
     # The grouped cut leaves "1234 2345", which only a second space-run
     # cut joins.
     assert mask_digits("Card 1234 567.8901.2345 ok")[0] == "Card 2345 ok"
+
+
+@pytest.mark.parametrize(
+    "number",
+    [
+        "4,111,111,111,111,234",
+        "4.111.111.111.111.234",
+        "4'111'111'111'111'234",
+        "4\u2019111\u2019111\u2019111\u2019111\u2019234",
+        "4,111,111,111,123",  # 13 digits
+        "411,111,111,111,123",  # 15 digits
+        "123,456,789,012",  # 12 digits, no decimal part: a policy cut
+        "1,234,567,890",  # 10 digits, no decimal part
+        # Thirteen or more digits are cut even with a decimal part.
+        "4,111,111,111,111,234.00",
+        "4.111.111.111.123,45",
+    ],
+)
+def test_a_number_in_thousands_groups_beyond_an_amount_is_cut(number: str) -> None:
+    masked, runs = mask_digits(f"Ref {number} ok")
+    assert masked is not None
+    whole = number.rsplit(".", 1)[0] if number.endswith(".00") else number
+    whole = whole.rsplit(",", 1)[0] if whole.endswith(",45") else whole
+    kept = "".join(ch for ch in masked if ch.isdigit())
+    tail = number[len(whole) :]
+    expected = "".join(ch for ch in whole if ch.isdigit())[-4:]
+    assert kept == expected + "".join(ch for ch in tail if ch.isdigit())
+    assert runs >= 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Total 12,345,678.90",
+        "Total 123,456,789,012.50",
+        "Total 123,456,789",
+        "Paid 1,234.56 on 01/02/2026",
+    ],
+)
+def test_amounts_that_occur_are_still_left_alone(text: str) -> None:
+    assert mask_digits(text) == (text, 0)

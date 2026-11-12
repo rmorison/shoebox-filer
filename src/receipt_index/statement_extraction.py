@@ -492,7 +492,7 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         nonlocal count
         run = match.group()
         digits = _NON_DIGIT.sub("", run)
-        if len(digits) < _MIN_MASKED_DIGITS or _THOUSANDS.fullmatch(run):
+        if len(digits) < _MIN_MASKED_DIGITS or _is_amount(match, len(digits)):
             return run
         count += 1
         return digits[-4:]
@@ -510,7 +510,7 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     return masked, count
 
 
-# The second cut: digit groups of three or more joined by any other
+# The second cut: digit groups (of three or more after the first) joined by any other
 # separator (". , / _ ' : # + | ~ ( \" and the rest of punctuation and
 # symbols, with a space either side), totalling eight or more digits. An
 # amount or count grouped in thousands ("123,456,789", "1.234.567",
@@ -519,9 +519,32 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
 _MIN_MASKED_DIGITS: Final = 8
 _MAX_MASK_PASSES: Final = 8
 _GROUPED_RUN = re.compile(
-    r"(?<![0-9])[0-9]{3,}(?:\s?(?:[^\w\s]|_){1,3}\s?[0-9]{3,})+(?![0-9])"
+    r"(?<![0-9])[0-9]+(?:\s?(?:[^\w\s]|_){1,3}\s?[0-9]{3,})+(?![0-9])"
 )
 _THOUSANDS = re.compile(r"[0-9]{1,3}(?:([,.'\u2019])[0-9]{3})(?:\1[0-9]{3})*")
+# A decimal part right after a thousands-grouped run: ".89" after commas,
+# ",89" after dots or apostrophes.
+_DECIMALS = re.compile(r"[.,][0-9]{2}(?![0-9])")
+# Amounts that occur: up to nine digits bare, up to twelve with decimals.
+# Thirteen or more digits are cut whatever their grouping.
+_MAX_BARE_AMOUNT_DIGITS: Final = 9
+_MAX_AMOUNT_DIGITS: Final = 12
+
+
+def _is_amount(match: re.Match[str], digits: int) -> bool:
+    """Whether a grouped run is a thousands-grouped amount, left alone.
+
+    Only an amount that can occur: at most twelve digits in thousands
+    groups, and over nine only when a decimal part follows (with the other
+    separator). "4,111,111,111,111,234" is a number, not an amount.
+    """
+    shape = _THOUSANDS.fullmatch(match.group())
+    if shape is None or digits > _MAX_AMOUNT_DIGITS:
+        return False
+    decimals = _DECIMALS.match(match.string, match.end())
+    if decimals is not None and decimals.group()[0] != shape.group(1):
+        return True
+    return digits <= _MAX_BARE_AMOUNT_DIGITS
 
 
 class PeriodIssue(enum.Enum):

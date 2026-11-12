@@ -566,18 +566,15 @@ def _gate_account(
         # Only a capped call has no output. An account that isn't called
         # (U5: its pages lie past the document's) is passed as an empty
         # extraction, which gates as empty_account.
-        msg = "an account call with no output that wasn't capped"
-        raise ValueError(msg)
+        raise GateInputError("uncapped_no_output")
     elif isinstance(run.output, LoanExtraction):
         if not is_loan:
-            msg = f"a loan's figures for a {listed.account_type} account"
-            raise ValueError(msg)
+            raise GateInputError("wrong_output_kind")
         read = _read_loan(run.output, listed, document_period)
         failure = _loan_failure(read)
     else:
         if is_loan:
-            msg = "an account's lines for a loan"
-            raise ValueError(msg)
+            raise GateInputError("wrong_output_kind")
         read = _read_balance_account(run.output, listed, document_period, grace)
         failure = _balance_failure(read, listed.account_type, grace)
 
@@ -632,6 +629,44 @@ def _hold_reason(
     return None
 
 
+GateInputReason = Literal[
+    "first_pass_kind",
+    "run_kind",
+    "output_kind",
+    "wrong_output_kind",
+    "uncapped_no_output",
+    "run_count",
+    "decimal",
+    "validation",
+    "gates",
+]
+
+
+class GateInputError(ValueError):
+    """``gate_statement``'s only error: a reason, with a fixed message.
+
+    It carries nothing from the input, so it can never quote the model's
+    output (which can hold an account number), and it is raised with no
+    cause or context. U5 treats it as an item error, logged by its class.
+    """
+
+    MESSAGES: Final[dict[str, str]] = {
+        "first_pass_kind": "the first pass isn't a FirstPass",
+        "run_kind": "an account result isn't an AccountRun",
+        "output_kind": "an account call's output is of no known kind",
+        "wrong_output_kind": "an account call's output is of the wrong kind",
+        "uncapped_no_output": "an account call with no output that wasn't capped",
+        "run_count": "the account results don't match the listed accounts",
+        "decimal": "an amount that isn't a decimal",
+        "validation": "a statement call's output failed validation",
+        "gates": "the statement couldn't be gated",
+    }
+
+    def __init__(self, reason: GateInputReason) -> None:
+        super().__init__(self.MESSAGES[reason])
+        self.reason: GateInputReason = reason
+
+
 def _plain(value: Any) -> Any:
     """A model as plain data, so validating it again checks every field.
 
@@ -651,13 +686,11 @@ def _plain(value: Any) -> Any:
 def _validated(first_pass: Any, runs: Any) -> tuple[FirstPass, list[AccountRun]]:
     """The inputs, checked: their kinds, then every field of every model."""
     if not isinstance(first_pass, FirstPass):
-        msg = "the first pass isn't a FirstPass"
-        raise ValueError(msg)
+        raise GateInputError("first_pass_kind")
     if not isinstance(runs, list | tuple) or not all(
         isinstance(run, AccountRun) for run in runs
     ):
-        msg = "an account result isn't an AccountRun"
-        raise ValueError(msg)
+        raise GateInputError("run_kind")
     checked_first = FirstPass.model_validate(_plain(first_pass))
     checked: list[AccountRun] = []
     for run in runs:
@@ -665,8 +698,7 @@ def _validated(first_pass: Any, runs: Any) -> tuple[FirstPass, list[AccountRun]]
         if output is not None and not isinstance(
             output, AccountExtraction | LoanExtraction
         ):
-            msg = "an account call's output is of no known kind"
-            raise ValueError(msg)
+            raise GateInputError("output_kind")
         checked.append(
             AccountRun(
                 output=None
@@ -691,26 +723,18 @@ def gate_statement(first_pass: FirstPass, runs: Sequence[AccountRun]) -> GatedSt
     ``ValueError`` with a fixed message and no cause: an error must never
     quote the model's output, which can hold an account number.
     """
+    failure: GateInputError
     try:
         checked_first, checked_runs = _validated(first_pass, runs)
-    except ValidationError:
-        msg = "a statement call's output failed validation"
-        raise ValueError(msg) from None
-    except ValueError as exc:
-        msg = (
-            str(exc)
-            if str(exc).startswith(("the first pass", "an account"))
-            else ("the statement's input is invalid")
-        )
-        raise ValueError(msg) from None
-    try:
         return _gate_statement(checked_first, checked_runs)
-    except ValueError as exc:
-        # The gates' own messages are fixed; keep them, without a cause.
-        raise ValueError(str(exc)) from None
+    except GateInputError as exc:
+        failure = GateInputError(exc.reason)
+    except ValidationError:
+        failure = GateInputError("validation")
     except Exception:
-        msg = "the statement couldn't be gated"
-        raise ValueError(msg) from None
+        failure = GateInputError("gates")
+    # Raised outside the handler and from None: no cause, no context.
+    raise failure from None
 
 
 def _gate_statement(
@@ -729,8 +753,7 @@ def _gate_statement(
     if first_pass.document_type not in STATEMENT_TYPES:
         return GatedStatement(status="rejected", hold_reason=None)
     if len(runs) != len(first_pass.accounts):
-        msg = f"{len(runs)} account results for {len(first_pass.accounts)} accounts"
-        raise ValueError(msg)
+        raise GateInputError("run_count")
 
     gated: list[_Gated] = []
     seen: dict[tuple[str, str | None], int] = {}
@@ -738,12 +761,9 @@ def _gate_statement(
     for ordinal, (listed, run) in enumerate(pairs, 1):
         try:
             one = _gate_account(ordinal, listed, run, first_pass.period)
-        except InvalidOperation as exc:
+        except InvalidOperation:
             # Only an output that bypassed its model's validation gets here.
-            # One error class for every malformed input, so U5 treats them
-            # alike: an item error, never a revision.
-            msg = f"account {ordinal}: an amount that isn't a decimal"
-            raise ValueError(msg) from exc
+            raise GateInputError("decimal") from None
         key = (one.account.account_type, one.account.last4)
         seen[key] = seen.get(key, 0) + 1
         gated.append(replace(one, account=replace(one.account, occurrence=seen[key])))

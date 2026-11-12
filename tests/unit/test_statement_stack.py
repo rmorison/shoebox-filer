@@ -300,43 +300,78 @@ def test_the_sdk_exports_no_span_even_with_a_global_provider_and_content_mode(
 
 
 # Calls and imports that patch the client or its transport, or wrap the
-# process: their spans carry statement text.
+# process: their spans carry statement text. Matched as patterns, so an
+# aliased import ("from opentelemetry import instrumentation") is caught.
 _NEVER_IN_THIS_PROCESS = (
-    "instrument_anthropic(",
-    "instrument_httpx(",
-    "instrument_pydantic_ai(",
-    "instrument_all(",
-    "import logfire",
-    "from logfire",
-    "opentelemetry.instrumentation",
+    r"instrument_anthropic\s*\(",
+    r"instrument_httpx\s*\(",
+    r"instrument_pydantic_ai\s*\(",
+    r"instrument_all\s*\(",
+    r"\bimport\s+logfire\b",
+    r"\bfrom\s+logfire\b",
+    r"opentelemetry\s*\.\s*instrumentation",
+    r"from\s+opentelemetry\s+import\s+[^\n]*\binstrumentation\b",
+    r"__import__\(\s*[\"']opentelemetry",
+    r"\bsitecustomize\b",
+)
+# Settings and launchers in the deployment that would turn tracing on.
+_NEVER_IN_THE_DEPLOYMENT = (
+    r"opentelemetry-instrument",
+    r"opentelemetry-bootstrap",
+    r"\bOTEL_[A-Z_]+",
+    r"ANTHROPIC_OPEN_TELEMETRY",
+    r"\bsitecustomize\b",
 )
 
 
+def _repo() -> Any:
+    from pathlib import Path
+
+    return Path(se.__file__).parents[2]
+
+
 def test_no_tracing_instrumentation_is_called_in_the_package() -> None:
+    import re
     from pathlib import Path
 
     root = Path(se.__file__).parent
+    modules = list(root.rglob("*.py"))
+    assert len(modules) > 10, "the package glob found too little to check"
+    assert not list(root.rglob("sitecustomize.py"))
     found = [
-        f"{path.relative_to(root)}: {needle}"
-        for path in root.rglob("*.py")
-        for needle in _NEVER_IN_THIS_PROCESS
-        if needle in path.read_text(encoding="utf-8")
+        f"{path.relative_to(root)}: {pattern}"
+        for path in modules
+        for pattern in _NEVER_IN_THIS_PROCESS
+        if re.search(pattern, path.read_text(encoding="utf-8"))
     ]
     assert found == []
 
 
-def test_the_deployment_never_wraps_the_service_in_auto_instrumentation() -> None:
-    from pathlib import Path
+def test_the_deployment_never_turns_tracing_on() -> None:
+    import re
 
-    deploy = Path(se.__file__).parents[2] / "deploy"
-    files = [p for p in deploy.rglob("*") if p.is_file()] if deploy.exists() else []
-    dockerfile = Path(se.__file__).parents[2] / "Dockerfile"
-    if dockerfile.exists():
-        files.append(dockerfile)
-    assert files, "no deployment files found to check"
-    wrapped = [
-        str(p)
+    repo = _repo()
+    files = [p for p in (repo / "deploy").rglob("*") if p.is_file()]
+    files += [p for p in (repo / "Dockerfile", repo / "example.env") if p.exists()]
+    assert len(files) > 3, "no deployment files found to check"
+    assert not [p for p in files if p.name == "sitecustomize.py"]
+    found = [
+        f"{p.relative_to(repo)}: {pattern}"
         for p in files
-        if "opentelemetry-instrument" in p.read_text(encoding="utf-8", errors="ignore")
+        for pattern in _NEVER_IN_THE_DEPLOYMENT
+        if re.search(pattern, p.read_text(encoding="utf-8", errors="ignore"))
     ]
-    assert wrapped == []
+    assert found == []
+
+
+def test_the_installed_anthropic_sdk_honours_the_tracing_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pyproject pins anthropic>=2.1.0, the release with `open_telemetry`.
+    # The client resolves the option when built: tracing off, even with the
+    # environment asking for content, and no trace headers.
+    monkeypatch.setenv("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content")
+    llm, _ = anthropic_model(api_key=_KEY, model=_MODEL)
+    resolved = llm.client._open_telemetry
+    assert resolved["traces"]["enabled"] is False
+    assert resolved["propagation"] is False

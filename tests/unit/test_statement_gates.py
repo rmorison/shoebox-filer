@@ -27,6 +27,7 @@ from receipt_index.statement_gates import (
     CARD_GRACE_DAYS,
     GatedAccount,
     GatedStatement,
+    GateInputError,
     SectionTotalFigure,
     canonical_json,
     content_digest,
@@ -703,10 +704,20 @@ def test_runs_must_match_the_listed_accounts() -> None:
 
 
 def test_an_output_of_the_wrong_kind_is_refused() -> None:
-    with pytest.raises(ValueError, match="loan"):
-        _gate(("deposit", _loan(interest="1.00")))
-    with pytest.raises(ValueError, match="loan"):
-        _gate(("loan", _clean()))
+    for pair in (("deposit", _loan(interest="1.00")), ("loan", _clean())):
+        with pytest.raises(GateInputError) as raised:
+            _gate(pair)
+        assert raised.value.reason == "wrong_output_kind"
+
+
+def test_every_gate_error_message_is_one_of_the_fixed_messages() -> None:
+    # The class can't carry anything else: a reason maps to a fixed text.
+    for reason, message in GateInputError.MESSAGES.items():
+        error = GateInputError(reason)  # type: ignore[arg-type]
+        assert str(error) == message
+        assert error.reason == reason
+    with pytest.raises(KeyError):
+        GateInputError("Bank 4111 1111 1111 3456")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -1269,7 +1280,7 @@ def test_input_built_without_validation_is_refused_with_a_fixed_message(
     with pytest.raises(ValueError) as raised:
         _gate(("card", run))
     error = raised.value
-    assert type(error) is ValueError
+    assert type(error) is GateInputError
     assert error.__cause__ is None
     assert error.__suppress_context__
     assert _SECRET not in str(error)
@@ -1302,7 +1313,7 @@ def test_an_input_of_the_wrong_kind_is_refused(run: Any) -> None:
     )
     with pytest.raises(ValueError) as raised:
         gate_statement(first, [run])
-    assert type(raised.value) is ValueError
+    assert type(raised.value) is GateInputError
     assert raised.value.__cause__ is None
 
 
@@ -1327,7 +1338,7 @@ def test_an_unexpected_error_in_the_gates_becomes_a_bare_value_error(
     monkeypatch.setattr(statement_gates, "_read_balance_account", broken)
     with pytest.raises(ValueError) as raised:
         _one("deposit", _clean())
-    assert type(raised.value) is ValueError
+    assert type(raised.value) is GateInputError
     assert _SECRET not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__
