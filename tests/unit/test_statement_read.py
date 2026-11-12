@@ -230,15 +230,20 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
     ("raw", "normalised"),
     [
         (
-            "\x00Syn\x07the\x1btic \x9bstate\u202ement\u200b text",
+            "\x00Syn\x07the\x1btic \x9bstate\x7fment\u200b text",
             "Synthetic statement text",
         ),
         ("tab\tkept\nnewline kept", "tab\tkept\nnewline kept"),
         ("Total\r12.00", "Total\n12.00"),
         ("a\x0bb\x0cc\x1cd\x1fe\x85f\u2028g\u2029h", "a\nb\nc\nd\ne\nf\ng\nh"),
-        ("pay\u2066ee\u2069\u202dlo\u202c\u061c\u200e\u200f", "payeelo"),
         (
-            "zero\u200bwidth\u200c\u200d\u2060\u2061\u2064\ufeff\u034f\u180e",
+            "pay\u2066ee\u2069\u2067\u2068\u202a\u202b\u202dlo\u202c\u202e"
+            "\u061c\u200e\u200f",
+            "payeelo",
+        ),
+        (
+            "zero\u200bwidth\u200c\u200d\u2060\u2061\u2062\u2063\u2064\ufeff"
+            "\u034f\u180e",
             "zerowidth",
         ),
         ("tag\U000e0049\U000e0067\U000e007f text", "tag text"),
@@ -583,15 +588,17 @@ def test_a_result_with_no_page_texts_is_over_the_page_cap() -> None:
         )
 
 
+# ru_maxrss is in kilobytes on Linux and in bytes on macOS.
 _PEAK_RSS = """
 import resource, sys
 from pathlib import Path
 from receipt_index.pdf_reader import read_statement
+per_mb = 1024 * 1024 if sys.platform == "darwin" else 1024
 data = Path(sys.argv[1]).read_bytes()
 before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 read = read_statement(data)
 after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-print(read.reason, (after - before) // 1024)
+print(read.reason, (after - before) // per_mb)
 """
 
 
