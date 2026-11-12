@@ -425,7 +425,7 @@ def _is_ignorable(ch: str) -> bool:
 
 @functools.cache
 def _masked_run() -> re.Pattern[str]:
-    """The run pattern, built once: about 850 ranges of ignorable characters."""
+    """Invisible characters inside a number, built once (about 850 ranges)."""
     ranges: list[list[int]] = []
     for code in range(sys.maxunicode + 1):
         # Lone surrogates (Cs) included: pydantic refuses them in model
@@ -441,7 +441,10 @@ def _masked_run() -> re.Pattern[str]:
         else f"{re.escape(chr(low))}-{re.escape(chr(high))}"
         for low, high in ranges
     )
-    return re.compile(rf"[0-9](?:[ \-{ignorable}]*[0-9]){{7,}}")
+    # Invisible characters between two characters of a number: dropped, so
+    # none can split one.
+    context = r"[0-9 \-./,'\u2019\u00b7\u2044]"
+    return re.compile(rf"(?<={context})[{ignorable}]+(?={context})")
 
 
 def _is_dash(ch: str) -> bool:
@@ -467,174 +470,121 @@ def _fold_separators(text: str) -> str:
 
 
 def mask_digits(text: str | None) -> tuple[str | None, int]:
-    """``text`` with every long digit run cut to its last four, and the count.
+    """``text`` with every account-like number cut to its last four, and the count.
 
-    The model's text is normalised first, as the statement's was (control,
-    bidirectional and invisible characters dropped), so a zero-width
-    character between two digit groups can't hide a number from the mask.
-    Then separators are folded (whitespace to one space, dashes to ``-``),
-    so a number grouped by non-breaking spaces, tabs or en dashes is caught.
-    A format character, combining mark, private-use or unassigned character
-    that normalisation keeps doesn't break a run either.
+    The text is normalised as the statement's was, separators are folded
+    (whitespace to one space, Unicode dashes to ``-``), and invisible
+    characters inside a number are dropped. Then each span of digits joined
+    only by spaces and the marks institutions print inside a number
+    (``- . / , ' \u2019 \u00b7 \u2044``) is split at its spaces into tokens.
+    An amount with cents and a short date (``11/09``, ``11/09/2026``, or a
+    range of them) are set aside and break a run; every run of the other
+    tokens that totals eight digits or more is cut to its last four digits.
+    A lone bare amount in thousands groups (nine digits or fewer,
+    ``123,456,789``) stays. Any other mark (``$ # % = @ +``, brackets) ends
+    a span, so an amount beside a store number or a date stays readable.
     """
     if text is None:
         return None, 0
-    text = normalise_statement_text(text)
+    text = _masked_run().sub("", _fold_separators(normalise_statement_text(text)))
     count = 0
 
-    def last_four(match: re.Match[str]) -> str:
+    def cut_span(span: re.Match[str]) -> str:
         nonlocal count
-        count += 1
-        return _NON_DIGIT.sub("", match.group())[-4:]
+        masked, cuts = _cut_tokens(span.group())
+        count += cuts
+        return masked
 
-    def strict(match: re.Match[str]) -> str:
-        nonlocal count
-        run = match.group()
-        digits = _NON_DIGIT.sub("", run)
-        if (
-            len(digits) < _MIN_MASKED_DIGITS
-            or _TIME.fullmatch(run)
-            or _is_amount(match, len(digits))
-        ):
-            return run
-        count += 1
-        return digits[-4:]
-
-    def grouped(match: re.Match[str]) -> str:
-        nonlocal count
-        run = match.group()
-        digits = _NON_DIGIT.sub("", run)
-        # A short run joined by spaces or by more than one mark may be an
-        # amount beside a date or another amount ("12/31 $123.45",
-        # "12,345.67 -8.00"). Its single-mark pieces decide: amounts and
-        # times are set aside, and if what's left still totals eight digits
-        # or more the whole run is cut, so no number stands in parts
-        # ("1234.5678 . 9012" is cut whole).
-        if len(digits) < _LONG_NUMBER_DIGITS and _LOOSE_SEPARATOR.search(run):
-            unknown = sum(
-                len(_NON_DIGIT.sub("", piece))
-                for piece in _PIECE.findall(run)
-                if not _is_amount_text(piece)
-            )
-            if unknown < _MIN_MASKED_DIGITS:
-                return run
-            count += 1
-            return digits[-4:]
-        return strict(match)
-
-    def spaced(match: re.Match[str]) -> str:
-        nonlocal count
-        run = match.group()
-        digits = _NON_DIGIT.sub("", run)
-        if len(digits) < _MIN_MASKED_DIGITS or (
-            len(digits) <= _MAX_AMOUNT_DIGITS
-            and any(_ENDS_IN_CENTS.search(token) for token in run.split())
-        ):
-            return run
-        count += 1
-        return digits[-4:]
-
-    # Every cut, until none changes anything: a number grouped by mixed
-    # separators ("4111 1111.1111 1234") leaves a part one cut joins only
-    # after the other has run.
-    masked = _fold_separators(text)
-    for _ in range(_MAX_MASK_PASSES):
-        before = masked
-        masked = _masked_run().sub(last_four, masked)
-        masked = _GROUPED_RUN.sub(grouped, masked)
-        masked = _SPACED_RUN.sub(spaced, masked)
-        if masked == before:
-            break
-    return masked, count
+    return _SPAN.sub(cut_span, text), count
 
 
-# The second cut: digit groups joined by any other separator (". , / _ ' :
-# # + | ~ ( \" and the rest of punctuation and symbols, with a space either
-# side), totalling eight or more digits. After the first group, a group has
-# two digits or more, and a last group may have one, so a number in pairs
-# ("41.11.11.11.11.11.11.12") or with a short tail ("4111.1111.1111.12") is
-# cut whole. An amount that can occur is left alone (see _is_amount); dotted
-# and slashed eight-digit dates are cut, as dashed ones are.
-_MIN_MASKED_DIGITS: Final = 8
-_MAX_MASK_PASSES: Final = 8
-# One or more marks, with any spaces around and between them.
-_MARK = r"(?:[^\w\s]|_)"
-_SEPARATOR = rf"\s*(?:{_MARK}\s*)+"
-_GROUPED_RUN = re.compile(
-    rf"(?<![0-9])[0-9]+(?:{_SEPARATOR}[0-9]{{2,}})+(?:{_SEPARATOR}[0-9])?(?![0-9])"
+# Marks an institution prints inside a number; any other ends one.
+_JOINERS = "-./,'\u2019\u00b7\u2044"
+_SPAN = re.compile(rf"[0-9]+(?:(?:(?: *[{_JOINERS}])+ *| +)[0-9]+)*")
+_TOKEN = re.compile(r"\S+")
+# An amount with cents: plain ("123456.78") or in thousands groups with the
+# other separator for the point ("1,234,567.89", "1.234.567,89").
+_PLAIN_CENTS = re.compile(r"[0-9]{1,12}[.,][0-9]{2}")
+_THOUSANDS_CENTS = re.compile(
+    r"(?P<whole>[0-9]{1,3}(?P<group>[,.'\u2019])[0-9]{3}(?:(?P=group)[0-9]{3})*)"
+    r"(?P<point>[.,])[0-9]{2}"
 )
-# The third cut: digit groups (each possibly with marks inside) joined only
-# by spaces, totalling eight or more digits with no decimal part anywhere:
-# "411,111 111,111 1234". With a decimal part they are amounts side by side
-# ("5,678.90 1,234.56", "CHECK 1234 5,678.90") and stay.
-_SPACED_RUN = re.compile(
-    rf"(?<![0-9])[0-9]+(?:{_MARK}+[0-9]+)*(?: +[0-9]+(?:{_MARK}+[0-9]+)*)+(?![0-9])"
-)
-_ENDS_IN_CENTS = re.compile(r"[.,][0-9]{2}$")
-# A separator that is more than one mark: a space, or two marks or more.
-_LOOSE_SEPARATOR = re.compile(rf"[0-9](?:\s|{_MARK}{{2,}}|{_MARK}\s|\s{_MARK})")
-# A run this long is cut whole however its groups are joined.
-_LONG_NUMBER_DIGITS: Final = 13
-# A piece of a loose run: digits joined by single marks.
-_PIECE = re.compile(rf"[0-9]+(?:{_MARK}[0-9]+)*")
-# A time of day, with seconds and a fraction: "12:30", "12:30:45.123".
-_TIME = re.compile(r"[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?(?:[.,][0-9]{1,6})?")
-
-
-# An amount's shape: thousands groups and an optional decimal part with the
-# other separator ("1,234,567.89", "1.234.567,89", "1'234'567.89"), or
-# plain digits with a decimal part ("123456.78").
-_THOUSANDS = re.compile(
-    r"(?P<whole>[0-9]{1,3}(?:(?P<group>[,.'\u2019])[0-9]{3})(?:(?P=group)[0-9]{3})*)"
-    r"(?:(?P<point>[.,])(?P<cents>[0-9]{2}))?"
-)
-_PLAIN = re.compile(r"(?P<whole>[0-9]{1,12})[.,](?P<cents>[0-9]{2})")
-# A decimal part right after a thousands-grouped run.
-_DECIMALS = re.compile(r"[.,][0-9]{2}(?![0-9])")
-# Amounts that occur: up to nine digits bare, up to twelve with decimals.
-# Thirteen or more digits are cut whatever their grouping.
-_MAX_BARE_AMOUNT_DIGITS: Final = 9
+_BARE_THOUSANDS = re.compile(r"[0-9]{1,3}([,.'\u2019])[0-9]{3}(?:\1[0-9]{3})*")
 _MAX_AMOUNT_DIGITS: Final = 12
+_MAX_BARE_AMOUNT_DIGITS: Final = 9
+_MIN_MASKED_DIGITS: Final = 8
+# A short date, or a range of two: month and day (either order) with "/" or
+# ".", and an optional two- or four-digit year.
+_DATE = re.compile(
+    r"(?P<a>[0-9]{1,2})(?P<s>[/.])(?P<b>[0-9]{1,2})(?:(?P=s)(?:[0-9]{2}|[0-9]{4}))?"
+)
 
 
-def _is_amount_text(text: str) -> bool:
-    """Whether a piece of text on its own is an amount that occurs, or a time."""
-    if _PLAIN.fullmatch(text) or _TIME.fullmatch(text):
+def _is_cents_amount(token: str) -> bool:
+    if _PLAIN_CENTS.fullmatch(token):
         return True
-    shape = _THOUSANDS.fullmatch(text)
+    shape = _THOUSANDS_CENTS.fullmatch(token)
+    return (
+        shape is not None
+        and shape.group("point") != shape.group("group")
+        and len(_NON_DIGIT.sub("", shape.group("whole"))) <= _MAX_AMOUNT_DIGITS
+    )
+
+
+def _is_one_date(token: str) -> bool:
+    shape = _DATE.fullmatch(token)
     if shape is None:
         return False
-    whole = len(_NON_DIGIT.sub("", shape.group("whole")))
-    if shape.group("cents") is not None:
-        return whole <= _MAX_AMOUNT_DIGITS and shape.group("point") != shape.group(
-            "group"
+    a, b = int(shape.group("a")), int(shape.group("b"))
+    return (1 <= a <= 12 and 1 <= b <= 31) or (1 <= a <= 31 and 1 <= b <= 12)
+
+
+def _is_date(token: str) -> bool:
+    """A short date, or a range of two joined by a dash."""
+    parts = token.split("-")
+    return 1 <= len(parts) <= 2 and all(_is_one_date(part) for part in parts)
+
+
+def _set_aside(token: str) -> bool:
+    """An amount with cents or a short date: not part of a number."""
+    core = token.strip(_JOINERS)
+    return bool(core) and (_is_cents_amount(core) or _is_date(core))
+
+
+def _cut_tokens(span: str) -> tuple[str, int]:
+    """One span with every run of number tokens of eight digits or more cut."""
+    tokens = list(_TOKEN.finditer(span))
+    runs: list[list[re.Match[str]]] = [[]]
+    for token in tokens:
+        if _set_aside(token.group()):
+            runs.append([])
+        elif _NON_DIGIT.sub("", token.group()):
+            runs[-1].append(token)
+        # A token of marks alone (" - ", " . ") neither counts nor breaks.
+    pieces: list[str] = []
+    position = 0
+    cuts = 0
+    for run in runs:
+        if not run:
+            continue
+        digits = "".join(_NON_DIGIT.sub("", t.group()) for t in run)
+        lone_amount = (
+            len(run) == 1
+            and _BARE_THOUSANDS.fullmatch(run[0].group().strip(_JOINERS))
+            and len(digits) <= _MAX_BARE_AMOUNT_DIGITS
         )
-    return whole <= _MAX_BARE_AMOUNT_DIGITS
-
-
-def _is_amount(match: re.Match[str], digits: int) -> bool:
-    """Whether a grouped run is an amount that can occur, left alone.
-
-    Thousands groups with at most twelve whole digits and a decimal part (in
-    the run or right after it, with the other separator), or at most nine
-    whole digits bare; or plain digits, at most twelve, with a decimal
-    part. "4,111,111,111,111,234" is a number, not an amount.
-    """
-    run = match.group()
-    if _PLAIN.fullmatch(run):
-        return True
-    shape = _THOUSANDS.fullmatch(run)
-    if shape is None:
-        return False
-    whole = len(_NON_DIGIT.sub("", shape.group("whole")))
-    if whole > _MAX_AMOUNT_DIGITS:
-        return False
-    if shape.group("cents") is not None:
-        return shape.group("point") != shape.group("group")
-    after = _DECIMALS.match(match.string, match.end())
-    if after is not None and after.group()[0] != shape.group("group"):
-        return True
-    return whole <= _MAX_BARE_AMOUNT_DIGITS
+        if len(digits) < _MIN_MASKED_DIGITS or lone_amount:
+            continue
+        start, end = run[0].start(), run[-1].end()
+        # Keep a mark the run's first token starts with ("-4111 ..."); a
+        # span always ends on a digit, so its last token never ends on one.
+        lead = len(run[0].group()) - len(run[0].group().lstrip(_JOINERS))
+        pieces.append(span[position : start + lead])
+        pieces.append(digits[-4:])
+        position = end
+        cuts += 1
+    pieces.append(span[position:])
+    return "".join(pieces), cuts
 
 
 class PeriodIssue(enum.Enum):

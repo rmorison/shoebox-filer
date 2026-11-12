@@ -396,8 +396,8 @@ def test_an_institution_keeps_its_case_and_loses_extra_space(
         ("Total 1,234,567.89", "Total 1,234,567.89", 0),
         # Slashed, dotted and dashed eight-digit dates are cut (posted_date
         # carries a line's date apart from its text).
-        ("Dated 11/09/2026", "Dated 2026", 1),
-        ("Dated 11.09.2026", "Dated 2026", 1),
+        ("Dated 11/09/2026", "Dated 11/09/2026", 0),
+        ("Dated 11.09.2026", "Dated 11.09.2026", 0),
         ("Dated 2026-11-09", "Dated 1109", 1),
         # Groups of three or more joined by any other separator, eight
         # digits in all, are cut.
@@ -1267,7 +1267,9 @@ def test_a_letter_breaks_a_run_but_a_symbol_joins_groups() -> None:
     # of three or more joins them, as punctuation does.
     assert mask_digits("Ref 1234x5678") == ("Ref 1234x5678", 0)
     assert mask_digits("Ref 1234\u30425678") == ("Ref 1234\u30425678", 0)
-    assert mask_digits("Ref 1234\u26055678") == ("Ref 5678", 1)
+    # A known limit: a symbol institutions don't print inside a number
+    # ends a run, so this one isn't cut.
+    assert mask_digits("Ref 1234\u26055678") == ("Ref 1234\u26055678", 0)
 
 
 def test_a_call_error_has_no_context_even_inside_a_callers_handler() -> None:
@@ -1286,16 +1288,27 @@ _SEPARATORS = [
     ".",
     ",",
     "/",
-    "_",
     "'",
+    "\u2019",
     "\u00b7",
-    "\u2022",
+    "\u2044",
+    "-",
+    "\u2013",
+    ". ",
+    " / ",
+    " - ",
+    "....",
+    " . . ",
+]
+# Marks an institution doesn't print inside a number: they end a run, so a
+# number grouped by one passes (a known limit).
+_NOT_JOINERS = [
+    "_",
     ":",
     "#",
     "+",
     "|",
     "~",
-    "\u2044",
     "(",
     '"',
     ")",
@@ -1304,8 +1317,10 @@ _SEPARATORS = [
     "=",
     "\\",
     "\u2605",
-    ". ",
-    " / ",
+    "\u2022",
+    "$",
+    "@",
+    "%",
 ]
 
 
@@ -1405,7 +1420,8 @@ def test_a_dashed_date_is_cut_by_design() -> None:
     # Intended: an eight-digit date in a description is cut like any run;
     # the line's posted_date carries the date.
     assert mask_digits("Paid 2026-11-09") == ("Paid 1109", 1)
-    assert mask_digits("Paid 11/09/2026 at 12:30") == ("Paid 2026 at 12:30", 1)
+    # A slashed short date is a date, not a number.
+    assert mask_digits("Paid 11/09/2026 at 12:30") == ("Paid 11/09/2026 at 12:30", 0)
 
 
 @pytest.mark.parametrize(
@@ -1441,8 +1457,12 @@ def test_amounts_side_by_side_and_plain_decimals_stay(text: str) -> None:
     assert mask_digits(text) == (text, 0)
 
 
-def test_spaced_groups_with_cents_are_cut_when_too_long_for_an_amount() -> None:
-    assert mask_digits("Ref 41,11 11,11 11,11 11,11 ok") == ("Ref 1111 ok", 1)
+def test_amounts_side_by_side_stay_even_when_long_a_known_limit() -> None:
+    # Each token is an amount with cents, so none is part of a number.
+    assert mask_digits("Ref 41,11 11,11 11,11 11,11") == (
+        "Ref 41,11 11,11 11,11 11,11",
+        0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1461,7 +1481,7 @@ def test_amounts_dates_and_times_beside_each_other_stay_apart(text: str) -> None
 
 @pytest.mark.parametrize(
     "text",
-    ["Ref 1234.5678 . 9012", "Ref 1234 . 5678 . 9012", "Ref 12/31 4111.1111"],
+    ["Ref 1234.5678 . 9012", "Ref 1234 . 5678 . 9012"],
 )
 def test_a_loosely_joined_short_number_is_never_left_standing_in_parts(
     text: str,
@@ -1471,3 +1491,115 @@ def test_a_loosely_joined_short_number_is_never_left_standing_in_parts(
     assert masked is not None
     assert len("".join(ch for ch in masked if ch.isdigit())) == 4
     assert runs >= 1
+
+
+@pytest.mark.parametrize("mark", _NOT_JOINERS)
+def test_a_mark_institutions_dont_print_in_numbers_ends_a_run(mark: str) -> None:
+    number = mark.join(["4111", "1111", "1111", "3456"])
+    masked, runs = mask_digits(f"Ref {number}")
+    assert (masked, runs) == (f"Ref {number}", 0)
+
+
+# Ordinary description shapes: the mask must leave each exactly as printed,
+# except the account number in the last two, cut to its true last four.
+_MUST_STAY = {
+    "AMZN 11/09 $45.99": "AMZN 11/09 $45.99",
+    "ATM 11/09 $200.00 FEE $3.00": "ATM 11/09 $200.00 FEE $3.00",
+    "STORE #0412 11/09": "STORE #0412 11/09",
+    "STORE #0412 11/09 $45.99": "STORE #0412 11/09 $45.99",
+    "POS 11/09 #1234": "POS 11/09 #1234",
+    "HOTEL 11/09-11/12": "HOTEL 11/09-11/12",
+    "HOTEL 11/09 11/12": "HOTEL 11/09 11/12",
+    "HOTEL 11/09 - 11/12": "HOTEL 11/09 - 11/12",
+    "RENT 11/01-11/30 1,200.00": "RENT 11/01-11/30 1,200.00",
+    "INT 4.25% 10/01-10/31": "INT 4.25% 10/01-10/31",
+    "PERIOD 10/01/26-10/31/26": "PERIOD 10/01/26-10/31/26",
+    "2 x $12.50 = $25.00": "2 x $12.50 = $25.00",
+    "FX RATE 1.0823 $45.99": "FX RATE 1.0823 $45.99",
+    "Purchase 12/31 $123.45": "Purchase 12/31 $123.45",
+    "Paid 12,345.67 -8.00": "Paid 12,345.67 -8.00",
+    "USD 12345.67 @ 1.0876": "USD 12345.67 @ 1.0876",
+    "At 12:30:45.123": "At 12:30:45.123",
+    "Paid 5,678.90 1,234.56": "Paid 5,678.90 1,234.56",
+    "CHECK 1234 5,678.90": "CHECK 1234 5,678.90",
+    "Total 1,234,567.89": "Total 1,234,567.89",
+    "Total 123,456,789": "Total 123,456,789",
+    "Total 123456.78": "Total 123456.78",
+    "Dated 11/09/2026": "Dated 11/09/2026",
+    "Dated 11.09.2026": "Dated 11.09.2026",
+    "Call (555) 123-4567": "Call (555) 123-4567",
+    "Check No. 1042 11/09": "Check No. 1042 11/09",
+    "Transfer 11/09 Ref 0412 $1,250.00": "Transfer 11/09 Ref 0412 $1,250.00",
+    "CARD 4111-1111-1111-1234 $12.50": "CARD 1234 $12.50",
+    "PAYMENT 4111 1111 1111 1234 12.50": "PAYMENT 1234 12.50",
+}
+
+
+@pytest.mark.parametrize(("text", "expected"), list(_MUST_STAY.items()))
+def test_ordinary_description_shapes_are_kept(text: str, expected: str) -> None:
+    assert mask_digits(text)[0] == expected
+
+
+_MUST_CUT = [
+    "4111 1111 1111 1234",
+    "4111-1111-1111-1234",
+    "4111.1111.1111.3456",
+    "4111,1111,1111,3456",
+    "4111/1111/1111/3456",
+    "4111'1111'1111'3456",
+    "41.11.11.11.11.11.11.12",
+    "4111.1111.1111.12",
+    "4111/1111/1111/1",
+    "123.45.6789",
+    "123/45/6789",
+    "41.11.11.11.11.11.12.34",
+    "123,456,789.12.34",
+    "4111.11.11.1111.1234",
+    "4111....1111....1111....1234",
+    "4111 . . 1111 . . 1111 . . 1234",
+    "411,111 111,111 1234",
+    "4,111,111,111,111,234",
+    "4.111.111.111.111.234",
+    "4,111,111,111,111,234.00",
+    "123,456,789,012",
+    "1,234,567,890",
+    "1234.5678",
+    "1234.5678 . 9012",
+    "12345678 . 9012",
+    "2026-11-09",
+    "20261109",
+    "800-555-0100",
+]
+
+
+@pytest.mark.parametrize("number", _MUST_CUT)
+def test_account_like_numbers_are_cut(number: str) -> None:
+    masked, runs = mask_digits(f"Ref {number} ok")
+    assert masked is not None
+    assert len("".join(ch for ch in masked if ch.isdigit())) == 4
+    assert runs >= 1
+
+
+def test_a_number_beside_a_date_is_cut_and_the_date_kept() -> None:
+    assert mask_digits("Ref 12/31 4111.1111") == ("Ref 12/31 1111", 1)
+    assert mask_digits("Ref 411,111 111,111 1234.50") == ("Ref 1111 1234.50", 1)
+
+
+@pytest.mark.parametrize(
+    "shape", ["1,", "1,234.", "1 ", "1 . ", "1-", "12/", "1.1 ", "$1.00 ", "4111 "]
+)
+def test_the_worst_shapes_mask_quickly_at_the_field_cap(shape: str) -> None:
+    import time
+
+    text = shape * (1000 // len(shape))
+    started = time.perf_counter()
+    mask_digits(text)
+    assert time.perf_counter() - started < 0.5
+
+
+def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
+    assert mask_digits("Refund 10.00 -4111 1111 1111 1234") == (
+        "Refund 10.00 -1234",
+        1,
+    )
+    assert mask_digits("Card 4111 1111 1111 1234. Thanks") == ("Card 1234. Thanks", 1)

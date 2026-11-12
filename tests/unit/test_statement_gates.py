@@ -1176,7 +1176,7 @@ def test_a_date_mid_way_through_an_inclusive_one_year_period_is_placed_once() ->
 
 
 @pytest.mark.parametrize(
-    "separator", [".", ",", "/", "_", "'", ":", "#", "+", "|", "~", "(", '"', "\u00b7"]
+    "separator", [".", ",", "/", "'", "\u00b7", "-", " . ", "\u2044"]
 )
 @pytest.mark.parametrize("knob", ["description", "section", "institution"])
 def test_a_number_grouped_by_punctuation_is_masked_in_every_field(
