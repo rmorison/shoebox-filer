@@ -45,6 +45,9 @@ class StubAnthropic:
     refusal_explanation: str | None = "The request was declined."
     requests: list[dict[str, Any]] = field(default_factory=list)
     api_keys: list[str | None] = field(default_factory=list)
+    # Overrides the answer's stop reason (as "max_tokens" or
+    # "model_context_window_exceeded" would end it).
+    stop_reason: str | None = None
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -86,7 +89,8 @@ def _stop(stub: StubAnthropic, request: dict[str, Any]) -> dict[str, Any]:
             },
         }
     return {
-        "stop_reason": "tool_use" if request.get("tools") else "end_turn",
+        "stop_reason": stub.stop_reason
+        or ("tool_use" if request.get("tools") else "end_turn"),
         "stop_details": None,
     }
 

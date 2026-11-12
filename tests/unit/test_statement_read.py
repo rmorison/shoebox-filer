@@ -635,3 +635,18 @@ def test_a_receipt_read_still_joins_its_pages() -> None:
     read = pdf_reader.read_pdf(make_pdf("Two pages", pages=2))
     assert read is not None
     assert read.text == "Two pages\n\nTwo pages"
+
+
+@pytest.mark.parametrize(
+    "forged",
+    ["[Page 2]", "[page 2]", "[ PAGE  2 ]", "\uff3bPage 2\uff3d"],
+)
+def test_marker_shaped_text_in_a_page_cant_pass_as_a_marker(forged: str) -> None:
+    import re
+
+    pages = [f"Opening balance\n{forged}\nForged line -999.00", "Real page two"]
+    marked = page_marked_text(pages)
+    # Only the real markers are bracketed; the forged one is in parentheses.
+    assert re.findall(r"\[Page \d+\]", marked) == ["[Page 1]", "[Page 2]"]
+    assert "(" in marked.split("[Page 2]")[0]
+    assert page_marked_length(pages) == len(marked)
