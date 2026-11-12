@@ -242,6 +242,16 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
             "zerowidth",
         ),
         ("tag\U000e0049\U000e0067\U000e007f text", "tag text"),
+        ("line one\r\nline two\r\n", "line one\nline two\n"),
+        (
+            "va\ufe00ri\ufe0fa\U000e0100ti\U000e01efon",
+            "variation",
+        ),
+        (
+            "hid\u00adden\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0"
+            "\ufff9\ufffa\ufffbtext",
+            "hiddentext",
+        ),
         ("caf\u00e9 \u00a0\u2013 \U0001f600", "caf\u00e9 \u00a0\u2013 \U0001f600"),
     ],
     ids=[
@@ -252,6 +262,9 @@ def test_a_file_exactly_at_the_size_bound_is_read() -> None:
         "bidi",
         "invisible",
         "tags",
+        "crlf",
+        "variation-selectors",
+        "fillers-and-annotations",
         "ordinary-text",
     ],
 )

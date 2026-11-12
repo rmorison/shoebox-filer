@@ -76,15 +76,25 @@ _CID = re.compile(r"\(cid:\d+\)")
 # paragraph separators) become a newline, so the words on either side stay
 # apart. NUL and every other C0 and C1 control (but not a tab) are dropped,
 # and so are bidirectional overrides, isolates and marks, zero-width and
-# other invisible characters, and Unicode tag characters. None carries
-# statement content; each can hide or reorder text for a reader or a model.
+# other invisible characters, Unicode tag characters, variation selectors,
+# and the other characters that render as nothing (a soft hyphen, the Hangul
+# fillers, the blank Braille pattern, the Khmer inherent vowels, the
+# interlinear annotation marks). None carries statement content; each can
+# hide or reorder text for a reader or a model, and variation selectors are
+# the best-known way to smuggle bytes into text. (An emoji or CJK variant
+# loses its selector, which doesn't matter for extraction.)
 _LINE_BREAKS = (0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x1F, 0x85, 0x2028, 0x2029)
 _NORMALISE: dict[int, str | None] = {
     **dict.fromkeys(
         [
             *(c for c in range(0x20) if c not in (0x09, 0x0A)),
             *range(0x7F, 0xA0),
+            0x00AD,
             0x034F,
+            0x115F,
+            0x1160,
+            0x17B4,
+            0x17B5,
             0x061C,
             0x180E,
             0x200E,
@@ -95,8 +105,14 @@ _NORMALISE: dict[int, str | None] = {
             0x200C,
             0x200D,
             *range(0x2060, 0x2065),
+            0x2800,
+            0x3164,
+            *range(0xFE00, 0xFE10),
             0xFEFF,
+            0xFFA0,
+            *range(0xFFF9, 0xFFFC),
             *range(0xE0000, 0xE0080),
+            *range(0xE0100, 0xE01F0),
         ]
     ),
     **dict.fromkeys(_LINE_BREAKS, "\n"),
@@ -289,10 +305,11 @@ def normalise_statement_text(text: str) -> str:
     file to unit separators, next line, and the line and paragraph
     separators) becomes a newline. NUL and every other C0 and C1 control
     except a tab, bidirectional overrides, isolates and marks, zero-width
-    and other invisible characters, and Unicode tag characters are dropped.
-    Nothing else changes.
+    and other invisible characters, Unicode tag characters and variation
+    selectors are dropped. A ``\\r\\n`` pair is one line break, so it
+    becomes one newline. Nothing else changes.
     """
-    return text.translate(_NORMALISE)
+    return text.replace("\r\n", "\n").translate(_NORMALISE)
 
 
 def _non_space(text: str) -> int:
