@@ -107,29 +107,45 @@ ShortText = Annotated[str, StringConstraints(max_length=200)]
 # line, short enough that a runaway output fails the call.
 Description = Annotated[str, StringConstraints(max_length=1000)]
 
-# A printed amount the model gave as a credit: a minus sign or parentheses.
+# How the model may copy an unsigned figure's printed sign. The forms are
+# matched after _fold_sign_marks, so any Unicode dash (an en dash, a figure
+# dash, the minus sign U+2212, a full-width hyphen-minus) reads as "-", and
+# full-width or small parentheses as "(" and ")", as the mask folds them.
 _AMOUNT = r"([0-9]{1,12}\.[0-9]{2})"
-# A minus (ASCII or U+2212) before it, parentheses round it, or a trailing
-# minus or "CR" after it; spaces allowed around the amount.
+# A credit: a minus before it, parentheses round it, or a trailing minus or
+# "CR" after it; spaces allowed around the amount.
 _CREDIT = re.compile(
-    rf"^\s*(?:[-\u2212]\s*{_AMOUNT}|\(\s*{_AMOUNT}\s*\)|{_AMOUNT}\s*(?:-|CR))\s*$",
+    rf"^\s*(?:-\s*{_AMOUNT}|\(\s*{_AMOUNT}\s*\)|{_AMOUNT}\s*(?:-|CR))\s*$",
     re.IGNORECASE,
 )
+# A charge: a plus before it or "DR" after it.
+_CHARGE = re.compile(rf"^\s*(?:\+\s*{_AMOUNT}|{_AMOUNT}\s*DR)\s*$", re.IGNORECASE)
 _PADDED = re.compile(rf"^\s*{_AMOUNT}\s*$")
+_PARENS = str.maketrans({"\uff08": "(", "\ufe59": "(", "\uff09": ")", "\ufe5a": ")"})
+
+
+def _fold_sign_marks(value: str) -> str:
+    """Unicode dashes to ``-`` and wide or small parentheses to ASCII ones."""
+    return "".join("-" if _is_dash(ch) else ch for ch in value).translate(_PARENS)
+
+
+def _amount(match: re.Match[str]) -> str:
+    return next(group for group in match.groups() if group is not None)
 
 
 def _magnitude(value: object) -> object:
-    """A total printed as a credit, as its magnitude.
+    """A total printed as a credit or a charge, as its magnitude.
 
     Totals are printed magnitudes (the gates compare magnitudes), but a card
     statement often prints its payments total with a minus sign or in
-    parentheses. Taking the magnitude keeps a valid statement from failing
-    as an item error.
+    parentheses, and some print "DR" or "+" on a charges total. Taking the
+    magnitude keeps a valid statement from failing as an item error.
     """
-    if isinstance(value, str) and (
-        match := _CREDIT.match(value) or _PADDED.match(value)
-    ):
-        return next(group for group in match.groups() if group is not None)
+    if isinstance(value, str):
+        folded = _fold_sign_marks(value)
+        for form in (_CREDIT, _CHARGE, _PADDED):
+            if match := form.match(folded):
+                return _amount(match)
     return value
 
 
@@ -141,12 +157,20 @@ def _credit_to_null(value: object) -> object:
     reversal comes back null, as if not printed; the ledger's own check of
     ``principal_after`` against its balance is the backstop. A signed
     breakdown would be a contract change.
+
+    A figure printed as a charge ("DR" or "+") is the amount itself, which
+    is what an unsigned breakdown figure already means. The cost, accepted
+    for version 1: under negative amortisation a principal_paid printed as
+    negative (the principal grew) is nulled too; principal_before and
+    principal_after, which are signed, still show the growth.
     """
     if isinstance(value, str):
-        if _CREDIT.match(value):
+        folded = _fold_sign_marks(value)
+        if _CREDIT.match(folded):
             return None
-        if match := _PADDED.match(value):
-            return match.group(1)
+        for form in (_CHARGE, _PADDED):
+            if match := form.match(folded):
+                return _amount(match)
     return value
 
 
@@ -680,7 +704,10 @@ class ContextWindowExceededError(Exception):
         self.response = response
 
 
-# The provider's own stop reason, where pydantic-ai keeps it.
+# The provider's own stop reason, where pydantic-ai keeps it. This value is
+# Anthropic's: another provider's context-window stop has its own raw reason
+# (or none), so on another provider it falls through to a cap, as
+# too_many_lines or a capped first pass, until its reason is added here.
 _CONTEXT_WINDOW_STOPS: Final = frozenset({"model_context_window_exceeded"})
 
 

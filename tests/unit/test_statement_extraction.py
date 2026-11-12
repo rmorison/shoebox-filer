@@ -108,6 +108,15 @@ def test_a_signed_two_place_amount_is_accepted(amount: str) -> None:
         "12.50cr",
         "( 12.50 )",
         " 12.50 ",
+        "\u201312.50",
+        "\u201212.50",
+        "\uff0d12.50",
+        "12.50\u2013",
+        "\uff0812.50\uff09",
+        "\ufe5912.50\ufe5a",
+        "+12.50",
+        "12.50 DR",
+        "12.50dr",
     ],
 )
 def test_a_total_printed_as_a_credit_is_kept_as_its_magnitude(printed: str) -> None:
@@ -127,7 +136,17 @@ def test_a_total_printed_as_a_credit_is_kept_as_its_magnitude(printed: str) -> N
     "field", ["principal_paid", "interest", "escrow", "fees", "advances"]
 )
 @pytest.mark.parametrize(
-    "printed", ["-25.00", "(25.00)", "\u221225.00", "25.00 CR", "25.00-"]
+    "printed",
+    [
+        "-25.00",
+        "(25.00)",
+        "\u221225.00",
+        "25.00 CR",
+        "25.00-",
+        "\u201325.00",
+        "\uff0d25.00",
+        "\uff0825.00\uff09",
+    ],
 )
 def test_a_loan_breakdown_printed_as_a_credit_comes_back_null(
     field: str, printed: str
@@ -141,7 +160,7 @@ def test_a_loan_breakdown_printed_as_a_credit_comes_back_null(
 
 @pytest.mark.parametrize(
     "printed",
-    ["+1.00", "-1.0", "(1.00", "--1.00", "-(1.00)", "1.00 DR", "1,234.50", "abc"],
+    ["-1.0", "(1.00", "--1.00", "-(1.00)", "+-1.00", "1.00 CRDR", "1,234.50", "abc"],
 )
 def test_totals_and_a_loans_breakdown_still_refuse_what_isnt_an_amount(
     printed: str,
@@ -152,6 +171,24 @@ def test_totals_and_a_loans_breakdown_still_refuse_what_isnt_an_amount(
         )
     with pytest.raises(ValidationError):
         LoanExtraction.model_validate({"fees": printed})
+
+
+@pytest.mark.parametrize("printed", ["+25.00", "25.00 DR", "25.00dr", " 25.00 "])
+def test_a_loan_breakdown_printed_as_a_charge_is_the_amount(printed: str) -> None:
+    assert LoanExtraction.model_validate({"fees": printed}).fees == "25.00"
+
+
+def test_negative_amortisation_nulls_principal_paid_but_keeps_the_balances() -> None:
+    # Accepted for version 1: the signed balances still show the growth.
+    loan = LoanExtraction.model_validate(
+        {
+            "principal_before": "100000.00",
+            "principal_after": "100150.00",
+            "principal_paid": "-150.00",
+        }
+    )
+    assert loan.principal_paid is None
+    assert loan.principal_after == "100150.00"
 
 
 def test_a_padded_breakdown_figure_is_kept() -> None:
