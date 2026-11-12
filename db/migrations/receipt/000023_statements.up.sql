@@ -281,6 +281,8 @@ CREATE TABLE IF NOT EXISTS receipt.statement_accounts (
         CHECK (octet_length(content_digest) = 32),
     -- A backstop for the application's mask: no run of eight digits (a full
     -- account or card number) in the institution or a total's section name.
+    -- ASCII digits only, by decision, as in the mask itself: fullwidth or
+    -- Arabic-Indic digits are neither masked nor refused.
     CONSTRAINT ck_statement_accounts_masked
         CHECK (institution !~ '[0-9]{8}'
                AND NOT jsonb_path_exists(section_totals,
@@ -322,7 +324,8 @@ CREATE TABLE IF NOT EXISTS receipt.statement_lines (
         REFERENCES receipt.statement_accounts (id),
     CONSTRAINT ck_statement_lines_ordinal CHECK (ordinal >= 1),
     CONSTRAINT ck_statement_lines_page CHECK (page >= 1),
-    -- A backstop for the application's mask: no run of eight digits.
+    -- A backstop for the application's mask: no run of eight ASCII digits
+    -- (other digit scripts are out of scope, as in the mask).
     CONSTRAINT ck_statement_lines_masked
         CHECK (description !~ '[0-9]{8}' AND section !~ '[0-9]{8}'),
     CONSTRAINT ck_statement_lines_not_nan
@@ -453,7 +456,8 @@ $$ LANGUAGE plpgsql;
 
 -- At commit, a new revision is its statement's current revision: every run
 -- is published, and none is left behind that would make the statement's
--- current revision look older than its newest.
+-- current revision look older than its newest. So one transaction writes at
+-- most one revision per statement: runs can't be batched.
 CREATE OR REPLACE FUNCTION receipt.check_statement_revision_is_current()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -482,6 +486,9 @@ CREATE CONSTRAINT TRIGGER trg_statement_revisions_current
 -- clean account's lines whatever the statement's status, so these are the
 -- rules a wrong status could break silently. Whether a usable revision is
 -- complete or incomplete is the gates' decision (U4), not checked here.
+-- A held revision with no accounts at all is legitimate: a statement that
+-- lists no accounts is held with hold_reason no_accounts (tested by
+-- test_a_revision_status_that_agrees_with_its_accounts_commits[no-accounts]).
 CREATE OR REPLACE FUNCTION receipt.check_statement_revision_accounts()
 RETURNS TRIGGER AS $$
 BEGIN
