@@ -29,9 +29,11 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from receipt_index.statement_extraction import (
     AccountExtraction,
     AccountRun,
+    DateIssue,
     FirstPass,
     ListedAccount,
     LoanExtraction,
+    PeriodIssue,
     PrintedPeriod,
     format_money,
     mask_digits,
@@ -241,10 +243,14 @@ def _money(value: str | None) -> str | None:
 
 
 def _period(*periods: PrintedPeriod | None) -> tuple[date, date] | None:
-    """The first of ``periods`` that can be placed."""
+    """The first of ``periods`` that can be placed.
+
+    One that isn't printed, has no year or is invalid gives way to the next:
+    the account's own period, else the document's (contract).
+    """
     for period in periods:
         placed = period_dates(period)
-        if placed is not None:
+        if not isinstance(placed, PeriodIssue):
             return placed
     return None
 
@@ -291,12 +297,19 @@ def _read_balance_account(
     read.column_totals = tuple(column_totals)
     body = _Masker()
     for ordinal, printed in enumerate(output.lines, 1):
-        posted = place_date(printed.posted, read.period, grace_days)
-        transacted = (
+        placed = place_date(printed.posted, read.period, grace_days)
+        # A yearless date with no period, or one that fits more than one year
+        # of a long period, is undated; one no year places (a 29 February
+        # with no leap year to put it in) fails the date gate.
+        undated = placed in (DateIssue.UNDATED, DateIssue.AMBIGUOUS)
+        posted = None if isinstance(placed, DateIssue) else placed
+        transacted_at = (
             None
             if printed.transacted is None
             else place_date(printed.transacted, read.period, grace_days, gated=False)
         )
+        # A transaction date isn't gated: one that can't be placed is null.
+        transacted = None if isinstance(transacted_at, DateIssue) else transacted_at
         section = body.section(printed.section)
         description = body.text(printed.description) or ""
         amount = format_money(printed.amount)
@@ -304,7 +317,7 @@ def _read_balance_account(
         read.lines.append(
             _Line(
                 posted=posted,
-                undated=printed.posted.year is None and read.period is None,
+                undated=undated,
                 line=None
                 if posted is None
                 else GatedLine(

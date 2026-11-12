@@ -213,9 +213,11 @@ def test_a_dormant_account_is_clean() -> None:
         ),
         pytest.param(
             "deposit",
-            _balance([_line(30, "-10.00", month=2)], ending="90.00"),
+            # A yearless 29 February: no year in a January 2027 period has
+            # one, and nor does the fallback year.
+            _balance([_line(29, "-10.00", month=2)], ending="90.00"),
             "date_out_of_period",
-            id="date-that-doesnt-exist",
+            id="date-no-year-places",
         ),
         pytest.param(
             "deposit",
@@ -540,13 +542,35 @@ def test_with_no_period_at_all_printed_years_pass_and_skip_the_date_gate() -> No
     assert account.period_start is None
 
 
-def test_a_date_that_doesnt_exist_fails_even_with_no_period() -> None:
-    # Otherwise its line would drop out of a clean account unseen.
-    run = _balance(
-        [_line(30, "-10.00", month=2, year=2027)], ending="90.00", period=None
-    )
-    account = _gate(("deposit", run), ("deposit", _clean()), period=None).accounts[0]
-    assert account.failure_class == "date_out_of_period"
+def test_a_date_that_fits_two_years_of_a_long_period_is_undated() -> None:
+    # A period of a year or more: 20 January falls in both of its years.
+    long = {
+        "start": {"month": 1, "day": 15, "year": 2025},
+        "end": {"month": 2, "day": 14, "year": 2026},
+    }
+    run = _balance([_line(20, "-10.00")], ending="90.00", period=long)
+    account = _gate(("deposit", run), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "undated"
+    placed = _balance([_line(10, "-10.00")], ending="90.00", period=long)
+    assert _one("deposit", placed).status == "clean"
+
+
+def test_a_transaction_date_no_year_places_is_null() -> None:
+    line = {**_line(3, "40.00"), "transacted": {"month": 2, "day": 29, "year": None}}
+    account = _one("card", _balance([line, _line(4, "-40.00")]))
+    assert account.status == "clean"
+    assert account.lines[0].transaction_date is None
+
+
+def test_an_invalid_account_period_gives_way_to_the_documents() -> None:
+    reversed_period = {
+        "start": {"month": 3, "day": 1, "year": 2027},
+        "end": {"month": 2, "day": 1, "year": 2027},
+    }
+    run = _balance([_line(5, "-10.00")], ending="90.00", period=reversed_period)
+    account = _one("deposit", run)
+    assert account.period_start == date(2027, 1, 1)
+    assert account.status == "clean"
 
 
 def test_a_transaction_date_is_placed_but_never_gated() -> None:
