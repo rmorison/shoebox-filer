@@ -50,6 +50,9 @@ if TYPE_CHECKING:
 # Days before the period a card's posted date may fall and still pass.
 CARD_GRACE_DAYS: Final = 7
 
+# The largest amount the statement tables hold: NUMERIC(14,2).
+_MAX_MONEY: Final = Decimal("999999999999.99")
+
 AccountStatus = Literal["clean", "held", "figures_only"]
 StatementStatus = Literal["complete", "incomplete", "held", "rejected"]
 FailureClass = Literal[
@@ -581,6 +584,10 @@ def _gate_account(
     own: AccountStatus = "figures_only" if is_loan else "clean"
     status: AccountStatus = "held" if failure is not None else own
     difference = _difference(read) if failure is not None else None
+    if difference is not None and abs(difference) > _MAX_MONEY:
+        # Beyond NUMERIC(14,2) (balances at the limit with opposite signs):
+        # stored as unknown, so the held revision still commits.
+        difference = None
     lines = tuple(x.line for x in read.lines if x.line is not None)
     account = GatedAccount(
         ordinal=ordinal,

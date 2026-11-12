@@ -1331,3 +1331,18 @@ def test_an_unexpected_error_in_the_gates_becomes_a_bare_value_error(
     assert _SECRET not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__
+
+
+def test_a_difference_beyond_the_columns_range_is_stored_as_unknown() -> None:
+    run = _balance(
+        [_line(5, "-10.00")],
+        beginning="999999999999.99",
+        ending="-999999999999.99",
+    )
+    account = _gate(("deposit", run), ("deposit", _clean())).accounts[0]
+    assert account.failure_class == "does_not_foot"
+    assert account.difference is None
+    # At the limit itself, the difference is kept.
+    edge = _balance([_line(5, "-0.01")], beginning="999999999999.99", ending="0.00")
+    held = _gate(("deposit", edge), ("deposit", _clean())).accounts[0]
+    assert held.difference == "-999999999999.98"
