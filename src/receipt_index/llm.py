@@ -39,18 +39,32 @@ def anthropic_model(
 
 # Loggers that print a whole request or response at DEBUG: the anthropic
 # SDK logs each request's options, which hold the document text (a
-# statement's account numbers) and, on a retry, the model's earlier output.
-PAYLOAD_LOGGERS: Final = ("anthropic", "httpx", "httpcore")
+# statement's account numbers) and, on a retry, the model's earlier output;
+# the HTTP stack under it (httpx, httpcore, and their 2.x forks httpx2 and
+# httpcore2) logs connection and stream events. Every top-level logger whose
+# name starts with one of these prefixes is clamped, so a renamed or forked
+# package is caught too; the known names are clamped even before import.
+PAYLOAD_LOGGER_PREFIXES: Final = ("anthropic", "httpx", "httpcore")
+PAYLOAD_LOGGERS: Final = ("anthropic", "httpx", "httpx2", "httpcore", "httpcore2")
+
+
+def _payload_logger_names() -> set[str]:
+    present = {name.split(".")[0] for name in logging.root.manager.loggerDict}
+    return set(PAYLOAD_LOGGERS) | {
+        name for name in present if name.startswith(PAYLOAD_LOGGER_PREFIXES)
+    }
 
 
 def quiet_payload_loggers() -> None:
     """Hold the payload loggers at INFO or above, whatever the app's level.
 
-    Called when logging is configured and when a statement agent is built,
-    so neither the app's DEBUG level nor ``ANTHROPIC_LOG=debug`` can print
-    a request. Debugging the SDK takes raising these loggers by hand.
+    Called when logging is configured and whenever an agent is built (by
+    which time the HTTP stack is imported), so neither the app's DEBUG level
+    nor ``ANTHROPIC_LOG=debug`` can print a request. Clamping a top-level
+    logger covers its children, including ones created later. Debugging the
+    SDK takes raising these loggers by hand.
     """
-    for name in PAYLOAD_LOGGERS:
+    for name in _payload_logger_names():
         logger = logging.getLogger(name)
         if logger.level < logging.INFO:  # NOTSET or DEBUG
             logger.setLevel(logging.INFO)

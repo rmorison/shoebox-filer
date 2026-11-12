@@ -131,19 +131,26 @@ def test_a_refusal_through_the_locked_stack_is_refused(
     assert len(stub_api.requests) == 1
 
 
+# A synthetic number with no repeated window, so no object address or
+# other incidental digits can match one of its eight-digit windows.
+_PLANTED = "5274910386254173"
+
+
 def test_a_failing_call_logs_no_model_output(
     stub_api: StubAnthropic, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # An invalid output that quotes a full card number. Every record any
-    # library logs during the call (pydantic-ai, anthropic, httpx), at any
-    # level, must hold no run of eight or more digits.
+    # An invalid output that quotes a full card number. No record any
+    # library logs during the call (pydantic-ai, anthropic, the HTTP stack),
+    # at any level, may hold any eight-digit window of it; and the payload
+    # loggers log nothing below INFO.
     import logging
-    import re
     import traceback
+
+    from receipt_index.llm import PAYLOAD_LOGGER_PREFIXES
 
     stub_api.tool_input = {
         **_ACCOUNT,
-        "institution": "Bank 4111111111113456",
+        "institution": f"Bank {_PLANTED}",
         "last4": "not-four-digits",
     }
     # The app at DEBUG, as `logging.level: DEBUG` sets it; the payload
@@ -154,12 +161,15 @@ def test_a_failing_call_logs_no_model_output(
         se.run_account(agent, _PAGES, _LISTED, None)
     assert raised.value.kind == "schema"
     assert caplog.records, "nothing was logged, so nothing was checked"
-    long_run = re.compile(r"[0-9]{8,}")
+    windows = {_PLANTED[i : i + 8] for i in range(len(_PLANTED) - 7)}
     for record in caplog.records:
         text = record.getMessage()
         if record.exc_info:
             text += "".join(traceback.format_exception(*record.exc_info))
-        assert not long_run.search(text), (record.name, text[:200])
+        leaked = [window for window in windows if window in text]
+        assert not leaked, (record.name, leaked, text[:200])
+        if record.name.split(".")[0].startswith(PAYLOAD_LOGGER_PREFIXES):
+            assert record.levelno >= logging.INFO, (record.name, text[:200])
 
 
 @pytest.mark.parametrize("build", ["receipt", "first_pass", "account"])
