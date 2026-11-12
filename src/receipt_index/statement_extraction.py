@@ -108,9 +108,14 @@ ShortText = Annotated[str, StringConstraints(max_length=200)]
 Description = Annotated[str, StringConstraints(max_length=1000)]
 
 # A printed amount the model gave as a credit: a minus sign or parentheses.
+_AMOUNT = r"([0-9]{1,12}\.[0-9]{2})"
+# A minus (ASCII or U+2212) before it, parentheses round it, or a trailing
+# minus or "CR" after it; spaces allowed around the amount.
 _CREDIT = re.compile(
-    r"^\s*(?:-([0-9]{1,12}\.[0-9]{2})|\(([0-9]{1,12}\.[0-9]{2})\))\s*$"
+    rf"^\s*(?:[-\u2212]\s*{_AMOUNT}|\(\s*{_AMOUNT}\s*\)|{_AMOUNT}\s*(?:-|CR))\s*$",
+    re.IGNORECASE,
 )
+_PADDED = re.compile(rf"^\s*{_AMOUNT}\s*$")
 
 
 def _magnitude(value: object) -> object:
@@ -121,8 +126,10 @@ def _magnitude(value: object) -> object:
     parentheses. Taking the magnitude keeps a valid statement from failing
     as an item error.
     """
-    if isinstance(value, str) and (match := _CREDIT.match(value)):
-        return match.group(1) or match.group(2)
+    if isinstance(value, str) and (
+        match := _CREDIT.match(value) or _PADDED.match(value)
+    ):
+        return next(group for group in match.groups() if group is not None)
     return value
 
 
@@ -135,8 +142,11 @@ def _credit_to_null(value: object) -> object:
     ``principal_after`` against its balance is the backstop. A signed
     breakdown would be a contract change.
     """
-    if isinstance(value, str) and _CREDIT.match(value):
-        return None
+    if isinstance(value, str):
+        if _CREDIT.match(value):
+            return None
+        if match := _PADDED.match(value):
+            return match.group(1)
     return value
 
 
@@ -200,7 +210,9 @@ class FirstPass(_Output):
     """
 
     document_type: FirstPassDocumentType
-    accounts: list[ListedAccount] = Field(default_factory=list, max_length=50)
+    # No length cap here: more than 8 accounts is a rejection (U5), not a
+    # schema error, and the output ceiling bounds the list.
+    accounts: list[ListedAccount] = Field(default_factory=list)
     printed_account_count: int | None = Field(default=None, ge=0, le=1000)
     period: PrintedPeriod | None = None
 
@@ -783,6 +795,16 @@ def _usage(messages: Sequence[Any]) -> CallUsage:
 _LIMITS = UsageLimits(request_limit=MAX_REQUESTS)
 
 
+def _retried(messages: Sequence[Any]) -> bool:
+    """Whether a response came before the one that stopped at the ceiling.
+
+    Only a cut-off first response is a cap. One that follows an output
+    retry began as a schema error, which stays an item error, retried by
+    the pipeline, rather than a cap that would hold or reject for good.
+    """
+    return any(isinstance(m, ModelResponse) for m in messages)
+
+
 def _attach_usage(exc: BaseException, usage: CallUsage) -> None:
     """Record a failed call's usage on its exception, if it takes attributes."""
     with contextlib.suppress(Exception):
@@ -812,6 +834,9 @@ def run_first_pass(
         except OutputCeilingReachedError as exc:
             # The cut-off response isn't in the run's messages; count it too.
             usage = _usage([*messages, exc.response])
+            if _retried(messages):
+                _attach_usage(exc, usage)
+                raise
             return FirstPassRun(output=None, capped=True, usage=usage)
         except ContextWindowExceededError as exc:
             _attach_usage(exc, _usage([*messages, exc.response]))
@@ -839,6 +864,9 @@ def run_account(
         except OutputCeilingReachedError as exc:
             # The cut-off response isn't in the run's messages; count it too.
             usage = _usage([*messages, exc.response])
+            if _retried(messages):
+                _attach_usage(exc, usage)
+                raise
             return AccountRun(output=None, capped=True, usage=usage)
         except ContextWindowExceededError as exc:
             _attach_usage(exc, _usage([*messages, exc.response]))

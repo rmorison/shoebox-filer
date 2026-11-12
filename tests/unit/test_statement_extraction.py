@@ -96,7 +96,20 @@ def test_a_signed_two_place_amount_is_accepted(amount: str) -> None:
     assert StatementLine.model_validate({**_LINE, "amount": amount}).amount == amount
 
 
-@pytest.mark.parametrize("printed", ["-12.50", "(12.50)", " -12.50 "])
+@pytest.mark.parametrize(
+    "printed",
+    [
+        "-12.50",
+        "(12.50)",
+        " -12.50 ",
+        "\u221212.50",
+        "12.50-",
+        "12.50 CR",
+        "12.50cr",
+        "( 12.50 )",
+        " 12.50 ",
+    ],
+)
 def test_a_total_printed_as_a_credit_is_kept_as_its_magnitude(printed: str) -> None:
     account = AccountExtraction.model_validate(
         {
@@ -113,7 +126,9 @@ def test_a_total_printed_as_a_credit_is_kept_as_its_magnitude(printed: str) -> N
 @pytest.mark.parametrize(
     "field", ["principal_paid", "interest", "escrow", "fees", "advances"]
 )
-@pytest.mark.parametrize("printed", ["-25.00", "(25.00)"])
+@pytest.mark.parametrize(
+    "printed", ["-25.00", "(25.00)", "\u221225.00", "25.00 CR", "25.00-"]
+)
 def test_a_loan_breakdown_printed_as_a_credit_comes_back_null(
     field: str, printed: str
 ) -> None:
@@ -125,7 +140,8 @@ def test_a_loan_breakdown_printed_as_a_credit_comes_back_null(
 
 
 @pytest.mark.parametrize(
-    "printed", ["+1.00", "-1.0", "(1.00", "1.00-", "--1.00", "abc"]
+    "printed",
+    ["+1.00", "-1.0", "(1.00", "--1.00", "-(1.00)", "1.00 DR", "1,234.50", "abc"],
 )
 def test_totals_and_a_loans_breakdown_still_refuse_what_isnt_an_amount(
     printed: str,
@@ -136,6 +152,18 @@ def test_totals_and_a_loans_breakdown_still_refuse_what_isnt_an_amount(
         )
     with pytest.raises(ValidationError):
         LoanExtraction.model_validate({"fees": printed})
+
+
+def test_a_padded_breakdown_figure_is_kept() -> None:
+    assert LoanExtraction.model_validate({"fees": " 25.00 "}).fees == "25.00"
+
+
+def test_the_first_pass_has_no_account_cap_of_its_own() -> None:
+    listed = {"label": "x", "account_type": "card", "first_page": 1, "last_page": 1}
+    first = FirstPass.model_validate(
+        {"document_type": "card", "accounts": [listed] * 60}
+    )
+    assert len(first.accounts) == 60
 
 
 def test_a_description_has_a_length_limit() -> None:
@@ -534,6 +562,47 @@ def test_a_first_pass_cut_off_at_the_ceiling_is_capped_and_not_retried() -> None
     assert run.output is None
     assert len(calls) == 1
     assert run.usage == se.CallUsage(input_tokens=1000, output_tokens=200, requests=1)
+
+
+@pytest.mark.parametrize("call", ["first_pass", "account"])
+def test_a_ceiling_stop_after_an_output_retry_is_an_error_not_a_cap(call: str) -> None:
+    # The first reply is a complete but invalid output; the retry is cut off.
+    # That began as a schema error, so it stays an item error.
+    replies: list[ModelResponse] = []
+
+    def reply(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool = info.output_tools[0].name
+        if not replies:
+            bad = (
+                {"document_type": "x"}
+                if call == "first_pass"
+                else {**_ACCOUNT, "last4": "x"}
+            )
+            response = ModelResponse(
+                parts=[ToolCallPart(tool, bad)],
+                usage=RequestUsage(input_tokens=1000, output_tokens=200),
+            )
+        else:
+            response = ModelResponse(
+                parts=[ToolCallPart(tool, "{")],
+                finish_reason="length",
+                usage=RequestUsage(input_tokens=1000, output_tokens=200),
+            )
+        replies.append(response)
+        return response
+
+    model = FunctionModel(reply)
+    with pytest.raises(se.OutputCeilingReachedError) as raised:
+        if call == "first_pass":
+            se.run_first_pass(se.create_first_pass_agent(model), _PAGES)
+        else:
+            se.run_account(
+                se.create_account_agent("deposit", model), _PAGES, _LISTED, None
+            )
+    assert len(replies) == 2
+    assert se.call_usage(raised.value) == se.CallUsage(
+        input_tokens=2000, output_tokens=400, requests=2
+    )
 
 
 def _context_window_stop() -> Any:
