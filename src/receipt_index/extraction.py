@@ -15,7 +15,7 @@ from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import ContentFilterError
 
-from receipt_index.llm import anthropic_model
+from receipt_index.llm import anthropic_model, quiet_payload_loggers
 from receipt_index.models import (
     Attachment,
     ExtractionResult,
@@ -233,6 +233,8 @@ def create_extraction_agent(
     system_prompt: str = _SYSTEM_PROMPT,
 ) -> Agent[None, ReceiptMetadata]:
     """Create a pydantic-ai Agent configured for receipt extraction."""
+    # Receipt text and the model's output never reach a DEBUG log.
+    quiet_payload_loggers()
     llm, settings = anthropic_model(api_key=api_key, model=model)
     return Agent(
         llm,
