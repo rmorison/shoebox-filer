@@ -454,6 +454,8 @@ What the stubbed tests can't show: whether the real model trims account numbers 
 - a rejected `document_type` gives a rejected statement with no accounts, whatever the first pass listed.
 - a capped account (`too_many_lines`) carries no figures, but keeps its period (its own printed one, else the document's), since the period is in its digest.
 - a total whose printed heading normalises and masks to nothing can't be matched to lines: the account fails `totals_mismatch`, and that total's section is published as an empty string: a section total's is never null, and a null column-total section means a whole-account table.
+- every gate compares exact decimals: one cent decides footing, the chain and both kinds of total.
+- input the output models should have refused (a non-finite or non-decimal amount, an output of the wrong kind, a run count that doesn't match) raises `ValueError`; a `decimal.InvalidOperation` is re-raised as one. U5 treats it as an item error, with no revision.
 - only a capped call has no output; `gate_statement` refuses any other call with none. U5 passes an account it doesn't call as an empty extraction, which gates as `empty_account`.
 - section keys: a line's `section` and a total's `section` go through the same normalisation and mask, so the same printed heading gives the same key. `None` is the same key on both sides and means no heading: a line with none counts toward no section total, since a section total's section is never `None`, and a column total with none covers the whole account, as the contract says.
 

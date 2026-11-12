@@ -23,7 +23,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from receipt_index.statement_extraction import (
@@ -614,6 +614,10 @@ def gate_statement(first_pass: FirstPass, runs: Sequence[AccountRun]) -> GatedSt
     ``runs`` holds one account call's result per account the first pass
     listed, in its order. A rejected document type gives a rejected
     statement with no accounts, whatever the first pass listed.
+
+    Raises ValueError for input the output models should have refused (an
+    amount that isn't a finite decimal, an output of the wrong kind, a call
+    with no output that wasn't capped, a run count that doesn't match).
     """
     if first_pass.document_type not in STATEMENT_TYPES:
         return GatedStatement(status="rejected", hold_reason=None)
@@ -625,7 +629,14 @@ def gate_statement(first_pass: FirstPass, runs: Sequence[AccountRun]) -> GatedSt
     seen: dict[tuple[str, str | None], int] = {}
     pairs = zip(first_pass.accounts, runs, strict=True)
     for ordinal, (listed, run) in enumerate(pairs, 1):
-        one = _gate_account(ordinal, listed, run, first_pass.period)
+        try:
+            one = _gate_account(ordinal, listed, run, first_pass.period)
+        except InvalidOperation as exc:
+            # Only an output that bypassed its model's validation gets here.
+            # One error class for every malformed input, so U5 treats them
+            # alike: an item error, never a revision.
+            msg = f"account {ordinal}: an amount that isn't a decimal"
+            raise ValueError(msg) from exc
         key = (one.account.account_type, one.account.last4)
         seen[key] = seen.get(key, 0) + 1
         gated.append(replace(one, account=replace(one.account, occurrence=seen[key])))

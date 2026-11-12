@@ -18,6 +18,7 @@ from receipt_index.statement_extraction import (
     AccountExtraction,
     AccountRun,
     CallUsage,
+    ColumnTotal,
     FirstPass,
     LoanExtraction,
     SectionTotal,
@@ -933,3 +934,170 @@ def test_every_free_text_field_is_masked(model: type[BaseModel]) -> None:
         assert digits not in raw.replace(" ", ""), path
         assert "3456" in raw, path
         assert statement.masked_runs >= 1, path
+
+
+# ---------------------------------------------------------------------------
+# Exactness: one cent decides every gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ending", "clean"), [("90.00", True), ("90.01", False), ("89.99", False)]
+)
+def test_footing_is_exact_to_the_cent(ending: str, clean: bool) -> None:
+    account = _one("deposit", _balance([_line(5, "-10.00")], ending=ending))
+    assert account.status == ("clean" if clean else "held")
+    if not clean:
+        assert account.failure_class == "does_not_foot"
+
+
+@pytest.mark.parametrize(
+    ("printed", "clean"), [("90.00", True), ("90.01", False), ("89.99", False)]
+)
+def test_the_chain_is_exact_to_the_cent(printed: str, clean: bool) -> None:
+    run = _balance([_line(5, "-10.00", printed)], ending="90.00")
+    account = _one("deposit", run)
+    assert account.failure_class == (None if clean else "balance_chain_break")
+
+
+@pytest.mark.parametrize(
+    ("total", "clean"), [("10.00", True), ("10.01", False), ("9.99", False)]
+)
+def test_a_section_total_is_exact_to_the_cent(total: str, clean: bool) -> None:
+    run = _balance(
+        [_line(5, "-10.00", section="fees")],
+        ending="90.00",
+        section_totals=[{"section": "fees", "amount": total}],
+    )
+    assert _one("deposit", run).failure_class == (None if clean else "totals_mismatch")
+
+
+@pytest.mark.parametrize("side", ["credits", "debits"])
+@pytest.mark.parametrize(
+    ("delta", "clean"), [("0.00", True), ("0.01", False), ("-0.01", False)]
+)
+def test_a_column_total_is_exact_to_the_cent(
+    side: str, delta: str, clean: bool
+) -> None:
+    from decimal import Decimal
+
+    expected = {"credits": Decimal("30.00"), "debits": Decimal("10.00")}[side]
+    run = _balance(
+        [_line(5, "-10.00"), _line(6, "30.00")],
+        ending="120.00",
+        column_totals=[{side: str(expected + Decimal(delta))}],
+    )
+    assert _one("deposit", run).failure_class == (None if clean else "totals_mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Date edges, each with a printed year so only the boundary is tested
+# ---------------------------------------------------------------------------
+
+_MID_JANUARY = {
+    "start": {"month": 1, "day": 10, "year": 2027},
+    "end": {"month": 1, "day": 20, "year": 2027},
+}
+
+
+@pytest.mark.parametrize(
+    ("account_type", "day", "inside"),
+    [
+        ("card", 3, True),  # start - 7
+        ("card", 2, False),  # start - 8
+        ("deposit", 10, True),  # start
+        ("deposit", 9, False),  # start - 1
+        ("card", 20, True),  # end
+        ("card", 21, False),  # end + 1
+        ("deposit", 20, True),
+        ("deposit", 21, False),
+    ],
+)
+def test_the_date_gate_edges(account_type: str, day: int, inside: bool) -> None:
+    run = _balance(
+        [_line(day, "10.00", year=2027)], ending="110.00", period=_MID_JANUARY
+    )
+    account = _one(account_type, run)
+    assert account.failure_class == (None if inside else "date_out_of_period")
+
+
+# ---------------------------------------------------------------------------
+# Money the output models should have refused
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("side", ["credits", "debits"])
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "sNaN"])
+def test_a_column_total_that_isnt_a_finite_amount_is_refused(
+    side: str, bad: str
+) -> None:
+    output = AccountExtraction.model_validate(
+        {
+            "line_order": "oldest_first",
+            "beginning_balance": "1.00",
+            "ending_balance": "1.00",
+        }
+    )
+    figures: dict[str, Any] = {"section": None, "credits": None, "debits": None}
+    figures[side] = bad
+    output.column_totals = [ColumnTotal.model_construct(**figures)]
+    run = AccountRun(output=output, capped=False, usage=CallUsage())
+    with pytest.raises(ValueError, match="finite"):
+        _gate(("deposit", run))
+
+
+def test_an_amount_that_isnt_a_decimal_is_a_value_error() -> None:
+    output = AccountExtraction.model_validate(
+        {
+            "line_order": "oldest_first",
+            "beginning_balance": "1.00",
+            "ending_balance": "1.00",
+        }
+    )
+    output.section_totals = [SectionTotal.model_construct(section="x", amount="abc")]
+    run = AccountRun(output=output, capped=False, usage=CallUsage())
+    with pytest.raises(ValueError, match="account 1: an amount that isn't a decimal"):
+        _gate(("deposit", run))
+
+
+# ---------------------------------------------------------------------------
+# More chains
+# ---------------------------------------------------------------------------
+
+
+def test_same_day_lines_are_walked_in_printed_order() -> None:
+    # Printed with the deposit first, so sorting a day by amount (or any key
+    # but printed order) would walk them the other way.
+    lines = [_line(5, "25.00", "125.00"), _line(5, "-10.00", "115.00")]
+    assert _one("deposit", _balance(lines, ending="115.00")).status == "clean"
+    # Balances that follow the other order of the same-day lines break.
+    swapped = [_line(5, "25.00", "90.00"), _line(5, "-10.00", "115.00")]
+    account = _one("deposit", _balance(swapped, ending="115.00"))
+    assert account.failure_class == "balance_chain_break"
+
+
+def test_a_card_in_credit_chains_and_foots_through_negative_balances() -> None:
+    # A card balance in credit is negative on the statement-balance basis.
+    run = _balance(
+        [_line(5, "5.00", "-15.00"), _line(6, "30.00", "15.00")],
+        beginning="-20.00",
+        ending="15.00",
+    )
+    assert _one("card", run).status == "clean"
+
+
+def test_an_overdrawn_deposit_chains_through_negative_balances() -> None:
+    run = _balance(
+        [_line(5, "-20.00", "-15.00"), _line(6, "40.00", "25.00")],
+        beginning="5.00",
+        ending="25.00",
+    )
+    assert _one("deposit", run).status == "clean"
+
+
+def test_a_newest_first_account_with_no_printed_balances_is_clean_if_it_foots() -> None:
+    lines = [_line(9, "25.00"), _line(5, "-10.00")]
+    newest = _balance(lines, ending="115.00", line_order="newest_first")
+    assert _one("deposit", newest).status == "clean"
+    off = _balance(lines, ending="115.01", line_order="newest_first")
+    assert _one("deposit", off).failure_class == "does_not_foot"
