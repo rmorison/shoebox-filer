@@ -1213,6 +1213,8 @@ _BLANK_JOINS = [
     "\U0001d159",
     "\U0001da7f",
     "\U0001da80",
+    "\U00013441",
+    "\U00013442",
 ]
 _BLANK_NAMED_BUT_VISIBLE = {
     "\u2400",
@@ -1246,7 +1248,10 @@ def test_every_blank_named_letter_or_symbol_is_joined_or_listed_as_visible() -> 
         if unicodedata.category(chr(code)) in {"Lo", "Lm", "So", "Sk"}
         and any(word in unicodedata.name(chr(code), "") for word in words)
     }
-    assert found == set(_BLANK_JOINS) | _BLANK_NAMED_BUT_VISIBLE
+    # Each Python's Unicode database names its own set: every one must be
+    # classified, and a newly named one fails until it is.
+    unclassified = found - (set(_BLANK_JOINS) | _BLANK_NAMED_BUT_VISIBLE)
+    assert not unclassified
 
 
 def test_a_visible_letter_or_symbol_breaks_a_run() -> None:
