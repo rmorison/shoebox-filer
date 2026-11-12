@@ -320,6 +320,42 @@ def test_a_capped_account_has_no_figures_but_keeps_its_period() -> None:
     )
 
 
+def _capped_with_period(listed: dict[str, Any] | None, document: Any) -> GatedAccount:
+    first = FirstPass.model_validate(
+        {
+            "document_type": "card",
+            "accounts": [
+                {
+                    "label": "Card",
+                    "account_type": "card",
+                    "first_page": 1,
+                    "last_page": 1,
+                    "period": listed,
+                }
+            ],
+            "period": document,
+        }
+    )
+    return gate_statement(first, [_CAPPED]).accounts[0]
+
+
+def test_a_capped_accounts_own_period_comes_before_the_documents() -> None:
+    february = {
+        "start": {"month": 2, "day": 1, "year": 2027},
+        "end": {"month": 2, "day": 28, "year": 2027},
+    }
+    account = _capped_with_period(february, _JANUARY)
+    assert (account.period_start, account.period_end) == (
+        date(2027, 2, 1),
+        date(2027, 2, 28),
+    )
+
+
+def test_a_capped_account_with_no_period_printed_has_none() -> None:
+    account = _capped_with_period(None, None)
+    assert (account.period_start, account.period_end) == (None, None)
+
+
 def test_a_call_with_no_output_that_wasnt_capped_is_refused() -> None:
     uncapped = AccountRun(output=None, capped=False, usage=CallUsage())
     with pytest.raises(ValueError, match="no output"):
@@ -353,6 +389,8 @@ def test_a_total_whose_heading_is_blank_holds_the_account(heading: str) -> None:
     )
     account = _gate(("deposit", column), ("deposit", _clean())).accounts[0]
     assert account.failure_class == "totals_mismatch"
+    # Not null, which would read as a whole-account table.
+    assert account.column_totals[0].section == ""
 
 
 def test_a_column_total_with_neither_side_printed_checks_nothing() -> None:

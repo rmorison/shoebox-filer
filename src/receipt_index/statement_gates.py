@@ -277,10 +277,15 @@ def _read_balance_account(
     column_totals = []
     for printed_column in output.column_totals:
         section = header.section(printed_column.section)
-        read.blank_heading |= printed_column.section is not None and section is None
+        blank = printed_column.section is not None and section is None
+        read.blank_heading |= blank
         column_totals.append(
             ColumnTotalFigure(
-                section, _money(printed_column.credits), _money(printed_column.debits)
+                # "" for a printed heading that came to nothing: null means a
+                # whole-account table.
+                "" if blank else section,
+                _money(printed_column.credits),
+                _money(printed_column.debits),
             )
         )
     read.column_totals = tuple(column_totals)
