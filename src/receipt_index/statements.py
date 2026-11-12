@@ -34,6 +34,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import BuiltinMethodType
 from typing import TYPE_CHECKING, Any, Final
 
 import psycopg
@@ -112,19 +113,33 @@ _REJECTED_TYPES: Final = {"scan": "scan", "unreadable": "unreadable"}
 _REJECTED_BOUNDS: Final = frozenset({"pages", "size", "memory", "text", "crash"})
 
 
-# The modules that tracing instrumentation loads, and that a plain import of
-# pydantic-ai or logfire never does (measured against the locked versions):
-# any OpenTelemetry instrumentor, and logfire's integrations that patch the
-# HTTP transport, the Anthropic client or pydantic-ai. `logfire` itself is
-# no sign: pydantic-ai's logfire extra imports it in every process. The
-# logfire names are private, so a test runs each instrument call for real
-# and fails if a release renames the module it loads.
+# Tracing instrumentation patches the client, its transport, pydantic-ai or
+# pydantic and exports what passes through: the statement's text and the
+# model's output. `logfire` itself is no sign, since pydantic-ai's logfire
+# extra imports it in every process. What is:
+#
+# - any OpenTelemetry instrumentor (a module under the package below);
+# - any logfire integration module outside the baseline: each of logfire's
+#   instrument_* calls loads its own (httpx, anthropic, openai, mcp,
+#   pydantic_ai, ...), and the check fails closed on one it doesn't know.
+#   The baseline is what the whole app loads at the pinned logfire, with no
+#   instrument call; a test runs the real entry point and fails if a logfire
+#   upgrade widens it, and another runs each instrument call for real.
 _INSTRUMENTATION_PACKAGE: Final = "opentelemetry.instrumentation"
-_PATCHING_MODULES: Final = frozenset(
+_LOGFIRE_INTEGRATIONS: Final = (
+    "logfire._internal.integrations",
+    "logfire.integrations",
+)
+_LOGFIRE_BASELINE: Final = frozenset(
     {
-        "logfire._internal.integrations.httpx",
-        "logfire._internal.integrations.llm_providers.anthropic",
-        "logfire._internal.integrations.pydantic_ai",
+        "logfire._internal.integrations",
+        "logfire._internal.integrations.executors",
+        "logfire._internal.integrations.llm_providers",
+        "logfire._internal.integrations.llm_providers.semconv",
+        "logfire.integrations",
+        "logfire.integrations.logging",
+        "logfire.integrations.pydantic",
+        "logfire.integrations.structlog",
     }
 )
 
@@ -133,26 +148,59 @@ class InstrumentationLoadedError(RuntimeError):
     """Tracing instrumentation is loaded: statement work is refused."""
 
 
+def _under(name: str, package: str) -> bool:
+    return name == package or name.startswith(f"{package}.")
+
+
+def instrumentation_modules(modules: Iterable[str]) -> list[str]:
+    """The names in ``modules`` that are a sign of tracing instrumentation."""
+    return sorted(
+        name
+        for name in modules
+        if _under(name, _INSTRUMENTATION_PACKAGE)
+        or (
+            any(_under(name, prefix) for prefix in _LOGFIRE_INTEGRATIONS)
+            and name not in _LOGFIRE_BASELINE
+        )
+    )
+
+
+def _pydantic_records() -> bool:
+    """True when a pydantic plugin wraps validators (logfire's records).
+
+    ``logfire.instrument_pydantic()``, or ``LOGFIRE_PYDANTIC_PLUGIN_RECORD``
+    with no code at all, wraps every validator built after it, the
+    TypeAdapters pydantic-ai builds included, and exports the validated
+    values. No module name shows it, so the check builds a validator and
+    looks: pydantic-core's own methods are builtins, a plugin's wrappers are
+    Python functions.
+    """
+    from pydantic import TypeAdapter
+
+    validator = TypeAdapter(dict[str, str]).validator
+    return not all(
+        isinstance(getattr(validator, method, None), BuiltinMethodType)
+        for method in ("validate_python", "validate_json")
+    )
+
+
 def refuse_instrumentation(modules: Iterable[str] | None = None) -> None:
     """Refuse statement work if tracing instrumentation is loaded.
 
-    An instrumentor patches the client or its transport and exports what it
-    sends: the statement's text and the model's output. Raises
-    :class:`InstrumentationLoadedError` naming the modules found (module
-    names, never data). ``modules`` defaults to ``sys.modules``.
+    Raises :class:`InstrumentationLoadedError` naming what it found (module
+    names, never data). ``modules`` defaults to ``sys.modules``. Run when
+    the statement agents are built, when ``serve`` starts, and at the start
+    of every statement run, since an instrument call can come later in a
+    long-lived process.
 
-    A heuristic: an instrumentor that loads none of these modules isn't
-    seen. The tests and the deployment rule stay the guard (plan U5,
-    Tracing).
+    Not everything is visible: pydantic-ai's ``Agent.instrument_all`` with a tracer
+    provider loads no module, which every statement agent's own
+    ``instrument = False`` covers. The tests and the deployment rule stay
+    the guard (plan U5, Tracing).
     """
-    names = list(sys.modules if modules is None else modules)
-    found = sorted(
-        name
-        for name in names
-        if name == _INSTRUMENTATION_PACKAGE
-        or name.startswith(f"{_INSTRUMENTATION_PACKAGE}.")
-        or name in _PATCHING_MODULES
-    )
+    found = instrumentation_modules(list(sys.modules if modules is None else modules))
+    if _pydantic_records():
+        found.append("a pydantic plugin recording validations")
     if found:
         msg = (
             "statement work is refused: tracing instrumentation is loaded "
@@ -238,7 +286,9 @@ def _safe_message(exc: BaseException) -> str:
     SQLSTATE are kept; any other error type is kept by name alone unless it
     is one the pipeline raises itself.
     """
-    if isinstance(exc, StatementCallError | StatementItemError):
+    if isinstance(
+        exc, StatementCallError | StatementItemError | InstrumentationLoadedError
+    ):
         return str(exc)
     if isinstance(exc, psycopg.Error):
         return f"{type(exc).__name__} (SQLSTATE {exc.sqlstate})"
@@ -546,6 +596,9 @@ def _error_class(exc: BaseException) -> ErrorClass:
         return exc.error_class
     if isinstance(exc, StatementItemError):
         return "content"
+    if isinstance(exc, InstrumentationLoadedError):
+        # The process, not the item: stop the source, count no attempt.
+        return "config"
     return classify(exc)
 
 
@@ -573,6 +626,9 @@ def process_statement(
     usage = _Usage()
     data = raw.raw_bytes or raw.file_content
     try:
+        # At the start of every run: an instrument call can come after
+        # serve started. A refusal stops the source as a config failure.
+        refuse_instrumentation()
         if not data:
             msg = "the statement item has no file content"
             raise StatementItemError(msg)

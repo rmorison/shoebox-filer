@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import textwrap
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -76,7 +75,7 @@ def test_create_refuses_while_instrumentation_is_loaded(
 
 
 # ---------------------------------------------------------------------------
-# The module check
+# The module check: fail closed on logfire's integrations
 # ---------------------------------------------------------------------------
 
 
@@ -88,7 +87,13 @@ def test_create_refuses_while_instrumentation_is_loaded(
         "opentelemetry.instrumentation.anything_new",
         "logfire._internal.integrations.httpx",
         "logfire._internal.integrations.llm_providers.anthropic",
+        "logfire._internal.integrations.llm_providers.openai",
         "logfire._internal.integrations.pydantic_ai",
+        "logfire._internal.integrations.mcp",
+        "logfire._internal.integrations.pytest",
+        # One no release has yet: fail closed.
+        "logfire._internal.integrations.anything_new",
+        "logfire.integrations.anything_new",
     ],
 )
 def test_a_loaded_instrumentation_module_is_refused(name: str) -> None:
@@ -103,34 +108,41 @@ def test_a_loaded_instrumentation_module_is_refused(name: str) -> None:
         # pydantic-ai's logfire extra imports these in every process.
         "logfire",
         "logfire_api",
-        "logfire._internal.integrations",
-        "logfire._internal.integrations.llm_providers",
+        *sorted(statements._LOGFIRE_BASELINE),
         "opentelemetry.sdk.trace",
         # A prefix match only on the dotted package, never a longer name.
         "opentelemetry.instrumentationish",
     ],
 )
-def test_modules_a_plain_import_loads_pass(name: str) -> None:
+def test_modules_the_app_loads_pass(name: str) -> None:
     refuse_instrumentation([name])
 
 
-def _run(script: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    script: str, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """``script`` in a fresh interpreter, with nothing sent anywhere."""
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("LOGFIRE_", "OTEL_"))
+        if not key.startswith(("LOGFIRE_", "OTEL_", "PYDANTIC_"))
     }
     env["LOGFIRE_SEND_TO_LOGFIRE"] = "false"
     env["LOGFIRE_CONSOLE"] = "false"
+    env.update(env_extra or {})
     return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
+        [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         env=env,
-        timeout=120,
+        timeout=180,
         check=False,
     )
+
+
+def _last_line(result: subprocess.CompletedProcess[str]) -> str:
+    assert result.returncode == 0, result.stderr[-2000:]
+    return result.stdout.strip().splitlines()[-1]
 
 
 _VERDICT = """
@@ -140,80 +152,143 @@ from receipt_index.statements import (
 )
 try:
     refuse_instrumentation()
-except InstrumentationLoadedError:
-    print("REFUSED")
+except InstrumentationLoadedError as exc:
+    print("REFUSED", exc)
 else:
     print("PASSED")
 """
 
+# The whole app imported: every module of the package.
+_IMPORT_APP = """
+import importlib
+import pkgutil
+import sys
 
-def test_a_plain_import_of_pydantic_ai_and_logfire_passes() -> None:
-    imports = """
-        import sys
-        import logfire
-        import pydantic_ai
-        import receipt_index.llm
-        import receipt_index.statements
-        assert "logfire" in sys.modules
-        """
-    result = _run(textwrap.dedent(imports) + _VERDICT)
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.strip().splitlines()[-1] == "PASSED"
+import receipt_index
+from receipt_index.statements import _LOGFIRE_INTEGRATIONS
+
+for info in pkgutil.walk_packages(receipt_index.__path__, "receipt_index."):
+    importlib.import_module(info.name)
+assert "logfire" in sys.modules
+"""
+# The statement entry point: the agents built as serve builds them (which
+# runs the check itself, and raises if it refuses).
+_WHOLE_APP = (
+    _IMPORT_APP
+    + """
+from receipt_index.llm import anthropic_model
+from receipt_index.statements import StatementAgents
+
+llm, settings = anthropic_model(api_key="stub-key", model="claude-haiku-5-5")
+StatementAgents.create(llm, settings)
+loaded = sorted(
+    name
+    for name in sys.modules
+    if name.startswith(_LOGFIRE_INTEGRATIONS)
+)
+print("LOADED", loaded)
+"""
+)
 
 
-# Each instrument call run for real. The logfire module names the check
-# looks for are private: if a release renames the module a call loads, the
-# check stops seeing it and this test fails.
-_INSTRUMENT_CALLS = {
-    "logfire.instrument_httpx": "logfire.instrument_httpx()",
-    "logfire.instrument_anthropic": "logfire.instrument_anthropic()",
-    "logfire.instrument_pydantic_ai": "logfire.instrument_pydantic_ai()",
-    "an opentelemetry instrumentor": (
-        "from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor\n"
-        "HTTPXClientInstrumentor().instrument()"
-    ),
-}
+def test_the_whole_app_at_its_statement_entry_point_passes() -> None:
+    """The control. A logfire upgrade that widens the baseline fails here."""
+    result = _run(_WHOLE_APP + _VERDICT)
+    assert _last_line(result) == "PASSED"
+    loaded = next(
+        line for line in result.stdout.splitlines() if line.startswith("LOADED")
+    )
+    assert loaded == f"LOADED {sorted(statements._LOGFIRE_BASELINE)}"
 
 
-@pytest.mark.parametrize("call", sorted(_INSTRUMENT_CALLS))
-def test_each_instrument_call_is_refused(call: str) -> None:
-    result = _run(
-        "import logfire\n"
-        "import pydantic_ai\n"
-        "logfire.configure(send_to_logfire=False, console=False)\n"
-        + _INSTRUMENT_CALLS[call]
+# Each instrument call run for real, after the whole app is imported. The
+# logfire module names are private: if a release changes what a call
+# loads, the check must still see it, or this test fails.
+_LOGFIRE_CALLS = (
+    "instrument_httpx",
+    "instrument_anthropic",
+    "instrument_openai",
+    "instrument_pydantic_ai",
+    "instrument_mcp",
+)
+
+
+def _instrumented(call: str) -> str:
+    return (
+        _WHOLE_APP
+        + "import logfire\n"
+        + "logfire.configure(send_to_logfire=False, console=False)\n"
+        + "before = set(sys.modules)\n"
+        + call
         + "\n"
-        + textwrap.dedent(_VERDICT)
+        + "from receipt_index.statements import instrumentation_modules\n"
+        + "new = sorted(set(sys.modules) - before)\n"
+        + "own = [m for m in instrumentation_modules(new)"
+        + " if m.startswith(_LOGFIRE_INTEGRATIONS)]\n"
+        + "print('OWN', own)\n"
+        + _VERDICT
     )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.strip().splitlines()[-1] == "REFUSED"
 
 
-def test_the_logfire_calls_are_refused_by_their_own_modules() -> None:
-    """Not only through an OpenTelemetry instrumentor they also load.
+@pytest.mark.parametrize("call", _LOGFIRE_CALLS)
+def test_each_logfire_instrument_call_is_refused_by_its_own_module(
+    call: str,
+) -> None:
+    # By a logfire module of its own, not only through an OpenTelemetry
+    # instrumentor it may also load (instrument_httpx loads one).
+    result = _run(_instrumented(f"logfire.{call}()"))
+    assert _last_line(result).startswith("REFUSED")
+    own = next(line for line in result.stdout.splitlines() if line.startswith("OWN"))
+    assert own != "OWN []", result.stdout
 
-    ``instrument_httpx`` loads ``opentelemetry.instrumentation`` too, so a
-    rename of its logfire module would hide behind that. This shows each
-    logfire module the check names is the one its call loads.
-    """
+
+def test_an_opentelemetry_instrumentor_is_refused() -> None:
     result = _run(
-        """
-        import sys
-        import logfire
-        import pydantic_ai
-        from receipt_index import statements
-        logfire.configure(send_to_logfire=False, console=False)
-        before = set(sys.modules)
-        logfire.instrument_httpx()
-        logfire.instrument_anthropic()
-        logfire.instrument_pydantic_ai()
-        loaded = set(sys.modules) - before
-        missing = sorted(statements._PATCHING_MODULES - loaded)
-        print("MISSING", missing)
-        """
+        _instrumented(
+            "from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor\n"
+            "HTTPXClientInstrumentor().instrument()"
+        )
     )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert result.stdout.strip().splitlines()[-1] == "MISSING []"
+    assert _last_line(result).startswith("REFUSED")
+
+
+# ---------------------------------------------------------------------------
+# The state check: pydantic recording, which loads no module
+# ---------------------------------------------------------------------------
+
+
+def test_logfire_instrument_pydantic_is_refused() -> None:
+    result = _run(_instrumented("logfire.instrument_pydantic()"))
+    assert _last_line(result).startswith("REFUSED")
+    assert "pydantic plugin" in _last_line(result)
+
+
+@pytest.mark.parametrize("configure", [False, True])
+def test_the_pydantic_record_variable_alone_is_refused(configure: bool) -> None:
+    # No code at all: the variable turns logfire's pydantic plugin on.
+    script = _IMPORT_APP
+    if configure:
+        script += (
+            "import logfire\nlogfire.configure(send_to_logfire=False, console=False)\n"
+        )
+    result = _run(
+        script + _VERDICT, env_extra={"LOGFIRE_PYDANTIC_PLUGIN_RECORD": "all"}
+    )
+    assert _last_line(result).startswith("REFUSED")
+    assert "pydantic plugin" in _last_line(result)
+
+
+def test_the_statement_models_tell_the_logfire_plugin_not_to_record() -> None:
+    from receipt_index import statement_extraction as se
+
+    for model in (se.FirstPass, se.AccountExtraction, se.LoanExtraction):
+        assert model.model_config.get("plugin_settings") == {
+            "logfire": {"record": "off"}
+        }
+
+
+def test_the_state_check_passes_in_this_process() -> None:
+    assert not statements._pydantic_records()
 
 
 # ---------------------------------------------------------------------------
@@ -336,3 +411,50 @@ def test_any_gate_error_is_an_item_error_kept_by_its_class(
     assert raised.__cause__ is None
     assert raised.__suppress_context__
     assert statements._error_class(raised) == "content"
+
+
+# ---------------------------------------------------------------------------
+# Every statement run checks first
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_refuses_when_instrumentation_was_loaded_after_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    from receipt_index.models import RawReceipt
+
+    logged: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        statements, "insert_ingest_log", lambda _conn, **row: logged.append(row)
+    )
+    looked_up = MagicMock()
+    monkeypatch.setattr(statements, "statement_for_sha256", looked_up)
+    name = "logfire._internal.integrations.mcp"
+    monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    raw = RawReceipt(
+        source_type="gdrive_statement",
+        source_id="item-1",
+        source_name="statements-drive",
+        date=datetime(2027, 1, 5, tzinfo=UTC),
+        raw_bytes=b"%PDF-1.7 synthetic",
+    )
+    outcome = statements.process_statement(
+        MagicMock(),
+        raw,
+        store=MagicMock(),
+        source_name="statements-drive",
+        agents=MagicMock(),
+        llm_model=_MODEL,
+    )
+    # The process, not the item: the source stops, no attempt is counted,
+    # and nothing of the item was read.
+    assert (outcome.status, outcome.error_class) == ("failed", "config")
+    assert outcome.stops_source
+    looked_up.assert_not_called()
+    (row,) = logged
+    assert row["status"] == "failed"
+    assert row["counts_attempt"] is False
+    assert name in row["error_message"]

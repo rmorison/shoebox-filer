@@ -221,9 +221,17 @@ Page = Annotated[
 
 
 class _Output(BaseModel):
-    """An output model: unknown fields are refused, not ignored."""
+    """An output model: unknown fields are refused, not ignored.
 
-    model_config = ConfigDict(extra="forbid")
+    logfire's pydantic plugin is told not to record these models: a record
+    would export the validated values (statement text). Not enough on its
+    own, since a TypeAdapter over one of them is still wrapped; the
+    statement check refuses work while the plugin records at all.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", plugin_settings={"logfire": {"record": "off"}}
+    )
 
 
 class DateParts(_Output):

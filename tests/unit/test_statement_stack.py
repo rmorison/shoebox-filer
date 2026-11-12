@@ -361,11 +361,15 @@ def test_no_tracing_instrumentation_is_called_in_the_package() -> None:
     modules = list(root.rglob("*.py"))
     assert len(modules) > 10, "the package glob found too little to check"
     assert not list(root.rglob("sitecustomize.py"))
+    # The statement check names the instrumentation package it refuses, on
+    # this one line; nothing else in the package may.
+    allowed = '_INSTRUMENTATION_PACKAGE: Final = "opentelemetry.instrumentation"\n'
+    assert allowed in (root / "statements.py").read_text(encoding="utf-8")
     found = [
         f"{path.relative_to(root)}: {pattern}"
         for path in modules
         for pattern in _NEVER_IN_THIS_PROCESS
-        if re.search(pattern, path.read_text(encoding="utf-8"))
+        if re.search(pattern, path.read_text(encoding="utf-8").replace(allowed, ""))
     ]
     assert found == []
 
@@ -419,3 +423,62 @@ def test_the_statement_constructors_refuse_a_model_that_could_be_traced() -> Non
     llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
     se.create_first_pass_agent(llm, settings)
     se.create_account_agent("loan", llm, settings)
+
+
+def test_agents_from_statement_agents_create_export_no_span_under_instrument_all(
+    stub_api: StubAnthropic,
+) -> None:
+    # Agent.instrument_all() with a live tracer provider loads no module, so
+    # the statement check can't see it: every agent StatementAgents.create
+    # builds must hold tracing off itself. The canary is in the page text
+    # (the request) and in the model's output (the response).
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic_ai import Agent
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+    from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    from receipt_index.statements import StatementAgents
+
+    canary = "SYNTHCANARY7319"
+    pages = (f"Synthetic Savings Bank {canary}", "Jan 5 Synthetic purchase -10.00")
+
+    def spans_text() -> str:
+        return repr(
+            [(s.name, dict(s.attributes or {})) for s in exporter.get_finished_spans()]
+        )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        # The control: an ordinary agent's span holds the canary, so the
+        # exporter is live and records content.
+        def reply(_: Any, __: AgentInfo) -> Any:
+            from pydantic_ai.messages import ModelResponse, TextPart
+
+            return ModelResponse(parts=[TextPart(f"ok {canary}")])
+
+        Agent(FunctionModel(reply)).run_sync(f"hello {canary}")
+        assert canary in spans_text()
+        exporter.clear()
+
+        llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+        agents = StatementAgents.create(llm, settings)
+        stub_api.tool_input = _FIRST_PASS
+        se.run_first_pass(agents.first_pass, pages)
+        stub_api.tool_input = {**_ACCOUNT, "institution": f"Bank {canary}"}
+        se.run_account(agents.accounts["deposit"], pages, _LISTED, None)
+        loan = se.ListedAccount(
+            label="Loan", account_type="loan", first_page=1, last_page=1
+        )
+        stub_api.tool_input = {"interest": "1.00"}
+        se.run_account(agents.accounts["loan"], pages, loan, None)
+        assert exporter.get_finished_spans() == ()
+        assert canary not in spans_text()
+    finally:
+        Agent.instrument_all(False)
