@@ -473,6 +473,365 @@ class TestEndToEnd:
         assert replies.calls == ["first_pass"]
 
 
+_CARD_FIRST_PASS: dict[str, Any] = {
+    **_FIRST_PASS,
+    "document_type": "card",
+    "accounts": [
+        {
+            "label": "Card ending 4321",
+            "account_type": "card",
+            "first_page": 1,
+            "last_page": 1,
+        }
+    ],
+}
+_CARD: dict[str, Any] = {
+    "institution": "Synthetic Card Services",
+    "last4": "4321",
+    "currency": "USD",
+    "beginning_balance": "50.00",
+    "ending_balance": "80.00",
+    "line_order": "oldest_first",
+    "lines": [
+        {
+            # Before the period, inside the card's grace days.
+            "posted": {"month": 12, "day": 28, "year": 2026},
+            "description": "Synthetic hardware store",
+            "amount": "40.00",
+            "page": 1,
+        },
+        {
+            "posted": {"month": 1, "day": 20, "year": None},
+            "description": "Synthetic payment received",
+            "amount": "-10.00",
+            "page": 1,
+        },
+    ],
+}
+_LOAN_FIRST_PASS: dict[str, Any] = {
+    **_FIRST_PASS,
+    "document_type": "loan_statement",
+    "accounts": [
+        {
+            "label": "Loan ending 5678",
+            "account_type": "loan",
+            "first_page": 1,
+            "last_page": 1,
+        }
+    ],
+}
+_LOAN: dict[str, Any] = {
+    "institution": "Synthetic Mortgage Co",
+    "last4": "5678",
+    "currency": "USD",
+    "principal_before": "1000.00",
+    "principal_after": "900.00",
+    "principal_paid": "100.00",
+    "interest": "5.00",
+}
+
+
+class ShapedReplies(Replies):
+    """Stubbed models whose reply for a call can be a whole ModelResponse.
+
+    ``shape`` maps a call kind to a function of the output tool's name that
+    returns the response (or raises), for a stop the plain replies can't
+    make: a cap, a refusal, a timeout. Its calls are recorded like any other.
+    """
+
+    def __init__(
+        self,
+        shape: dict[str, Callable[[str], ModelResponse]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.shape = shape
+
+    def _model(self, kind: str) -> FunctionModel:
+        if kind not in self.shape:
+            return super()._model(kind)
+
+        def reply(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            self.calls.append(kind)
+            return self.shape[kind](info.output_tools[0].name)
+
+        return FunctionModel(reply)
+
+
+def _capped(tool: str) -> ModelResponse:
+    # A cut-off tool call, as the provider gives one at the output ceiling.
+    return ModelResponse(
+        parts=[ToolCallPart(tool, {"document_type": "deposit"})],
+        finish_reason="length",
+    )
+
+
+def _refused(_tool: str) -> ModelResponse:
+    from pydantic_ai.messages import TextPart
+
+    return ModelResponse(
+        parts=[TextPart("Synthetic refusal.")],
+        finish_reason="content_filter",
+        provider_details={"finish_reason": "refusal"},
+    )
+
+
+def _timed_out(_tool: str) -> ModelResponse:
+    from pydantic_ai.exceptions import ModelRequestTimeout
+
+    raise ModelRequestTimeout("test-model", 0.01)
+
+
+def _revision(conn: psycopg.Connection[dict[str, Any]]) -> Any:
+    """The one statement and its current revision."""
+    return _one(
+        conn,
+        "SELECT s.status AS statement_status, s.document_type AS statement_type,"
+        " r.status, r.document_type, r.hold_reason, r.rejected_bound,"
+        " r.printed_account_count, r.llm_model, r.pages"
+        " FROM receipt.statements s"
+        " JOIN receipt.statement_revisions r ON r.id = s.current_revision_id",
+    )
+
+
+def _accounts(conn: psycopg.Connection[dict[str, Any]]) -> list[Any]:
+    return conn.execute(
+        "SELECT * FROM receipt.statement_accounts ORDER BY ordinal"
+    ).fetchall()
+
+
+def _line_count(conn: psycopg.Connection[dict[str, Any]]) -> int:
+    return int(_one(conn, "SELECT count(*) AS n FROM receipt.statement_lines")["n"])
+
+
+def _success_log(conn: psycopg.Connection[dict[str, Any]], raw: RawReceipt) -> Any:
+    (latest, *older) = get_item_history(conn, raw.source_id)
+    assert (latest.status, latest.source_type) == ("success", STATEMENT_SOURCE_TYPE)
+    assert latest.error_class is None
+    assert [row.status for row in older] == ["started"]
+    return _one(
+        conn,
+        "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+        " WHERE source_id = %(id)s AND status = 'success'",
+        id=raw.source_id,
+    )
+
+
+class TestOutcomes:
+    """Each outcome through process_statement: revision, rows and log."""
+
+    def test_a_card_statement_is_complete_with_its_grace_days(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(first_pass=_CARD_FIRST_PASS, account=_CARD)
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "card"]
+
+        revision = _revision(pg_conn)
+        assert (revision["statement_status"], revision["statement_type"]) == (
+            "complete",
+            "card",
+        )
+        assert (revision["status"], revision["hold_reason"]) == ("complete", None)
+        assert revision["rejected_bound"] is None
+        (account,) = _accounts(pg_conn)
+        assert (account["account_type"], account["status"]) == ("card", "clean")
+        assert (account["last4"], account["date_grace_days"]) == ("4321", 7)
+        assert account["failure_class"] is None
+        lines = pg_conn.execute(
+            "SELECT posted_date, amount FROM receipt.statement_lines ORDER BY ordinal"
+        ).fetchall()
+        assert [(str(x["posted_date"]), str(x["amount"])) for x in lines] == [
+            ("2026-12-28", "40.00"),
+            ("2027-01-20", "-10.00"),
+        ]
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (2, "test-model")
+
+    def test_a_loan_only_statement_keeps_its_figures_only(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(first_pass=_LOAN_FIRST_PASS, account=_LOAN)
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "loan"]
+
+        revision = _revision(pg_conn)
+        assert (revision["statement_status"], revision["statement_type"]) == (
+            "complete",
+            "loan_statement",
+        )
+        assert (revision["status"], revision["hold_reason"]) == ("complete", None)
+        (account,) = _accounts(pg_conn)
+        assert (account["account_type"], account["status"]) == ("loan", "figures_only")
+        assert account["failure_class"] is None
+        assert (
+            str(account["principal_before"]),
+            str(account["principal_after"]),
+            str(account["principal_paid"]),
+            str(account["interest"]),
+        ) == ("1000.00", "900.00", "100.00", "5.00")
+        assert account["escrow"] is None
+        assert account["beginning_balance"] is None
+        assert _line_count(pg_conn) == 0  # a loan has figures, never lines
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (2, "test-model")
+
+    def test_balances_that_dont_reconcile_hold_the_statement(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(account={**_ACCOUNT, "ending_balance": "120.00"})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "held"
+        assert (revision["status"], revision["hold_reason"]) == (
+            "held",
+            "no_usable_account",
+        )
+        (account,) = _accounts(pg_conn)
+        assert (account["status"], account["failure_class"]) == (
+            "held",
+            "does_not_foot",
+        )
+        assert str(account["difference"]) == "5.00"
+        assert (account["first_page"], account["last_page"]) == (1, 1)
+        assert not account["held_by_statement"]
+        assert _line_count(pg_conn) == 0  # a held account's lines aren't kept
+        log = _success_log(pg_conn, raw)
+        assert log["llm_requests"] == 2
+
+    def test_a_capped_first_pass_is_rejected_over_bounds(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"first_pass": _capped})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        # One request, not retried: a retry would stop in the same place.
+        assert replies.calls == ["first_pass"]
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "rejected"
+        assert (
+            revision["status"],
+            revision["document_type"],
+            revision["rejected_bound"],
+            revision["hold_reason"],
+        ) == ("rejected", "over_bounds", "accounts", None)
+        assert (revision["llm_model"], revision["pages"]) == ("test-model", 1)
+        assert _accounts(pg_conn) == []
+        assert _line_count(pg_conn) == 0
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (1, "test-model")
+
+    def test_a_capped_account_call_holds_it_as_too_many_lines(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _capped})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "deposit"]
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "held"
+        assert (revision["status"], revision["hold_reason"]) == (
+            "held",
+            "no_usable_account",
+        )
+        assert revision["rejected_bound"] is None
+        (account,) = _accounts(pg_conn)
+        assert (account["status"], account["failure_class"]) == (
+            "held",
+            "too_many_lines",
+        )
+        # Nothing was read, so the pages are kept to look at again.
+        assert (account["first_page"], account["last_page"]) == (1, 1)
+        assert account["beginning_balance"] is None
+        assert _line_count(pg_conn) == 0
+        log = _success_log(pg_conn, raw)
+        assert log["llm_requests"] == 2
+
+
+class TestCountedItemErrors:
+    """A refusal and a timeout: counted item errors that write no revision."""
+
+    def _assert_counted_failure(
+        self,
+        conn: psycopg.Connection[dict[str, Any]],
+        raw: RawReceipt,
+        outcome: Any,
+        kind: str,
+    ) -> None:
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert not outcome.stops_source
+        for table in (
+            "statements",
+            "statement_revisions",
+            "statement_accounts",
+            "statement_sources",
+        ):
+            count = _one(conn, f"SELECT count(*) AS n FROM receipt.{table}")["n"]
+            assert count == 0, table
+        (latest, *older) = get_item_history(conn, raw.source_id)
+        assert [row.status for row in older] == ["started"]
+        assert (latest.status, latest.source_type) == ("failed", STATEMENT_SOURCE_TYPE)
+        assert (latest.error_class, latest.counts_attempt) == ("content", True)
+        assert latest.next_retry_at is not None
+        # The kind is kept; the class in brackets is the original error's.
+        assert latest.error_message is not None
+        assert latest.error_message.startswith(
+            f"statement account call failed: {kind} ("
+        ), latest.error_message
+        row = _one(
+            conn,
+            "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+            " WHERE source_id = %(id)s AND status = 'failed'",
+            id=raw.source_id,
+        )
+        # The first pass's request is still counted on the failed row.
+        assert row["llm_requests"] >= 1
+        assert row["llm_model"] == "test-model"
+
+    def test_a_refused_account_call_is_a_counted_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _refused})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies, policy=RetryPolicy())
+        assert replies.calls == ["first_pass", "deposit"]
+        self._assert_counted_failure(pg_conn, raw, outcome, "refused")
+
+    def test_an_account_call_timeout_is_a_counted_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _timed_out})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies, policy=RetryPolicy())
+        assert replies.calls == ["first_pass", "deposit"]
+        self._assert_counted_failure(pg_conn, raw, outcome, "timeout")
+
+
 class TestFailures:
     def test_a_schema_error_writes_no_revision_and_is_retried(
         self,
@@ -752,6 +1111,8 @@ class TestRetries:
     def test_a_requeued_statement_item_stays_a_statement_item(
         self,
         pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         raw = _raw(make_pdf(_PAGE))
         self._failed_statement(pg_conn, raw)
@@ -768,6 +1129,55 @@ class TestRetries:
             configured=[_SOURCE],
         )
         assert [entry.source_id for entry in due] == [raw.source_id]
+
+        # The full pass: the requeued item goes to the statement pipeline.
+        def no_receipts(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a statement item reached process_item")
+
+        monkeypatch.setattr(pipeline, "process_item", no_receipts)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                return raw
+
+        replies = Replies()
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        with ExitStack() as stack:
+            pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=replies.agents(),
+            )
+        assert (result.processed, result.failed, result.stopped) == (1, 0, None)
+        assert replies.calls == ["first_pass", "deposit"]
+        assert _revision(pg_conn)["statement_status"] == "complete"
+        source = _one(
+            pg_conn, "SELECT source_id, source_name FROM receipt.statement_sources"
+        )
+        assert (source["source_id"], source["source_name"]) == (raw.source_id, _SOURCE)
+        history = get_item_history(pg_conn, raw.source_id)
+        assert [row.status for row in history[:3]] == ["success", "started", "queued"]
+        assert {row.source_type for row in history} == {STATEMENT_SOURCE_TYPE}
+        # Done now: not due again, and not offered by `retry`.
+        assert not select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert not select_retry_candidates(pg_conn, RetryFilter(status="failed"))
 
 
 def test_the_synthetic_pdf_reads_as_text() -> None:
@@ -826,6 +1236,115 @@ class TestRetriesWithoutAgents:
                 )
             assert (result.processed, result.failed) == (0, 0)
         assert get_item_history(pg_conn, raw.source_id) == before
+
+
+class TestWatchdog:
+    # One step's budget, and how long each stubbed model call takes: each
+    # step fits, the item as a whole doesn't.
+    _BUDGET = 0.8
+    _CALL = 0.5
+
+    def test_a_step_at_each_phase_keeps_a_slow_item_inside_the_watchdog(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        # serve's own clock and watchdog, on a small budget, around a retry
+        # pass with serve's RunControl: three slow calls (the first pass and
+        # two accounts) take longer than one step's budget together.
+        import threading
+        import time
+
+        from receipt_index.service import WATCHDOG_EXIT_CODE, HealthLoop, ItemClock
+
+        raw = _raw(make_pdf(_PAGE))
+        TestRetries()._failed_statement(pg_conn, raw)
+        two = {
+            **_FIRST_PASS,
+            "accounts": [_FIRST_PASS["accounts"][0]] * 2,
+            "printed_account_count": 2,
+        }
+
+        def slow(tool: str, args: dict[str, Any]) -> ModelResponse:
+            time.sleep(self._CALL)
+            return ModelResponse(parts=[ToolCallPart(tool, args)])
+
+        replies = ShapedReplies(
+            {
+                "first_pass": lambda tool: slow(tool, two),
+                "deposit": lambda tool: slow(tool, _ACCOUNT),
+            }
+        )
+        clock = ItemClock()
+        stop, worker_done = threading.Event(), threading.Event()
+        exits: list[int] = []
+        longest: list[float] = [0.0]
+        loop = HealthLoop(
+            clock,
+            stop=stop,
+            worker_done=worker_done,
+            item_timeout_seconds=self._BUDGET,
+            exit_fn=exits.append,
+            interval_seconds=0.02,
+        )
+        real_watchdog = loop._watchdog
+
+        def watchdog() -> float | None:
+            running = real_watchdog()
+            if running is not None:
+                longest[0] = max(longest[0], running)
+            return running
+
+        loop._watchdog = watchdog  # type: ignore[method-assign]
+        health = threading.Thread(target=loop.run, daemon=True)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                return raw
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        health.start()
+        started = time.monotonic()
+        try:
+            with ExitStack() as stack:
+                pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+                result = pipeline.run_due_retries(
+                    pg_conn,
+                    due,
+                    pool=pool,
+                    store=store,
+                    agents={},
+                    llm_model="test-model",
+                    own_source=_SOURCE,
+                    control=clock,
+                    statement_agents=replies.agents(),
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            worker_done.set()
+            health.join(5)
+
+        assert result.processed == 1
+        assert replies.calls == ["first_pass", "deposit", "deposit"]
+        assert _revision(pg_conn)["statement_status"] == "complete"
+        # The item ran longer than one step's budget, yet no step did, so
+        # the watchdog never fired.
+        assert elapsed > self._BUDGET
+        assert exits == [], f"the watchdog fired: exit {WATCHDOG_EXIT_CODE}"
+        assert self._CALL * 0.9 <= longest[0] < self._BUDGET, longest[0]
+        assert clock.busy_since() is None  # idle again after the item
 
 
 def _read(reason: str | None, pages: int = 1) -> Any:
