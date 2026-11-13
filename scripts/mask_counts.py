@@ -229,8 +229,8 @@ def count_field(
         field_cuts += _count_span(mask, span, counts, field_asides, kind)
     if field_cuts:
         counts["fields.with_a_cut"] += 1
-    for kind in field_asides:
-        counts[f"fields.with_set_aside.{kind}"] += 1
+    for aside in field_asides:
+        counts[f"fields.with_set_aside.{aside}"] += 1
     _, expected = se.mask_digits(text)
     if expected != field_cuts:
         counts["check.cut_count_mismatch"] += 1

@@ -73,8 +73,27 @@ def test_a_call_error_keeps_its_own_message() -> None:
         # A name has no amounts to keep: a long date run is cut too.
         ("Statement 2027-01-31.pdf", "Statement 0131.pdf"),
         ("Statement 01/2027.pdf", "Statement 01/2027.pdf"),
-        # A letter ends a run.
+        # A cased letter ends a run.
         ("Acct 1234 Stmt 2027-01.pdf", "Acct 1234 Stmt 2027-01.pdf"),
+        # Letters that look like marks (tatweel, katakana long-vowel mark,
+        # modifier apostrophe, dental click) join a run like the mark.
+        ("4111\u06401111\u06401111\u06401234.pdf", "1234.pdf"),
+        ("4111\u30fc1111\u30fc1111\u30fc1234.pdf", "1234.pdf"),
+        ("4111\u02bc1111\u02bc1111\u02bc1234.pdf", "1234.pdf"),
+        ("4111\u01c01111\u01c01111\u01c01234.pdf", "1234.pdf"),
+        ("\u660e\u7d304111\u660e1111\u660e1111\u660e1234.pdf", "\u660e\u7d301234.pdf"),
+        # Digits that aren't ASCII are normalized and count as digits.
+        (
+            "\u2074\u00b9\u00b9\u00b9 \u00b9\u00b9\u00b9\u00b9 "
+            "\u00b9\u00b9\u00b9\u00b9 \u00b9\u00b2\u00b3\u2074.pdf",
+            "1234.pdf",
+        ),
+        (
+            "\u2463\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2461\u2462\u2463.pdf",
+            "1234.pdf",
+        ),
+        ("\uff14\uff11\uff11\uff11-1111-\uff11\uff11\uff11\uff11-1234.pdf", "1234.pdf"),
+        ("4111\u2080\u2081\u2081\u2081.1111.1234.pdf", "1234.pdf"),
         # Nothing that can't be stored: a NUL is dropped, a lone surrogate
         # drops the name.
         ("a\x00b.pdf", "ab.pdf"),
@@ -92,24 +111,33 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
     # synthetic names of digit groups and marks never reach it.
     import random
     import re
+    import unicodedata
 
     rng = random.Random(7319)
-    marks = [*" _-.#()/,;:+=[]{}'~!@$%^&*", "", "  ", "\u2013", "\u00b7"]
+    marks = [
+        *" _-.#()/,;:+=[]{}'~!@$%^&*",
+        *"\u0640\u30fc\u02bc\u02c8\u01c0\u3164\u2800\u200b\u660e",
+        "",
+        "  ",
+        "\u2013",
+        "\u00b7",
+    ]
+    digits = "0123456789\u00b9\u00b2\u2460\uff11\u0661"
     for _ in range(3000):
         parts = []
         for _ in range(rng.randint(1, 8)):
-            parts.append(
-                "".join(rng.choice("0123456789") for _ in range(rng.randint(1, 6)))
-            )
+            parts.append("".join(rng.choice(digits) for _ in range(rng.randint(1, 6))))
             parts.append(rng.choice(marks))
         name = (
             rng.choice(["", "Stmt ", "x"]) + "".join(parts) + rng.choice([".pdf", ""])
         )
         masked = masked_file_name(name)
         assert masked is None or not re.search(r"[0-9]{8}", masked), name
-        # Nor eight digits joined by anything but letters.
-        runs = re.findall(r"\d(?:[\W\d_]*\d)?", masked or "")
-        assert all(len(re.findall(r"\d", run)) < 8 for run in runs), name
+        # Nor eight digits, of any script, joined by anything but a cased
+        # letter.
+        normalized = unicodedata.normalize("NFKC", masked or "")
+        for run in re.split(r"[^\W\d_]", normalized):
+            assert sum(char.isdecimal() for char in run) < 8, name
 
 
 # ---------------------------------------------------------------------------

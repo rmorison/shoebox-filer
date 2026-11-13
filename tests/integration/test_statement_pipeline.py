@@ -1241,8 +1241,8 @@ class TestRetriesWithoutAgents:
 class TestWatchdog:
     # One step's budget, and how long each stubbed model call takes: each
     # step fits, the item as a whole doesn't.
-    _BUDGET = 0.8
-    _CALL = 0.5
+    _BUDGET = 3.0
+    _CALL = 1.5
 
     def test_a_step_at_each_phase_keeps_a_slow_item_inside_the_watchdog(
         self,

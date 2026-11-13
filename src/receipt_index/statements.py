@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import re
 import sys
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -113,12 +113,13 @@ _PDF: Final = "application/pdf"
 # the source and the hash, and a source's name can hold an account number
 # or be no valid store name at all.
 _STORE_NAME: Final = "statement.pdf"
-# A file name's digit groups joined by anything but a letter are one run
-# (``4111_1111_1111_1234``, ``(4111)(1111)``, ``4111.1111``), and a run of
-# this many digits or more is cut to its last four. The database's CHECK on
-# ``statement_sources.file_name`` (no eight digits in a row) stays the
-# backstop.
-_NAME_RUN: Final = re.compile(r"\d(?:[\W\d_]*\d)?")
+# A file name's digit groups joined by anything but a cased letter are one
+# run (``4111_1111_1111_1234``, ``(4111)(1111)``, ``4111.1111``, a modifier
+# letter or a tatweel that looks like a mark), and a run of this many digits
+# or more is cut to its last four. The name is NFKC-normalized first, so
+# superscript, circled and fullwidth digits count as digits. The database's
+# CHECK on ``statement_sources.file_name`` (no eight digits in a row) stays
+# the backstop.
 _NAME_MIN_DIGITS: Final = 8
 _ACCOUNT_TYPES: Final[tuple[AccountType, ...]] = ("deposit", "card", "loan")
 
@@ -309,19 +310,48 @@ def _step(control: RunControl | None, source_id: str) -> None:
         control.step(source_id)
 
 
-def _cut_name_run(run: re.Match[str]) -> str:
-    digits = re.findall(r"\d", run.group())
-    if len(digits) < _NAME_MIN_DIGITS:
-        return run.group()
-    return "".join(digits[-4:])
+def _is_name_digit(char: str) -> bool:
+    return unicodedata.digit(char, None) is not None
+
+
+def _ends_name_run(char: str) -> bool:
+    return unicodedata.category(char) in ("Lu", "Ll", "Lt")
+
+
+def _cut_name_runs(name: str) -> str:
+    """Cut every run of ``_NAME_MIN_DIGITS`` digits or more to its last four.
+
+    A run starts at a digit and takes every later digit up to the next
+    cased letter; whatever lies between its last digit and that letter is
+    kept as it is. Linear in the name's length.
+    """
+    out: list[str] = []
+    i, end = 0, len(name)
+    while i < end:
+        if not _is_name_digit(name[i]):
+            out.append(name[i])
+            i += 1
+            continue
+        last = j = i
+        while j < end and not _ends_name_run(name[j]):
+            if _is_name_digit(name[j]):
+                last = j
+            j += 1
+        run = name[i : last + 1]
+        digits = [char for char in run if _is_name_digit(char)]
+        out.append(run if len(digits) < _NAME_MIN_DIGITS else "".join(digits[-4:]))
+        i = last + 1
+    return "".join(out)
 
 
 def masked_file_name(name: str | None) -> str | None:
     """A source item's file name with every long digit run cut (Masking).
 
     Stricter than a description: after the description mask, digit groups
-    joined by anything but a letter count as one run, so a card number
-    joined by ``_ # ( ) .`` is cut too. A file name has no amounts to keep
+    joined by anything but a cased letter count as one run, so a card
+    number joined by ``_ # ( ) .``, or by a modifier letter that looks like
+    a mark, is cut too. Superscript, circled and fullwidth digits are
+    normalized (NFKC) and count as digits. A file name has no amounts to keep
     readable, so a long date run (``2027-01-31``) is cut as well. Never
     raises: a name it can't make safe to store is dropped (None), so no
     name can fail an item.
@@ -329,10 +359,10 @@ def masked_file_name(name: str | None) -> str | None:
     if name is None:
         return None
     try:
-        masked, _ = mask_digits(name)
+        masked, _ = mask_digits(unicodedata.normalize("NFKC", name))
         if masked is None:
             return None
-        masked = _NAME_RUN.sub(_cut_name_run, masked).replace("\x00", "")
+        masked = _cut_name_runs(masked).replace("\x00", "")
         masked.encode("utf-8")  # a lone surrogate can't be stored
     except Exception:
         return None
