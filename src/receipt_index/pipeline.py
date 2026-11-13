@@ -190,13 +190,16 @@ def _record_failure(
     state: AttemptState,
     stored_ref: str | None = None,
     error_class: ErrorClass | None = None,
+    error_message: str | None = None,
 ) -> ErrorClass:
     """Write an item's ``failed`` row and return its class.
 
-    The class comes from the exception unless ``error_class`` is given. A
-    failure to write the row is only logged.
+    The class comes from the exception unless ``error_class`` is given, and
+    the row's message is the exception's text unless ``error_message`` is.
+    A failure to write the row is only logged.
     """
     cls = error_class or classify(exc)
+    statement = source_type == STATEMENT_INGEST_TYPE
     fields = failure_fields(policy, state, cls, _now())
     try:
         insert_ingest_log(
@@ -208,7 +211,7 @@ def _record_failure(
             email_subject=subject,
             email_sender=sender,
             email_date=email_date,
-            error_message=str(exc),
+            error_message=str(exc) if error_message is None else error_message,
             llm_input_tokens=(extraction.input_tokens if extraction else None),
             llm_output_tokens=(extraction.output_tokens if extraction else None),
             llm_cache_read_tokens=(
@@ -222,8 +225,18 @@ def _record_failure(
             error_class=fields.error_class,
             stored_ref=stored_ref,
         )
-    except Exception:
-        logger.warning("Failed to write ingest log for %s", source_id, exc_info=True)
+    except Exception as write_error:
+        if statement:
+            # By class alone: a database error's detail quotes the row.
+            logger.warning(
+                "Failed to write ingest log for %s: %s",
+                source_id,
+                type(write_error).__name__,
+            )
+        else:
+            logger.warning(
+                "Failed to write ingest log for %s", source_id, exc_info=True
+            )
     return cls
 
 
@@ -1313,6 +1326,15 @@ def run_due_retries(
                 exc_: Exception = fetched.item_error or LookupError(
                     "item is no longer in the source"
                 )
+                # A source's error can quote the item (a Drive file name can
+                # hold an account number): a statement item's keeps its
+                # class alone, as the statement pipeline's own errors do.
+                message = (
+                    type(exc_).__name__
+                    if source_type == STATEMENT_INGEST_TYPE
+                    and fetched.item_error is not None
+                    else str(exc_)
+                )
                 _record_failure(
                     conn,
                     source_id=entry.source_id,
@@ -1327,8 +1349,9 @@ def run_due_retries(
                     policy=policy,
                     state=state,
                     error_class="content",
+                    error_message=message,
                 )
-                logger.warning("Retry of %s: %s", entry.source_id, exc_)
+                logger.warning("Retry of %s: %s", entry.source_id, message)
                 result.failed += 1
                 continue
 

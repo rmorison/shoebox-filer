@@ -345,6 +345,17 @@ _NEVER_IN_THE_DEPLOYMENT = (
     r"ANTHROPIC_OPEN_TELEMETRY",
     r"\bsitecustomize\b",
 )
+# APM agents the module check can't see (plan U5, Tracing): their packages,
+# launchers and settings, in the deployment and in the locked dependencies.
+_NO_APM_AGENT = (
+    r"\bsentry[_-]sdk\b",
+    r"\bddtrace\b",
+    r"\bDD_TRACE",
+    r"\bnewrelic\b",
+    r"\bNEW_RELIC_",
+    r"\belastic[_-]?apm\b",
+    r"\bELASTIC_APM_",
+)
 
 
 def _repo() -> Any:
@@ -382,10 +393,16 @@ def test_the_deployment_never_turns_tracing_on() -> None:
     files += [p for p in (repo / "Dockerfile", repo / "example.env") if p.exists()]
     assert len(files) > 3, "no deployment files found to check"
     assert not [p for p in files if p.name == "sitecustomize.py"]
+    # The lock holds opentelemetry-instrumentation-httpx (logfire's httpx
+    # extra, never imported), so it is checked for APM agents only.
+    lock = repo / "uv.lock"
+    assert lock.exists()
+    checks = [(p, (*_NEVER_IN_THE_DEPLOYMENT, *_NO_APM_AGENT)) for p in files]
+    checks.append((lock, _NO_APM_AGENT))
     found = [
         f"{p.relative_to(repo)}: {pattern}"
-        for p in files
-        for pattern in _NEVER_IN_THE_DEPLOYMENT
+        for p, patterns in checks
+        for pattern in patterns
         if re.search(pattern, p.read_text(encoding="utf-8", errors="ignore"))
     ]
     assert found == []

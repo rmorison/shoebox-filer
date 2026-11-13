@@ -7,6 +7,7 @@ reply is the test's own: no real statement, institution or amount.
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from contextlib import ExitStack
 from datetime import UTC, datetime
@@ -266,6 +267,69 @@ class TestEndToEnd:
             == 2
         )
 
+    def test_the_same_bytes_written_during_the_model_calls_make_a_copy(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Two sources hold the same PDF. The second source's item passes the
+        # copy check, then, while its models run, the first source's item
+        # writes the statement. The second must end as a copy: a source row,
+        # a success, no new revision, no error and no attempt.
+        from receipt_index import statements
+
+        data = make_pdf(_PAGE)
+        first, second = _raw(data), _raw(data)
+        first_replies, second_replies = Replies(), Replies()
+        real_extract = statements.extract_statement
+        raced: list[Any] = []
+        pending = [first]
+
+        def extract(*args: Any, **kwargs: Any) -> Any:
+            extracted = real_extract(*args, **kwargs)
+            if pending:  # once, for the second item: the first one wins
+                raced.append(_run(pg_conn, pending.pop(), store, first_replies))
+            return extracted
+
+        monkeypatch.setattr(statements, "extract_statement", extract)
+        outcome = _run(pg_conn, second, store, second_replies)
+
+        assert [o.status for o in raced] == ["success"]
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        # Both items ran their models; only one statement and one revision.
+        assert first_replies.calls == second_replies.calls == ["first_pass", "deposit"]
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_revisions")["n"]
+            == 1
+        )
+        sources = pg_conn.execute(
+            "SELECT source_id FROM receipt.statement_sources ORDER BY source_id"
+        ).fetchall()
+        assert sorted(s["source_id"] for s in sources) == sorted(
+            [first.source_id, second.source_id]
+        )
+        (latest, *older) = get_item_history(pg_conn, second.source_id)
+        assert latest.status == "success"
+        assert [row.status for row in older] == ["started"]
+        # The wasted run's tokens are still on its success row.
+        row = _one(
+            pg_conn,
+            "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+            " WHERE source_id = %(id)s AND status = 'success'",
+            id=second.source_id,
+        )
+        assert row["llm_requests"] == 2
+        assert row["llm_model"] == "test-model"
+        # One stored file, every location of it recorded: no orphan.
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.stored_files")["n"] == 1
+        locations = _one(pg_conn, "SELECT count(*) AS n FROM receipt.file_locations")[
+            "n"
+        ]
+        assert locations == len(_originals(tmp_path / "store"))
+
     def test_a_scan_is_rejected_with_no_model_call(
         self,
         pg_conn: psycopg.Connection[dict[str, Any]],
@@ -521,6 +585,67 @@ class TestRetries:
         assert result.processed == 1
         assert fetched_by == ["statements-drive"]
         assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+
+    def test_a_drive_error_on_a_statement_retry_is_kept_by_its_class(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A source's error can quote the item: a Drive file name can hold an
+        # account number. On a statement item it reaches no log record, no
+        # traceback and no ingest_log row; only its class does.
+        digits = "4929381766207319"
+        raw = _raw(make_pdf(_PAGE))
+        self._failed_statement(pg_conn, raw)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                msg = f"can't download 'Statement {digits}.pdf'"
+                raise RuntimeError(msg)
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        caplog.set_level(logging.DEBUG)
+        with ExitStack() as stack:
+            pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=Replies().agents(),
+            )
+        assert result.failed == 1
+        formatter = logging.Formatter()
+        logged = [
+            record.getMessage()
+            + (formatter.formatException(record.exc_info) if record.exc_info else "")
+            for record in caplog.records
+        ]
+        assert any("RuntimeError" in text for text in logged), logged
+        assert not [text for text in logged if digits[-4:] in text]
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.error_message) == ("failed", "RuntimeError")
+        messages = pg_conn.execute(
+            "SELECT error_message FROM receipt.ingest_log"
+            " WHERE error_message IS NOT NULL"
+        ).fetchall()
+        assert not [m for m in messages if digits[-4:] in m["error_message"]]
 
     def test_an_item_that_delivered_a_statement_is_never_due_again(
         self,

@@ -14,6 +14,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import logfire
 import pytest
 
 from receipt_index import statements
@@ -118,10 +119,8 @@ def test_modules_the_app_loads_pass(name: str) -> None:
     refuse_instrumentation([name])
 
 
-def _run(
-    script: str, env_extra: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    """``script`` in a fresh interpreter, with nothing sent anywhere."""
+def _env(env_extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The test's environment, with nothing sent anywhere."""
     env = {
         key: value
         for key, value in os.environ.items()
@@ -130,11 +129,18 @@ def _run(
     env["LOGFIRE_SEND_TO_LOGFIRE"] = "false"
     env["LOGFIRE_CONSOLE"] = "false"
     env.update(env_extra or {})
+    return env
+
+
+def _run(
+    script: str, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """``script`` in a fresh interpreter, with nothing sent anywhere."""
     return subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        env=env,
+        env=_env(env_extra),
         timeout=180,
         check=False,
     )
@@ -202,15 +208,54 @@ def test_the_whole_app_at_its_statement_entry_point_passes() -> None:
 
 
 # Each instrument call run for real, after the whole app is imported. The
-# logfire module names are private: if a release changes what a call
-# loads, the check must still see it, or this test fails.
-_LOGFIRE_CALLS = (
-    "instrument_httpx",
-    "instrument_anthropic",
-    "instrument_openai",
-    "instrument_pydantic_ai",
-    "instrument_mcp",
+# list is every ``instrument_*`` call the installed logfire has, so a call a
+# release adds is run here without anyone listing it. The logfire module
+# names are private: if a release changes what a call loads, the check must
+# still see it, or this test fails.
+_LOGFIRE_CALLS = tuple(
+    sorted(name for name in dir(logfire) if name.startswith("instrument_"))
 )
+# Calls refused today by a logfire module of their own. Installed with the
+# app, so never skipped: one that stops loading its module fails.
+_OWN_MODULE_CALLS = frozenset(
+    {
+        "instrument_anthropic",
+        "instrument_httpx",
+        "instrument_mcp",
+        "instrument_openai",
+        "instrument_print",
+        "instrument_pydantic_ai",
+    }
+)
+# Refused by the state check: it loads no module (see below).
+_STATE_CALLS = frozenset({"instrument_pydantic"})
+
+# Call one instrument function with a stand-in for each required argument
+# (an app or a handler). A call that needs a package that isn't installed
+# says so, and the test skips it; any other error fails the test.
+_CALL_ONE = """
+import inspect
+
+name = sys.argv[1]
+call = getattr(logfire, name)
+params = inspect.signature(call).parameters.values()
+args = [
+    (lambda *_a, **_k: None)
+    for p in params
+    if p.default is p.empty
+    and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+]
+try:
+    call(*args)
+except (ImportError, RuntimeError) as exc:
+    text = str(exc)
+    if isinstance(exc, ModuleNotFoundError) or (
+        "install" in text or ("requires" in text and "package" in text)
+    ):
+        print("SKIP", type(exc).__name__, text.splitlines()[0])
+        raise SystemExit(0)
+    raise
+"""
 
 
 def _instrumented(call: str) -> str:
@@ -226,20 +271,45 @@ def _instrumented(call: str) -> str:
         + "own = [m for m in instrumentation_modules(new)"
         + " if m.startswith(_LOGFIRE_INTEGRATIONS)]\n"
         + "print('OWN', own)\n"
+        + "print('REFUSED_NEW', instrumentation_modules(new))\n"
         + _VERDICT
     )
 
 
+def test_the_instrument_calls_are_found() -> None:
+    # A rename or a logfire that lists nothing would empty the list below.
+    assert set(_LOGFIRE_CALLS) >= _OWN_MODULE_CALLS | _STATE_CALLS
+
+
 @pytest.mark.parametrize("call", _LOGFIRE_CALLS)
-def test_each_logfire_instrument_call_is_refused_by_its_own_module(
-    call: str,
-) -> None:
-    # By a logfire module of its own, not only through an OpenTelemetry
-    # instrumentor it may also load (instrument_httpx loads one).
-    result = _run(_instrumented(f"logfire.{call}()"))
-    assert _last_line(result).startswith("REFUSED")
-    own = next(line for line in result.stdout.splitlines() if line.startswith("OWN"))
-    assert own != "OWN []", result.stdout
+def test_every_logfire_instrument_call_is_refused(call: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _instrumented(_CALL_ONE), call],
+        capture_output=True,
+        text=True,
+        env=_env(),
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    lines = result.stdout.splitlines()
+    skipped = [line for line in lines if line.startswith("SKIP")]
+    if skipped:
+        assert call not in _OWN_MODULE_CALLS | _STATE_CALLS, skipped[0]
+        reason = skipped[0].removeprefix("SKIP ")
+        pytest.skip(f"{call} needs a package that isn't installed: {reason}")
+    assert lines[-1].startswith("REFUSED"), result.stdout
+    if call in _STATE_CALLS:
+        assert "pydantic plugin" in lines[-1]
+        return
+    # Refused by a module the call loaded, not by anything already loaded.
+    new = next(line for line in lines if line.startswith("REFUSED_NEW"))
+    assert new != "REFUSED_NEW []", result.stdout
+    if call in _OWN_MODULE_CALLS:
+        # By a logfire module of its own, not only through an OpenTelemetry
+        # instrumentor it may also load (instrument_httpx loads one).
+        own = next(line for line in lines if line.startswith("OWN"))
+        assert own != "OWN []", result.stdout
 
 
 def test_an_opentelemetry_instrumentor_is_refused() -> None:
@@ -449,9 +519,33 @@ def test_any_gate_error_is_an_item_error_kept_by_its_class(
     raised = _extract_with_failing_gates(monkeypatch, error)
     assert str(raised) == (f"the gates refused the statement: {type(error).__name__}")
     assert _CARD not in str(raised)
+    # Raised after the except block: no cause, and no context either, so
+    # nothing that walks ``__context__`` reaches the original.
     assert raised.__cause__ is None
-    assert raised.__suppress_context__
+    assert raised.__context__ is None
     assert statements._error_class(raised) == "content"
+
+
+def test_a_reader_that_couldnt_start_is_an_item_error_with_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reader(*_a: object, **_k: object) -> None:
+        raise BlockingIOError(11, f"Resource temporarily unavailable {_CARD}")
+
+    monkeypatch.setattr(statements, "read_statement", reader)
+    with pytest.raises(StatementItemError) as raised:
+        statements.extract_statement(
+            b"%PDF",
+            agents=SimpleNamespace(first_pass=None, accounts={}),  # type: ignore[arg-type]
+            llm_model=_MODEL,
+            source_id="item-1",
+            control=None,
+            usage=statements._Usage(),
+        )
+    assert str(raised.value).startswith("the statement reader couldn't start:")
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert statements._error_class(raised.value) == "content"
 
 
 # ---------------------------------------------------------------------------

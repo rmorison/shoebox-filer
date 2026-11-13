@@ -128,9 +128,19 @@ def fetch_item(
             pool.unavailable[name] = f"source {name} unavailable: {exc}"
             raise SourceDownError(pool.unavailable[name]) from exc
         except Exception as exc:
-            logger.warning(
-                "Re-fetch of %s from %s failed", source_id, name, exc_info=True
-            )
+            if source_type == STATEMENT_INGEST_TYPE:
+                # By class alone, with no traceback: the error can quote the
+                # item, and a statement's file name can hold an account number.
+                logger.warning(
+                    "Re-fetch of %s from %s failed: %s",
+                    source_id,
+                    name,
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Re-fetch of %s from %s failed", source_id, name, exc_info=True
+                )
             item_error = exc
             continue
         if raw is not None:

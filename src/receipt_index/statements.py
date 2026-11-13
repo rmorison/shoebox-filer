@@ -79,6 +79,7 @@ from receipt_index.statement_repository import (
     insert_account,
     insert_lines,
     insert_revision,
+    lock_feed,
     new_statement_id,
     statement_for_sha256,
 )
@@ -214,8 +215,12 @@ def refuse_instrumentation(modules: Iterable[str] | None = None) -> None:
 
     Not everything is visible: pydantic-ai's ``Agent.instrument_all`` with a tracer
     provider loads no module, which every statement agent's own
-    ``instrument = False`` covers. The tests and the deployment rule stay
-    the guard (plan U5, Tracing).
+    ``instrument = False`` covers. Nor does tracing that isn't OpenTelemetry
+    or logfire: an APM agent (``sentry_sdk`` with its httpx integration,
+    ``ddtrace``, ``newrelic``, ``elasticapm``) or a code-level
+    ``@logfire.instrument`` decorator. And it runs once per item, so a change
+    made by another thread during a model call is seen at the next item. The
+    tests and the deployment rule stay the guard (plan U5, Tracing).
     """
     found = instrumentation_modules(list(sys.modules if modules is None else modules))
     if _pydantic_records():
@@ -365,13 +370,17 @@ def extract_statement(
     and lets a :class:`StatementCallError` through.
     """
     _step(control, source_id)
+    start_failure: str | None = None
     try:
         read = read_statement(data, bounds=STATEMENT_BOUNDS)
     except OSError as exc:
         # Starting the reader failed (no processes or descriptors left, or a
         # full temporary directory): the same bounded, retried item error.
-        msg = f"the statement reader couldn't start: {_safe_message(exc)}"
-        raise StatementItemError(msg) from None
+        start_failure = _safe_message(exc)
+    if start_failure is not None:
+        # Raised outside the except block, so the error carries no context.
+        msg = f"the statement reader couldn't start: {start_failure}"
+        raise StatementItemError(msg)
     logger.info(
         "Statement %s read: %s pages, encrypted=%s, reason=%s",
         source_id,
@@ -439,14 +448,19 @@ def extract_statement(
         usage.add(run.usage)
         runs.append(run)
 
+    gate_failure: str | None = None
     try:
         gated = gate_statement(first, runs)
     except Exception as exc:
         # The gates raise one GateInputError with a fixed message; anything
         # else is a bug. Either way an item error, kept by its class alone,
         # so no message can quote the model's output.
-        msg = f"the gates refused the statement: {type(exc).__name__}"
-        raise StatementItemError(msg) from None
+        gate_failure = type(exc).__name__
+    if gate_failure is not None:
+        # Raised outside the except block: ``from None`` would only hide the
+        # original, which would stay reachable as ``__context__``.
+        msg = f"the gates refused the statement: {gate_failure}"
+        raise StatementItemError(msg)
     period = period_dates(first.period)
     start, end = period if isinstance(period, tuple) else (None, None)
     revision = RevisionRow(
@@ -601,6 +615,40 @@ def _record_failure(
         )
 
 
+def _add_copy(
+    conn: psycopg.Connection[dict[str, Any]],
+    raw: RawReceipt,
+    existing: UUID,
+    *,
+    source_name: str,
+    file_name: str | None,
+    received_at: datetime,
+    llm_model: str,
+    usage: _Usage,
+    state: AttemptState,
+) -> ItemOutcome:
+    """Record a copy of a statement's bytes: a source row and a success row."""
+    add_source(
+        conn,
+        statement_id=existing,
+        source_name=source_name,
+        source_id=raw.source_id,
+        file_name=file_name,
+        received_at=received_at,
+    )
+    _success_row(
+        conn,
+        raw,
+        source_name=source_name,
+        llm_model=llm_model,
+        usage=usage,
+        state=state,
+    )
+    conn.commit()
+    logger.info("Statement %s is a copy of statement %s", raw.source_id, existing)
+    return ItemOutcome("success")
+
+
 def _error_class(exc: BaseException) -> ErrorClass:
     """How a statement failure is retried.
 
@@ -657,27 +705,17 @@ def process_statement(
 
         existing = statement_for_sha256(conn, digest)
         if existing is not None:
-            add_source(
-                conn,
-                statement_id=existing,
-                source_name=source_name,
-                source_id=raw.source_id,
-                file_name=file_name,
-                received_at=received_at,
-            )
-            _success_row(
+            return _add_copy(
                 conn,
                 raw,
+                existing,
                 source_name=source_name,
-                llm_model=None,
+                file_name=file_name,
+                received_at=received_at,
+                llm_model=llm_model,
                 usage=usage,
                 state=state,
             )
-            conn.commit()
-            logger.info(
-                "Statement %s is a copy of statement %s", raw.source_id, existing
-            )
-            return ItemOutcome("success")
         conn.commit()
 
         stored = put_original(
@@ -699,7 +737,14 @@ def process_statement(
             usage=usage,
         )
 
-        # One short transaction, in the U2 insert order.
+        # One short transaction, in the U2 insert order. The feed lock comes
+        # first, and the copy check again under it: another source may have
+        # written a statement from the same bytes during the model calls.
+        # Then this item is a copy too. Its model run is wasted, but it is a
+        # success with no new revision, not an error and not an attempt. The
+        # original is recorded either way (the same bytes, so the same stored
+        # file), so a copy stored under this source's folder isn't an orphan.
+        lock_feed(conn)
         original_id = record_original(
             conn,
             ref=stored.ref,
@@ -707,6 +752,19 @@ def process_statement(
             byte_size=len(data),
             media_type=_PDF,
         )
+        existing = statement_for_sha256(conn, digest)
+        if existing is not None:
+            return _add_copy(
+                conn,
+                raw,
+                existing,
+                source_name=source_name,
+                file_name=file_name,
+                received_at=received_at,
+                llm_model=llm_model,
+                usage=usage,
+                state=state,
+            )
         statement_id = new_statement_id(conn)
         revision_id, _ = insert_revision(conn, statement_id, extracted.revision)
         if extracted.gated is not None:
