@@ -71,6 +71,11 @@ class TestFileNames:
             "Stmt({})({})({})({}).pdf",
             "{}.{}.{}.{}.pdf",
             "Statement {} {} {} {}.pdf",
+            "{}%2D{}%2D{}%2D{}.pdf",
+            "{}%5F{}%5F{}%5F{}.pdf",
+            "{}%2E{}%2E{}%2E{}.pdf",
+            "{}x{}x{}x{}.pdf",
+            "{}-visa-{}-{}-{}.pdf",
         ],
     )
     def test_a_card_number_in_a_file_name_reaches_no_stored_row_or_path(

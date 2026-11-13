@@ -54,6 +54,8 @@ HEADER = (
     "# the ZIP+4 decision reads set_aside.zip4_alone.from_json (descriptions",
     "# the model extracted): the .from_pdf and .from_txt counts include",
     "# address lines",
+    "# files.pdf, files.txt and files.json count the files read; a file that",
+    "# failed is in none of them, only in files.failed",
     "# label<TAB>count",
 )
 

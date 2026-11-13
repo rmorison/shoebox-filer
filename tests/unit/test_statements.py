@@ -73,8 +73,23 @@ def test_a_call_error_keeps_its_own_message() -> None:
         # A name has no amounts to keep: a long date run is cut too.
         ("Statement 2027-01-31.pdf", "Statement 0131.pdf"),
         ("Statement 01/2027.pdf", "Statement 01/2027.pdf"),
-        # A cased letter ends a run.
-        ("Acct 1234 Stmt 2027-01.pdf", "Acct 1234 Stmt 2027-01.pdf"),
+        # A word of five or more cased letters ends a run; a shorter one
+        # between two groups joins them, so a short word's neighbors can be
+        # over-cut (the name is display-only).
+        ("Statement 2026-01 Checking.pdf", "Statement 2026-01 Checking.pdf"),
+        ("4111 Statement 2027-01.pdf", "4111 Statement 2027-01.pdf"),
+        ("4111x1111x1111x1234.pdf", "1234.pdf"),
+        ("4111-visa-1111-1111-1234.pdf", "1234.pdf"),
+        ("Acct 1234 Stmt 2027-01.pdf", "Acct 2701.pdf"),
+        # Percent-encoded marks are decoded first; an escape left after
+        # decoding joins, and its digits count.
+        ("4111%2D1111%2D1111%2D1234.pdf", "1234.pdf"),
+        ("4111%5F1111%5F1111%5F1234.pdf", "1234.pdf"),
+        ("4111%2E1111%2E1111%2E1234.pdf", "1234.pdf"),
+        ("4111%252D1111%252D1111%252D1234.pdf", "1234.pdf"),
+        ("Statement%2001%2F2027.pdf", "Statement 01/2027.pdf"),
+        ("100% of 2027.pdf", "100% of 2027.pdf"),
+        ("%2541%2511%2511%2511%2512%2534.pdf", "%1234.pdf"),
         # Letters that look like marks (tatweel, katakana long-vowel mark,
         # modifier apostrophe, dental click) join a run like the mark.
         ("4111\u06401111\u06401111\u06401234.pdf", "1234.pdf"),
@@ -117,6 +132,7 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
     marks = [
         *" _-.#()/,;:+=[]{}'~!@$%^&*",
         *"\u0640\u30fc\u02bc\u02c8\u01c0\u3164\u2800\u200b\u660e",
+        *("x", "ab", "visa", "Stmt", "%2D", "%5F", "%2e", "%20"),
         "",
         "  ",
         "\u2013",
@@ -133,10 +149,10 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
         )
         masked = masked_file_name(name)
         assert masked is None or not re.search(r"[0-9]{8}", masked), name
-        # Nor eight digits, of any script, joined by anything but a cased
-        # letter.
+        # Nor eight digits, of any script, joined by anything but a word of
+        # five or more letters.
         normalized = unicodedata.normalize("NFKC", masked or "")
-        for run in re.split(r"[^\W\d_]", normalized):
+        for run in re.split(r"[^\W\d_]{5,}", normalized):
             assert sum(char.isdecimal() for char in run) < 8, name
 
 

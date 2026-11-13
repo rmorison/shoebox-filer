@@ -32,6 +32,7 @@ import hashlib
 import logging
 import sys
 import unicodedata
+import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -113,14 +114,19 @@ _PDF: Final = "application/pdf"
 # the source and the hash, and a source's name can hold an account number
 # or be no valid store name at all.
 _STORE_NAME: Final = "statement.pdf"
-# A file name's digit groups joined by anything but a cased letter are one
-# run (``4111_1111_1111_1234``, ``(4111)(1111)``, ``4111.1111``, a modifier
-# letter or a tatweel that looks like a mark), and a run of this many digits
-# or more is cut to its last four. The name is NFKC-normalized first, so
-# superscript, circled and fullwidth digits count as digits. The database's
-# CHECK on ``statement_sources.file_name`` (no eight digits in a row) stays
-# the backstop.
+# A file name's digit groups joined by anything but a word of five or more
+# cased letters are one run (``4111_1111_1111_1234``, ``(4111)(1111)``,
+# ``4111x1111``, ``4111-visa-1111``, a modifier letter or a tatweel that
+# looks like a mark), and a run of this many digits or more is cut to its
+# last four. The name is percent-decoded and NFKC-normalized first, so an
+# encoded mark and superscript, circled and fullwidth digits count; a
+# ``%XX`` left after decoding joins too, and its digits count. The database's CHECK on
+# ``statement_sources.file_name`` (no eight digits in a row) stays the
+# backstop.
 _NAME_MIN_DIGITS: Final = 8
+# A shorter run of cased letters between two digit groups joins them.
+_NAME_MIN_WORD: Final = 5
+_HEX: Final = frozenset("0123456789abcdefABCDEF")
 _ACCOUNT_TYPES: Final[tuple[AccountType, ...]] = ("deposit", "card", "loan")
 
 # read_statement's reasons that reject the statement, and as what.
@@ -318,12 +324,19 @@ def _ends_name_run(char: str) -> bool:
     return unicodedata.category(char) in ("Lu", "Ll", "Lt")
 
 
+def _escape_at(name: str, i: int) -> bool:
+    """A ``%XX`` escape starts at ``i``."""
+    return name[i] == "%" and len(name) > i + 2 and set(name[i + 1 : i + 3]) <= _HEX
+
+
 def _cut_name_runs(name: str) -> str:
     """Cut every run of ``_NAME_MIN_DIGITS`` digits or more to its last four.
 
-    A run starts at a digit and takes every later digit up to the next
-    cased letter; whatever lies between its last digit and that letter is
-    kept as it is. Linear in the name's length.
+    A run starts at a digit and takes every later digit up to the next word
+    of ``_NAME_MIN_WORD`` cased letters or more. A ``%XX`` escape inside it
+    joins (its hex letters end nothing), and its digits count. Whatever
+    lies between the run's last digit and the word is kept as it is.
+    Linear in the name's length.
     """
     out: list[str] = []
     i, end = 0, len(name)
@@ -333,7 +346,21 @@ def _cut_name_runs(name: str) -> str:
             i += 1
             continue
         last = j = i
-        while j < end and not _ends_name_run(name[j]):
+        while j < end:
+            if _escape_at(name, j):
+                for k in (j + 1, j + 2):
+                    if _is_name_digit(name[k]):
+                        last = k
+                j += 3
+                continue
+            if _ends_name_run(name[j]):
+                word = j
+                while word < end and _ends_name_run(name[word]):
+                    word += 1
+                if word - j >= _NAME_MIN_WORD:
+                    break
+                j = word
+                continue
             if _is_name_digit(name[j]):
                 last = j
             j += 1
@@ -348,18 +375,22 @@ def masked_file_name(name: str | None) -> str | None:
     """A source item's file name with every long digit run cut (Masking).
 
     Stricter than a description: after the description mask, digit groups
-    joined by anything but a cased letter count as one run, so a card
-    number joined by ``_ # ( ) .``, or by a modifier letter that looks like
-    a mark, is cut too. Superscript, circled and fullwidth digits are
-    normalized (NFKC) and count as digits. A file name has no amounts to keep
-    readable, so a long date run (``2027-01-31``) is cut as well. Never
+    joined by anything but a word of five or more cased letters count as
+    one run, so a card number joined by ``_ # ( ) .``, by ``x`` or
+    ``-visa-``, or by a modifier letter that looks like a mark, is cut
+    too. The name is percent-decoded first, and superscript, circled and
+    fullwidth digits are normalized (NFKC) and count as digits. A file name
+    has no amounts to keep readable, so a long date run (``2027-01-31``),
+    or digits either side of a short word, is cut as well. Never
     raises: a name it can't make safe to store is dropped (None), so no
     name can fail an item.
     """
     if name is None:
         return None
     try:
-        masked, _ = mask_digits(unicodedata.normalize("NFKC", name))
+        masked, _ = mask_digits(
+            unicodedata.normalize("NFKC", urllib.parse.unquote(name))
+        )
         if masked is None:
             return None
         masked = _cut_name_runs(masked).replace("\x00", "")

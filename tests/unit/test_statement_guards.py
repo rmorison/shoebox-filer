@@ -642,18 +642,41 @@ def test_every_run_clamps_a_payload_logger_lowered_after_start(
     from datetime import UTC, datetime
     from unittest.mock import MagicMock
 
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from receipt_index import statement_extraction as se
     from receipt_index.models import RawReceipt
 
-    monkeypatch.setattr(statements, "insert_ingest_log", lambda _conn, **_row: None)
+    def never(_messages: Any, _info: AgentInfo) -> Any:
+        raise AssertionError("no model call in this test")
+
     child = logging.getLogger("anthropic._base_client")
     monkeypatch.setattr(child, "level", child.level)  # restored afterwards
-    # After the agents are built, by hand: the SDK would log each request.
+    # The agents are built first (each build clamps), then the level is
+    # lowered by hand, before the run: the SDK would log each request.
+    se.create_first_pass_agent(FunctionModel(never))
+    se.create_account_agent("card", FunctionModel(never))
+    assert child.getEffectiveLevel() == logging.INFO
     child.setLevel(logging.DEBUG)
+
+    # The level as the run's read and model calls would see it.
+    seen: list[int] = []
+
+    def extract(*_args: Any, **_kwargs: Any) -> Any:
+        seen.append(child.getEffectiveLevel())
+        msg = "stop after the level is seen"
+        raise statements.StatementItemError(msg)
+
+    monkeypatch.setattr(statements, "insert_ingest_log", lambda _conn, **_row: None)
+    monkeypatch.setattr(statements, "statement_for_sha256", lambda *_a: None)
+    monkeypatch.setattr(statements, "put_original", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(statements, "extract_statement", extract)
     raw = RawReceipt(
         source_type="gdrive_statement",
         source_id="item-1",
         source_name="statements-drive",
         date=datetime(2027, 1, 5, tzinfo=UTC),
+        raw_bytes=b"%PDF-1.4 synthetic",
     )
     statements.process_statement(
         MagicMock(),
@@ -663,4 +686,6 @@ def test_every_run_clamps_a_payload_logger_lowered_after_start(
         agents=MagicMock(),
         llm_model=_MODEL,
     )
+    # The run's own clamp held from before the read to the end.
+    assert seen == [logging.INFO]
     assert child.level == logging.INFO
