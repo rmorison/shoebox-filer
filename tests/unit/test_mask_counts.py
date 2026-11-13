@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -118,6 +119,25 @@ def test_each_shape_adds_its_counts(line: str, expected: dict[str, int]) -> None
     assert counts["check.cut_count_mismatch"] == 0
 
 
+_KINDS = ("pdf", "txt", "json")
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize(("line", "expected"), _CASES)
+def test_each_set_aside_is_also_counted_under_its_input_kind(
+    line: str, expected: dict[str, int], kind: str
+) -> None:
+    counts: Counter[str] = Counter()
+    mask_counts.count_field(mask_counts._Mask(), line, counts, kind)
+    for label, total in expected.items():
+        if not label.startswith("set_aside."):
+            continue
+        assert counts[label] == total
+        assert counts[f"{label}.from_{kind}"] == total
+        for other in set(_KINDS) - {kind}:
+            assert counts[f"{label}.from_{other}"] == 0
+
+
 def test_every_mask_label_has_a_case() -> None:
     watched = {
         label
@@ -126,7 +146,19 @@ def test_every_mask_label_has_a_case() -> None:
         in {"set_aside", "neighbour", "effect", "overcut", "limit"}
     }
     covered = {label for _, expected in _CASES for label in expected}
+    # The per-kind rows, checked by the test above for each case's totals.
+    covered |= {
+        f"{label}.from_{kind}"
+        for label in covered
+        if label.startswith("set_aside.")
+        for kind in _KINDS
+    }
     assert watched - covered == set()
+    # Every set-aside total has its per-kind rows.
+    for label in watched:
+        if label.startswith("set_aside.") and label.count(".") == 1:
+            for kind in _KINDS:
+                assert f"{label}.from_{kind}" in mask_counts.LABELS
 
 
 def test_field_counts_and_the_self_check() -> None:
@@ -161,6 +193,8 @@ def test_render_refuses_a_label_it_doesnt_list() -> None:
 _CARD = "4929 3817 6620 7319"
 _MERCHANT = "Quillfeather Stationers"
 _BANK = "Synthetic Savings Bank"
+# A statement's address line: its ZIP+4 is set aside on a page or text line.
+_ADDRESS = "1 MAIN ST SEATTLE WA 98101-1234"
 
 
 def _windows(number: str) -> set[str]:
@@ -172,7 +206,7 @@ def _corpus(root: Path) -> Path:
     folder = root / f"{_BANK} statements"
     folder.mkdir()
     (folder / f"{_BANK} 2027-01 card {_CARD[-4:]}.txt").write_text(
-        f"{_BANK}\nCARD {_CARD} 01/05 {_MERCHANT} $45.99\n"
+        f"{_BANK}\n{_ADDRESS}\nCARD {_CARD} 01/05 {_MERCHANT} $45.99\n"
         f"PAYMENT THANK YOU 01/20 -120.00\nACCT 12345-6789 0123\n",
         encoding="utf-8",
     )
@@ -191,6 +225,7 @@ def _corpus(root: Path) -> Path:
     (folder / f"{_BANK} {_CARD[-4:]}.pdf").write_bytes(
         make_pdf(f"{_MERCHANT} CARD {_CARD} 01/05 45.99", pages=2)
     )
+    (folder / f"{_BANK} address {_CARD[-4:]}.pdf").write_bytes(make_pdf(_ADDRESS))
     (folder / f"{_BANK} notes {_CARD[-4:]}.csv").write_text(_CARD, encoding="utf-8")
     (folder / f"{_BANK} broken {_CARD[-4:]}.json").write_text(
         f"{{ {_CARD}", encoding="utf-8"
@@ -235,24 +270,112 @@ def test_the_output_is_fixed_labels_and_counts_and_holds_no_input(
     assert counts["files.txt"] == 1
     # The broken JSON counts only as failed, with nothing else of it.
     assert counts["files.json"] == 1
-    assert counts["files.pdf"] == 1
+    assert counts["files.pdf"] == 2
     assert counts["files.failed"] == 1  # the broken JSON: counted, not named
     assert counts["files.other_type_skipped"] == 1
+    assert counts["files.unreadable_folder"] == 0
     assert counts["neighbour.zip4_cut"] == 1
+    # The address line's ZIP+4, set aside in the text file and the PDF; the
+    # extracted descriptions hold none, so the decision's count is 0.
+    assert counts["set_aside.zip4_alone"] == 2
+    assert counts["set_aside.zip4_alone.from_txt"] == 1
+    assert counts["set_aside.zip4_alone.from_pdf"] == 1
+    assert counts["set_aside.zip4_alone.from_json"] == 0
+    # Two dates and an amount in the text file; a date and an amount on
+    # each card PDF page; none in the JSON.
+    assert counts["set_aside.short_date.from_txt"] == 2
+    assert counts["set_aside.short_date.from_pdf"] == 2
+    assert counts["set_aside.short_date.from_json"] == 0
+    # Each total is the sum of its per-kind rows.
+    for shape in mask_counts._SET_ASIDE_SHAPES:
+        assert counts[f"set_aside.{shape}"] == sum(
+            counts[f"set_aside.{shape}.from_{kind}"] for kind in ("pdf", "txt", "json")
+        )
     assert counts["effect.date_without_separators_cut"] == 1
     # The card, in the text file, the extraction and both PDF pages.
     assert counts["cuts"] >= 4
     assert counts["check.cut_count_mismatch"] == 0
 
 
+def _assert_nothing_echoed(
+    result: subprocess.CompletedProcess[str], *paths: Path
+) -> None:
+    out = result.stdout + result.stderr
+    assert "Traceback" not in out
+    assert _BANK not in out
+    for window in _windows(_CARD):
+        assert window not in out
+    for path in paths:
+        assert str(path) not in out
+        assert path.name not in out
+
+
+_ROOT_ERROR = "error: the path given doesn't exist or can't be read\n"
+
+
 def test_a_missing_path_is_not_echoed(tmp_path: Path) -> None:
     missing = tmp_path / f"{_BANK} {_CARD}"
     result = _run(str(missing))
     assert result.returncode == 2
-    assert _BANK not in result.stderr
-    for window in _windows(_CARD):
-        assert window not in result.stderr
+    _assert_nothing_echoed(result, missing)
+    assert result.stderr == _ROOT_ERROR
     assert result.stdout == ""
+
+
+def test_a_path_too_long_for_the_os_is_not_echoed(tmp_path: Path) -> None:
+    # One component over 255 bytes: ENAMETOOLONG on any touch.
+    too_long = tmp_path / f"{_BANK} {_CARD} {'x' * 260}"
+    result = _run(str(too_long))
+    assert result.returncode == 2
+    _assert_nothing_echoed(result, too_long)
+    assert result.stderr == _ROOT_ERROR
+    assert result.stdout == ""
+
+
+_AS_ROOT = sys.platform != "win32" and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_AS_ROOT, reason="root reads a folder with no permissions")
+@pytest.mark.parametrize("inside", [False, True], ids=["root", "root_inside"])
+def test_an_unreadable_path_is_not_echoed(tmp_path: Path, inside: bool) -> None:
+    locked = tmp_path / f"{_BANK} {_CARD}"
+    locked.mkdir()
+    (locked / f"{_BANK} {_CARD[-4:]}.txt").write_text(_CARD, encoding="utf-8")
+    root = locked / f"{_BANK} 2027" if inside else locked
+    if inside:
+        root.mkdir()
+    locked.chmod(0)
+    try:
+        result = _run(str(root))
+    finally:
+        locked.chmod(0o700)
+    assert result.returncode == 2
+    _assert_nothing_echoed(result, root)
+    assert result.stderr == _ROOT_ERROR
+    assert result.stdout == ""
+
+
+@pytest.mark.skipif(_AS_ROOT, reason="root reads a folder with no permissions")
+def test_an_unreadable_subfolder_is_counted_not_named(tmp_path: Path) -> None:
+    folder = tmp_path / "statements"
+    folder.mkdir()
+    (folder / "a.txt").write_text("AMZN 11/09 $45.99\n", encoding="utf-8")
+    locked = folder / f"{_BANK} {_CARD}"
+    locked.mkdir()
+    (locked / f"{_BANK} {_CARD[-4:]}.txt").write_text(_CARD, encoding="utf-8")
+    locked.chmod(0)
+    try:
+        result = _run(str(folder))
+    finally:
+        locked.chmod(0o700)
+    assert result.returncode == 0, "the count failed"
+    _assert_nothing_echoed(result, locked)
+    assert result.stderr == ""
+    body = result.stdout.splitlines()[len(mask_counts.HEADER) :]
+    counts = {k: int(v) for k, v in (line.split("\t") for line in body)}
+    assert counts["files.unreadable_folder"] == 1
+    assert counts["files.txt"] == 1
+    assert counts["files.failed"] == 0
 
 
 def test_usage_without_a_path() -> None:

@@ -19,8 +19,12 @@ DIR is searched for:
 
 The output is fixed labels and counts, nothing else: no statement text, no
 merchant, institution or file name, and no digit taken from the input. A
-file that can't be read is counted, never named. Logging and warnings are
-off, so no library prints a line of a statement either.
+file or subfolder that can't be read is counted, never named; a path given
+that can't be read (missing, too long, no permission) gets one fixed error.
+Logging and warnings are off, so no library prints a line of a statement
+either. Each set-aside is also counted by input kind (``.from_pdf``,
+``.from_txt``, ``.from_json``): page and text lines include address lines,
+so the ZIP+4 decision reads ``set_aside.zip4_alone.from_json``.
 
 The counting mirrors the mask's own token rules (it calls the mask's
 helpers) and checks itself: ``check.cut_count_mismatch`` counts fields
@@ -31,7 +35,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 import sys
 import warnings
 from collections import Counter
@@ -45,8 +51,21 @@ HEADER = (
     "# statement mask counts (plan U5): fixed labels and counts only",
     "# effect.*, overcut.* and limit.* count shapes: upper bounds, since a",
     "# real account number can have the same shape as a side effect",
+    "# the ZIP+4 decision reads set_aside.zip4_alone.from_json (descriptions",
+    "# the model extracted): the .from_pdf and .from_txt counts include",
+    "# address lines",
     "# label<TAB>count",
 )
+
+# The set-aside shapes, and the input kinds each is also counted under.
+_SET_ASIDE_SHAPES = (
+    "amount_with_cents",
+    "short_date",
+    "short_date_range",
+    "year_range_alone",
+    "zip4_alone",
+)
+_KINDS = ("pdf", "txt", "json")
 
 # Every label the script can print, in print order. Nothing else is printed.
 LABELS: tuple[str, ...] = (
@@ -56,6 +75,7 @@ LABELS: tuple[str, ...] = (
     "files.pdf_not_read",
     "files.failed",
     "files.other_type_skipped",
+    "files.unreadable_folder",
     "fields",
     "fields.with_a_digit_span",
     "fields.with_a_cut",
@@ -67,6 +87,13 @@ LABELS: tuple[str, ...] = (
     "set_aside.short_date_range",
     "set_aside.year_range_alone",
     "set_aside.zip4_alone",
+    # The same, by input kind: a PDF page line or a text line can be an
+    # address, where an extracted description (JSON) rarely is.
+    *(
+        f"set_aside.{shape}.from_{kind}"
+        for shape in _SET_ASIDE_SHAPES
+        for kind in _KINDS
+    ),
     "fields.with_set_aside.amount_with_cents",
     "fields.with_set_aside.short_date",
     "fields.with_set_aside.short_date_range",
@@ -180,8 +207,14 @@ class _Mask:
         return bool(self.se._is_one_date(part))
 
 
-def count_field(mask: _Mask, text: str, counts: Counter[str]) -> None:
-    """Add one field's counts. Reads the text; records numbers only."""
+def count_field(
+    mask: _Mask, text: str, counts: Counter[str], kind: str | None = None
+) -> None:
+    """Add one field's counts. Reads the text; records numbers only.
+
+    ``kind`` (``pdf``, ``txt`` or ``json``) is the input the field came
+    from; each set-aside is also counted under it.
+    """
     se = mask.se
     counts["fields"] += 1
     prepared = mask.prepare(text)
@@ -193,7 +226,7 @@ def count_field(mask: _Mask, text: str, counts: Counter[str]) -> None:
     for span_match in spans:
         counts["spans"] += 1
         span = span_match.group()
-        field_cuts += _count_span(mask, span, counts, field_asides)
+        field_cuts += _count_span(mask, span, counts, field_asides, kind)
     if field_cuts:
         counts["fields.with_a_cut"] += 1
     for kind in field_asides:
@@ -204,7 +237,11 @@ def count_field(mask: _Mask, text: str, counts: Counter[str]) -> None:
 
 
 def _count_span(
-    mask: _Mask, span: str, counts: Counter[str], field_asides: set[str]
+    mask: _Mask,
+    span: str,
+    counts: Counter[str],
+    field_asides: set[str],
+    source: str | None = None,
 ) -> int:
     se = mask.se
     tokens = list(se._TOKEN.finditer(span))
@@ -225,6 +262,8 @@ def _count_span(
                 run = []
             items.append(("aside", (kind, mask.core(token.group()))))
             counts[f"set_aside.{kind}"] += 1
+            if source is not None:
+                counts[f"set_aside.{kind}.from_{source}"] += 1
             field_asides.add(kind)
         elif mask.digits(token.group()):
             run.append(token)
@@ -364,21 +403,70 @@ def _fields(path: Path, counts: Counter[str]) -> Iterator[str]:
         counts["files.other_type_skipped"] += 1
 
 
+class RootUnreadableError(Exception):
+    """The path given can't be read. Carries no part of the path."""
+
+
+def _root_paths(root: Path) -> tuple[bool, list[os.DirEntry[str]]]:
+    """Whether ``root`` is a file, else its entries.
+
+    Any failure touching the root raises :class:`RootUnreadableError`, with
+    the original exception (and so the path) dropped.
+    """
+    try:
+        if stat.S_ISREG(root.stat().st_mode):
+            return True, []
+        with os.scandir(root) as listing:
+            return False, list(listing)
+    except Exception:
+        pass
+    raise RootUnreadableError
+
+
+def _files_under(
+    entries: list[os.DirEntry[str]], counts: Counter[str]
+) -> Iterator[Path]:
+    """Files under a folder's entries; symlinked folders aren't followed.
+
+    A subfolder that can't be listed is counted, never named.
+    """
+    stack = [entries]
+    while stack:
+        for entry in stack.pop():
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = not is_dir and entry.is_file()
+            except OSError:
+                counts["files.failed"] += 1
+                continue
+            if is_file:
+                yield Path(entry.path)
+            elif is_dir:
+                try:
+                    with os.scandir(entry.path) as listing:
+                        stack.append(list(listing))
+                except OSError:
+                    counts["files.unreadable_folder"] += 1
+
+
 def count_paths(root: Path) -> Counter[str]:
-    """Every count for the files under ``root`` (or ``root`` itself)."""
-    mask = _Mask()
+    """Every count for the files under ``root`` (or ``root`` itself).
+
+    Raises :class:`RootUnreadableError` when ``root`` can't be read.
+    """
     counts: Counter[str] = Counter()
-    paths = (
-        [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
-    )
+    is_file, entries = _root_paths(root)
+    paths = [root] if is_file else sorted(_files_under(entries, counts))
+    mask = _Mask()
     for path in paths:
         # Collect the file's fields first: a file that fails part-way adds
         # no field counts, only files.failed.
         file_counts: Counter[str] = Counter()
+        kind = path.suffix.lower().removeprefix(".")
         try:
             fields = list(_fields(path, file_counts))
             for field in fields:
-                count_field(mask, field, file_counts)
+                count_field(mask, field, file_counts, kind)
         except Exception:
             counts["files.failed"] += 1
             continue
@@ -402,13 +490,13 @@ def main(argv: list[str]) -> int:
     if len(argv) != 1 or argv[0].startswith("-"):
         print("usage: mask_counts.py DIR", file=sys.stderr)
         return 2
-    root = Path(argv[0])
-    if not root.exists():
-        # The path isn't echoed: it could name an institution.
-        print("error: the path given doesn't exist", file=sys.stderr)
-        return 2
     try:
-        output = render(count_paths(root))
+        output = render(count_paths(Path(argv[0])))
+    except RootUnreadableError:
+        # The path isn't echoed: it could name an institution. Missing,
+        # too long or unreadable all read the same.
+        print("error: the path given doesn't exist or can't be read", file=sys.stderr)
+        return 2
     except Exception:
         print("error: the count failed", file=sys.stderr)
         return 1
