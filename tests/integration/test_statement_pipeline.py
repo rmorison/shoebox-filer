@@ -330,6 +330,87 @@ class TestEndToEnd:
         ]
         assert locations == len(_originals(tmp_path / "store"))
 
+    def test_two_sources_writing_the_same_bytes_at_once_make_one_statement(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Real concurrency, on two connections: the first source's item has
+        # written its statement and holds the feed lock, uncommitted, while
+        # the second's write transaction starts. The second must wait, see
+        # the statement once the first commits, and end as a copy.
+        import threading
+
+        import psycopg as pg
+        from psycopg.rows import dict_row
+
+        from receipt_index import statements
+        from tests.integration.conftest import _DB_DSN
+
+        data = make_pdf(_PAGE)
+        first, second = _raw(data), _raw(data)
+        other = pg.connect(_DB_DSN, row_factory=dict_row)
+        watcher = pg.connect(_DB_DSN, row_factory=dict_row, autocommit=True)
+        written, go, waited = threading.Event(), threading.Event(), threading.Event()
+        real_add_source = statements.add_source
+
+        def add_source(conn: Any, **kwargs: Any) -> None:
+            real_add_source(conn, **kwargs)
+            if conn is other:
+                written.set()  # the statement is in, the feed lock held
+                assert go.wait(30), "the second item never waited"
+
+        monkeypatch.setattr(statements, "add_source", add_source)
+        outcomes: dict[str, Any] = {}
+
+        def run_first() -> None:
+            outcomes["first"] = _run(other, first, store, Replies())
+
+        def release_when_second_waits() -> None:
+            pid = pg_conn.info.backend_pid
+            for _ in range(600):
+                row = watcher.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    (pid,),
+                ).fetchone()
+                if row is not None and row["wait_event_type"] == "Lock":
+                    waited.set()
+                    go.set()
+                    return
+                threading.Event().wait(0.05)
+            go.set()  # let the first finish; the asserts below then fail
+
+        threads = [threading.Thread(target=run_first)]
+        try:
+            threads[0].start()
+            assert written.wait(30), "the first item never wrote"
+            threads.append(threading.Thread(target=release_when_second_waits))
+            threads[1].start()
+            outcomes["second"] = _run(pg_conn, second, store, Replies())
+        finally:
+            go.set()
+            for thread in threads:
+                thread.join(30)
+            other.close()
+            watcher.close()
+
+        assert waited.is_set(), "the second item never waited on a lock"
+        assert outcomes["first"].status == "success"
+        assert (outcomes["second"].status, outcomes["second"].error_class) == (
+            "success",
+            None,
+        )
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_sources")["n"]
+            == 2
+        )
+        assert not _one(
+            pg_conn,
+            "SELECT count(*) AS n FROM receipt.ingest_log WHERE status = 'failed'",
+        )["n"]
+
     def test_a_scan_is_rejected_with_no_model_call(
         self,
         pg_conn: psycopg.Connection[dict[str, Any]],
@@ -596,7 +677,7 @@ class TestRetries:
         # account number. On a statement item it reaches no log record, no
         # traceback and no ingest_log row; only its class does.
         digits = "4929381766207319"
-        raw = _raw(make_pdf(_PAGE))
+        raw = _raw(make_pdf(_PAGE), source_id="drive-statement-retry")
         self._failed_statement(pg_conn, raw)
 
         class Adapter:
@@ -638,14 +719,17 @@ class TestRetries:
             for record in caplog.records
         ]
         assert any("RuntimeError" in text for text in logged), logged
-        assert not [text for text in logged if digits[-4:] in text]
+        # No window of the digits: a fixed source ID, so nothing else in a
+        # record can match one by chance.
+        windows = {digits[i : i + 4] for i in range(len(digits) - 3)}
+        assert not [text for text in logged for w in windows if w in text]
         (latest, *_) = get_item_history(pg_conn, raw.source_id)
         assert (latest.status, latest.error_message) == ("failed", "RuntimeError")
         messages = pg_conn.execute(
             "SELECT error_message FROM receipt.ingest_log"
             " WHERE error_message IS NOT NULL"
         ).fetchall()
-        assert not [m for m in messages if digits[-4:] in m["error_message"]]
+        assert not [m for m in messages for w in windows if w in m["error_message"]]
 
     def test_an_item_that_delivered_a_statement_is_never_due_again(
         self,

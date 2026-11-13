@@ -245,12 +245,35 @@ args = [
     if p.default is p.empty
     and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
 ]
+import importlib.util
+import re
+
+# logfire's own wording for a missing package, and nothing looser.
+_NEEDS = re.compile(
+    r"requires (the `[^`]+` package|a version of the `[^`]+` package"
+    r"|\\w+ and its OpenTelemetry dependencies)"
+    r"|^Run `pip install [^`]+` to"
+)
+
+
+def _absent(missing):
+    # A third-party package not installed: never logfire's own module.
+    if not missing or missing.split(".")[0] == "logfire":
+        return False
+    try:
+        return importlib.util.find_spec(missing) is None
+    except ImportError:  # its parent package is missing too
+        return True
+
+
 try:
     call(*args)
 except (ImportError, RuntimeError) as exc:
     text = str(exc)
-    if isinstance(exc, ModuleNotFoundError) or (
-        "install" in text or ("requires" in text and "package" in text)
+    if (
+        isinstance(exc, ModuleNotFoundError) and _absent(exc.name)
+    ) or (
+        not isinstance(exc, ModuleNotFoundError) and _NEEDS.search(text)
     ):
         print("SKIP", type(exc).__name__, text.splitlines()[0])
         raise SystemExit(0)
@@ -530,7 +553,7 @@ def test_a_reader_that_couldnt_start_is_an_item_error_with_no_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def reader(*_a: object, **_k: object) -> None:
-        raise BlockingIOError(11, f"Resource temporarily unavailable {_CARD}")
+        raise BlockingIOError(11, "Resource temporarily unavailable")
 
     monkeypatch.setattr(statements, "read_statement", reader)
     with pytest.raises(StatementItemError) as raised:
@@ -542,7 +565,11 @@ def test_a_reader_that_couldnt_start_is_an_item_error_with_no_context(
             control=None,
             usage=statements._Usage(),
         )
-    assert str(raised.value).startswith("the statement reader couldn't start:")
+    # strerror is the OS's own text, which _safe_message keeps.
+    assert str(raised.value) == (
+        "the statement reader couldn't start: "
+        "BlockingIOError: Resource temporarily unavailable"
+    )
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert statements._error_class(raised.value) == "content"
