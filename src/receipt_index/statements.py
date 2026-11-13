@@ -116,17 +116,24 @@ _PDF: Final = "application/pdf"
 _STORE_NAME: Final = "statement.pdf"
 # A file name's digit groups joined by anything but a word of five or more
 # cased letters are one run (``4111_1111_1111_1234``, ``(4111)(1111)``,
-# ``4111x1111``, ``4111-visa-1111``, a modifier letter or a tatweel that
-# looks like a mark), and a run of this many digits or more is cut to its
-# last four. The name is percent-decoded and NFKC-normalized first, so an
-# encoded mark and superscript, circled and fullwidth digits count; a
-# ``%XX`` left after decoding joins too, and its digits count. The database's CHECK on
+# ``4111x1111``, ``4111-visa-1111``, a tatweel or a katakana long-vowel
+# mark), and a run of this many digits or more becomes ``_NAME_CUT``, with
+# no digits. The name is percent-decoded to a fixed point and
+# NFKC-normalized first: an encoded mark is read as the mark, superscript,
+# circled and fullwidth digits count as digits, and a modifier letter that
+# NFKC folds to a plain one (``ʰ`` to ``h``) is a short word. A ``%XX`` left
+# after decoding joins too, and its digits count. The database's CHECK on
 # ``statement_sources.file_name`` (no eight digits in a row) stays the
 # backstop.
 _NAME_MIN_DIGITS: Final = 8
 # A shorter run of cased letters between two digit groups joins them.
 _NAME_MIN_WORD: Final = 5
 _HEX: Final = frozenset("0123456789abcdefABCDEF")
+# What a cut run becomes in a file name: no digits, since a run's last four
+# are as often a date's tail as an account's, and the accounts hold theirs.
+_NAME_CUT: Final = "[number]"
+# Percent-decoding passes: enough for a double- or triple-encoded mark.
+_NAME_DECODE_PASSES: Final = 4
 _ACCOUNT_TYPES: Final[tuple[AccountType, ...]] = ("deposit", "card", "loan")
 
 # read_statement's reasons that reject the statement, and as what.
@@ -329,8 +336,25 @@ def _escape_at(name: str, i: int) -> bool:
     return name[i] == "%" and len(name) > i + 2 and set(name[i + 1 : i + 3]) <= _HEX
 
 
+def _decoded(name: str) -> str:
+    """``name`` percent-decoded, NFKC-normalized and stripped of NULs.
+
+    Repeated until it stops changing, a few passes at most: a pass can
+    make a new escape (``%3①`` becomes ``%31``). A bad escape is kept as it
+    is and bytes that aren't UTF-8 become U+FFFD: decoding never raises.
+    """
+    for _ in range(_NAME_DECODE_PASSES):
+        decoded = unicodedata.normalize("NFKC", urllib.parse.unquote(name)).replace(
+            "\x00", ""
+        )
+        if decoded == name:
+            break
+        name = decoded
+    return name
+
+
 def _cut_name_runs(name: str) -> str:
-    """Cut every run of ``_NAME_MIN_DIGITS`` digits or more to its last four.
+    """Replace every run of ``_NAME_MIN_DIGITS`` digits or more by ``_NAME_CUT``.
 
     A run starts at a digit and takes every later digit up to the next word
     of ``_NAME_MIN_WORD`` cased letters or more. A ``%XX`` escape inside it
@@ -365,8 +389,8 @@ def _cut_name_runs(name: str) -> str:
                 last = j
             j += 1
         run = name[i : last + 1]
-        digits = [char for char in run if _is_name_digit(char)]
-        out.append(run if len(digits) < _NAME_MIN_DIGITS else "".join(digits[-4:]))
+        digits = sum(_is_name_digit(char) for char in run)
+        out.append(run if digits < _NAME_MIN_DIGITS else _NAME_CUT)
         i = last + 1
     return "".join(out)
 
@@ -374,26 +398,38 @@ def _cut_name_runs(name: str) -> str:
 def masked_file_name(name: str | None) -> str | None:
     """A source item's file name with every long digit run cut (Masking).
 
-    Stricter than a description: after the description mask, digit groups
-    joined by anything but a word of five or more cased letters count as
-    one run, so a card number joined by ``_ # ( ) .``, by ``x`` or
-    ``-visa-``, or by a modifier letter that looks like a mark, is cut
-    too. The name is percent-decoded first, and superscript, circled and
-    fullwidth digits are normalized (NFKC) and count as digits. A file name
-    has no amounts to keep readable, so a long date run (``2027-01-31``),
-    or digits either side of a short word, is cut as well. Never
-    raises: a name it can't make safe to store is dropped (None), so no
-    name can fail an item.
+    Stricter than a description. The name is percent-decoded to a fixed
+    point and NFKC-normalized, so an encoded mark is read as the mark and
+    superscript, circled and fullwidth digits count as digits. Then digit
+    groups joined by anything but a word of five or more cased letters are
+    one run, so a card number joined by ``_ # ( ) .``, by ``x``, ``a`` or
+    ``-visa-``, or by a tatweel, is one run, and a run of eight digits or
+    more becomes ``[number]``. A file name has no amounts to keep readable,
+    so a long date run (``2027-01-31``), or digits either side of a short
+    word, is cut as well. The description mask then runs as a backstop.
+
+    Known limits: groups split by a word of five or more letters stay
+    apart; numerals spelled out or written as CJK numerals aren't digits;
+    a number written in hex isn't read as one.
+
+    Never raises: a name it can't make safe to store is dropped (None), so
+    no name can fail an item.
     """
     if name is None:
         return None
     try:
-        masked, _ = mask_digits(
-            unicodedata.normalize("NFKC", urllib.parse.unquote(name))
-        )
-        if masked is None:
-            return None
-        masked = _cut_name_runs(masked).replace("\x00", "")
+        # Again until it stops changing (a few passes at most): the
+        # description mask's own clean-up can join a new escape, and a
+        # masked name masked again must come out the same.
+        masked = name
+        for _ in range(_NAME_DECODE_PASSES):
+            again, _ = mask_digits(_cut_name_runs(_decoded(masked)))
+            if again is None:
+                return None
+            if again == masked:
+                break
+            masked = again
+        masked = masked.replace("\x00", "")
         masked.encode("utf-8")  # a lone surrogate can't be stored
     except Exception:
         return None

@@ -196,6 +196,20 @@ def _one(conn: psycopg.Connection[dict[str, Any]], sql: str, **params: Any) -> A
     return conn.execute(sql, params).fetchone()
 
 
+# A copy's name, holding a synthetic grouped number the CHECK (eight digits
+# in a row) can't catch, and what it must be stored as.
+_GROUPED_NAME = "Stmt_4929_3817_6620_7319.pdf"
+_GROUPED_MASKED = "Stmt_[number].pdf"
+
+
+def _source_file_name(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> Any:
+    return _one(
+        conn,
+        "SELECT file_name FROM receipt.statement_sources WHERE source_id = %(id)s",
+        id=source_id,
+    )["file_name"]
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> LocalEvidenceStore:
     root = tmp_path / "store"
@@ -241,7 +255,7 @@ class TestEndToEnd:
         ]
         source = _one(pg_conn, "SELECT file_name FROM receipt.statement_sources")
         # The file name is masked before it is stored.
-        assert source["file_name"] == "Statement 1234.pdf"
+        assert source["file_name"] == "Statement [number].pdf"
         (latest, *_) = get_item_history(pg_conn, raw.source_id)
         assert (latest.status, latest.source_type) == ("success", STATEMENT_SOURCE_TYPE)
         assert replies.calls == ["first_pass", "deposit"]
@@ -258,9 +272,12 @@ class TestEndToEnd:
         replies = Replies()
         _run(pg_conn, _raw(data), store, replies)
         again = Replies()
-        outcome = _run(pg_conn, _raw(data), store, again)
+        copy = _raw(data, name=_GROUPED_NAME)
+        outcome = _run(pg_conn, copy, store, again)
         assert outcome.status == "success"
         assert again.calls == []  # no model call for a copy
+        # A copy's name is masked too: grouped, so the CHECK can't catch it.
+        assert _source_file_name(pg_conn, copy.source_id) == _GROUPED_MASKED
         assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
         assert (
             _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_sources")["n"]
@@ -281,7 +298,7 @@ class TestEndToEnd:
         from receipt_index import statements
 
         data = make_pdf(_PAGE)
-        first, second = _raw(data), _raw(data)
+        first, second = _raw(data), _raw(data, name=_GROUPED_NAME)
         first_replies, second_replies = Replies(), Replies()
         real_extract = statements.extract_statement
         raced: list[Any] = []
@@ -298,6 +315,8 @@ class TestEndToEnd:
 
         assert [o.status for o in raced] == ["success"]
         assert (outcome.status, outcome.error_class) == ("success", None)
+        # The copy under the lock masks its name too.
+        assert _source_file_name(pg_conn, second.source_id) == _GROUPED_MASKED
         # Both items ran their models; only one statement and one revision.
         assert first_replies.calls == second_replies.calls == ["first_pass", "deposit"]
         assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1

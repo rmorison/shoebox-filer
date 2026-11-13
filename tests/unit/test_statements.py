@@ -62,57 +62,73 @@ def test_a_call_error_keeps_its_own_message() -> None:
 @pytest.mark.parametrize(
     ("name", "masked"),
     [
-        ("Statement 4111 1111 1111 1234.pdf", "Statement 1234.pdf"),
+        ("Statement 4111 1111 1111 1234.pdf", "Statement [number].pdf"),
         ("estatement_2027-01.pdf", "estatement_2027-01.pdf"),
         (None, None),
-        # Joined by marks a description keeps apart: one run in a name.
-        ("Statement_4111_1111_1111_1234.pdf", "Statement_1234.pdf"),
-        ("4111#1111#1111#1234.pdf", "1234.pdf"),
-        ("Stmt(4111)(1111)(1111)(1234).pdf", "Stmt(1234).pdf"),
-        ("4111.1111.1111.1234.pdf", "1234.pdf"),
+        # Joined by marks a description keeps apart: one run in a name. A
+        # cut run keeps no digits: its last four are as often a date's tail.
+        ("Statement_4111_1111_1111_1234.pdf", "Statement_[number].pdf"),
+        ("4111#1111#1111#1234.pdf", "[number].pdf"),
+        ("Stmt(4111)(1111)(1111)(1234).pdf", "Stmt([number]).pdf"),
+        ("4111.1111.1111.1234.pdf", "[number].pdf"),
+        ("Statement_12345678_2026-01-31.pdf", "Statement_[number].pdf"),
         # A name has no amounts to keep: a long date run is cut too.
-        ("Statement 2027-01-31.pdf", "Statement 0131.pdf"),
+        ("Statement 2027-01-31.pdf", "Statement [number].pdf"),
         ("Statement 01/2027.pdf", "Statement 01/2027.pdf"),
         # A word of five or more cased letters ends a run; a shorter one
         # between two groups joins them, so a short word's neighbors can be
         # over-cut (the name is display-only).
         ("Statement 2026-01 Checking.pdf", "Statement 2026-01 Checking.pdf"),
         ("4111 Statement 2027-01.pdf", "4111 Statement 2027-01.pdf"),
-        ("4111x1111x1111x1234.pdf", "1234.pdf"),
-        ("4111-visa-1111-1111-1234.pdf", "1234.pdf"),
-        ("Acct 1234 Stmt 2027-01.pdf", "Acct 2701.pdf"),
-        # Percent-encoded marks are decoded first; an escape left after
-        # decoding joins, and its digits count.
-        ("4111%2D1111%2D1111%2D1234.pdf", "1234.pdf"),
-        ("4111%5F1111%5F1111%5F1234.pdf", "1234.pdf"),
-        ("4111%2E1111%2E1111%2E1234.pdf", "1234.pdf"),
-        ("4111%252D1111%252D1111%252D1234.pdf", "1234.pdf"),
+        ("4111x2222x3333x4444.pdf", "[number].pdf"),
+        ("4111a2222b3333c4444.pdf", "[number].pdf"),
+        ("4111-visa-1111-1111-1234.pdf", "[number].pdf"),
+        ("acct 4111 2222 then 3333 4444.pdf", "acct [number].pdf"),
+        ("41110000OOOO4444.pdf", "[number].pdf"),
+        ("Acct 1234 Stmt 2027-01.pdf", "Acct [number].pdf"),
+        # A modifier letter NFKC folds to a plain one is a short word.
+        ("4111\u02b02222\u02b03333\u02b04444.pdf", "[number].pdf"),
+        # Percent-encoded marks are decoded, to a fixed point, first.
+        ("Statement%5F4111%5F2222%5F3333%5F4444.pdf", "Statement_[number].pdf"),
+        ("4111%2D1111%2D1111%2D1234.pdf", "[number].pdf"),
+        ("4111%2E1111%2E1111%2E1234.pdf", "[number].pdf"),
+        ("4111%252D1111%252D1111%252D1234.pdf", "[number].pdf"),
+        ("4111%252525252D2222%252525252D3333%252525252D4444.pdf", "[number].pdf"),
         ("Statement%2001%2F2027.pdf", "Statement 01/2027.pdf"),
         ("100% of 2027.pdf", "100% of 2027.pdf"),
-        ("%2541%2511%2511%2511%2512%2534.pdf", "%1234.pdf"),
+        ("%ZZ4111%2G2222.pdf", "%ZZ[number].pdf"),
         # Letters that look like marks (tatweel, katakana long-vowel mark,
-        # modifier apostrophe, dental click) join a run like the mark.
-        ("4111\u06401111\u06401111\u06401234.pdf", "1234.pdf"),
-        ("4111\u30fc1111\u30fc1111\u30fc1234.pdf", "1234.pdf"),
-        ("4111\u02bc1111\u02bc1111\u02bc1234.pdf", "1234.pdf"),
-        ("4111\u01c01111\u01c01111\u01c01234.pdf", "1234.pdf"),
-        ("\u660e\u7d304111\u660e1111\u660e1111\u660e1234.pdf", "\u660e\u7d301234.pdf"),
+        # modifier apostrophe, dental click, a CJK character) join a run.
+        ("4111\u06401111\u06401111\u06401234.pdf", "[number].pdf"),
+        ("4111\u30fc1111\u30fc1111\u30fc1234.pdf", "[number].pdf"),
+        ("4111\u02bc1111\u02bc1111\u02bc1234.pdf", "[number].pdf"),
+        ("4111\u01c01111\u01c01111\u01c01234.pdf", "[number].pdf"),
+        (
+            "\u660e\u7d304111\u660e1111\u660e1111\u660e1234.pdf",
+            "\u660e\u7d30[number].pdf",
+        ),
         # Digits that aren't ASCII are normalized and count as digits.
         (
             "\u2074\u00b9\u00b9\u00b9 \u00b9\u00b9\u00b9\u00b9 "
             "\u00b9\u00b9\u00b9\u00b9 \u00b9\u00b2\u00b3\u2074.pdf",
-            "1234.pdf",
+            "[number].pdf",
         ),
         (
-            "\u2463\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2460\u2461\u2462\u2463.pdf",
-            "1234.pdf",
+            "\u2463\u2460\u2460\u2460\u2460\u2460\u2460\u2460"
+            "\u2460\u2460\u2460\u2460\u2460\u2461\u2462\u2463.pdf",
+            "[number].pdf",
         ),
-        ("\uff14\uff11\uff11\uff11-1111-\uff11\uff11\uff11\uff11-1234.pdf", "1234.pdf"),
-        ("4111\u2080\u2081\u2081\u2081.1111.1234.pdf", "1234.pdf"),
-        # Nothing that can't be stored: a NUL is dropped, a lone surrogate
-        # drops the name.
+        (
+            "\uff14\uff11\uff11\uff11-1111-\uff11\uff11\uff11\uff11-1234.pdf",
+            "[number].pdf",
+        ),
+        ("4111\u2080\u2081\u2081\u2081.1111.1234.pdf", "[number].pdf"),
+        # Nothing that can't be stored: a NUL is dropped (an encoded one
+        # too), a lone surrogate drops the name, bad UTF-8 is replaced.
         ("a\x00b.pdf", "ab.pdf"),
+        ("a%00b.pdf", "ab.pdf"),
         ("bad\ud800.pdf", None),
+        ("bad%ED%A0%80.pdf", "bad\ufffd\ufffd\ufffd.pdf"),
         ("", None),
     ],
 )
@@ -132,7 +148,8 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
     marks = [
         *" _-.#()/,;:+=[]{}'~!@$%^&*",
         *"\u0640\u30fc\u02bc\u02c8\u01c0\u3164\u2800\u200b\u660e",
-        *("x", "ab", "visa", "Stmt", "%2D", "%5F", "%2e", "%20"),
+        *("x", "ab", "visa", "Stmt", "then", "OOOO", "\u02b0"),
+        *("%2D", "%5F", "%2e", "%20", "%252D", "%00"),
         "",
         "  ",
         "\u2013",
@@ -149,6 +166,7 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
         )
         masked = masked_file_name(name)
         assert masked is None or not re.search(r"[0-9]{8}", masked), name
+        assert masked_file_name(masked) == masked, name  # idempotent
         # Nor eight digits, of any script, joined by anything but a word of
         # five or more letters.
         normalized = unicodedata.normalize("NFKC", masked or "")

@@ -42,9 +42,9 @@ pytestmark = pytest.mark.integration
 
 __all__ = ["store"]  # the fixture, shared with the pipeline tests
 
-# A synthetic card number; its last four may stay, no other group may.
+# A synthetic card number: no group of it may reach a stored row or path.
 _GROUPS = ("4929", "3817", "6620", "7319")
-_HIDDEN = _GROUPS[:3]
+_HIDDEN = _GROUPS
 
 
 def _sinks(conn: psycopg.Connection[dict[str, Any]], store_root: Path) -> list[str]:
@@ -76,6 +76,11 @@ class TestFileNames:
             "{}%2E{}%2E{}%2E{}.pdf",
             "{}x{}x{}x{}.pdf",
             "{}-visa-{}-{}-{}.pdf",
+            "Statement%5F{}%5F{}%5F{}%5F{}.pdf",
+            "{}%252D{}%252D{}%252D{}.pdf",
+            "{}a{}b{}c{}.pdf",
+            "{}\u02b0{}\u02b0{}\u02b0{}.pdf",
+            "acct {} {} then {} {}.pdf",
         ],
     )
     def test_a_card_number_in_a_file_name_reaches_no_stored_row_or_path(
@@ -92,7 +97,7 @@ class TestFileNames:
         assert texts, "nothing was stored, so nothing was checked"
         assert not [t for t in texts for group in _HIDDEN if group in t], texts
         stored = _one(pg_conn, "SELECT file_name FROM receipt.statement_sources")
-        assert _GROUPS[3] in stored["file_name"]  # the last four stay
+        assert "[number]" in stored["file_name"]  # cut, with no digits kept
         # The store names every original the same: the folder carries the
         # date, the source and the hash.
         located = _one(pg_conn, "SELECT locator FROM receipt.file_locations")
@@ -251,3 +256,113 @@ class TestDone:
         rows_after = _one(pg_conn, "SELECT count(*) AS n FROM receipt.ingest_log")
         # The other worker's started, success and queued rows, and no more.
         assert rows_after["n"] == rows_before["n"] + 3
+
+
+class TestFeedLock:
+    def test_an_item_waits_on_the_feed_lock_and_ends_as_a_copy(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The same bytes' original is already recorded (an earlier attempt
+        # stored it), so recording it again waits on nothing. Another
+        # connection holds the feed lock with the same bytes' statement
+        # written but not committed. The item reaches its write transaction
+        # and must wait on the lock; once the holder commits, it ends as a
+        # copy, with no attempt counted. Without the lock it would insert a
+        # second statement for the same original and fail on the unique
+        # constraint once the holder commits.
+        import hashlib
+        import threading
+
+        import psycopg as pg
+        from psycopg.rows import dict_row
+
+        from receipt_index import statements
+        from receipt_index.originals import put_original
+        from receipt_index.repository import record_original
+        from receipt_index.store import StoreFolder
+        from tests.integration.conftest import _DB_DSN
+
+        data = make_pdf(_PAGE)
+        digest = hashlib.sha256(data).digest()
+        holder_raw = _raw(data, source_id="drive-lock-holder")
+        item = _raw(data, source_id="drive-lock-waiter")
+        assert holder_raw.date is not None
+        stored = put_original(
+            pg_conn,
+            store,
+            data,
+            media_type="application/pdf",
+            folder=StoreFolder.for_original(holder_raw.date, _SOURCE, digest),
+            name="statement.pdf",
+        )
+        record_original(
+            pg_conn,
+            ref=stored.ref,
+            sha256=digest,
+            byte_size=len(data),
+            media_type="application/pdf",
+        )
+        pg_conn.commit()
+
+        holder = pg.connect(_DB_DSN, row_factory=dict_row)
+        watcher = pg.connect(_DB_DSN, row_factory=dict_row, autocommit=True)
+        written, go, waited = threading.Event(), threading.Event(), threading.Event()
+        real_add_source = statements.add_source
+
+        def add_source(conn: Any, **kwargs: Any) -> None:
+            real_add_source(conn, **kwargs)
+            if conn is holder:
+                written.set()  # the statement is in, the feed lock held
+                assert go.wait(30), "the item never waited"
+
+        monkeypatch.setattr(statements, "add_source", add_source)
+        outcomes: dict[str, Any] = {}
+
+        def hold() -> None:
+            outcomes["holder"] = _run(holder, holder_raw, store, Replies())
+
+        def release_when_the_item_waits() -> None:
+            pid = pg_conn.info.backend_pid
+            for _ in range(600):
+                row = watcher.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    (pid,),
+                ).fetchone()
+                if row is not None and row["wait_event_type"] == "Lock":
+                    waited.set()
+                    break
+                threading.Event().wait(0.05)
+            go.set()  # the holder commits
+
+        threads = [threading.Thread(target=hold)]
+        try:
+            threads[0].start()
+            assert written.wait(30), "the holder never wrote"
+            threads.append(threading.Thread(target=release_when_the_item_waits))
+            threads[1].start()
+            outcomes["item"] = _run(pg_conn, item, store, Replies())
+        finally:
+            go.set()
+            for thread in threads:
+                thread.join(30)
+            holder.close()
+            watcher.close()
+
+        assert waited.is_set(), "the item never waited on a lock"
+        assert outcomes["holder"].status == "success"
+        assert (outcomes["item"].status, outcomes["item"].error_class) == (
+            "success",
+            None,
+        )
+        (latest, *older) = get_item_history(pg_conn, item.source_id)
+        assert latest.status == "success"
+        assert latest.error_class is None
+        assert [row.status for row in older] == ["started"]
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_sources")["n"]
+            == 2
+        )
