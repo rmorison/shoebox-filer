@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ import psycopg
 
 from receipt_index.errors import classify
 from receipt_index.fetching import STATEMENT_INGEST_TYPE
+from receipt_index.llm import quiet_payload_loggers
 from receipt_index.originals import put_original
 from receipt_index.pdf_reader import StatementRead, read_statement
 from receipt_index.pdf_validate import STATEMENT_BOUNDS
@@ -107,6 +109,17 @@ STATEMENT_SOURCE_TYPE: Final = STATEMENT_INGEST_TYPE
 MAX_ACCOUNTS: Final = 8
 
 _PDF: Final = "application/pdf"
+# Every original's name in the store: the folder already carries the date,
+# the source and the hash, and a source's name can hold an account number
+# or be no valid store name at all.
+_STORE_NAME: Final = "statement.pdf"
+# A file name's digit groups joined by anything but a letter are one run
+# (``4111_1111_1111_1234``, ``(4111)(1111)``, ``4111.1111``), and a run of
+# this many digits or more is cut to its last four. The database's CHECK on
+# ``statement_sources.file_name`` (no eight digits in a row) stays the
+# backstop.
+_NAME_RUN: Final = re.compile(r"\d(?:[\W\d_]*\d)?")
+_NAME_MIN_DIGITS: Final = 8
 _ACCOUNT_TYPES: Final[tuple[AccountType, ...]] = ("deposit", "card", "loan")
 
 # read_statement's reasons that reject the statement, and as what.
@@ -296,10 +309,34 @@ def _step(control: RunControl | None, source_id: str) -> None:
         control.step(source_id)
 
 
+def _cut_name_run(run: re.Match[str]) -> str:
+    digits = re.findall(r"\d", run.group())
+    if len(digits) < _NAME_MIN_DIGITS:
+        return run.group()
+    return "".join(digits[-4:])
+
+
 def masked_file_name(name: str | None) -> str | None:
-    """A source item's file name with every long digit run cut (Masking)."""
-    masked, _ = mask_digits(name)
-    return masked
+    """A source item's file name with every long digit run cut (Masking).
+
+    Stricter than a description: after the description mask, digit groups
+    joined by anything but a letter count as one run, so a card number
+    joined by ``_ # ( ) .`` is cut too. A file name has no amounts to keep
+    readable, so a long date run (``2027-01-31``) is cut as well. Never
+    raises: a name it can't make safe to store is dropped (None), so no
+    name can fail an item.
+    """
+    if name is None:
+        return None
+    try:
+        masked, _ = mask_digits(name)
+        if masked is None:
+            return None
+        masked = _NAME_RUN.sub(_cut_name_run, masked).replace("\x00", "")
+        masked.encode("utf-8")  # a lone surrogate can't be stored
+    except Exception:
+        return None
+    return masked or None
 
 
 def _safe_message(exc: BaseException) -> str:
@@ -693,9 +730,11 @@ def process_statement(
     usage = _Usage()
     data = raw.raw_bytes or raw.file_content
     try:
-        # At the start of every run: an instrument call can come after
-        # serve started. A refusal stops the source as a config failure.
+        # At the start of every run: an instrument call, or a payload
+        # logger set below INFO, can come after serve started. A refusal
+        # stops the source as a config failure; a logger is clamped again.
         refuse_instrumentation()
+        quiet_payload_loggers()
         if not data:
             msg = "the statement item has no file content"
             raise StatementItemError(msg)
@@ -724,7 +763,7 @@ def process_statement(
             data,
             media_type=_PDF,
             folder=StoreFolder.for_original(received_at, source_name, digest),
-            name=file_name or "statement.pdf",
+            name=_STORE_NAME,
         )
         # End the read transaction before the PDF read and the model calls.
         conn.commit()

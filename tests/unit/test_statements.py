@@ -65,10 +65,51 @@ def test_a_call_error_keeps_its_own_message() -> None:
         ("Statement 4111 1111 1111 1234.pdf", "Statement 1234.pdf"),
         ("estatement_2027-01.pdf", "estatement_2027-01.pdf"),
         (None, None),
+        # Joined by marks a description keeps apart: one run in a name.
+        ("Statement_4111_1111_1111_1234.pdf", "Statement_1234.pdf"),
+        ("4111#1111#1111#1234.pdf", "1234.pdf"),
+        ("Stmt(4111)(1111)(1111)(1234).pdf", "Stmt(1234).pdf"),
+        ("4111.1111.1111.1234.pdf", "1234.pdf"),
+        # A name has no amounts to keep: a long date run is cut too.
+        ("Statement 2027-01-31.pdf", "Statement 0131.pdf"),
+        ("Statement 01/2027.pdf", "Statement 01/2027.pdf"),
+        # A letter ends a run.
+        ("Acct 1234 Stmt 2027-01.pdf", "Acct 1234 Stmt 2027-01.pdf"),
+        # Nothing that can't be stored: a NUL is dropped, a lone surrogate
+        # drops the name.
+        ("a\x00b.pdf", "ab.pdf"),
+        ("bad\ud800.pdf", None),
+        ("", None),
     ],
 )
 def test_a_file_name_is_masked(name: str | None, masked: str | None) -> None:
     assert masked_file_name(name) == masked
+
+
+def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
+    # The database's CHECK on statement_sources.file_name refuses eight
+    # digits in a row, which would fail the item on every attempt. Random
+    # synthetic names of digit groups and marks never reach it.
+    import random
+    import re
+
+    rng = random.Random(7319)
+    marks = [*" _-.#()/,;:+=[]{}'~!@$%^&*", "", "  ", "\u2013", "\u00b7"]
+    for _ in range(3000):
+        parts = []
+        for _ in range(rng.randint(1, 8)):
+            parts.append(
+                "".join(rng.choice("0123456789") for _ in range(rng.randint(1, 6)))
+            )
+            parts.append(rng.choice(marks))
+        name = (
+            rng.choice(["", "Stmt ", "x"]) + "".join(parts) + rng.choice([".pdf", ""])
+        )
+        masked = masked_file_name(name)
+        assert masked is None or not re.search(r"[0-9]{8}", masked), name
+        # Nor eight digits joined by anything but letters.
+        runs = re.findall(r"\d(?:[\W\d_]*\d)?", masked or "")
+        assert all(len(re.findall(r"\d", run)) < 8 for run in runs), name
 
 
 # ---------------------------------------------------------------------------

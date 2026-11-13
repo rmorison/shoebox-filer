@@ -80,13 +80,16 @@ def _payload_logger_names() -> set[str]:
 def quiet_payload_loggers() -> None:
     """Hold the payload loggers at INFO or above, whatever the app's level.
 
-    Called when logging is configured and whenever an agent is built (by
-    which time the HTTP stack is imported), so neither the app's DEBUG level
-    nor ``ANTHROPIC_LOG=debug`` can print a request. Every top-level logger
+    Called when logging is configured, whenever an agent is built (by
+    which time the HTTP stack is imported) and at the start of every
+    statement run, so neither the app's DEBUG level nor
+    ``ANTHROPIC_LOG=debug`` can print a request. Every top-level logger
     under the prefixes is clamped, which covers its children; a child that
-    was given its own level below INFO is clamped too, so there is no
-    by-hand way to make the SDK log a request in this process (a decision:
-    statements carry account numbers).
+    was given its own level below INFO is clamped too (a decision:
+    statements carry account numbers). A level set by hand between two
+    calls holds until the next one: code that lowers a payload logger
+    during a statement run is clamped at the next run, not at once. So
+    nothing in this process may set one below INFO.
     """
     for name in _payload_logger_names():
         logger = logging.getLogger(name)

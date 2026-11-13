@@ -315,6 +315,26 @@ def test_a_killed_or_failed_child_gives_no_text(code: int) -> None:
         assert read_pdf(make_pdf("Killed")) is None
 
 
+def test_a_failed_read_logs_its_stderr_by_size_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A read's traceback can quote the page text: a statement's holds
+    # account numbers.
+    code = (
+        "import resource, sys; resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); "
+        "sys.stderr.write('ValueError: Statement 4929 3817 6620 7319'); sys.exit(1)"
+    )
+    with (
+        fake_child(code),
+        caplog.at_level("WARNING", logger="receipt_index.pdf_validate"),
+    ):
+        assert read_pdf(make_pdf("Failed read")) is None
+    assert "PDF read stopped: failed with exit code 1" in caplog.text
+    assert "41 bytes of stderr" in caplog.text
+    for group in ("4929", "3817", "6620", "7319", "Statement"):
+        assert group not in caplog.text
+
+
 @pytest.mark.parametrize(
     "stdout",
     [b"", b"garbage", b'{"pages": 1}', b"[1, 2]"],

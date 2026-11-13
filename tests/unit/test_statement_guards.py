@@ -350,6 +350,19 @@ def test_an_opentelemetry_instrumentor_is_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_the_validator_probe_alone_refuses_pydantic_recording() -> None:
+    # The plugin-setting check hidden (its module out of sys.modules): the
+    # TypeAdapter probe must still see the wrapped validators.
+    result = _run(
+        _instrumented(
+            "logfire.instrument_pydantic()\n"
+            "sys.modules.pop('logfire.integrations.pydantic', None)"
+        )
+    )
+    assert _last_line(result).startswith("REFUSED")
+    assert "pydantic plugin" in _last_line(result)
+
+
 def test_logfire_instrument_pydantic_is_refused() -> None:
     result = _run(_instrumented("logfire.instrument_pydantic()"))
     assert _last_line(result).startswith("REFUSED")
@@ -620,3 +633,34 @@ def test_a_run_refuses_when_instrumentation_was_loaded_after_start(
     assert row["status"] == "failed"
     assert row["counts_attempt"] is False
     assert name in row["error_message"]
+
+
+def test_every_run_clamps_a_payload_logger_lowered_after_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    from receipt_index.models import RawReceipt
+
+    monkeypatch.setattr(statements, "insert_ingest_log", lambda _conn, **_row: None)
+    child = logging.getLogger("anthropic._base_client")
+    monkeypatch.setattr(child, "level", child.level)  # restored afterwards
+    # After the agents are built, by hand: the SDK would log each request.
+    child.setLevel(logging.DEBUG)
+    raw = RawReceipt(
+        source_type="gdrive_statement",
+        source_id="item-1",
+        source_name="statements-drive",
+        date=datetime(2027, 1, 5, tzinfo=UTC),
+    )
+    statements.process_statement(
+        MagicMock(),
+        raw,
+        store=MagicMock(),
+        source_name="statements-drive",
+        agents=MagicMock(),
+        llm_model=_MODEL,
+    )
+    assert child.level == logging.INFO
