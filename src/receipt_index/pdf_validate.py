@@ -345,7 +345,8 @@ def run_bounded_job(job: str, data: bytes, limits: PdfLimits, *args: str) -> Bou
 
     The child's output goes to unlinked temporary files, not pipes, so the
     parent never holds more of it than the output cap allows: stdout is read
-    only when it is within the cap, and only the tail of stderr is read.
+    only when it is within the cap, and only the tail of stderr is read: a
+    failed ``check``'s tail is logged, a failed ``read``'s size alone.
     """
     if len(data) > limits.max_bytes:
         logger.warning(
@@ -381,12 +382,19 @@ def run_bounded_job(job: str, data: bytes, limits: PdfLimits, *args: str) -> Bou
                 proc.kill()
                 proc.wait()
         if proc.returncode != 0:
+            err_size = err.seek(0, os.SEEK_END)
+            if job == "read":
+                # A read's traceback can quote the text it read, and a
+                # statement's holds account numbers: its size only.
+                detail = f"{err_size} bytes of stderr"
+            else:
+                detail = _tail(err, err_size)
             logger.warning(
                 "PDF %s stopped: %s (%d bytes): %s",
                 job,
                 _stopped_by(proc.returncode, limits),
                 len(data),
-                _tail(err, err.seek(0, os.SEEK_END)),
+                detail,
             )
             return BoundedRun(None, _stop_reason(proc.returncode))
         size = out.seek(0, os.SEEK_END)

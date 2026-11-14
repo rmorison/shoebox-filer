@@ -29,6 +29,21 @@ class SourceDownError(Exception):
     """The item's source can't be reached in this run."""
 
 
+STATEMENT_INGEST_TYPE = "gdrive_statement"
+
+
+def ingest_type(config: SourceConfig) -> str:
+    """The ``source_type`` a source's items are logged under.
+
+    A Drive source that takes statements (``documents: statements``, U6)
+    logs ``gdrive_statement``, so its items are never offered to a receipt
+    source or the reverse; any other source logs its config ``type``.
+    """
+    if getattr(config, "documents", None) == "statements":
+        return STATEMENT_INGEST_TYPE
+    return config.type
+
+
 class SourcePool:
     """The configured sources' adapters, opened on first use.
 
@@ -58,7 +73,9 @@ class SourcePool:
         if source_name in self._configs:
             return [source_name]
         return [
-            name for name, config in self._configs.items() if config.type == source_type
+            name
+            for name, config in self._configs.items()
+            if ingest_type(config) == source_type
         ]
 
     def config(self, name: str) -> SourceConfig | None:
@@ -111,9 +128,19 @@ def fetch_item(
             pool.unavailable[name] = f"source {name} unavailable: {exc}"
             raise SourceDownError(pool.unavailable[name]) from exc
         except Exception as exc:
-            logger.warning(
-                "Re-fetch of %s from %s failed", source_id, name, exc_info=True
-            )
+            if source_type == STATEMENT_INGEST_TYPE:
+                # By class alone, with no traceback: the error can quote the
+                # item, and a statement's file name can hold an account number.
+                logger.warning(
+                    "Re-fetch of %s from %s failed: %s",
+                    source_id,
+                    name,
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Re-fetch of %s from %s failed", source_id, name, exc_info=True
+                )
             item_error = exc
             continue
         if raw is not None:

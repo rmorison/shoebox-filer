@@ -571,6 +571,22 @@ class TestItemClock:
             assert clock.busy_since() == (now.now, "poll mail")
         assert clock.busy_since() is None
 
+    def test_steps_keep_a_long_item_inside_the_watchdog(self) -> None:
+        # A statement longer than one step's budget, made of steps each
+        # inside it: the watchdog times from the last step, never the start.
+        now = Clock()
+        clock = ItemClock(now=now)
+        budget = 1200
+        with clock.job(Job("retries", "statements")), clock.running("item-1"):
+            for _ in range(4):  # the read, the first pass, two accounts
+                now.now += budget - 100
+                busy = clock.busy_since()
+                assert busy is not None
+                assert now.now - busy[0] < budget
+                clock.step("item-1")
+                assert clock.busy_since() == (now.now, "item-1")
+        assert now.now > budget * 3
+
     def test_should_stop_follows_the_event(self) -> None:
         stop = threading.Event()
         clock = ItemClock(stop=stop)

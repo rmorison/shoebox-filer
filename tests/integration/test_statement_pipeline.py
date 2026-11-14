@@ -1,0 +1,1548 @@
+"""The statement pipeline against Postgres, with stubbed models (plan U5).
+
+Every statement here is a synthetic PDF built by the test, and every model
+reply is the test's own: no real statement, institution or amount.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import uuid
+from contextlib import ExitStack
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from receipt_index import pipeline
+from receipt_index.fetching import SourcePool
+from receipt_index.models import RawReceipt
+from receipt_index.repository import (
+    RetryFilter,
+    get_item_history,
+    insert_ingest_log,
+    select_due,
+    select_retry_candidates,
+)
+from receipt_index.requeue import apply_requeue
+from receipt_index.retries import AttemptState, RetryPolicy
+from receipt_index.statement_extraction import (
+    create_account_agent,
+    create_first_pass_agent,
+)
+from receipt_index.statements import (
+    STATEMENT_SOURCE_TYPE,
+    StatementAgents,
+    process_statement,
+)
+from receipt_index.store import LocalEvidenceStore
+from tests.pdfs import make_pdf
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    import psycopg
+
+pytestmark = pytest.mark.integration
+
+_SOURCE = "statements-drive"
+_PAGE = "Synthetic Savings Bank statement page"
+
+_FIRST_PASS: dict[str, Any] = {
+    "document_type": "deposit",
+    "accounts": [
+        {
+            "label": "Checking ending 1234",
+            "account_type": "deposit",
+            "first_page": 1,
+            "last_page": 1,
+        }
+    ],
+    "printed_account_count": 1,
+    "period": {
+        "start": {"month": 1, "day": 1, "year": 2027},
+        "end": {"month": 1, "day": 31, "year": 2027},
+    },
+}
+_ACCOUNT: dict[str, Any] = {
+    "institution": "Synthetic Savings Bank",
+    "last4": "1234",
+    "currency": "USD",
+    "beginning_balance": "100.00",
+    "ending_balance": "115.00",
+    "line_order": "oldest_first",
+    "lines": [
+        {
+            "posted": {"month": 1, "day": 5, "year": None},
+            "description": "Synthetic grocery purchase",
+            "amount": "-10.00",
+            "running_balance": "90.00",
+            "page": 1,
+        },
+        {
+            "posted": {"month": 1, "day": 9, "year": None},
+            "description": "Synthetic payroll deposit",
+            "amount": "25.00",
+            "running_balance": "115.00",
+            "page": 1,
+        },
+    ],
+}
+
+
+class Replies:
+    """Stubbed models: one reply for the first pass, one for each account."""
+
+    def __init__(
+        self,
+        first_pass: dict[str, Any] | None = None,
+        account: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
+        self.first_pass = first_pass or _FIRST_PASS
+        self.account = account or _ACCOUNT
+        self.calls: list[str] = []
+
+    def _model(self, kind: str) -> FunctionModel:
+        def reply(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            self.calls.append(kind)
+            if kind == "first_pass":
+                args = self.first_pass
+            else:
+                args = self.account() if callable(self.account) else self.account
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args)])
+
+        return FunctionModel(reply)
+
+    def agents(self) -> StatementAgents:
+        return StatementAgents(
+            first_pass=create_first_pass_agent(self._model("first_pass")),
+            accounts={
+                kind: create_account_agent(kind, self._model(kind))
+                for kind in ("deposit", "card", "loan")
+            },
+        )
+
+
+class Steps:
+    """A RunControl that records each watchdog step."""
+
+    def __init__(self) -> None:
+        self.steps: list[str] = []
+
+    def should_stop(self) -> bool:
+        return False
+
+    def running(self, source_id: str) -> Any:
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    def step(self, source_id: str) -> None:
+        self.steps.append(source_id)
+
+
+def _raw(
+    data: bytes, *, source_id: str | None = None, name: str = "statement.pdf"
+) -> RawReceipt:
+    return RawReceipt(
+        source_id=source_id or f"drive-{uuid.uuid4().hex}",
+        source_name=_SOURCE,
+        source_type="gdrive",
+        date=datetime(2027, 2, 3, tzinfo=UTC),
+        subject=name,
+        sender="",
+        file_name=name,
+        file_content=data,
+        file_content_type="application/pdf",
+        raw_bytes=data,
+    )
+
+
+def _started(conn: psycopg.Connection[dict[str, Any]], raw: RawReceipt) -> None:
+    insert_ingest_log(
+        conn,
+        source_id=raw.source_id,
+        source_type=STATEMENT_SOURCE_TYPE,
+        source_name=_SOURCE,
+        status="started",
+    )
+
+
+def _run(
+    conn: psycopg.Connection[dict[str, Any]],
+    raw: RawReceipt,
+    store: LocalEvidenceStore,
+    replies: Replies,
+    **kwargs: Any,
+) -> Any:
+    _started(conn, raw)
+    return process_statement(
+        conn,
+        raw,
+        store=store,
+        source_name=_SOURCE,
+        agents=replies.agents(),
+        llm_model="test-model",
+        **kwargs,
+    )
+
+
+def _one(conn: psycopg.Connection[dict[str, Any]], sql: str, **params: Any) -> Any:
+    return conn.execute(sql, params).fetchone()
+
+
+# A copy's name, holding a synthetic grouped number the CHECK (eight digits
+# in a row) can't catch, and what it must be stored as.
+_GROUPED_NAME = "Stmt_4929_3817_6620_7319.pdf"
+_GROUPED_MASKED = "Stmt_[number].pdf"
+
+
+def _source_file_name(conn: psycopg.Connection[dict[str, Any]], source_id: str) -> Any:
+    return _one(
+        conn,
+        "SELECT file_name FROM receipt.statement_sources WHERE source_id = %(id)s",
+        id=source_id,
+    )["file_name"]
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> LocalEvidenceStore:
+    root = tmp_path / "store"
+    root.mkdir()
+    return LocalEvidenceStore(root)
+
+
+def _originals(store_root: Path) -> list[Path]:
+    return [p for p in (store_root / "originals").rglob("*") if p.is_file()]
+
+
+class TestEndToEnd:
+    def test_a_clean_deposit_statement_is_complete(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        tmp_path: Path,
+    ) -> None:
+        replies = Replies()
+        raw = _raw(make_pdf(_PAGE), name="Statement 4111 1111 1111 1234.pdf")
+        steps = Steps()
+        outcome = _run(pg_conn, raw, store, replies, control=steps)
+        assert outcome.status == "success"
+
+        statement = _one(
+            pg_conn,
+            "SELECT s.status, s.document_type, r.masked_runs, r.pages,"
+            " r.input_tokens, r.llm_model FROM receipt.statements s"
+            " JOIN receipt.statement_revisions r ON r.id = s.current_revision_id",
+        )
+        assert (statement["status"], statement["document_type"]) == (
+            "complete",
+            "deposit",
+        )
+        assert statement["pages"] == 1
+        assert statement["llm_model"] == "test-model"
+        lines = pg_conn.execute(
+            "SELECT description, amount FROM receipt.statement_lines ORDER BY ordinal"
+        ).fetchall()
+        assert [line["description"] for line in lines] == [
+            "Synthetic grocery purchase",
+            "Synthetic payroll deposit",
+        ]
+        source = _one(pg_conn, "SELECT file_name FROM receipt.statement_sources")
+        # The file name is masked before it is stored.
+        assert source["file_name"] == "Statement [number].pdf"
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.source_type) == ("success", STATEMENT_SOURCE_TYPE)
+        assert replies.calls == ["first_pass", "deposit"]
+        # A step for the read, the first pass and the one account call.
+        assert steps.steps == [raw.source_id] * 3
+        assert len(_originals(tmp_path / "store")) == 1
+
+    def test_the_same_bytes_from_two_drops_are_one_statement(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        data = make_pdf(_PAGE)
+        replies = Replies()
+        _run(pg_conn, _raw(data), store, replies)
+        again = Replies()
+        copy = _raw(data, name=_GROUPED_NAME)
+        outcome = _run(pg_conn, copy, store, again)
+        assert outcome.status == "success"
+        assert again.calls == []  # no model call for a copy
+        # A copy's name is masked too: grouped, so the CHECK can't catch it.
+        assert _source_file_name(pg_conn, copy.source_id) == _GROUPED_MASKED
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_sources")["n"]
+            == 2
+        )
+
+    def test_the_same_bytes_written_during_the_model_calls_make_a_copy(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Two sources hold the same PDF. The second source's item passes the
+        # copy check, then, while its models run, the first source's item
+        # writes the statement. The second must end as a copy: a source row,
+        # a success, no new revision, no error and no attempt.
+        from receipt_index import statements
+
+        data = make_pdf(_PAGE)
+        first, second = _raw(data), _raw(data, name=_GROUPED_NAME)
+        first_replies, second_replies = Replies(), Replies()
+        real_extract = statements.extract_statement
+        raced: list[Any] = []
+        pending = [first]
+
+        def extract(*args: Any, **kwargs: Any) -> Any:
+            extracted = real_extract(*args, **kwargs)
+            if pending:  # once, for the second item: the first one wins
+                raced.append(_run(pg_conn, pending.pop(), store, first_replies))
+            return extracted
+
+        monkeypatch.setattr(statements, "extract_statement", extract)
+        outcome = _run(pg_conn, second, store, second_replies)
+
+        assert [o.status for o in raced] == ["success"]
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        # The copy under the lock masks its name too.
+        assert _source_file_name(pg_conn, second.source_id) == _GROUPED_MASKED
+        # Both items ran their models; only one statement and one revision.
+        assert first_replies.calls == second_replies.calls == ["first_pass", "deposit"]
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_revisions")["n"]
+            == 1
+        )
+        sources = pg_conn.execute(
+            "SELECT source_id FROM receipt.statement_sources ORDER BY source_id"
+        ).fetchall()
+        assert sorted(s["source_id"] for s in sources) == sorted(
+            [first.source_id, second.source_id]
+        )
+        (latest, *older) = get_item_history(pg_conn, second.source_id)
+        assert latest.status == "success"
+        assert [row.status for row in older] == ["started"]
+        # The wasted run's tokens are still on its success row.
+        row = _one(
+            pg_conn,
+            "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+            " WHERE source_id = %(id)s AND status = 'success'",
+            id=second.source_id,
+        )
+        assert row["llm_requests"] == 2
+        assert row["llm_model"] == "test-model"
+        # One stored file, every location of it recorded: no orphan.
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.stored_files")["n"] == 1
+        locations = _one(pg_conn, "SELECT count(*) AS n FROM receipt.file_locations")[
+            "n"
+        ]
+        assert locations == len(_originals(tmp_path / "store"))
+
+    def test_two_sources_writing_the_same_bytes_at_once_make_one_statement(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Real concurrency, on two connections: the first source's item has
+        # written its statement and holds the feed lock, uncommitted, while
+        # the second's write transaction starts. The second must wait, see
+        # the statement once the first commits, and end as a copy.
+        import threading
+
+        import psycopg as pg
+        from psycopg.rows import dict_row
+
+        from receipt_index import statements
+        from tests.integration.conftest import _DB_DSN
+
+        data = make_pdf(_PAGE)
+        first, second = _raw(data), _raw(data)
+        other = pg.connect(_DB_DSN, row_factory=dict_row)
+        watcher = pg.connect(_DB_DSN, row_factory=dict_row, autocommit=True)
+        written, go, waited = threading.Event(), threading.Event(), threading.Event()
+        real_add_source = statements.add_source
+
+        def add_source(conn: Any, **kwargs: Any) -> None:
+            real_add_source(conn, **kwargs)
+            if conn is other:
+                written.set()  # the statement is in, the feed lock held
+                assert go.wait(30), "the second item never waited"
+
+        monkeypatch.setattr(statements, "add_source", add_source)
+        outcomes: dict[str, Any] = {}
+
+        def run_first() -> None:
+            outcomes["first"] = _run(other, first, store, Replies())
+
+        def release_when_second_waits() -> None:
+            pid = pg_conn.info.backend_pid
+            for _ in range(600):
+                row = watcher.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    (pid,),
+                ).fetchone()
+                if row is not None and row["wait_event_type"] == "Lock":
+                    waited.set()
+                    go.set()
+                    return
+                threading.Event().wait(0.05)
+            go.set()  # let the first finish; the asserts below then fail
+
+        threads = [threading.Thread(target=run_first)]
+        try:
+            threads[0].start()
+            assert written.wait(30), "the first item never wrote"
+            threads.append(threading.Thread(target=release_when_second_waits))
+            threads[1].start()
+            outcomes["second"] = _run(pg_conn, second, store, Replies())
+        finally:
+            go.set()
+            for thread in threads:
+                thread.join(30)
+            other.close()
+            watcher.close()
+
+        assert waited.is_set(), "the second item never waited on a lock"
+        assert outcomes["first"].status == "success"
+        assert (outcomes["second"].status, outcomes["second"].error_class) == (
+            "success",
+            None,
+        )
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+        assert (
+            _one(pg_conn, "SELECT count(*) AS n FROM receipt.statement_sources")["n"]
+            == 2
+        )
+        assert not _one(
+            pg_conn,
+            "SELECT count(*) AS n FROM receipt.ingest_log WHERE status = 'failed'",
+        )["n"]
+
+    def test_a_scan_is_rejected_with_no_model_call(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies()
+        outcome = _run(pg_conn, _raw(make_pdf(None, pages=2)), store, replies)
+        assert outcome.status == "success"
+        row = _one(
+            pg_conn,
+            "SELECT s.status, s.document_type, r.llm_model FROM receipt.statements s"
+            " JOIN receipt.statement_revisions r ON r.id = s.current_revision_id",
+        )
+        assert (row["status"], row["document_type"], row["llm_model"]) == (
+            "rejected",
+            "scan",
+            None,
+        )
+        assert replies.calls == []
+
+    def test_a_document_that_isnt_a_statement_is_rejected_by_type(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(first_pass={"document_type": "loan_bill"})
+        _run(pg_conn, _raw(make_pdf(_PAGE)), store, replies)
+        row = _one(pg_conn, "SELECT status, document_type FROM receipt.statements")
+        assert (row["status"], row["document_type"]) == ("rejected", "loan_bill")
+        assert replies.calls == ["first_pass"]
+
+    def test_more_accounts_than_the_cap_is_rejected_over_bounds(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        listed = _FIRST_PASS["accounts"][0]
+        replies = Replies(first_pass={**_FIRST_PASS, "accounts": [listed] * 9})
+        _run(pg_conn, _raw(make_pdf(_PAGE)), store, replies)
+        row = _one(
+            pg_conn,
+            "SELECT document_type, rejected_bound FROM receipt.statement_revisions",
+        )
+        assert (row["document_type"], row["rejected_bound"]) == (
+            "over_bounds",
+            "accounts",
+        )
+
+    def test_an_account_past_the_last_page_is_dropped_without_a_call(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        past = {**_FIRST_PASS["accounts"][0], "first_page": 1, "last_page": 3}
+        replies = Replies(first_pass={**_FIRST_PASS, "accounts": [past]})
+        _run(pg_conn, _raw(make_pdf(_PAGE)), store, replies)
+        row = _one(pg_conn, "SELECT status FROM receipt.statements")
+        revision = _one(pg_conn, "SELECT hold_reason FROM receipt.statement_revisions")
+        assert (row["status"], revision["hold_reason"]) == ("held", "dropped_account")
+        assert replies.calls == ["first_pass"]
+
+
+_CARD_FIRST_PASS: dict[str, Any] = {
+    **_FIRST_PASS,
+    "document_type": "card",
+    "accounts": [
+        {
+            "label": "Card ending 4321",
+            "account_type": "card",
+            "first_page": 1,
+            "last_page": 1,
+        }
+    ],
+}
+_CARD: dict[str, Any] = {
+    "institution": "Synthetic Card Services",
+    "last4": "4321",
+    "currency": "USD",
+    "beginning_balance": "50.00",
+    "ending_balance": "80.00",
+    "line_order": "oldest_first",
+    "lines": [
+        {
+            # Before the period, inside the card's grace days.
+            "posted": {"month": 12, "day": 28, "year": 2026},
+            "description": "Synthetic hardware store",
+            "amount": "40.00",
+            "page": 1,
+        },
+        {
+            "posted": {"month": 1, "day": 20, "year": None},
+            "description": "Synthetic payment received",
+            "amount": "-10.00",
+            "page": 1,
+        },
+    ],
+}
+_LOAN_FIRST_PASS: dict[str, Any] = {
+    **_FIRST_PASS,
+    "document_type": "loan_statement",
+    "accounts": [
+        {
+            "label": "Loan ending 5678",
+            "account_type": "loan",
+            "first_page": 1,
+            "last_page": 1,
+        }
+    ],
+}
+_LOAN: dict[str, Any] = {
+    "institution": "Synthetic Mortgage Co",
+    "last4": "5678",
+    "currency": "USD",
+    "principal_before": "1000.00",
+    "principal_after": "900.00",
+    "principal_paid": "100.00",
+    "interest": "5.00",
+}
+
+
+class ShapedReplies(Replies):
+    """Stubbed models whose reply for a call can be a whole ModelResponse.
+
+    ``shape`` maps a call kind to a function of the output tool's name that
+    returns the response (or raises), for a stop the plain replies can't
+    make: a cap, a refusal, a timeout. Its calls are recorded like any other.
+    """
+
+    def __init__(
+        self,
+        shape: dict[str, Callable[[str], ModelResponse]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.shape = shape
+
+    def _model(self, kind: str) -> FunctionModel:
+        if kind not in self.shape:
+            return super()._model(kind)
+
+        def reply(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            self.calls.append(kind)
+            return self.shape[kind](info.output_tools[0].name)
+
+        return FunctionModel(reply)
+
+
+def _capped(tool: str) -> ModelResponse:
+    # A cut-off tool call, as the provider gives one at the output ceiling.
+    return ModelResponse(
+        parts=[ToolCallPart(tool, {"document_type": "deposit"})],
+        finish_reason="length",
+    )
+
+
+def _refused(_tool: str) -> ModelResponse:
+    from pydantic_ai.messages import TextPart
+
+    return ModelResponse(
+        parts=[TextPart("Synthetic refusal.")],
+        finish_reason="content_filter",
+        provider_details={"finish_reason": "refusal"},
+    )
+
+
+def _timed_out(_tool: str) -> ModelResponse:
+    from pydantic_ai.exceptions import ModelRequestTimeout
+
+    raise ModelRequestTimeout("test-model", 0.01)
+
+
+def _revision(conn: psycopg.Connection[dict[str, Any]]) -> Any:
+    """The one statement and its current revision."""
+    return _one(
+        conn,
+        "SELECT s.status AS statement_status, s.document_type AS statement_type,"
+        " r.status, r.document_type, r.hold_reason, r.rejected_bound,"
+        " r.printed_account_count, r.llm_model, r.pages"
+        " FROM receipt.statements s"
+        " JOIN receipt.statement_revisions r ON r.id = s.current_revision_id",
+    )
+
+
+def _accounts(conn: psycopg.Connection[dict[str, Any]]) -> list[Any]:
+    return conn.execute(
+        "SELECT * FROM receipt.statement_accounts ORDER BY ordinal"
+    ).fetchall()
+
+
+def _line_count(conn: psycopg.Connection[dict[str, Any]]) -> int:
+    return int(_one(conn, "SELECT count(*) AS n FROM receipt.statement_lines")["n"])
+
+
+def _success_log(conn: psycopg.Connection[dict[str, Any]], raw: RawReceipt) -> Any:
+    (latest, *older) = get_item_history(conn, raw.source_id)
+    assert (latest.status, latest.source_type) == ("success", STATEMENT_SOURCE_TYPE)
+    assert latest.error_class is None
+    assert [row.status for row in older] == ["started"]
+    return _one(
+        conn,
+        "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+        " WHERE source_id = %(id)s AND status = 'success'",
+        id=raw.source_id,
+    )
+
+
+class TestOutcomes:
+    """Each outcome through process_statement: revision, rows and log."""
+
+    def test_a_card_statement_is_complete_with_its_grace_days(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(first_pass=_CARD_FIRST_PASS, account=_CARD)
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "card"]
+
+        revision = _revision(pg_conn)
+        assert (revision["statement_status"], revision["statement_type"]) == (
+            "complete",
+            "card",
+        )
+        assert (revision["status"], revision["hold_reason"]) == ("complete", None)
+        assert revision["rejected_bound"] is None
+        (account,) = _accounts(pg_conn)
+        assert (account["account_type"], account["status"]) == ("card", "clean")
+        assert (account["last4"], account["date_grace_days"]) == ("4321", 7)
+        assert account["failure_class"] is None
+        lines = pg_conn.execute(
+            "SELECT posted_date, amount FROM receipt.statement_lines ORDER BY ordinal"
+        ).fetchall()
+        assert [(str(x["posted_date"]), str(x["amount"])) for x in lines] == [
+            ("2026-12-28", "40.00"),
+            ("2027-01-20", "-10.00"),
+        ]
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (2, "test-model")
+
+    def test_a_loan_only_statement_keeps_its_figures_only(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(first_pass=_LOAN_FIRST_PASS, account=_LOAN)
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "loan"]
+
+        revision = _revision(pg_conn)
+        assert (revision["statement_status"], revision["statement_type"]) == (
+            "complete",
+            "loan_statement",
+        )
+        assert (revision["status"], revision["hold_reason"]) == ("complete", None)
+        (account,) = _accounts(pg_conn)
+        assert (account["account_type"], account["status"]) == ("loan", "figures_only")
+        assert account["failure_class"] is None
+        assert (
+            str(account["principal_before"]),
+            str(account["principal_after"]),
+            str(account["principal_paid"]),
+            str(account["interest"]),
+        ) == ("1000.00", "900.00", "100.00", "5.00")
+        assert account["escrow"] is None
+        assert account["beginning_balance"] is None
+        assert _line_count(pg_conn) == 0  # a loan has figures, never lines
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (2, "test-model")
+
+    def test_balances_that_dont_reconcile_hold_the_statement(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = Replies(account={**_ACCOUNT, "ending_balance": "120.00"})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "held"
+        assert (revision["status"], revision["hold_reason"]) == (
+            "held",
+            "no_usable_account",
+        )
+        (account,) = _accounts(pg_conn)
+        assert (account["status"], account["failure_class"]) == (
+            "held",
+            "does_not_foot",
+        )
+        assert str(account["difference"]) == "5.00"
+        assert (account["first_page"], account["last_page"]) == (1, 1)
+        assert not account["held_by_statement"]
+        assert _line_count(pg_conn) == 0  # a held account's lines aren't kept
+        log = _success_log(pg_conn, raw)
+        assert log["llm_requests"] == 2
+
+    def test_a_capped_first_pass_is_rejected_over_bounds(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"first_pass": _capped})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        # One request, not retried: a retry would stop in the same place.
+        assert replies.calls == ["first_pass"]
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "rejected"
+        assert (
+            revision["status"],
+            revision["document_type"],
+            revision["rejected_bound"],
+            revision["hold_reason"],
+        ) == ("rejected", "over_bounds", "accounts", None)
+        assert (revision["llm_model"], revision["pages"]) == ("test-model", 1)
+        assert _accounts(pg_conn) == []
+        assert _line_count(pg_conn) == 0
+        log = _success_log(pg_conn, raw)
+        assert (log["llm_requests"], log["llm_model"]) == (1, "test-model")
+
+    def test_a_capped_account_call_holds_it_as_too_many_lines(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _capped})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("success", None)
+        assert replies.calls == ["first_pass", "deposit"]
+
+        revision = _revision(pg_conn)
+        assert revision["statement_status"] == "held"
+        assert (revision["status"], revision["hold_reason"]) == (
+            "held",
+            "no_usable_account",
+        )
+        assert revision["rejected_bound"] is None
+        (account,) = _accounts(pg_conn)
+        assert (account["status"], account["failure_class"]) == (
+            "held",
+            "too_many_lines",
+        )
+        # Nothing was read, so the pages are kept to look at again.
+        assert (account["first_page"], account["last_page"]) == (1, 1)
+        assert account["beginning_balance"] is None
+        assert _line_count(pg_conn) == 0
+        log = _success_log(pg_conn, raw)
+        assert log["llm_requests"] == 2
+
+
+class TestCountedItemErrors:
+    """A refusal and a timeout: counted item errors that write no revision."""
+
+    def _assert_counted_failure(
+        self,
+        conn: psycopg.Connection[dict[str, Any]],
+        raw: RawReceipt,
+        outcome: Any,
+        kind: str,
+    ) -> None:
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert not outcome.stops_source
+        for table in (
+            "statements",
+            "statement_revisions",
+            "statement_accounts",
+            "statement_sources",
+        ):
+            count = _one(conn, f"SELECT count(*) AS n FROM receipt.{table}")["n"]
+            assert count == 0, table
+        (latest, *older) = get_item_history(conn, raw.source_id)
+        assert [row.status for row in older] == ["started"]
+        assert (latest.status, latest.source_type) == ("failed", STATEMENT_SOURCE_TYPE)
+        assert (latest.error_class, latest.counts_attempt) == ("content", True)
+        assert latest.next_retry_at is not None
+        # The kind is kept; the class in brackets is the original error's.
+        assert latest.error_message is not None
+        assert latest.error_message.startswith(
+            f"statement account call failed: {kind} ("
+        ), latest.error_message
+        row = _one(
+            conn,
+            "SELECT llm_requests, llm_model FROM receipt.ingest_log"
+            " WHERE source_id = %(id)s AND status = 'failed'",
+            id=raw.source_id,
+        )
+        # The first pass's request is still counted on the failed row.
+        assert row["llm_requests"] >= 1
+        assert row["llm_model"] == "test-model"
+
+    def test_a_refused_account_call_is_a_counted_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _refused})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies, policy=RetryPolicy())
+        assert replies.calls == ["first_pass", "deposit"]
+        self._assert_counted_failure(pg_conn, raw, outcome, "refused")
+
+    def test_an_account_call_timeout_is_a_counted_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        replies = ShapedReplies({"deposit": _timed_out})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies, policy=RetryPolicy())
+        assert replies.calls == ["first_pass", "deposit"]
+        self._assert_counted_failure(pg_conn, raw, outcome, "timeout")
+
+
+class TestFailures:
+    def test_a_schema_error_writes_no_revision_and_is_retried(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        number = "5274910386254173"
+        replies = Replies(account={**_ACCOUNT, "last4": f"not {number}"})
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies, policy=RetryPolicy())
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert latest.status == "failed"
+        assert latest.counts_attempt
+        assert latest.error_message is not None
+        assert number not in latest.error_message
+        assert "schema" in latest.error_message
+
+    def test_a_crash_after_the_original_is_stored_resumes_without_a_second_copy(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        tmp_path: Path,
+    ) -> None:
+        data = make_pdf(_PAGE)
+        failing = Replies(account={**_ACCOUNT, "last4": "x"})
+        raw = _raw(data)
+        assert _run(pg_conn, raw, store, failing).status == "failed"
+        assert len(_originals(tmp_path / "store")) == 1
+        outcome = _run(pg_conn, raw, store, Replies(), state=AttemptState(2))
+        assert outcome.status == "success"
+        assert len(_originals(tmp_path / "store")) == 1
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.stored_files")["n"] == 1
+
+
+class TestRetries:
+    def _failed_statement(
+        self, conn: psycopg.Connection[dict[str, Any]], raw: RawReceipt
+    ) -> None:
+        insert_ingest_log(
+            conn,
+            source_id=raw.source_id,
+            source_type=STATEMENT_SOURCE_TYPE,
+            source_name=_SOURCE,
+            status="failed",
+            error_message="earlier failure",
+            error_class="content",
+            next_retry_at=datetime(2000, 1, 1, tzinfo=UTC),
+        )
+
+    def test_a_due_statement_item_goes_to_the_statement_pipeline(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        raw = _raw(make_pdf(_PAGE))
+        self._failed_statement(pg_conn, raw)
+
+        def no_receipts(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a statement item reached process_item")
+
+        monkeypatch.setattr(pipeline, "process_item", no_receipts)
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert [entry.source_id for entry in due] == [raw.source_id]
+        # A receipt source of type gdrive is never offered the statement row.
+        assert not select_due(
+            pg_conn,
+            source_name="receipts-drive",
+            source_type="gdrive",
+            configured=[_SOURCE, "receipts-drive"],
+        )
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                return raw
+
+        adapter = Adapter()
+        config = SimpleNamespace(name=_SOURCE, type="gdrive")
+        with ExitStack() as stack:
+            pool = SourcePool([config], lambda _: adapter, stack)  # type: ignore[list-item, arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=Replies().agents(),
+            )
+        assert result.processed == 1
+        # Done now: not due, and not offered by `retry`.
+        assert not select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert not select_retry_candidates(pg_conn, RetryFilter(status="failed"))
+
+    def test_an_item_whose_source_was_removed_is_fetched_by_a_statement_source(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Its source is gone from the config: the retry falls back to the
+        # configured sources of its ingest type, so a statement Drive source
+        # re-fetches it and a receipt Drive source (same config type) never
+        # sees it.
+        raw = _raw(make_pdf(_PAGE))
+        insert_ingest_log(
+            pg_conn,
+            source_id=raw.source_id,
+            source_type=STATEMENT_SOURCE_TYPE,
+            source_name="removed-statements",
+            status="failed",
+            error_message="earlier failure",
+            error_class="content",
+            next_retry_at=datetime(2000, 1, 1, tzinfo=UTC),
+        )
+
+        def no_receipts(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a statement item reached process_item")
+
+        monkeypatch.setattr(pipeline, "process_item", no_receipts)
+        fetched_by: list[str] = []
+
+        class Adapter:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                fetched_by.append(self.name)
+                if self.name != "statements-drive":
+                    raise AssertionError("a receipt source fetched a statement")
+                return raw
+
+        configs = [
+            SimpleNamespace(name="receipts-drive", type="gdrive"),
+            SimpleNamespace(
+                name="statements-drive", type="gdrive", documents="statements"
+            ),
+        ]
+        configured = [c.name for c in configs]
+        # Offered to the statement source, never to the receipt one.
+        assert not select_due(
+            pg_conn,
+            source_name="receipts-drive",
+            source_type="gdrive",
+            configured=configured,
+        )
+        due = select_due(
+            pg_conn,
+            source_name="statements-drive",
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=configured,
+        )
+        assert [entry.source_id for entry in due] == [raw.source_id]
+        with ExitStack() as stack:
+            pool = SourcePool(configs, lambda c: Adapter(c.name), stack)  # type: ignore[arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source="statements-drive",
+                statement_agents=Replies().agents(),
+            )
+        assert result.processed == 1
+        assert fetched_by == ["statements-drive"]
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 1
+
+    def test_a_drive_error_on_a_statement_retry_is_kept_by_its_class(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A source's error can quote the item: a Drive file name can hold an
+        # account number. On a statement item it reaches no log record, no
+        # traceback and no ingest_log row; only its class does.
+        digits = "4929381766207319"
+        raw = _raw(make_pdf(_PAGE), source_id="drive-statement-retry")
+        self._failed_statement(pg_conn, raw)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                msg = f"can't download 'Statement {digits}.pdf'"
+                raise RuntimeError(msg)
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        caplog.set_level(logging.DEBUG)
+        with ExitStack() as stack:
+            pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=Replies().agents(),
+            )
+        assert result.failed == 1
+        formatter = logging.Formatter()
+        logged = [
+            record.getMessage()
+            + (formatter.formatException(record.exc_info) if record.exc_info else "")
+            for record in caplog.records
+        ]
+        assert any("RuntimeError" in text for text in logged), logged
+        # No window of the digits: a fixed source ID, so nothing else in a
+        # record can match one by chance.
+        windows = {digits[i : i + 4] for i in range(len(digits) - 3)}
+        assert not [text for text in logged for w in windows if w in text]
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.error_message) == ("failed", "RuntimeError")
+        messages = pg_conn.execute(
+            "SELECT error_message FROM receipt.ingest_log"
+            " WHERE error_message IS NOT NULL"
+        ).fetchall()
+        assert not [m for m in messages for w in windows if w in m["error_message"]]
+
+    def test_an_item_that_delivered_a_statement_is_never_due_again(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        # Its statement_sources row makes it done, whatever its latest row
+        # says: a stale failure after the success isn't due or retried.
+        raw = _raw(make_pdf(_PAGE))
+        assert _run(pg_conn, raw, store, Replies()).status == "success"
+        self._failed_statement(pg_conn, raw)
+        assert not select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert not select_retry_candidates(pg_conn, RetryFilter(status="failed"))
+
+    def test_a_requeued_statement_item_stays_a_statement_item(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        raw = _raw(make_pdf(_PAGE))
+        self._failed_statement(pg_conn, raw)
+        spec = RetryFilter(status="failed")
+        candidates = select_retry_candidates(pg_conn, spec)
+        assert [c.source_id for c in candidates] == [raw.source_id]
+        apply_requeue(pg_conn, spec, candidates)
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.source_type) == ("queued", STATEMENT_SOURCE_TYPE)
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert [entry.source_id for entry in due] == [raw.source_id]
+
+        # The full pass: the requeued item goes to the statement pipeline.
+        def no_receipts(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a statement item reached process_item")
+
+        monkeypatch.setattr(pipeline, "process_item", no_receipts)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                return raw
+
+        replies = Replies()
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        with ExitStack() as stack:
+            pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=replies.agents(),
+            )
+        assert (result.processed, result.failed, result.stopped) == (1, 0, None)
+        assert replies.calls == ["first_pass", "deposit"]
+        assert _revision(pg_conn)["statement_status"] == "complete"
+        source = _one(
+            pg_conn, "SELECT source_id, source_name FROM receipt.statement_sources"
+        )
+        assert (source["source_id"], source["source_name"]) == (raw.source_id, _SOURCE)
+        history = get_item_history(pg_conn, raw.source_id)
+        assert [row.status for row in history[:3]] == ["success", "started", "queued"]
+        assert {row.source_type for row in history} == {STATEMENT_SOURCE_TYPE}
+        # Done now: not due again, and not offered by `retry`.
+        assert not select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        assert not select_retry_candidates(pg_conn, RetryFilter(status="failed"))
+
+
+def test_the_synthetic_pdf_reads_as_text() -> None:
+    # A guard on the fixture: the end-to-end tests need a text PDF.
+    from receipt_index.pdf_reader import read_statement
+
+    read = read_statement(make_pdf(_PAGE))
+    assert read.reason is None
+    assert read.page_texts is not None
+    assert (
+        hashlib.sha256(make_pdf(_PAGE)).digest()
+        == hashlib.sha256(make_pdf(_PAGE)).digest()
+    )
+
+
+class TestRetriesWithoutAgents:
+    def test_a_pass_without_statement_agents_leaves_the_item_untouched(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        # No fetch, no started row: a started row would be closed next pass
+        # as a counted failure, using up the item's attempts.
+        raw = _raw(make_pdf(_PAGE))
+        TestRetries()._failed_statement(pg_conn, raw)
+        before = get_item_history(pg_conn, raw.source_id)
+
+        class NoFetch:
+            def __enter__(self) -> NoFetch:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                raise AssertionError("fetched without statement agents")
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive")
+        for _ in range(2):
+            with ExitStack() as stack:
+                pool = SourcePool([config], lambda _: NoFetch(), stack)  # type: ignore[list-item, arg-type, return-value]
+                result = pipeline.run_due_retries(
+                    pg_conn,
+                    due,
+                    pool=pool,
+                    store=store,
+                    agents={},
+                    llm_model="test-model",
+                    own_source=_SOURCE,
+                )
+            assert (result.processed, result.failed) == (0, 0)
+        assert get_item_history(pg_conn, raw.source_id) == before
+
+
+class TestWatchdog:
+    # One step's budget, and how long each stubbed model call takes: each
+    # step fits, the item as a whole doesn't.
+    _BUDGET = 3.0
+    _CALL = 1.5
+
+    def test_a_step_at_each_phase_keeps_a_slow_item_inside_the_watchdog(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        # serve's own clock and watchdog, on a small budget, around a retry
+        # pass with serve's RunControl: three slow calls (the first pass and
+        # two accounts) take longer than one step's budget together.
+        import threading
+        import time
+
+        from receipt_index.service import WATCHDOG_EXIT_CODE, HealthLoop, ItemClock
+
+        raw = _raw(make_pdf(_PAGE))
+        TestRetries()._failed_statement(pg_conn, raw)
+        two = {
+            **_FIRST_PASS,
+            "accounts": [_FIRST_PASS["accounts"][0]] * 2,
+            "printed_account_count": 2,
+        }
+
+        def slow(tool: str, args: dict[str, Any]) -> ModelResponse:
+            time.sleep(self._CALL)
+            return ModelResponse(parts=[ToolCallPart(tool, args)])
+
+        replies = ShapedReplies(
+            {
+                "first_pass": lambda tool: slow(tool, two),
+                "deposit": lambda tool: slow(tool, _ACCOUNT),
+            }
+        )
+        clock = ItemClock()
+        stop, worker_done = threading.Event(), threading.Event()
+        exits: list[int] = []
+        longest: list[float] = [0.0]
+        loop = HealthLoop(
+            clock,
+            stop=stop,
+            worker_done=worker_done,
+            item_timeout_seconds=self._BUDGET,
+            exit_fn=exits.append,
+            interval_seconds=0.02,
+        )
+        real_watchdog = loop._watchdog
+
+        def watchdog() -> float | None:
+            running = real_watchdog()
+            if running is not None:
+                longest[0] = max(longest[0], running)
+            return running
+
+        loop._watchdog = watchdog  # type: ignore[method-assign]
+        health = threading.Thread(target=loop.run, daemon=True)
+
+        class Adapter:
+            def __enter__(self) -> Adapter:
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+            def fetch_by_id(self, source_id: str) -> RawReceipt:
+                return raw
+
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        health.start()
+        started = time.monotonic()
+        try:
+            with ExitStack() as stack:
+                pool = SourcePool([config], lambda _: Adapter(), stack)  # type: ignore[list-item, arg-type, return-value]
+                result = pipeline.run_due_retries(
+                    pg_conn,
+                    due,
+                    pool=pool,
+                    store=store,
+                    agents={},
+                    llm_model="test-model",
+                    own_source=_SOURCE,
+                    control=clock,
+                    statement_agents=replies.agents(),
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            worker_done.set()
+            health.join(5)
+
+        assert result.processed == 1
+        assert replies.calls == ["first_pass", "deposit", "deposit"]
+        assert _revision(pg_conn)["statement_status"] == "complete"
+        # The item ran longer than one step's budget, yet no step did, so
+        # the watchdog never fired.
+        assert elapsed > self._BUDGET
+        assert exits == [], f"the watchdog fired: exit {WATCHDOG_EXIT_CODE}"
+        assert self._CALL * 0.9 <= longest[0] < self._BUDGET, longest[0]
+        assert clock.busy_since() is None  # idle again after the item
+
+
+def _read(reason: str | None, pages: int = 1) -> Any:
+    from receipt_index.pdf_reader import StatementRead
+
+    return StatementRead(None, pages=pages, reason=reason, encrypted=False)  # type: ignore[arg-type]
+
+
+class TestErrorPaths:
+    @pytest.mark.parametrize("reason", ["timeout", "failed"])
+    def test_a_read_that_stopped_is_a_retried_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+    ) -> None:
+        from receipt_index import statements
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        replies = Replies()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert not outcome.stops_source
+        assert replies.calls == []
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.counts_attempt) == ("failed", True)
+
+    def test_a_reader_that_couldnt_start_is_a_retried_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A parent-side OSError (no processes, or a full temporary directory)
+        # propagates out of read_statement; U5 retries it like a stopped read.
+        import errno
+
+        from receipt_index import statements
+
+        def no_reader(*_a: object, **_k: object) -> None:
+            raise OSError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        monkeypatch.setattr(statements, "read_statement", no_reader)
+        replies = Replies()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, replies)
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        assert replies.calls == []
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert (latest.status, latest.counts_attempt) == ("failed", True)
+        assert latest.next_retry_at is not None
+        assert latest.error_message == (
+            "the statement reader couldn't start: "
+            "BlockingIOError: Resource temporarily unavailable"
+        )
+
+    @pytest.mark.parametrize("reason", ["timeout", "failed"])
+    def test_a_stopped_read_is_terminal_at_the_last_attempt(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+    ) -> None:
+        # Bounded: a file that really does exhaust the host is retried a
+        # fixed number of times, never forever.
+        from receipt_index import statements
+        from receipt_index.retries import AttemptState, RetryPolicy
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        policy = RetryPolicy()
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(
+            pg_conn,
+            raw,
+            store,
+            Replies(),
+            policy=policy,
+            state=AttemptState(policy.max_attempts),
+        )
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert latest.attempt == policy.max_attempts
+        assert latest.counts_attempt
+        assert latest.next_retry_at is None
+
+    @pytest.mark.parametrize(
+        ("reason", "document_type", "bound"),
+        [
+            ("unreadable", "unreadable", None),
+            ("pages", "over_bounds", "pages"),
+            ("size", "over_bounds", "size"),
+            ("memory", "over_bounds", "memory"),
+            ("text", "over_bounds", "text"),
+            ("crash", "over_bounds", "crash"),
+        ],
+    )
+    def test_a_read_over_a_bound_is_a_rejected_revision(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+        reason: str,
+        document_type: str,
+        bound: str | None,
+    ) -> None:
+        from receipt_index import statements
+
+        monkeypatch.setattr(statements, "read_statement", lambda *a, **k: _read(reason))
+        replies = Replies()
+        assert _run(pg_conn, _raw(make_pdf(_PAGE)), store, replies).status == "success"
+        row = _one(
+            pg_conn,
+            "SELECT status, document_type, rejected_bound"
+            " FROM receipt.statement_revisions",
+        )
+        assert (row["status"], row["document_type"], row["rejected_bound"]) == (
+            "rejected",
+            document_type,
+            bound,
+        )
+        assert replies.calls == []
+
+    @pytest.mark.parametrize(
+        ("status", "error_class"), [(503, "transient"), (401, "config")]
+    )
+    def test_a_provider_error_stops_the_source_and_writes_nothing(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        status: int,
+        error_class: str,
+    ) -> None:
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        def fail() -> dict[str, Any]:
+            raise ModelHTTPError(status, "test-model")
+
+        raw = _raw(make_pdf(_PAGE))
+        outcome = _run(pg_conn, raw, store, Replies(account=fail))
+        assert (outcome.status, outcome.error_class) == ("failed", error_class)
+        assert outcome.stops_source
+        assert _one(pg_conn, "SELECT count(*) AS n FROM receipt.statements")["n"] == 0
+        (latest, *_) = get_item_history(pg_conn, raw.source_id)
+        assert latest.status == "failed"
+
+    def test_an_item_with_no_file_content_is_an_item_error(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+    ) -> None:
+        import dataclasses
+
+        raw = dataclasses.replace(_raw(b""), raw_bytes=None, file_content=None)
+        outcome = _run(pg_conn, raw, store, Replies())
+        assert (outcome.status, outcome.error_class) == ("failed", "content")
+
+    def test_a_failed_call_logs_no_number_and_no_traceback(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        number = "5274910386254173"
+        caplog.set_level(logging.DEBUG)
+        raw = _raw(make_pdf(_PAGE), name=f"Statement {number}.pdf")
+        replies = Replies(
+            account={**_ACCOUNT, "institution": f"Bank {number}", "last4": "x"}
+        )
+        assert _run(pg_conn, raw, store, replies).status == "failed"
+        windows = {number[i : i + 8] for i in range(len(number) - 7)}
+        assert caplog.records
+        for record in caplog.records:
+            text = record.getMessage()
+            assert not any(w in text for w in windows), (record.name, text[:200])
+            if record.name.startswith("receipt_index"):
+                assert record.exc_info is None, record.name

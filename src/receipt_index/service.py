@@ -49,7 +49,7 @@ from imapclient.exceptions import LoginError
 
 from receipt_index.adapters.imap import connect_imap
 from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
-from receipt_index.fetching import SourcePool
+from receipt_index.fetching import SourcePool, ingest_type
 from receipt_index.health import (
     HEARTBEAT_WRITE_SECONDS,
     Pause,
@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from receipt_index.locks import SourceLock
     from receipt_index.models import ReceiptMetadata
     from receipt_index.retries import RetryPolicy
+    from receipt_index.statements import StatementAgents
     from receipt_index.store import EvidenceStore
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,14 @@ class ItemClock:
             yield
         finally:
             self._mark(self._job_label)
+
+    def step(self, source_id: str) -> None:
+        """Start a new step of the running item: the watchdog times from now.
+
+        A statement's read, first pass and each account call are steps, each
+        within ``item_timeout_seconds``; the item as a whole may run longer.
+        """
+        self._mark(source_id)
 
 
 class IdleWatcher:
@@ -446,8 +455,10 @@ class Worker:
         configured: list[str],
         all_sources: Sequence[SourceConfig] | None = None,
         now: Callable[[], float] = time.monotonic,
+        statement_agents: StatementAgents | None = None,
     ) -> None:
         self.sources = {s.name: s for s in sources}
+        self.statement_agents = statement_agents
         self.locks = dict(locks)
         self.queue = queue
         self.stop = stop
@@ -569,7 +580,7 @@ class Worker:
         due = select_due(
             conn,
             source_name=source.name,
-            source_type=source.type,
+            source_type=ingest_type(source),
             configured=self.configured,
         )
         if not due:
@@ -588,6 +599,7 @@ class Worker:
                 policy=self.policy,
                 own_source=source.name,
                 control=self.clock,
+                statement_agents=self.statement_agents,
             )
         return None if retried.stopped is None else f"retries {retried.stopped}"
 
@@ -802,7 +814,18 @@ class Service:
         ping_interval_seconds: float = 300.0,
         ping_probe: Callable[[], list[str]] | None = None,
         requested: Sequence[str] | None = None,
+        statement_agents: StatementAgents | None = None,
     ) -> None:
+        if statement_agents is not None:
+            from receipt_index.statement_extraction import warm_mask
+            from receipt_index.statements import refuse_instrumentation
+
+            # Fail loud at start, not on the first statement, if tracing
+            # instrumentation is loaded (it would export statement text).
+            refuse_instrumentation()
+            # Build the mask's pattern now, not inside a statement's first
+            # watchdog step (about a second).
+            warm_mask()
         self.timings = timings
         self._watching = [s.name for s in sources]
         # What serve was asked to watch, held or not (`status` flags the gap).
@@ -826,6 +849,7 @@ class Service:
             llm_model=llm_model,
             policy=policy,
             configured=[s.name for s in all_sources],
+            statement_agents=statement_agents,
         )
         self.watchers = [
             IdleWatcher(

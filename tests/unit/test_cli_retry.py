@@ -277,7 +277,7 @@ def test_requeue_count_is_written_after_a_failed_write() -> None:
                 e for e in entries if e.source_id == sid
             ],
         ),
-        patch.object(requeue, "has_receipt", return_value=False),
+        patch.object(requeue, "item_done", return_value=False),
         patch.object(
             requeue,
             "insert_ingest_log",
@@ -304,7 +304,7 @@ def test_a_failed_count_update_keeps_the_loop_error() -> None:
     with (
         patch.object(requeue, "insert_retry_request", return_value=_REQUEST),
         patch.object(requeue, "get_item_history", return_value=entries),
-        patch.object(requeue, "has_receipt", return_value=False),
+        patch.object(requeue, "item_done", return_value=False),
         patch.object(
             requeue, "insert_ingest_log", side_effect=RuntimeError("connection reset")
         ),

@@ -79,6 +79,8 @@ class TestGetProcessedSourceIds:
         conn.execute.assert_called_once_with(
             "SELECT source_id FROM receipt.provenance "
             "UNION "
+            "SELECT source_id FROM receipt.statement_sources "
+            "UNION "
             "SELECT source_id FROM receipt.ingest_log"
         )
 

@@ -294,6 +294,31 @@ def set_current_revision(
     return change_seq
 
 
+def statement_for_sha256(
+    conn: psycopg.Connection[dict[str, Any]], sha256: bytes
+) -> UUID | None:
+    """The statement already made from these bytes, if any.
+
+    The same PDF dropped twice is one statement with two source rows.
+    """
+    row = conn.execute(
+        "SELECT id FROM receipt.statements WHERE source_sha256 = %(sha256)s",
+        {"sha256": sha256},
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def statement_source_exists(
+    conn: psycopg.Connection[dict[str, Any]], source_id: str
+) -> bool:
+    """Whether a source item has already delivered a statement."""
+    row = conn.execute(
+        "SELECT 1 FROM receipt.statement_sources WHERE source_id = %(source_id)s",
+        {"source_id": source_id},
+    ).fetchone()
+    return row is not None
+
+
 def add_source(
     conn: psycopg.Connection[dict[str, Any]],
     *,

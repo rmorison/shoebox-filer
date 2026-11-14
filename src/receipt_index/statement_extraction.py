@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model, ModelRequestParameters
     from pydantic_ai.settings import ModelSettings
 
+    from receipt_index.errors import ErrorClass
+
 # Recorded on every revision. Raise one when its prompt or output model
 # changes in a way that could change what comes back.
 FIRST_PASS_VERSION: Final = 1
@@ -219,9 +221,17 @@ Page = Annotated[
 
 
 class _Output(BaseModel):
-    """An output model: unknown fields are refused, not ignored."""
+    """An output model: unknown fields are refused, not ignored.
 
-    model_config = ConfigDict(extra="forbid")
+    logfire's pydantic plugin is told not to record these models: a record
+    would export the validated values (statement text). Not enough on its
+    own, since a TypeAdapter over one of them is still wrapped; the
+    statement check refuses work while the plugin records at all.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", plugin_settings={"logfire": {"record": "off"}}
+    )
 
 
 class DateParts(_Output):
@@ -462,6 +472,12 @@ def _dashes() -> re.Pattern[str]:
         if _is_dash(chr(code))
     ]
     return re.compile("[" + "".join(re.escape(ch) for ch in dashes) + "]")
+
+
+def warm_mask() -> None:
+    """Build the mask's patterns now, once per process (about a second)."""
+    _masked_run()
+    _dashes()
 
 
 def _fold_separators(text: str) -> str:
@@ -1181,7 +1197,11 @@ class StatementCallError(Exception):
     """
 
     def __init__(
-        self, call: str, kind: CallErrorKind, error_class: str, usage: CallUsage
+        self,
+        call: str,
+        kind: CallErrorKind,
+        error_class: ErrorClass,
+        usage: CallUsage,
     ) -> None:
         super().__init__(f"statement {call} failed: {kind} ({error_class})")
         self.call = call

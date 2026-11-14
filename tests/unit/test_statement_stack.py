@@ -252,6 +252,26 @@ def test_the_pydantic_ai_banner_is_off() -> None:
     assert pydantic_ai.BANNER_ENABLED is False
 
 
+def test_a_child_logger_set_to_debug_by_hand_is_clamped_too() -> None:
+    import logging
+
+    from receipt_index.llm import quiet_payload_loggers
+
+    child = logging.getLogger("anthropic._base_client")
+    saved = child.level
+    try:
+        child.setLevel(logging.DEBUG)
+        quiet_payload_loggers()
+        assert not child.isEnabledFor(logging.DEBUG)
+        # A child left to inherit isn't given a level of its own.
+        quiet = logging.getLogger("httpcore2.connection")
+        if quiet.level == logging.NOTSET:
+            quiet_payload_loggers()
+            assert quiet.level == logging.NOTSET
+    finally:
+        child.setLevel(saved)
+
+
 def test_the_sdk_exports_no_span_even_with_a_global_provider_and_content_mode(
     stub_api: StubAnthropic, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -325,6 +345,17 @@ _NEVER_IN_THE_DEPLOYMENT = (
     r"ANTHROPIC_OPEN_TELEMETRY",
     r"\bsitecustomize\b",
 )
+# APM agents the module check can't see (plan U5, Tracing): their packages,
+# launchers and settings, in the deployment and in the locked dependencies.
+_NO_APM_AGENT = (
+    r"\bsentry[_-]sdk\b",
+    r"\bddtrace\b",
+    r"\bDD_TRACE",
+    r"\bnewrelic\b",
+    r"\bNEW_RELIC_",
+    r"\belastic[_-]?apm\b",
+    r"\bELASTIC_APM_",
+)
 
 
 def _repo() -> Any:
@@ -341,11 +372,15 @@ def test_no_tracing_instrumentation_is_called_in_the_package() -> None:
     modules = list(root.rglob("*.py"))
     assert len(modules) > 10, "the package glob found too little to check"
     assert not list(root.rglob("sitecustomize.py"))
+    # The statement check names the instrumentation package it refuses, on
+    # this one line; nothing else in the package may.
+    allowed = '_INSTRUMENTATION_PACKAGE: Final = "opentelemetry.instrumentation"\n'
+    assert allowed in (root / "statements.py").read_text(encoding="utf-8")
     found = [
         f"{path.relative_to(root)}: {pattern}"
         for path in modules
         for pattern in _NEVER_IN_THIS_PROCESS
-        if re.search(pattern, path.read_text(encoding="utf-8"))
+        if re.search(pattern, path.read_text(encoding="utf-8").replace(allowed, ""))
     ]
     assert found == []
 
@@ -358,10 +393,16 @@ def test_the_deployment_never_turns_tracing_on() -> None:
     files += [p for p in (repo / "Dockerfile", repo / "example.env") if p.exists()]
     assert len(files) > 3, "no deployment files found to check"
     assert not [p for p in files if p.name == "sitecustomize.py"]
+    # The lock holds opentelemetry-instrumentation-httpx (logfire's httpx
+    # extra, never imported), so it is checked for APM agents only.
+    lock = repo / "uv.lock"
+    assert lock.exists()
+    checks = [(p, (*_NEVER_IN_THE_DEPLOYMENT, *_NO_APM_AGENT)) for p in files]
+    checks.append((lock, _NO_APM_AGENT))
     found = [
         f"{p.relative_to(repo)}: {pattern}"
-        for p in files
-        for pattern in _NEVER_IN_THE_DEPLOYMENT
+        for p, patterns in checks
+        for pattern in patterns
         if re.search(pattern, p.read_text(encoding="utf-8", errors="ignore"))
     ]
     assert found == []
@@ -399,3 +440,62 @@ def test_the_statement_constructors_refuse_a_model_that_could_be_traced() -> Non
     llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
     se.create_first_pass_agent(llm, settings)
     se.create_account_agent("loan", llm, settings)
+
+
+def test_agents_from_statement_agents_create_export_no_span_under_instrument_all(
+    stub_api: StubAnthropic,
+) -> None:
+    # Agent.instrument_all() with a live tracer provider loads no module, so
+    # the statement check can't see it: every agent StatementAgents.create
+    # builds must hold tracing off itself. The canary is in the page text
+    # (the request) and in the model's output (the response).
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from pydantic_ai import Agent
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+    from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    from receipt_index.statements import StatementAgents
+
+    canary = "SYNTHCANARY7319"
+    pages = (f"Synthetic Savings Bank {canary}", "Jan 5 Synthetic purchase -10.00")
+
+    def spans_text() -> str:
+        return repr(
+            [(s.name, dict(s.attributes or {})) for s in exporter.get_finished_spans()]
+        )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        # The control: an ordinary agent's span holds the canary, so the
+        # exporter is live and records content.
+        def reply(_: Any, __: AgentInfo) -> Any:
+            from pydantic_ai.messages import ModelResponse, TextPart
+
+            return ModelResponse(parts=[TextPart(f"ok {canary}")])
+
+        Agent(FunctionModel(reply)).run_sync(f"hello {canary}")
+        assert canary in spans_text()
+        exporter.clear()
+
+        llm, settings = anthropic_model(api_key=_KEY, model=_MODEL)
+        agents = StatementAgents.create(llm, settings)
+        stub_api.tool_input = _FIRST_PASS
+        se.run_first_pass(agents.first_pass, pages)
+        stub_api.tool_input = {**_ACCOUNT, "institution": f"Bank {canary}"}
+        se.run_account(agents.accounts["deposit"], pages, _LISTED, None)
+        loan = se.ListedAccount(
+            label="Loan", account_type="loan", first_page=1, last_page=1
+        )
+        stub_api.tool_input = {"interest": "1.00"}
+        se.run_account(agents.accounts["loan"], pages, loan, None)
+        assert exporter.get_finished_spans() == ()
+        assert canary not in spans_text()
+    finally:
+        Agent.instrument_all(False)

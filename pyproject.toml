@@ -96,7 +96,9 @@ disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=receipt_index --cov-report=term-missing --cov-report=html"
+# logfire's pytest plugin loads an integration module outside the statement
+# check's baseline, which would refuse statement work in every test.
+addopts = "--cov=receipt_index --cov-report=term-missing --cov-report=html -p no:pytest_logfire"
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
 ]

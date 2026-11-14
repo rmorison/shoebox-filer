@@ -62,24 +62,39 @@ PAYLOAD_LOGGERS: Final = ("anthropic", "httpx", "httpx2", "httpcore", "httpcore2
 
 
 def _payload_logger_names() -> set[str]:
-    present = {name.split(".")[0] for name in logging.root.manager.loggerDict}
-    return set(PAYLOAD_LOGGERS) | {
-        name for name in present if name.startswith(PAYLOAD_LOGGER_PREFIXES)
-    }
+    """The known names, and every logger already made under the prefixes.
+
+    Children are included: a child given its own level (say
+    ``anthropic._base_client`` set to DEBUG by hand) would otherwise log
+    below its clamped parent.
+    """
+    registry = logging.root.manager.loggerDict
+    under = [n for n in registry if n.split(".")[0].startswith(PAYLOAD_LOGGER_PREFIXES)]
+    # Every top-level name, even one only a placeholder for its children so
+    # far, and every child that is a real logger (it may have its own level).
+    tops = {n.split(".")[0] for n in under}
+    made = {n for n in under if isinstance(registry[n], logging.Logger)}
+    return set(PAYLOAD_LOGGERS) | tops | made
 
 
 def quiet_payload_loggers() -> None:
     """Hold the payload loggers at INFO or above, whatever the app's level.
 
-    Called when logging is configured and whenever an agent is built (by
-    which time the HTTP stack is imported), so neither the app's DEBUG level
-    nor ``ANTHROPIC_LOG=debug`` can print a request. Clamping a top-level
-    logger covers its children, including ones created later. Debugging the
-    SDK takes raising these loggers by hand. A child logger given its own
-    level (``anthropic._base_client`` set to DEBUG) is not covered: setting
-    one is that by-hand step.
+    Called when logging is configured, whenever an agent is built (by
+    which time the HTTP stack is imported) and at the start of every
+    statement run, so neither the app's DEBUG level nor
+    ``ANTHROPIC_LOG=debug`` can print a request. Every top-level logger
+    under the prefixes is clamped, which covers its children; a child that
+    was given its own level below INFO is clamped too (a decision:
+    statements carry account numbers). A level set by hand between two
+    calls holds until the next one: code that lowers a payload logger
+    during a statement run is clamped at the next run, not at once. So
+    nothing in this process may set one below INFO.
     """
     for name in _payload_logger_names():
         logger = logging.getLogger(name)
-        if logger.level < logging.INFO:  # NOTSET or DEBUG
+        top = "." not in name
+        if (top and logger.level < logging.INFO) or (
+            not top and logging.NOTSET < logger.level < logging.INFO
+        ):
             logger.setLevel(logging.INFO)

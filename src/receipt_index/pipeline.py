@@ -27,7 +27,7 @@ from receipt_index import duplicates
 from receipt_index.adapters.base import SourceUnavailableError
 from receipt_index.errors import classify
 from receipt_index.extraction import EXTRACTION_PROMPT_VERSION, extract_metadata
-from receipt_index.fetching import SourceDownError, fetch_item
+from receipt_index.fetching import STATEMENT_INGEST_TYPE, SourceDownError, fetch_item
 from receipt_index.locks import SourceLockLostError, item_lock
 from receipt_index.models import (
     MIN_RECEIPT_CONFIDENCE,
@@ -46,7 +46,6 @@ from receipt_index.repository import (
     get_item_history,
     get_processed_source_ids,
     get_sync_state,
-    has_receipt,
     insert_extraction,
     insert_ingest_log,
     insert_provenance,
@@ -54,6 +53,7 @@ from receipt_index.repository import (
     insert_receipt,
     is_due,
     is_source_id_known,
+    item_done,
     orphaned_refs,
     record_poll,
     record_rendition,
@@ -94,6 +94,7 @@ if TYPE_CHECKING:
         SyncState,
     )
     from receipt_index.originals import StoredEmail
+    from receipt_index.statements import StatementAgents
     from receipt_index.store import EvidenceStore, StoredFile
 
 logger = logging.getLogger(__name__)
@@ -111,12 +112,17 @@ class RunControl(Protocol):
 
     ``should_stop`` is asked before each item: the loops stop between items,
     so no item is left half-done and the cursor rule holds. ``running`` wraps
-    each item, so a watchdog can time it.
+    each item, so a watchdog can time it. ``step`` re-marks the running
+    item's clock: the statement pipeline calls it at each phase (the read,
+    the first pass, each account call), so the watchdog times each phase,
+    not the whole item. The receipt path doesn't call it.
     """
 
     def should_stop(self) -> bool: ...
 
     def running(self, source_id: str) -> AbstractContextManager[object]: ...
+
+    def step(self, source_id: str) -> None: ...
 
 
 def _running(
@@ -184,13 +190,16 @@ def _record_failure(
     state: AttemptState,
     stored_ref: str | None = None,
     error_class: ErrorClass | None = None,
+    error_message: str | None = None,
 ) -> ErrorClass:
     """Write an item's ``failed`` row and return its class.
 
-    The class comes from the exception unless ``error_class`` is given. A
-    failure to write the row is only logged.
+    The class comes from the exception unless ``error_class`` is given, and
+    the row's message is the exception's text unless ``error_message`` is.
+    A failure to write the row is only logged.
     """
     cls = error_class or classify(exc)
+    statement = source_type == STATEMENT_INGEST_TYPE
     fields = failure_fields(policy, state, cls, _now())
     try:
         insert_ingest_log(
@@ -202,7 +211,7 @@ def _record_failure(
             email_subject=subject,
             email_sender=sender,
             email_date=email_date,
-            error_message=str(exc),
+            error_message=str(exc) if error_message is None else error_message,
             llm_input_tokens=(extraction.input_tokens if extraction else None),
             llm_output_tokens=(extraction.output_tokens if extraction else None),
             llm_cache_read_tokens=(
@@ -216,8 +225,18 @@ def _record_failure(
             error_class=fields.error_class,
             stored_ref=stored_ref,
         )
-    except Exception:
-        logger.warning("Failed to write ingest log for %s", source_id, exc_info=True)
+    except Exception as write_error:
+        if statement:
+            # By class alone: a database error's detail quotes the row.
+            logger.warning(
+                "Failed to write ingest log for %s: %s",
+                source_id,
+                type(write_error).__name__,
+            )
+        else:
+            logger.warning(
+                "Failed to write ingest log for %s", source_id, exc_info=True
+            )
     return cls
 
 
@@ -1188,6 +1207,7 @@ def run_due_retries(
     policy: RetryPolicy | None = None,
     own_source: str | None = None,
     control: RunControl | None = None,
+    statement_agents: StatementAgents | None = None,
 ) -> RetryResult:
     """Run the items that are due again, one at a time.
 
@@ -1200,7 +1220,10 @@ def run_due_retries(
       ``started``, so an unreachable source leaves no row and uses up no
       attempt, then process it as attempt ``n``.
 
-    ``agents`` maps ``"email"`` and ``"document"`` to their agents. The pass
+    ``agents`` maps ``"email"`` and ``"document"`` to their agents. A
+    statement item (``source_type`` ``gdrive_statement``) goes to the
+    statement pipeline with ``statement_agents``, never to ``process_item``;
+    without them it is left for a run that has them. The pass
     ends when ``own_source`` (the source it runs for) can't be reached, or
     on a transient or config failure. When another source of the type can't
     be reached, only the item being looked for there is left for later.
@@ -1224,7 +1247,7 @@ def run_due_retries(
             if (
                 latest is None
                 or not is_due(latest, _now())
-                or has_receipt(conn, entry.source_id)
+                or item_done(conn, entry.source_id)
             ):
                 conn.commit()
                 continue
@@ -1233,6 +1256,15 @@ def run_due_retries(
             source_name = latest.source_name
             source_type = latest.source_type
             email_date = latest.email_date
+            if source_type == STATEMENT_INGEST_TYPE and statement_agents is None:
+                # Left for a pass that has the statement agents, before any
+                # fetch or row: a started row here would be closed next pass
+                # as a counted failure, using up the item's attempts.
+                logger.warning(
+                    "Retry of statement %s left for later: no statement agents",
+                    entry.source_id,
+                )
+                continue
 
             if latest.status == "started":
                 logger.warning(
@@ -1294,6 +1326,15 @@ def run_due_retries(
                 exc_: Exception = fetched.item_error or LookupError(
                     "item is no longer in the source"
                 )
+                # A source's error can quote the item (a Drive file name can
+                # hold an account number): a statement item's keeps its
+                # class alone, as the statement pipeline's own errors do.
+                message = (
+                    type(exc_).__name__
+                    if source_type == STATEMENT_INGEST_TYPE
+                    and fetched.item_error is not None
+                    else str(exc_)
+                )
                 _record_failure(
                     conn,
                     source_id=entry.source_id,
@@ -1308,29 +1349,48 @@ def run_due_retries(
                     policy=policy,
                     state=state,
                     error_class="content",
+                    error_message=message,
                 )
-                logger.warning("Retry of %s: %s", entry.source_id, exc_)
+                logger.warning("Retry of %s: %s", entry.source_id, message)
                 result.failed += 1
                 continue
 
             raw = fetched.raw
-            agent = agents["document" if raw.source_type == "gdrive" else "email"]
-            outcome = process_item(
-                conn,
-                raw,
-                store=store,
-                # Found, so the source that had it is known.
-                source_name=fetched.source_name or raw.source_name,
-                source_type=source_type,
-                agent=agent,
-                llm_model=llm_model,
-                policy=policy,
-                state=state,
-            )
+            if source_type == STATEMENT_INGEST_TYPE:
+                assert statement_agents is not None  # checked before the fetch
+                from receipt_index.statements import process_statement
+
+                outcome = process_statement(
+                    conn,
+                    raw,
+                    store=store,
+                    source_name=fetched.source_name or raw.source_name,
+                    agents=statement_agents,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=state,
+                    control=control,
+                )
+            else:
+                agent = agents["document" if raw.source_type == "gdrive" else "email"]
+                outcome = process_item(
+                    conn,
+                    raw,
+                    store=store,
+                    # Found, so the source that had it is known.
+                    source_name=fetched.source_name or raw.source_name,
+                    source_type=source_type,
+                    agent=agent,
+                    llm_model=llm_model,
+                    policy=policy,
+                    state=state,
+                )
         if outcome.status == "success" and outcome.receipt is not None:
             result.processed += 1
             result.receipts.append(outcome.receipt)
             _warn_orphans(conn, entry.source_id)
+        elif outcome.status == "success":  # a statement
+            result.processed += 1
         elif outcome.status == "skipped":
             result.skipped += 1
         elif outcome.status == "failed":
