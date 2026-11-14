@@ -668,6 +668,52 @@ class TestServeCommand:
         kwargs = service_cls.call_args.kwargs
         assert kwargs["statement_agents"] is build.return_value
 
+    def test_a_statement_source_it_does_not_hold_builds_no_agents(
+        self, config_file: Path
+    ) -> None:
+        """Another serve watches the statement source (review, U6).
+
+        This serve holds only a receipt source, so it builds no statement
+        agents and doesn't refuse to start over a source it doesn't watch.
+        """
+        from tests.unit.test_cli import FakeSourceLock
+
+        statement = _statement_config()
+        receipts = statement.model_copy(
+            update={
+                "name": "scans",
+                "folder_id": "receipts-folder",
+                "documents": "receipts",
+            }
+        )
+        config = _make_config().model_copy(update={"sources": [receipts, statement]})
+        FakeSourceLock.held = {_SOURCE}
+        FakeSourceLock.acquired = []
+
+        def no_agents(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("statement agents built for a source not held")
+
+        try:
+            with (
+                patch("receipt_index.cli.load_config", return_value=config),
+                patch("receipt_index.locks.SourceLock", FakeSourceLock),
+                patch("receipt_index.llm.anthropic_model", no_agents),
+                patch("receipt_index.extraction.create_extraction_agent"),
+                patch("receipt_index.store.open_store"),
+                patch("receipt_index.service.Service") as service_cls,
+            ):
+                service_cls.return_value.shutdown.return_value = True
+                result = CliRunner().invoke(
+                    cli, ["--config", str(config_file), "serve"]
+                )
+        finally:
+            FakeSourceLock.held = set()
+        assert result.exit_code == 0, result.output
+        assert FakeSourceLock.acquired == ["scans"]
+        kwargs = service_cls.call_args.kwargs
+        assert [s.name for s in kwargs["sources"]] == ["scans"]
+        assert kwargs["statement_agents"] is None
+
 
 class TestBackfill:
     def test_backfill_refuses_a_statement_source(self, config_file: Path) -> None:
