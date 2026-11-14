@@ -1118,15 +1118,23 @@ def run_ingest(
         try:
             read = adapter.list_new(state)
         except Exception as exc:
-            logger.exception("Failed to read source %s", source_name)
-            result.source_error = f"read failed: {exc}"
+            if item_type == STATEMENT_INGEST_TYPE:
+                # A listing error can quote a file name, which can hold an
+                # account number: a statement source keeps its class alone,
+                # with no traceback, in the log, sync_state and `status`.
+                reason = type(exc).__name__
+                logger.error("Failed to read source %s: %s", source_name, reason)
+            else:
+                reason = str(exc)
+                logger.exception("Failed to read source %s", source_name)
+            result.source_error = f"read failed: {reason}"
             if not dry_run:
                 record_poll(
                     conn,
                     source_name=source_name,
                     source_type=source_type,
                     folder=folder,
-                    error=str(exc),
+                    error=reason,
                 )
             return result
         if not dry_run:

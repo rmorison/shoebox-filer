@@ -7,14 +7,18 @@ is the test's own: no real statement, institution, name or amount.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import uuid
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from receipt_index import pipeline
+from receipt_index.adapters.base import SourceUnavailableError
+from receipt_index.config import GdriveSourceConfig
+from receipt_index.fetching import SourcePool
 from receipt_index.models import ItemRef, RawReceipt, SourceRead
 from receipt_index.repository import (
     count_ingest_failures,
@@ -479,3 +483,141 @@ class TestIntake:
             {"id": sid},
         ).fetchall()
         assert row["source_type"] == "gdrive"
+
+
+def _logged(caplog: pytest.LogCaptureFixture) -> str:
+    """Every record as a handler would write it, tracebacks included."""
+    fmt = logging.Formatter("%(name)s %(levelname)s %(message)s")
+    return "\n".join(fmt.format(r) for r in caplog.records)
+
+
+class _DownDrive(_Drive):
+    """A statement folder whose errors quote a file name."""
+
+    def __init__(self, items: dict[str, bytes], *, listing: bool) -> None:
+        super().__init__(items)
+        self.listing = listing
+
+    def list_new(self, state: Any) -> SourceRead:
+        if self.listing:
+            msg = f"listing failed at {_NAME}"
+            raise RuntimeError(msg)
+        return super().list_new(state)
+
+    def fetch(self, ref: ItemRef) -> RawReceipt:
+        msg = f"server error fetching {_NAME}"
+        raise SourceUnavailableError(msg)
+
+    def fetch_by_id(self, source_id: str) -> RawReceipt | None:
+        msg = f"server error fetching {_NAME}"
+        raise SourceUnavailableError(msg)
+
+
+class TestNoListingText:
+    """A source's own error text never leaves a statement source (review, U6).
+
+    Each error quotes a file name holding a synthetic card number; neither
+    the sync state, the text `status` and pauses show, nor any log record
+    may hold it.
+    """
+
+    def _ingest(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        *,
+        listing: bool,
+    ) -> pipeline.IngestResult:
+        return pipeline.run_ingest(
+            conn=pg_conn,
+            adapter=_DownDrive(  # type: ignore[arg-type]
+                {f"drive-{uuid.uuid4().hex}": make_pdf(_PAGE)}, listing=listing
+            ),
+            store=store,
+            source_name=_SOURCE,
+            source_type="gdrive",
+            item_type=STATEMENT_SOURCE_TYPE,
+            llm_model="test-model",
+            statement_agents=Replies().agents(),
+        )
+
+    def _state_error(self, pg_conn: psycopg.Connection[dict[str, Any]]) -> str:
+        (state,) = [s for s in list_sync_state(pg_conn) if s.source_name == _SOURCE]
+        assert state.last_error is not None
+        return state.last_error
+
+    def test_a_listing_error_keeps_its_class_alone(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        result = self._ingest(pg_conn, store, listing=True)
+        assert result.source_error == "read failed: RuntimeError"
+        assert self._state_error(pg_conn) == "RuntimeError"
+        assert "RuntimeError" in _logged(caplog)
+        assert _NUMBER not in _logged(caplog)
+
+    def test_a_source_down_while_fetching_keeps_its_class_alone(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        result = self._ingest(pg_conn, store, listing=False)
+        assert result.source_error == "SourceUnavailableError"
+        assert self._state_error(pg_conn) == "SourceUnavailableError"
+        assert _NUMBER not in _logged(caplog)
+
+    def test_a_source_down_in_the_retry_pass_keeps_its_class_alone(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        sid = f"drive-{uuid.uuid4().hex}"
+        insert_ingest_log(
+            pg_conn,
+            source_id=sid,
+            source_type=STATEMENT_SOURCE_TYPE,
+            source_name=_SOURCE,
+            status="failed",
+            error_class="transient",
+            counts_attempt=False,
+            next_retry_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        pg_conn.commit()
+        due = select_due(
+            pg_conn,
+            source_name=_SOURCE,
+            source_type=STATEMENT_SOURCE_TYPE,
+            configured=[_SOURCE],
+        )
+        config = GdriveSourceConfig(
+            name=_SOURCE,
+            type="gdrive",
+            folder_id="statements-folder",
+            token_json="{}",
+            documents="statements",
+        )
+        with ExitStack() as stack:
+            down: Any = _DownDrive({}, listing=False)
+            pool = SourcePool([config], lambda _c: down, stack)
+            result = pipeline.run_due_retries(
+                pg_conn,
+                due,
+                pool=pool,
+                store=store,
+                agents={},
+                llm_model="test-model",
+                own_source=_SOURCE,
+                statement_agents=Replies().agents(),
+            )
+        assert result.stopped == f"source {_SOURCE} unavailable: SourceUnavailableError"
+        assert _NUMBER not in _logged(caplog)
+        # Left as it was: no started row, no attempt used.
+        latest, *_ = get_item_history(pg_conn, sid)
+        assert latest.status == "failed"
