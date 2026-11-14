@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from receipt_index import duplicates
 from receipt_index.adapters.gdrive import UNSUPPORTED_REASON
+from receipt_index.fetching import STATEMENT_INGEST_TYPE
 from receipt_index.models import (
     FAILED_RUN_KEY,
     MIN_RECEIPT_CONFIDENCE,
@@ -737,6 +738,34 @@ def count_statements_by_source(
     return counts
 
 
+def count_statement_failures(
+    conn: psycopg.Connection[dict[str, Any]], source_name: str
+) -> dict[str, int]:
+    """One statement source's open failures, for ``status``.
+
+    The same meaning as the global counts: ``pending`` is due now,
+    ``retrying`` is due later, ``terminal`` is not retried automatically.
+    Only statement items count, so receipt failures left under a name that
+    now takes statements don't.
+    """
+    row = conn.execute(
+        f"""        SELECT
+            count(*) FILTER (WHERE l.next_retry_at <= now()) AS pending,
+            count(*) FILTER (WHERE l.next_retry_at > now()) AS retrying,
+            count(*) FILTER (WHERE l.next_retry_at IS NULL) AS terminal
+          FROM ({_LATEST}) l
+         WHERE l.status = 'failed'
+           AND l.source_type = %(type)s
+           AND l.source_name = %(name)s
+           AND {_NOT_DONE}
+        """,
+        {"type": STATEMENT_INGEST_TYPE, "name": source_name},
+    ).fetchone()
+    if row is None:
+        return {"pending": 0, "retrying": 0, "terminal": 0}
+    return {k: int(row[k]) for k in ("pending", "retrying", "terminal")}
+
+
 def count_ingest_failures(
     conn: psycopg.Connection[dict[str, Any]],
     *,
@@ -828,6 +857,11 @@ def select_due(
     a source not in ``configured`` (renamed or removed), belongs to every
     source of its type; the re-fetch tries each of them. The item lock keeps
     two passes from running it twice.
+
+    A row that names this source must also be of its type: a source switched
+    between receipts and statements leaves its old items due but unselected
+    (``status`` still counts them), instead of a pass that can't run them
+    picking them up on every round.
     """
     params: dict[str, object] = {
         "name": source_name,
@@ -838,7 +872,7 @@ def select_due(
     }
     sql = (
         f"SELECT * FROM ({_LATEST}) l WHERE {_DUE} "
-        "AND (l.source_name = %(name)s"
+        "AND ((l.source_name = %(name)s AND l.source_type = %(type)s)"
         " OR ((l.source_name IS NULL"
         " OR (%(configured)s::text[] IS NOT NULL"
         " AND l.source_name <> ALL(%(configured)s::text[])))"

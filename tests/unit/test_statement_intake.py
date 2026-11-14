@@ -724,21 +724,16 @@ class TestStatus:
                 _SOURCE: {"complete": 3, "incomplete": 0, "held": 1, "rejected": 2},
                 "gone": {"complete": 9, "incomplete": 0, "held": 0, "rejected": 0},
             }
-        failures: list[tuple[str, str | None]] = []
+        failures: list[str] = []
 
-        def count(
-            _c: Any,
-            *,
-            status: str,
-            since: Any = None,
-            source_name: str | None = None,
-        ) -> int:
-            failures.append((status, source_name))
-            return {"retrying": 4, "terminal": 5}.get(status, 0)
+        def count(_c: Any, source_name: str) -> dict[str, int]:
+            failures.append(source_name)
+            return {"pending": 6, "retrying": 4, "terminal": 5}
 
         monkeypatch.setattr(repository, "list_sync_state", lambda _c: [])
         monkeypatch.setattr(repository, "count_due_retries", lambda _c: 0)
-        monkeypatch.setattr(repository, "count_ingest_failures", count)
+        monkeypatch.setattr(repository, "count_ingest_failures", lambda *_a, **_k: 0)
+        monkeypatch.setattr(repository, "count_statement_failures", count)
         monkeypatch.setattr(
             repository, "count_statements_by_source", lambda _c: by_source
         )
@@ -767,12 +762,12 @@ class TestStatus:
             "incomplete": 0,
             "held": 1,
             "rejected": 2,
+            "pending": 6,
             "retrying": 4,
             "terminal": 5,
         }
         # Its retry counts are its own, not every source's.
-        assert ("retrying", _SOURCE) in failures
-        assert ("terminal", _SOURCE) in failures
+        assert failures == [_SOURCE]
         assert by_name["scans"]["documents"] == "receipts"
         assert by_name["scans"]["statements"] is None
         assert by_name["mail"]["statements"] is None
@@ -780,7 +775,7 @@ class TestStatus:
         assert f"  {_SOURCE} (gdrive, statements, f2)" in text
         assert (
             "    statements: complete 3, incomplete 0, held 1, rejected 2, "
-            "retrying 4, terminal 5"
+            "pending 6, retrying 4, terminal 5"
         ) in text
         assert "  scans (gdrive, f1)" in text
 
@@ -794,6 +789,7 @@ class TestStatus:
             "incomplete": 0,
             "held": 0,
             "rejected": 0,
+            "pending": 6,
             "retrying": 4,
             "terminal": 5,
         }
@@ -804,4 +800,4 @@ class TestStatus:
         report, failures = self._collect(monkeypatch, tmp_path, retries=False)
         (statement,) = [s for s in report.sources if s.name == _SOURCE]
         assert statement.statements is None
-        assert all(name is None for _status, name in failures)
+        assert failures == []

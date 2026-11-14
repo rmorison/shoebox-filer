@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -18,10 +18,13 @@ from receipt_index import pipeline
 from receipt_index.models import ItemRef, RawReceipt, SourceRead
 from receipt_index.repository import (
     count_ingest_failures,
+    count_statement_failures,
     count_statements_by_source,
     get_item_history,
+    insert_ingest_log,
     list_sync_state,
     orphaned_refs,
+    select_due,
 )
 from receipt_index.retries import RetryPolicy, attempt_state
 from receipt_index.statements import STATEMENT_SOURCE_TYPE
@@ -263,6 +266,71 @@ class TestStatusCounts:
             _SOURCE: {"complete": 1, "incomplete": 0, "held": 0, "rejected": 1}
         }
 
+    def test_failures_are_counted_per_statement_source_like_the_global_ones(
+        self, pg_conn: psycopg.Connection[dict[str, Any]]
+    ) -> None:
+        now = datetime.now(UTC)
+        rows = [
+            # (item, type, source, next retry)
+            ("due", STATEMENT_SOURCE_TYPE, _SOURCE, now - timedelta(minutes=1)),
+            ("later", STATEMENT_SOURCE_TYPE, _SOURCE, now + timedelta(hours=1)),
+            ("dead", STATEMENT_SOURCE_TYPE, _SOURCE, None),
+            # A receipt item left under the name, and another source's item.
+            ("receipt", "gdrive", _SOURCE, now + timedelta(hours=1)),
+            ("elsewhere", STATEMENT_SOURCE_TYPE, "other", None),
+        ]
+        for item, kind, source, retry in rows:
+            insert_ingest_log(
+                pg_conn,
+                source_id=f"{item}-{uuid.uuid4().hex}",
+                source_type=kind,
+                source_name=source,
+                status="failed",
+                error_class="content",
+                next_retry_at=retry,
+            )
+        pg_conn.commit()
+        assert count_statement_failures(pg_conn, _SOURCE) == {
+            "pending": 1,
+            "retrying": 1,
+            "terminal": 1,
+        }
+        assert count_statement_failures(pg_conn, "none-yet") == {
+            "pending": 0,
+            "retrying": 0,
+            "terminal": 0,
+        }
+
+
+class TestSelectDue:
+    def test_a_source_selects_only_due_items_of_its_own_type(
+        self, pg_conn: psycopg.Connection[dict[str, Any]]
+    ) -> None:
+        """A source switched between receipts and statements (review, U6).
+
+        Its old items stay due but no pass of the other type selects them,
+        so none is left "for later" on every round.
+        """
+        past = datetime.now(UTC) - timedelta(minutes=1)
+        ids = {}
+        for kind in (STATEMENT_SOURCE_TYPE, "gdrive"):
+            ids[kind] = f"{kind}-{uuid.uuid4().hex}"
+            insert_ingest_log(
+                pg_conn,
+                source_id=ids[kind],
+                source_type=kind,
+                source_name=_SOURCE,
+                status="failed",
+                error_class="content",
+                next_retry_at=past,
+            )
+        pg_conn.commit()
+        for kind in (STATEMENT_SOURCE_TYPE, "gdrive"):
+            due = select_due(
+                pg_conn, source_name=_SOURCE, source_type=kind, configured=[_SOURCE]
+            )
+            assert [d.source_id for d in due] == [ids[kind]]
+
 
 class _Drive:
     """A statement folder: one listing, bodies by file ID."""
@@ -354,8 +422,60 @@ class TestIntake:
         assert state.source_type == "gdrive"
         assert state.drive_page_token == "tok-1"
         # Nothing anywhere holds the number.
-        dump = pg_conn.execute(
-            "SELECT string_agg(t::text, ' ') AS all FROM receipt.ingest_log t"
-        ).fetchone()
-        assert dump is not None
-        assert _NUMBER not in (dump["all"] or "")
+        for table in (
+            "ingest_log",
+            "statement_sources",
+            "statements",
+            "statement_revisions",
+            "statement_accounts",
+            "statement_lines",
+            "statement_feed_state",
+            "stored_files",
+            "file_locations",
+            "sync_state",
+        ):
+            dump = pg_conn.execute(
+                f"SELECT string_agg(t::text, ' ') AS all FROM receipt.{table} t"
+            ).fetchone()
+            assert dump is not None
+            assert _NUMBER not in (dump["all"] or ""), table
+
+    def test_a_receipt_source_never_reaches_the_statement_pipeline(
+        self,
+        pg_conn: psycopg.Connection[dict[str, Any]],
+        store: LocalEvidenceStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from receipt_index import statements
+
+        def no_statements(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a receipt item reached process_statement")
+
+        seen: list[str] = []
+
+        def receipt(_conn: Any, raw: RawReceipt, **kwargs: Any) -> Any:
+            seen.append(raw.source_id)
+            return pipeline.ItemOutcome("failed", error_class="content")
+
+        monkeypatch.setattr(statements, "process_statement", no_statements)
+        monkeypatch.setattr(pipeline, "process_item", receipt)
+        sid = f"drive-{uuid.uuid4().hex}"
+        result = pipeline.run_ingest(
+            conn=pg_conn,
+            adapter=_Drive({sid: make_pdf(_PAGE)}),  # type: ignore[arg-type]
+            store=store,
+            source_name=_SOURCE,
+            source_type="gdrive",
+            item_type="gdrive",
+            llm_model="test-model",
+            # Given, but a receipt source never uses them.
+            statement_agents=Replies().agents(),
+        )
+        assert seen == [sid]
+        assert result.source_error is None
+        assert _count(pg_conn, "statements") == 0
+        (row,) = pg_conn.execute(
+            "SELECT source_type FROM receipt.ingest_log WHERE source_id = %(id)s",
+            {"id": sid},
+        ).fetchall()
+        assert row["source_type"] == "gdrive"

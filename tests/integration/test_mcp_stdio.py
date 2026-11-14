@@ -499,10 +499,11 @@ def test_an_original_no_statement_points_at_shows_in_no_tool(
 
     data = b"%PDF-1.4 synthetic statement"
     locator = "originals/2027/02/2027-02-03__statements-drive__abc/statement.pdf"
-    record_original(
+    digest = hashlib.sha256(data).digest()
+    file_id = record_original(
         pg_conn,
         ref=f"local:{locator}",
-        sha256=hashlib.sha256(data).digest(),
+        sha256=digest,
         byte_size=len(data),
         media_type="application/pdf",
     )
@@ -521,9 +522,14 @@ def test_an_original_no_statement_points_at_shows_in_no_tool(
 
     async def session() -> dict[str, CallToolResult]:
         async with Client(_in_process(store, log)) as client:
+            # The file's own ID, where a receipt ID goes: a tool that read
+            # stored_files directly would answer with the file.
+            by_file_id = {"receipt_id": str(file_id)}
             return {
                 "all": await client.call_tool("search_receipts", {}),
                 "failures": await client.call_tool("list_failures", {}),
+                "one": await client.call_tool("get_receipt", by_file_id),
+                "file": await client.call_tool("get_receipt_file", by_file_id),
             }
 
     r = anyio.run(session)
@@ -534,6 +540,15 @@ def test_an_original_no_statement_points_at_shows_in_no_tool(
     assert failures is not None
     (failure,) = failures["failures"]
     assert failure["source_id"] == "drive-statement-1"
+    assert not r["all"].is_error
+    assert not r["failures"].is_error
+    # Not found, as for any ID that names no receipt: the file isn't an error
+    # of its own, and no tool reaches it.
+    for name in ("one", "file"):
+        assert r[name].is_error
+        assert "not found" in json.dumps(r[name].model_dump(mode="json")).lower()
     for result in r.values():
-        assert not result.is_error
-        assert "statement.pdf" not in json.dumps(result.structured_content)
+        out = json.dumps(result.model_dump(mode="json"))
+        assert "statement.pdf" not in out
+        assert locator not in out
+        assert digest.hex() not in out

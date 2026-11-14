@@ -472,7 +472,7 @@ def _statement_counts(
     """Give each statement source its own counts (``status`` only)."""
     from receipt_index.repository import (
         STATEMENT_STATUSES,
-        count_ingest_failures,
+        count_statement_failures,
         count_statements_by_source,
     )
 
@@ -482,10 +482,7 @@ def _statement_counts(
     by_source = count_statements_by_source(conn)
     for status in takes:
         counts = dict(by_source.get(status.name, dict.fromkeys(STATEMENT_STATUSES, 0)))
-        for kind in ("retrying", "terminal"):
-            counts[kind] = count_ingest_failures(
-                conn, status=kind, source_name=status.name
-            )
+        counts.update(count_statement_failures(conn, status.name))
         status.statements = counts
 
 
