@@ -49,7 +49,7 @@ from imapclient.exceptions import LoginError
 
 from receipt_index.adapters.imap import connect_imap
 from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
-from receipt_index.fetching import SourcePool, ingest_type
+from receipt_index.fetching import STATEMENT_INGEST_TYPE, SourcePool, ingest_type
 from receipt_index.health import (
     HEARTBEAT_WRITE_SECONDS,
     Pause,
@@ -552,17 +552,25 @@ class Worker:
     def _poll(
         self, conn: psycopg.Connection[dict[str, Any]], source: SourceConfig
     ) -> str | None:
+        item_type = ingest_type(source)
+        if item_type == STATEMENT_INGEST_TYPE and self.statement_agents is None:
+            # Service refuses this at start; a guard, not a path.
+            return "takes statements, but serve has no statement agents"
         result = run_ingest(
             conn=conn,
             adapter=self._adapter_factory(source),
             store=self.store,
             source_name=source.name,
+            # The sync state keeps the config type; the items are logged and
+            # dispatched under the source's ingest type.
             source_type=source.type,
+            item_type=item_type,
             agent=self.agents[_agent_kind(source)],
             llm_model=self.llm_model,
             source_lock=self.locks[source.name],
             policy=self.policy,
             control=self.clock,
+            statement_agents=self.statement_agents,
         )
         if result.processed or result.skipped or result.failed:
             logger.info(
@@ -816,6 +824,10 @@ class Service:
         requested: Sequence[str] | None = None,
         statement_agents: StatementAgents | None = None,
     ) -> None:
+        takes = [s.name for s in sources if ingest_type(s) == STATEMENT_INGEST_TYPE]
+        if takes and statement_agents is None:
+            msg = f"statement source(s) {', '.join(takes)} need the statement agents"
+            raise ValueError(msg)
         if statement_agents is not None:
             from receipt_index.statement_extraction import warm_mask
             from receipt_index.statements import refuse_instrumentation

@@ -292,6 +292,13 @@ class StatementItemError(Exception):
     """An item error of the statement pipeline: retried, then terminal."""
 
 
+class StatementStoppedError(Exception):
+    """The process is stopping: the item ends between phases, uncounted."""
+
+
+_STOPPED = "the process is stopping; the statement is run again on the next start"
+
+
 @dataclass
 class _Usage:
     input_tokens: int = 0
@@ -318,9 +325,19 @@ def _now() -> datetime:
 
 
 def _step(control: RunControl | None, source_id: str) -> None:
-    """Re-mark the item's watchdog clock: each phase is its own step."""
-    if control is not None:
-        control.step(source_id)
+    """Re-mark the item's watchdog clock: each phase is its own step.
+
+    A stop asked for since the last step ends the item here, before the
+    next phase starts, as a :class:`StatementStoppedError`: no revision, no
+    counted attempt, and the item is run again on the next start. A stop
+    asked for during the last account call lets the item finish, since only
+    the gates and one short write are left.
+    """
+    if control is None:
+        return
+    if control.should_stop():
+        raise StatementStoppedError(_STOPPED)
+    control.step(source_id)
 
 
 def _is_name_digit(char: str) -> bool:
@@ -409,8 +426,16 @@ def masked_file_name(name: str | None) -> str | None:
     word, is cut as well. The description mask then runs as a backstop.
 
     Known limits: groups split by a word of five or more letters stay
-    apart; numerals spelled out or written as CJK numerals aren't digits;
-    a number written in hex isn't read as one.
+    apart; numerals spelled out, written as CJK numerals or as Roman
+    numerals aren't digits; a number written in hex isn't read as one. Two
+    more only ever cut too much: a name encoded five or more times over is
+    kept partly encoded (with its digits cut), and the digits inside a
+    ``%XX`` still left count toward the eight.
+
+    Bounded: at most ``_NAME_DECODE_PASSES`` passes, each linear in the
+    name's length. The result after the last pass is cut either way, but
+    it isn't promised to be a fixed point: for a name that hasn't settled
+    by then, masking it again can change it further.
 
     Never raises: a name it can't make safe to store is dropped (None), so
     no name can fail an item.
@@ -418,9 +443,10 @@ def masked_file_name(name: str | None) -> str | None:
     if name is None:
         return None
     try:
-        # Again until it stops changing (a few passes at most): the
-        # description mask's own clean-up can join a new escape, and a
-        # masked name masked again must come out the same.
+        # Again until it stops changing, a few passes at most: the
+        # description mask's own clean-up can join a new escape. Every pass
+        # cuts, so the result is cut even when the last pass still changed
+        # it; it is then not promised to come out the same if masked again.
         masked = name
         for _ in range(_NAME_DECODE_PASSES):
             again, _ = mask_digits(_cut_name_runs(_decoded(masked)))
@@ -445,7 +471,11 @@ def _safe_message(exc: BaseException) -> str:
     is one the pipeline raises itself.
     """
     if isinstance(
-        exc, StatementCallError | StatementItemError | InstrumentationLoadedError
+        exc,
+        StatementCallError
+        | StatementItemError
+        | StatementStoppedError
+        | InstrumentationLoadedError,
     ):
         return str(exc)
     if isinstance(exc, psycopg.Error):
@@ -797,7 +827,7 @@ def _error_class(exc: BaseException) -> ErrorClass:
         return exc.error_class
     if isinstance(exc, StatementItemError):
         return "content"
-    if isinstance(exc, InstrumentationLoadedError):
+    if isinstance(exc, InstrumentationLoadedError | StatementStoppedError):
         # The process, not the item: stop the source, count no attempt.
         return "config"
     return classify(exc)
@@ -862,7 +892,21 @@ def process_statement(
             folder=StoreFolder.for_original(received_at, source_name, digest),
             name=_STORE_NAME,
         )
-        # End the read transaction before the PDF read and the model calls.
+        # Recorded at once, in its own short transaction (no feed lock), so
+        # a run that fails after the store write leaves a recorded original:
+        # the retry finds it by its hash and stores no second copy, whatever
+        # its received date. Unlike a receipt's, whose rows come only with
+        # the receipt. No statement may point at it yet; nothing reads one
+        # that way (the read contract reaches an original only through a
+        # statement). This also ends the read transaction before the PDF
+        # read and the model calls.
+        original_id = record_original(
+            conn,
+            ref=stored.ref,
+            sha256=digest,
+            byte_size=len(data),
+            media_type=_PDF,
+        )
         conn.commit()
         extracted = extract_statement(
             data,
@@ -877,17 +921,10 @@ def process_statement(
         # first, and the copy check again under it: another source may have
         # written a statement from the same bytes during the model calls.
         # Then this item is a copy too. Its model run is wasted, but it is a
-        # success with no new revision, not an error and not an attempt. The
-        # original is recorded either way (the same bytes, so the same stored
-        # file), so a copy stored under this source's folder isn't an orphan.
+        # success with no new revision, not an error and not an attempt. Its
+        # original was recorded when it was put, so a copy stored under this
+        # source's folder isn't an orphan.
         lock_feed(conn)
-        original_id = record_original(
-            conn,
-            ref=stored.ref,
-            sha256=digest,
-            byte_size=len(data),
-            media_type=_PDF,
-        )
         existing = statement_for_sha256(conn, digest)
         if existing is not None:
             return _add_copy(

@@ -28,6 +28,16 @@ sources:
   #   type: gdrive
   #   folder_id: "1aBcDeFgHiJkLmNoPqRsTuVwXyZ"
   #   token_json: ${GDRIVE_TOKEN_JSON}              # from: receipt-index auth gdrive
+  #   documents: receipts                           # default: receipts
+
+  # Google Drive folder of bank and card statements (PDF). Its files go to
+  # the statement pipeline only, never to receipt extraction. Its folder
+  # must not be any other source's folder, and every source name is unique.
+  # - name: bank-statements
+  #   type: gdrive
+  #   folder_id: "1zYxWvUtSrQpOnMlKjIhGfEdCbA"
+  #   token_json: ${GDRIVE_TOKEN_JSON}
+  #   documents: statements
 
 # ---------------------------------------------------------------------------
 # Database — PostgreSQL connection

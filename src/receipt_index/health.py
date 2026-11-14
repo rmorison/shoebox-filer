@@ -253,6 +253,11 @@ class SourceStatus:
     folder: str
     stale_after_seconds: int
     row: SyncState | None
+    # receipts or statements; a statement source has its own counts.
+    documents: str = "receipts"
+    # Statements by current status, and its items retrying or terminal.
+    # None for a receipt source, or when the counts weren't read.
+    statements: dict[str, int] | None = None
 
     def success_age(self, now: datetime) -> float | None:
         if self.row is None or self.row.last_success_at is None:
@@ -408,6 +413,7 @@ def collect(
             folder=source_folder(s),
             stale_after_seconds=stale_threshold(s, ingest),
             row=None,
+            documents=getattr(s, "documents", "receipts"),
         )
         for s in config.sources
     ]
@@ -432,6 +438,8 @@ def collect(
                         conn, status="skipped", since=now - SKIPPED_WINDOW
                     ),
                 }
+            if retries:
+                _statement_counts(conn, statuses)
             if window > 0:
                 report.terminal_recent = count_ingest_failures(
                     conn, status="terminal", since=now - timedelta(seconds=window)
@@ -456,6 +464,29 @@ def collect(
         now=now,
     )
     return report
+
+
+def _statement_counts(
+    conn: psycopg.Connection[dict[str, Any]], statuses: list[SourceStatus]
+) -> None:
+    """Give each statement source its own counts (``status`` only)."""
+    from receipt_index.repository import (
+        STATEMENT_STATUSES,
+        count_ingest_failures,
+        count_statements_by_source,
+    )
+
+    takes = [s for s in statuses if s.documents == "statements"]
+    if not takes:
+        return
+    by_source = count_statements_by_source(conn)
+    for status in takes:
+        counts = dict(by_source.get(status.name, dict.fromkeys(STATEMENT_STATUSES, 0)))
+        for kind in ("retrying", "terminal"):
+            counts[kind] = count_ingest_failures(
+                conn, status=kind, source_name=status.name
+            )
+        status.statements = counts
 
 
 def window_label(seconds: int) -> str:
@@ -516,6 +547,7 @@ def report_json(report: Report) -> dict[str, Any]:
             {
                 "name": status.name,
                 "type": status.type,
+                "documents": status.documents,
                 "folder": status.folder,
                 "cursor": _cursor(row),
                 "last_poll_at": _iso(row.last_poll_at) if row else None,
@@ -527,6 +559,7 @@ def report_json(report: Report) -> dict[str, Any]:
                 "last_error_current": _error_current(row) if row else False,
                 "resets": row.resets if row else 0,
                 "archive_enabled_at": _iso(row.archive_enabled_at) if row else None,
+                "statements": status.statements,
             }
         )
     worker: dict[str, Any] | None = None
@@ -578,7 +611,15 @@ def report_text(report: Report) -> list[str]:
     data = report_json(report)
     out = ["Sources"]
     for src in data["sources"]:
-        out.append(f"  {src['name']} ({src['type']}, {src['folder']})")
+        kind = src["type"]
+        if src["documents"] == "statements":
+            kind = f"{kind}, statements"
+        out.append(f"  {src['name']} ({kind}, {src['folder']})")
+        counts = src["statements"]
+        if counts is not None:
+            out.append(
+                "    statements: " + ", ".join(f"{k} {counts[k]}" for k in counts)
+            )
         cursor = src["cursor"]
         if cursor is None:
             out.append("    no sync state yet")

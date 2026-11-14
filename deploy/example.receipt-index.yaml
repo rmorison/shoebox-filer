@@ -34,6 +34,14 @@ sources:
     folder_id: "replace-with-gdrive-folder-id"
     token_json: ${GDRIVE_TOKEN_JSON}
 
+  # Bank and card statements (PDF), to the statement pipeline only. Its
+  # folder must be a folder no other source reads.
+  # - name: bank-statements
+  #   type: gdrive
+  #   folder_id: "replace-with-statements-folder-id"
+  #   token_json: ${GDRIVE_TOKEN_JSON}
+  #   documents: statements
+
 # Timing for `receipt-index serve` (the compose `ingest` service) and the
 # one-shot `ingest`. Every key has a default; these are the defaults.
 ingest:

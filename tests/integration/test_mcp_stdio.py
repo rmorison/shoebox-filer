@@ -479,3 +479,61 @@ def test_startup_check_passes_read_role() -> None:
 def test_startup_check_refuses_in_process(role: str, match: str) -> None:
     with pytest.raises(RoleCheckError, match=match):
         startup_check(_dsn(role))
+
+
+@pytest.mark.usefixtures("roles")
+def test_an_original_no_statement_points_at_shows_in_no_tool(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    store: Path,
+    tmp_path: Path,
+) -> None:
+    """A statement item that failed after its original was put (plan U6).
+
+    The original is recorded when it is put, so it can stay with no
+    statement and no receipt pointing at it. No read tool lists it: the
+    tools reach a file only through a receipt.
+    """
+    import hashlib
+
+    from receipt_index.repository import record_original
+
+    data = b"%PDF-1.4 synthetic statement"
+    locator = "originals/2027/02/2027-02-03__statements-drive__abc/statement.pdf"
+    record_original(
+        pg_conn,
+        ref=f"local:{locator}",
+        sha256=hashlib.sha256(data).digest(),
+        byte_size=len(data),
+        media_type="application/pdf",
+    )
+    insert_ingest_log(
+        pg_conn,
+        source_id="drive-statement-1",
+        source_type="gdrive_statement",
+        source_name="statements-drive",
+        status="failed",
+        error_message="the gates refused the statement: GateInputError",
+        error_class="content",
+        counts_attempt=True,
+    )
+    pg_conn.commit()
+    log = tmp_path / "mcp-access.jsonl"
+
+    async def session() -> dict[str, CallToolResult]:
+        async with Client(_in_process(store, log)) as client:
+            return {
+                "all": await client.call_tool("search_receipts", {}),
+                "failures": await client.call_tool("list_failures", {}),
+            }
+
+    r = anyio.run(session)
+    found = r["all"].structured_content
+    assert found is not None
+    assert found["total"] == 0
+    failures = r["failures"].structured_content
+    assert failures is not None
+    (failure,) = failures["failures"]
+    assert failure["source_id"] == "drive-statement-1"
+    for result in r.values():
+        assert not result.is_error
+        assert "statement.pdf" not in json.dumps(result.structured_content)

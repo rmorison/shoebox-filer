@@ -709,6 +709,34 @@ def get_ingest_failures(
     return [IngestLogEntry.model_validate(row) for row in cur.fetchall()]
 
 
+STATEMENT_STATUSES = ("complete", "incomplete", "held", "rejected")
+
+
+def count_statements_by_source(
+    conn: psycopg.Connection[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    """Each source's statements by their current status, for ``status``.
+
+    A statement counts once for each source that delivered it (the same
+    bytes dropped in two sources count in both). Every status is present,
+    zero when none.
+    """
+    rows = conn.execute(
+        """        SELECT ss.source_name, s.status, count(DISTINCT s.id) AS n
+          FROM receipt.statement_sources ss
+          JOIN receipt.statements s ON s.id = ss.statement_id
+         GROUP BY ss.source_name, s.status
+        """
+    ).fetchall()
+    counts: dict[str, dict[str, int]] = {}
+    for row in rows:
+        by_status = counts.setdefault(
+            row["source_name"], dict.fromkeys(STATEMENT_STATUSES, 0)
+        )
+        by_status[row["status"]] = int(row["n"])
+    return counts
+
+
 def count_ingest_failures(
     conn: psycopg.Connection[dict[str, Any]],
     *,

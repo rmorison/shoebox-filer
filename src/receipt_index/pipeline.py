@@ -180,8 +180,8 @@ def _record_failure(
     source_id: str,
     source_type: str,
     source_name: str | None,
-    subject: str,
-    sender: str,
+    subject: str | None,
+    sender: str | None,
     email_date: Any,
     exc: Exception,
     extraction: ExtractionResult | None,
@@ -830,8 +830,16 @@ def handle_item(
     llm_model: str,
     agent: Agent[None, ReceiptMetadata] | None = None,
     policy: RetryPolicy | None = None,
+    statement_agents: StatementAgents | None = None,
+    control: RunControl | None = None,
 ) -> ItemOutcome:
     """Take the item lock, re-check, fetch, write ``started`` and process.
+
+    ``source_type`` is the item's ingest type. A statement item
+    (``gdrive_statement``) goes to the statement pipeline with
+    ``statement_agents``, never to ``process_item``; its rows carry no
+    subject or sender (a Drive item's subject is its file name), and its
+    skip and fetch errors keep no file name.
 
     Returns ``locked`` when another process holds the item, and ``known``
     when the item gained a record between listing and locking. Once the
@@ -851,20 +859,33 @@ def handle_item(
         # connection never sits idle in a transaction while a fetch waits.
         conn.commit()
 
+        statement = source_type == STATEMENT_INGEST_TYPE
+        if statement and statement_agents is None:
+            msg = "a statement item needs the statement agents"
+            raise ValueError(msg)
+        # A Drive item's subject is its file name, which can hold an account
+        # number: a statement item's rows carry neither subject nor sender.
+        subject = None if statement else ref.subject
+        sender = None if statement else ref.sender
         email_date = _email_date(ref.source_type, ref)
         if ref.skip_reason is not None:
             mime = (ref.drive_meta or {}).get("mimeType", "unknown")
+            file_name = ref.file_name
+            if statement:
+                from receipt_index.statements import masked_file_name
+
+                file_name = masked_file_name(file_name)
             insert_ingest_log(
                 conn,
                 source_id=ref.source_id,
                 source_type=source_type,
                 source_name=source_name,
                 status="skipped",
-                email_subject=ref.subject,
-                email_sender=ref.sender,
+                email_subject=subject,
+                email_sender=sender,
                 email_date=email_date,
                 error_message=(
-                    f"Skipped: {ref.skip_reason} ({mime}, {ref.file_name or '?'})"
+                    f"Skipped: {ref.skip_reason} ({mime}, {file_name or '?'})"
                 ),
             )
             logger.info("Skipped %s: %s (%s)", ref.source_id, ref.skip_reason, mime)
@@ -889,31 +910,59 @@ def handle_item(
             source_type=source_type,
             source_name=source_name,
             status="started",
-            email_subject=ref.subject,
-            email_sender=ref.sender,
+            email_subject=subject,
+            email_sender=sender,
             email_date=email_date,
         )
 
         policy = policy or RetryPolicy()
         if fetch_error is not None or raw is None:
+            exc = fetch_error or LookupError("item is no longer in the source")
+            # A source's error can quote the item: a statement item's keeps
+            # its class alone, with no traceback.
+            message = (
+                type(exc).__name__
+                if statement and fetch_error is not None
+                else str(exc)
+            )
             _record_failure(
                 conn,
                 source_id=ref.source_id,
                 source_type=source_type,
                 source_name=source_name,
-                subject=ref.subject,
-                sender=ref.sender,
+                subject=subject,
+                sender=sender,
                 email_date=email_date,
-                exc=fetch_error or LookupError("item is no longer in the source"),
+                exc=exc,
                 extraction=None,
                 llm_model=llm_model,
                 policy=policy,
                 state=AttemptState(),
                 error_class="content",
+                error_message=message,
             )
-            logger.warning("Failed to fetch %s", ref.source_id, exc_info=fetch_error)
+            if statement:
+                logger.warning("Failed to fetch %s: %s", ref.source_id, message)
+            else:
+                logger.warning(
+                    "Failed to fetch %s", ref.source_id, exc_info=fetch_error
+                )
             return ItemOutcome("failed", error_class="content")
 
+        if statement:
+            from receipt_index.statements import process_statement
+
+            assert statement_agents is not None  # checked above
+            return process_statement(
+                conn,
+                raw,
+                store=store,
+                source_name=source_name,
+                agents=statement_agents,
+                llm_model=llm_model,
+                policy=policy,
+                control=control,
+            )
         return process_item(
             conn,
             raw,
@@ -1043,6 +1092,8 @@ def run_ingest(
     source_lock: SourceLock | None = None,
     policy: RetryPolicy | None = None,
     control: RunControl | None = None,
+    item_type: str | None = None,
+    statement_agents: StatementAgents | None = None,
 ) -> IngestResult:
     """Read what is new in one source and process it, one item at a time.
 
@@ -1050,7 +1101,16 @@ def run_ingest(
     every cursor write. ``dry_run`` reads the new range but writes nothing:
     no rows, no locks, no cursor. ``limit`` caps the unseen items handled.
     ``control`` (``serve``'s) can stop the loop between items.
+
+    ``source_type`` is the source's config type, which its sync state keeps;
+    ``item_type`` (``fetching.ingest_type``, default ``source_type``) is
+    what its items are logged and dispatched under. A statement source's
+    items need ``statement_agents``.
     """
+    item_type = item_type or source_type
+    if item_type == STATEMENT_INGEST_TYPE and statement_agents is None and not dry_run:
+        msg = f"source {source_name} takes statements: it needs the statement agents"
+        raise ValueError(msg)
     result = IngestResult()
     with adapter:
         folder = adapter.folder
@@ -1122,10 +1182,12 @@ def run_ingest(
                         ref,
                         store=store,
                         source_name=source_name,
-                        source_type=source_type,
+                        source_type=item_type,
                         agent=agent,
                         llm_model=llm_model,
                         policy=policy,
+                        statement_agents=statement_agents,
+                        control=control,
                     )
                 if outcome.status == "locked":
                     logger.info(
@@ -1134,9 +1196,11 @@ def run_ingest(
                     )
                     continue
                 processed_ids.add(ref.source_id)
-                if outcome.status == "success" and outcome.receipt is not None:
+                if outcome.status == "success":
+                    # A statement's success carries no receipt.
                     result.processed += 1
-                    result.receipts.append(outcome.receipt)
+                    if outcome.receipt is not None:
+                        result.receipts.append(outcome.receipt)
                 elif outcome.status == "skipped":
                     result.skipped += 1
                 elif outcome.status == "failed":
@@ -1150,14 +1214,22 @@ def run_ingest(
             if not dry_run:
                 cursor.finish()
         except (SourceLockLostError, SourceUnavailableError) as exc:
-            logger.error("Source %s: %s; stopping this source", source_name, exc)
-            result.source_error = str(exc)
+            # An adapter's error from fetching an item can quote it: a
+            # statement source's is kept by its class.
+            text = (
+                type(exc).__name__
+                if item_type == STATEMENT_INGEST_TYPE
+                and isinstance(exc, SourceUnavailableError)
+                else str(exc)
+            )
+            logger.error("Source %s: %s; stopping this source", source_name, text)
+            result.source_error = text
             record_poll(
                 conn,
                 source_name=source_name,
                 source_type=source_type,
                 folder=folder,
-                error=str(exc),
+                error=text,
             )
 
     return result
@@ -1256,6 +1328,14 @@ def run_due_retries(
             source_name = latest.source_name
             source_type = latest.source_type
             email_date = latest.email_date
+            # A statement item's rows carry no subject or sender, whatever an
+            # older row holds: a Drive item's subject is its file name.
+            statement = source_type == STATEMENT_INGEST_TYPE
+            subject = None if statement else latest.email_subject
+            sender = None if statement else latest.email_sender
+            # A receipt item's failed rows keep their old blank for a NULL.
+            failed_subject = None if statement else subject or ""
+            failed_sender = None if statement else sender or ""
             if source_type == STATEMENT_INGEST_TYPE and statement_agents is None:
                 # Left for a pass that has the statement agents, before any
                 # fetch or row: a started row here would be closed next pass
@@ -1277,8 +1357,8 @@ def run_due_retries(
                     source_id=entry.source_id,
                     source_type=source_type,
                     source_name=source_name,
-                    subject=latest.email_subject or "",
-                    sender=latest.email_sender or "",
+                    subject=failed_subject,
+                    sender=failed_sender,
                     email_date=email_date,
                     exc=RuntimeError(_DIED_MID_ITEM),
                     extraction=None,
@@ -1317,8 +1397,8 @@ def run_due_retries(
                 source_type=source_type,
                 source_name=name,
                 status="started",
-                email_subject=latest.email_subject,
-                email_sender=latest.email_sender,
+                email_subject=subject,
+                email_sender=sender,
                 email_date=email_date,
                 attempt=state.number,
             )
@@ -1331,8 +1411,7 @@ def run_due_retries(
                 # class alone, as the statement pipeline's own errors do.
                 message = (
                     type(exc_).__name__
-                    if source_type == STATEMENT_INGEST_TYPE
-                    and fetched.item_error is not None
+                    if statement and fetched.item_error is not None
                     else str(exc_)
                 )
                 _record_failure(
@@ -1340,8 +1419,8 @@ def run_due_retries(
                     source_id=entry.source_id,
                     source_type=source_type,
                     source_name=name,
-                    subject=latest.email_subject or "",
-                    sender=latest.email_sender or "",
+                    subject=failed_subject,
+                    sender=failed_sender,
                     email_date=email_date,
                     exc=exc_,
                     extraction=None,
@@ -1356,7 +1435,7 @@ def run_due_retries(
                 continue
 
             raw = fetched.raw
-            if source_type == STATEMENT_INGEST_TYPE:
+            if statement:
                 assert statement_agents is not None  # checked before the fetch
                 from receipt_index.statements import process_statement
 
