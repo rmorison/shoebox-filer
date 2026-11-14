@@ -142,11 +142,14 @@ class TestShutdownDuringAStatement:
         assert latest.counts_attempt is False
         assert latest.next_retry_at is not None
         assert latest.error_message is not None
-        assert "stopping" in latest.error_message
-        # The original stays, recorded, for the next start.
+        assert latest.error_message == (
+            "the process is stopping; the statement is retried after the "
+            "uncounted delay"
+        )
+        # The original stays, recorded, for the retry.
         assert _count(pg_conn, "stored_files") == 1
 
-        # The next start runs it as the same attempt, and completes it.
+        # The retry runs it as the same attempt, and completes it.
         state = attempt_state(get_item_history(pg_conn, raw.source_id))
         assert state.number == 1
         again = StopDuring(None, first_pass=_THREE_ACCOUNTS)

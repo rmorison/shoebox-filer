@@ -296,7 +296,7 @@ class StatementStoppedError(Exception):
     """The process is stopping: the item ends between phases, uncounted."""
 
 
-_STOPPED = "the process is stopping; the statement is run again on the next start"
+_STOPPED = "the process is stopping; the statement is retried after the uncounted delay"
 
 
 @dataclass
@@ -329,7 +329,7 @@ def _step(control: RunControl | None, source_id: str) -> None:
 
     A stop asked for since the last step ends the item here, before the
     next phase starts, as a :class:`StatementStoppedError`: no revision, no
-    counted attempt, and the item is run again on the next start. A stop
+    counted attempt, and the item is retried after the uncounted delay. A stop
     asked for during the last account call lets the item finish, since only
     the gates and one short write are left.
     """
