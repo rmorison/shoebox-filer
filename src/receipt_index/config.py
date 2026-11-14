@@ -99,6 +99,20 @@ class GdriveSourceConfig(BaseModel):
     # card statements, which go to the statement pipeline only.
     documents: Literal["receipts", "statements"] = "receipts"
 
+    @field_validator("folder_id")
+    @classmethod
+    def _normalize_folder_id(cls, value: str) -> str:
+        """Without surrounding whitespace or trailing ``/``.
+
+        Such a variant names no Drive folder, but it would slip past the
+        check that no statement source shares a folder with another source.
+        """
+        folder = value.strip().rstrip("/").strip()
+        if not folder:
+            msg = "folder_id is empty"
+            raise ValueError(msg)
+        return folder
+
 
 def _source_discriminator(v: Any) -> str:
     """Discriminate source config union by the ``type`` field."""

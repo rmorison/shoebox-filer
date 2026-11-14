@@ -122,6 +122,22 @@ class TestConfig:
                 _drive("more-statements", "f1", "statements"),
             )
 
+    @pytest.mark.parametrize("variant", ["abc/", " abc", "abc /", "\tabc//"])
+    def test_a_folder_id_variant_still_overlaps(self, variant: str) -> None:
+        with pytest.raises(ValidationError, match="same Drive folder as receipt"):
+            _app(_drive("scans", "abc"), _drive(_SOURCE, variant, "statements"))
+
+    def test_a_folder_id_is_kept_without_whitespace_or_a_trailing_slash(
+        self,
+    ) -> None:
+        (source,) = _app(_drive("scans", " abc/ ")).sources
+        assert isinstance(source, GdriveSourceConfig)
+        assert source.folder_id == "abc"
+
+    def test_two_receipt_sources_on_one_folder_stay_accepted(self) -> None:
+        config = _app(_drive("scans", "abc"), _drive("more-scans", "abc/"))
+        assert len(config.sources) == 2
+
     def test_two_sources_with_one_name_are_refused(self) -> None:
         with pytest.raises(ValidationError, match="two sources are named 'mail'"):
             _app(_imap("mail"), _drive("mail", "f2", "statements"))
