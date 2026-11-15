@@ -1457,12 +1457,10 @@ def test_amounts_side_by_side_and_plain_decimals_stay(text: str) -> None:
     assert mask_digits(text) == (text, 0)
 
 
-def test_amounts_side_by_side_stay_even_when_long_a_known_limit() -> None:
-    # Each token is an amount with cents, so none is part of a number.
-    assert mask_digits("Ref 41,11 11,11 11,11 11,11") == (
-        "Ref 41,11 11,11 11,11 11,11",
-        0,
-    )
+def test_four_amounts_side_by_side_of_card_length_are_cut() -> None:
+    # Each token is shaped like an amount with cents, but four groups of 13
+    # digits or more may be a card number: cut.
+    assert mask_digits("Ref 41,11 11,11 11,11 11,11") == ("Ref 1111", 1)
 
 
 @pytest.mark.parametrize(
@@ -1601,7 +1599,8 @@ def test_account_like_numbers_are_cut(number: str) -> None:
 
 def test_a_number_beside_a_date_is_cut_and_the_date_kept() -> None:
     assert mask_digits("Ref 12/31 4111.1111") == ("Ref 12/31 1111", 1)
-    assert mask_digits("Ref 411,111 111,111 1234.50") == ("Ref 1111 1234.50", 1)
+    # 16 digits in runs under 13: the amount-shaped group is cut too.
+    assert mask_digits("Ref 411,111 111,111 1234.50") == ("Ref 3450", 1)
 
 
 @pytest.mark.parametrize(
@@ -1651,8 +1650,9 @@ def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
         ("TUITION 2025-2026. 3 CREDITS", "TUITION 0263 CREDITS"),
         ("ZIP 98101-1234, 5 ITEMS", "ZIP 2345 ITEMS"),
         ("FY 2025 - 2026", "FY 2026"),
-        # A date-shaped first group stays beside the cut (a known limit).
-        ("Ref 12.11 3456 7890 1234", "Ref 12.11 1234"),
+        # A date-shaped first group in a span of 13 digits or more is cut
+        # with the rest.
+        ("Ref 12.11 3456 7890 1234", "Ref 1234"),
     ],
 )
 def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:

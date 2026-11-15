@@ -196,9 +196,9 @@ def test_an_amount_beside_a_store_number_stays_readable(text: str) -> None:
         # from a number's groups, so they are cut together.
         ("STORE 0412*4599", "STORE 4599"),
         ("STORE #0412 #4599", "STORE #4599"),
-        # A number whose last group runs into cents keeps that group, as it
-        # does when the groups are spaced.
-        ("Card 4111*1111*1111*1234.50", "Card 1111*1234.50"),
+        # A number whose last group runs into cents: 16 digits in runs under
+        # 13, so the amount-shaped group is cut with the rest.
+        ("Card 4111*1111*1111*1234.50", "Card 3450"),
     ],
 )
 def test_where_an_amount_and_a_number_cant_be_told_apart_the_mask_cuts(
@@ -656,3 +656,52 @@ def test_the_presentation_marks_are_other_letters() -> None:
 @pytest.mark.parametrize("mark", _PRESENTATION_MARKS)
 def test_a_presentation_form_of_a_mark_joins(mark: str) -> None:
     assert mask_digits(f"Card {_number(mark)}") == ("Card 4444", 1)
+
+
+# An amount or a date is set aside only in a span of fewer than 13 digits,
+# its own included: the shortest card number. A card number's groups that
+# look like an amount or a date are cut with the rest.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("4111 1111 11.11 1111", "1111"),
+        ("4111 11/09 1111 1234", "1234"),
+        ("4111*2222*3333*44.55", "4455"),
+        ("Card 4111 2222 33.44 5", "Card 3445"),  # 13 digits: the boundary
+    ],
+)
+def test_an_amount_or_date_in_a_card_length_span_is_cut(
+    text: str, expected: str
+) -> None:
+    assert mask_digits(text) == (expected, 1)
+
+
+def test_an_amount_in_a_span_of_twelve_digits_is_kept() -> None:
+    assert mask_digits("Card 4111 2222 33.44") == ("Card 2222 33.44", 1)
+
+
+@pytest.mark.parametrize("text", ["STORE #0412 $45.99", "STORE 0412*45.99"])
+def test_an_amount_beside_a_store_number_is_still_kept(text: str) -> None:
+    assert mask_digits(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PAYMENT 4111 1111 1111 1234 12.50",  # a whole run of 13 or more
+        "RENT 11/01-11/30 1,200.00",
+        "$12,345.67 $23,456.78",
+        "Fees 1.11 1/11 2.22 3.33",  # four groups, under 13 digits
+    ],
+)
+def test_amounts_and_dates_beside_a_whole_run_or_alone_are_kept(text: str) -> None:
+    masked, _ = mask_digits(text)
+    assert masked is not None
+    assert masked.endswith(text.split()[-1])
+    if not text.startswith("PAYMENT"):
+        assert mask_digits(text) == (text, 0)
+
+
+def test_a_card_written_only_in_amount_and_date_shapes_is_cut() -> None:
+    # Four or more groups, 13 digits or more, every one set aside.
+    assert mask_digits("Ref 41.11 11/11 11.11 12.34") == ("Ref 1234", 1)

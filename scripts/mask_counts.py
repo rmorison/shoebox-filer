@@ -113,6 +113,8 @@ LABELS: tuple[str, ...] = (
     "effect.short_tokens_after_a_date_cut",
     "effect.adjacent_tokens_joined_cut",
     "effect.bare_thousands_over_nine_digits_cut",
+    # A span of 13 digits or more cut whole, its amounts and dates with it.
+    "effect.card_length_span_cut",
     "overcut.two_years_side_by_side",
     "overcut.two_group_dash_number",
     "overcut.two_bare_thousands_side_by_side",
@@ -244,6 +246,13 @@ def _count_span(
     source: str | None = None,
 ) -> int:
     se = mask.se
+    groups, runs = se._split_runs(span)
+    if se._cut_whole(span, groups, runs):
+        # Cut whole: nothing is set aside, every group is one run.
+        counts["effect.card_length_span_cut"] += 1
+        cut = _count_run(mask, span, groups, after_date=False, counts=counts)
+        counts["cuts"] += int(cut)
+        return int(cut)
     tokens = list(se._TOKEN.finditer(span))
     left = [
         t

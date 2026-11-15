@@ -107,8 +107,18 @@ _CASES: list[tuple[str, dict[str, int]]] = [
         },
     ),
     ("Total 123,456,789", {"limit.lone_bare_thousands_kept": 1, "cuts": 0}),
-    ("12.11 3456 7890 1234", {"limit.date_shaped_group_before_a_cut": 1}),
-    ("PMT 4111 1111 1111 1234.50", {"limit.amount_right_after_a_cut": 1}),
+    # Under 13 digits in the span, an amount or a date beside a cut stays.
+    ("12.11 3456 7890", {"limit.date_shaped_group_before_a_cut": 1}),
+    ("PMT 4111 1111 34.50", {"limit.amount_right_after_a_cut": 1}),
+    # From 13 digits, with no whole run that long, it is cut too.
+    (
+        "12.11 3456 7890 1234",
+        {"limit.date_shaped_group_before_a_cut": 0, "effect.card_length_span_cut": 1},
+    ),
+    (
+        "PMT 4111 1111 1111 1234.50",
+        {"limit.amount_right_after_a_cut": 0, "effect.card_length_span_cut": 1},
+    ),
     # Any punctuation or symbol, or an x, joins digit groups; tokens split at
     # those marks, so an amount beside a store number is still set aside.
     ("Card 4111#2222#3333#4444", {"cuts": 1}),
@@ -120,6 +130,17 @@ _CASES: list[tuple[str, dict[str, int]]] = [
     ("Call (555) 123-4567", {"effect.adjacent_tokens_joined_cut": 1, "cuts": 1}),
     ("At 12:30:45.123", {"effect.adjacent_tokens_joined_cut": 1, "cuts": 1}),
     ("ACCT 12345-6789 #0412", {"neighbour.zip4_cut": 1, "cuts": 1}),
+    # A span of 13 digits or more, cut whole with its amount or date.
+    (
+        "Card 4111 1111 11.11 1111",
+        {"effect.card_length_span_cut": 1, "cuts": 1, "set_aside.amount_with_cents": 0},
+    ),
+    ("Ref 41.11 11/11 11.11 12.34", {"effect.card_length_span_cut": 1, "cuts": 1}),
+    # A whole run of 13 digits or more: the amount beside it is set aside.
+    (
+        "PAYMENT 4111 1111 1111 1234 12.50",
+        {"effect.card_length_span_cut": 0, "set_aside.amount_with_cents": 1},
+    ),
 ]
 
 

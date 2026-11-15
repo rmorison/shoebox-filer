@@ -697,33 +697,36 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     ``_digit_fold``: a digit of any script, a circled, superscript or fullwidth
     digit, a number character worth a whole number, a symbol that expands to
     digits; never an other letter). A vulgar fraction becomes its digits around
-    the fraction slash, after a space if a digit precedes it. Separators are folded
-    (whitespace to one space, Unicode dashes to ``-``), and invisible characters
-    inside a number are dropped. Those three, the normalisation and the cut are
-    the only changes to the text. Then each span of digit groups joined by any
-    run of spaces and joiners is read: a joiner is any punctuation or symbol
-    (``# : * | + $ %``, brackets, a bullet, a star, a fullwidth form), modifier
-    letter, spacing mark, number character left after the fold (never counted),
-    or x letter (x, chi, khi and Cyrillic ha forms, and letters built on them),
-    classified after NFKC. The span is split into tokens at its spaces and at
-    every joiner except the marks that shape an amount or a date (``- . / , '
-    \u2019 \u00b7 \u2044``). An amount with cents and a short date (``11/09``,
-    ``11/09/2026``, or a range of them) are set aside and break a run. So are a
-    range of years (``2025-2026``) and a ZIP+4 (``94105-1234``), but only when,
-    once amounts and dates are set aside, one is the only token with digits left
-    in its span; beside any other digit group either is part of a number. Every
-    run of the other tokens that totals eight digits or more is cut to its last
-    four digits. A lone bare amount in thousands groups (nine digits or fewer,
-    ``123,456,789``) stays. So an amount with cents or a date beside a store
-    number stays readable (``STORE #0412 $45.99``, ``0412*45.99``), while groups
-    split by any mark are cut together (``4111#2222#3333#4444`` becomes
-    ``4444``). Where the two can't be told apart (``STORE 0412*4599``) they are
-    cut: a leaked number costs more than an over-cut description. Only a letter
-    (cased, or another letter such as a CJK ideograph) that isn't an x form ends
-    a span. Known limits: an other letter that looks like a mark (a click letter
-    like a bar) ends one too, and so keeps a number in parts; an other letter
-    with a numeral value is not folded, so a number written wholly in them
-    passes.
+    the fraction slash, after a space if a digit precedes it. Separators are
+    folded (whitespace to one space, Unicode dashes to ``-``), and invisible
+    characters inside a number are dropped. Those three, the normalisation and
+    the cut are the only changes to the text. Then each span of digit groups
+    joined by any run of spaces and joiners is read: a joiner is any punctuation
+    or symbol (``# : * | + $ %``, brackets, a bullet, a star, a fullwidth form),
+    modifier letter, spacing mark, number character left after the fold (never
+    counted), or x letter (x, chi, khi and Cyrillic ha forms, and letters built
+    on them), classified after NFKC. The span is split into tokens at its spaces
+    and at every joiner except the marks that shape an amount or a date (``- . /
+    , ' \u2019 \u00b7 \u2044``). An amount with cents and a short date
+    (``11/09``, ``11/09/2026``, or a range of them) are set aside and break a
+    run. So are a range of years (``2025-2026``) and a ZIP+4 (``94105-1234``),
+    but only when, once amounts and dates are set aside, one is the only token
+    with digits left in its span; beside any other digit group either is part of
+    a number. Every run of the other tokens that totals eight digits or more is
+    cut to its last four digits. A span of 13 digits or more, the shortest card
+    number, sets nothing aside and is cut whole when no run of its number tokens
+    holds 13 digits, or when it has only amounts and dates in four groups or
+    more (see ``_cut_whole``). A lone bare amount in thousands groups (nine
+    digits or fewer, ``123,456,789``) stays. So an amount with cents or a date
+    beside a store number stays readable (``STORE #0412 $45.99``,
+    ``0412*45.99``), while groups split by any mark are cut together
+    (``4111#2222#3333#4444`` becomes ``4444``). Where the two can't be told
+    apart (``STORE 0412*4599``) they are cut: a leaked number costs more than an
+    over-cut description. Only a letter (cased, or another letter such as a CJK
+    ideograph) that isn't an x form ends a span. Known limits: an other letter
+    that looks like a mark (a click letter like a bar) ends one too, and so
+    keeps a number in parts; an other letter with a numeral value is not folded,
+    so a number written wholly in them passes.
     """
     if text is None:
         return None, 0
@@ -756,6 +759,12 @@ _BARE_THOUSANDS = re.compile(r"[0-9]{1,3}([,.'\u2019])[0-9]{3}(?:\1[0-9]{3})*")
 _MAX_AMOUNT_DIGITS: Final = 12
 _MAX_BARE_AMOUNT_DIGITS: Final = 9
 _MIN_MASKED_DIGITS: Final = 8
+# The shortest card number, and the fewest groups a card number printed
+# only in amount- or date-shaped groups has. A span with that many digits,
+# an amount's or a date's own included, may set nothing aside: see
+# _cut_whole.
+_MIN_CARD_DIGITS: Final = 13
+_MIN_CARD_GROUPS: Final = 4
 # A short date, or a range of two: month and day (either order) with "/" or
 # ".", and an optional two- or four-digit year.
 _DATE = re.compile(
@@ -813,6 +822,18 @@ def _set_aside(token: str, *, alone: bool) -> bool:
 
 def _cut_tokens(span: str) -> tuple[str, int]:
     """One span with every run of number tokens of eight digits or more cut."""
+    groups, runs = _split_runs(span)
+    if _cut_whole(span, groups, runs):
+        return _cut_runs(span, [groups])
+    return _cut_runs(span, runs)
+
+
+Runs = list[list[re.Match[str]]]
+
+
+def _split_runs(span: str) -> tuple[list[re.Match[str]], Runs]:
+    """A span's tokens with digits, and its runs of number tokens between
+    the set-aside ones."""
     tokens = list(_TOKEN.finditer(span))
     # "Alone": once amounts and dates are set aside, the only token with
     # digits left in the span. A span ends at any mark that isn't a joiner.
@@ -831,6 +852,31 @@ def _cut_tokens(span: str) -> tuple[str, int]:
         elif _NON_DIGIT.sub("", token.group()):
             runs[-1].append(token)
         # A token of marks alone (" - ", " . ") neither counts nor breaks.
+    groups = [t for t in tokens if _NON_DIGIT.sub("", t.group())]
+    return groups, runs
+
+
+def _cut_whole(span: str, groups: list[re.Match[str]], runs: Runs) -> bool:
+    """Whether a span is cut whole, its amounts and dates included.
+
+    Only a span of 13 digits or more is, and only when some number tokens are
+    left once amounts and dates are set aside and no run of them holds 13 digits
+    or more: a card number split by amount- or date-shaped groups. A whole run
+    of 13 or more is a card number already, cut on its own, so an amount beside
+    it stays. A span of amounts and dates alone is cut when it has four groups
+    or more (a card number in four groups shaped like amounts or dates); with
+    fewer it stays, like a rent line's dates and amount.
+    """
+    if len(_NON_DIGIT.sub("", span)) < _MIN_CARD_DIGITS:
+        return False
+    lengths = [len(_NON_DIGIT.sub("", "".join(t.group() for t in run))) for run in runs]
+    if any(lengths):
+        return max(lengths) < _MIN_CARD_DIGITS
+    return len(groups) >= _MIN_CARD_GROUPS
+
+
+def _cut_runs(span: str, runs: Runs) -> tuple[str, int]:
+    """``span`` with each run of eight digits or more cut to its last four."""
     pieces: list[str] = []
     position = 0
     cuts = 0
