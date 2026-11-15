@@ -1687,6 +1687,22 @@ def test_a_year_range_or_zip_alone_in_its_span_stays(text: str) -> None:
         ("Call (555) 123-4567", "Call (4567"),
         ("At 12:30:45.123", "At 5123"),
         ("ACCT 12345-6789 #0412", "ACCT 0412"),
+        # Whole amounts and counters side by side, with no store number:
+        # no cents, so they read as a number's groups.
+        ("$1,000 $2,000", "$2000"),
+        ("$1,000 - $2,000", "$2000"),
+        ("$12,500 $13,000", "$3000"),
+        ("100% 200% 300% 400%", "0400%"),
+        ("(1234) (5678)", "(5678)"),
+        ("Cash back 5% 12345678", "Cash back 5678"),
+        # A date with a time, and a range of two dashed dates.
+        ("2026-11-15 12:34:56", "3456"),
+        ("2026-11-15 2026-11-16", "1116"),
+        # A span of 13 digits or more with no whole run that long is cut
+        # whole: a store number, a date and two amounts.
+        ("STORE 0412 11/09 45.99 12.50", "STORE 1250"),
+        # One character worth ten million or more folds to eight digits.
+        ("Units \U0001eca1", "Units 0000"),
     ],
 )
 def test_shapes_joined_by_any_mark_are_over_cut(text: str, expected: str) -> None:
