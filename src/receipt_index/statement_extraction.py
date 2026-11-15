@@ -415,8 +415,8 @@ def normalise_institution(name: str | None) -> str | None:
 # Normalisation drops many of those, but not all (an Arabic number sign, a
 # Mongolian selector, a combining accent), and none may hide a number. A digit
 # outside ASCII (fullwidth, circled, another script's, a number character
-# worth a whole number) counts once folded, by decision; a fraction and an other
-# letter with a numeral value are not folded.
+# worth a whole number, a vulgar fraction's digits) counts once folded, by
+# decision; an other letter with a numeral value is not folded.
 _IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
 # Letters and symbols that render as blank space. The normaliser drops the
 # Hangul and halfwidth fillers and the blank Braille pattern; the mask joins
@@ -580,6 +580,7 @@ def _dashes() -> re.Pattern[str]:
 def warm_mask() -> None:
     """Build the mask's patterns now, once per process (several seconds)."""
     _digit_folds()
+    _fraction_folds()
     _masked_run()
     _invisible()
     _span()
@@ -607,10 +608,9 @@ def _digit_fold(ch: str) -> str | None:
       mathematical digit, or a symbol that expands to digits and a word,
       of which only the digits are kept. (NFKD finds no digit NFKC misses.)
 
-    A vulgar fraction (its NFKC form holds the fraction slash) is never
-    folded: ``1`` and a half stays as written. It joins as a number
-    character. Other letters (Lo) with a numeral value are never folded:
-    they are letters, and a known limit.
+    A vulgar fraction (its NFKC form holds the fraction slash) is folded
+    apart, by ``_fraction_folds``. Other letters (Lo) with a numeral value
+    are never folded: they are letters, and a known limit.
     """
     if ch.isascii():
         return None
@@ -641,9 +641,39 @@ def _digit_folds() -> dict[int, str]:
     return folds
 
 
+@functools.cache
+def _fraction_folds() -> tuple[re.Pattern[str], dict[str, str]]:
+    """Every vulgar fraction, and its NFKC form (ASCII digits and the
+    fraction slash, U+2044), built once."""
+    forms: dict[str, str] = {}
+    for code in range(0x80, sys.maxunicode + 1):
+        if 0xD800 <= code <= 0xDFFF:
+            continue
+        ch = chr(code)
+        nfkc = unicodedata.normalize("NFKC", ch)
+        if nfkc != ch and "\u2044" in nfkc:
+            forms[ch] = nfkc.translate(_digit_folds())
+    pattern = re.compile("[" + "".join(re.escape(ch) for ch in forms) + "]")
+    return pattern, forms
+
+
 def _fold_digits(text: str) -> str:
-    """Every digit outside ASCII to the ASCII digits it stands for."""
-    return text.translate(_digit_folds())
+    """Every digit outside ASCII to the ASCII digits it stands for.
+
+    A vulgar fraction becomes its NFKC form, so its digits count: a half is
+    ``1`` and ``2`` around the fraction slash. After a digit it takes a
+    space first, so ``72`` and a half reads ``72 1/2`` (with the fraction
+    slash), not one number.
+    """
+    text = text.translate(_digit_folds())
+    pattern, forms = _fraction_folds()
+
+    def fold(match: re.Match[str]) -> str:
+        start = match.start()
+        space = " " if start and "0" <= text[start - 1] <= "9" else ""
+        return space + forms[match.group()]
+
+    return pattern.sub(fold, text)
 
 
 def _prepare(text: str) -> str:
@@ -665,8 +695,9 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     The text is normalised as the statement's was. Every character outside ASCII
     that stands for digits becomes the ASCII digits it stands for (see
     ``_digit_fold``: a digit of any script, a circled, superscript or fullwidth
-    digit, a number character worth a whole number, a symbol that expands to digits;
-    never a vulgar fraction or an other letter). Separators are folded
+    digit, a number character worth a whole number, a symbol that expands to
+    digits; never an other letter). A vulgar fraction becomes its digits around
+    the fraction slash, after a space if a digit precedes it. Separators are folded
     (whitespace to one space, Unicode dashes to ``-``), and invisible characters
     inside a number are dropped. Those three, the normalisation and the cut are
     the only changes to the text. Then each span of digit groups joined by any

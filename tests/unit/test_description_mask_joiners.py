@@ -256,7 +256,8 @@ def _stands_for_digits(ch: str) -> bool:
     # its NFKC or NFKD form; never a vulgar fraction.
     nfkc = unicodedata.normalize("NFKC", ch)
     if "\u2044" in nfkc:
-        return False
+        # A vulgar fraction folds to digits and the fraction slash.
+        return nfkc != ch
     if unicodedata.category(ch) in {"No", "Nl"}:
         value = unicodedata.numeric(ch, None)
         if value is not None and value.is_integer() and value >= 0:
@@ -561,13 +562,34 @@ def test_a_digit_value_zero_counts_toward_the_eight(zero: str) -> None:
     assert mask_digits(f"Ref 123{zero * 3}45") == ("Ref 0045", 1)
 
 
-_FRACTIONS = ["\u00bd", "\u2153", "\u215f", "\u2189"]
+# Vulgar fractions: each folds to its NFKC form, digits and the fraction
+# slash, and its digits count. After a digit it takes a space first, so a
+# whole number and a fraction stay apart.
+_FRACTIONS = [
+    "\u00bc",
+    "\u00bd",
+    "\u00be",
+    *[chr(code) for code in range(0x2150, 0x2160)],
+    "\u2189",
+]
 
 
 @pytest.mark.parametrize("fraction", _FRACTIONS)
-def test_a_fraction_is_not_folded(fraction: str) -> None:
-    text = f"Paid 1{fraction} lb"
-    assert mask_digits(text) == (text, 0)
+def test_a_fractions_digits_count(fraction: str) -> None:
+    masked, runs = mask_digits(f"Ref 1234{fraction}456")
+    assert runs == 1
+    assert masked is not None
+    assert len([ch for ch in masked if ch.isdigit()]) == 4
+
+
+def test_a_fraction_one_inside_a_number_counts() -> None:
+    assert mask_digits("Acct 123\u215f4567") == ("Acct 4567", 1)
+
+
+def test_a_fraction_after_a_whole_number_stays_readable() -> None:
+    assert mask_digits("Paid 72\u00bd lb") == ("Paid 72 1\u20442 lb", 0)
+    assert mask_digits("Paid \u00bd lb") == ("Paid 1\u20442 lb", 0)
+    assert mask_digits("\u00bd lb") == ("1\u20442 lb", 0)
 
 
 @pytest.mark.parametrize("fraction", _FRACTIONS)
