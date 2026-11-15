@@ -670,6 +670,7 @@ def test_every_run_clamps_a_payload_logger_lowered_after_start(
     monkeypatch.setattr(statements, "insert_ingest_log", lambda _conn, **_row: None)
     monkeypatch.setattr(statements, "statement_for_sha256", lambda *_a: None)
     monkeypatch.setattr(statements, "put_original", lambda *_a, **_k: MagicMock())
+    monkeypatch.setattr(statements, "record_original", lambda *_a, **_k: MagicMock())
     monkeypatch.setattr(statements, "extract_statement", extract)
     raw = RawReceipt(
         source_type="gdrive_statement",

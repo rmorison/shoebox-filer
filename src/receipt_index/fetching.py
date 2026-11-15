@@ -125,7 +125,10 @@ def fetch_item(
             raw = pool.adapter(name).fetch_by_id(source_id)
         except SourceUnavailableError as exc:
             logger.warning("Source %s is unavailable; not contacting it again", name)
-            pool.unavailable[name] = f"source {name} unavailable: {exc}"
+            # A statement source's error is kept by its class: the adapter's
+            # text names the item and the API's reason, which can quote it.
+            reason = type(exc).__name__ if source_type == STATEMENT_INGEST_TYPE else exc
+            pool.unavailable[name] = f"source {name} unavailable: {reason}"
             raise SourceDownError(pool.unavailable[name]) from exc
         except Exception as exc:
             if source_type == STATEMENT_INGEST_TYPE:

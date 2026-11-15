@@ -181,8 +181,10 @@ def store_email_original(
     The folder is ``originals/YYYY/MM/{received-date}__{source}__{hash}``,
     from the ``.eml``'s sha256 and ``received_at``. An email with no Date
     header is dated when it was fetched, so a retry on a later day writes a
-    second folder and leaves the first for ``verify --orphans``. Bytes that
-    occur twice in the email are written once.
+    second folder and leaves the first unrecorded. Nothing reports such a
+    folder yet: ``failures --orphans`` lists only renditions that failed
+    rows recorded, and the evidence-store design's ``verify --orphans`` isn't
+    built. Bytes that occur twice in the email are written once.
 
     ``conn`` is only read, to find bytes the store already holds; the caller
     owns its transaction. Raises ``ValueError`` without ``raw.raw_bytes``.

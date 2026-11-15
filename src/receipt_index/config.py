@@ -95,6 +95,23 @@ class GdriveSourceConfig(BaseModel):
     type: Literal["gdrive"] = "gdrive"
     folder_id: str
     token_json: str
+    # What the folder holds: receipts (the default, unchanged) or bank and
+    # card statements, which go to the statement pipeline only.
+    documents: Literal["receipts", "statements"] = "receipts"
+
+    @field_validator("folder_id")
+    @classmethod
+    def _normalize_folder_id(cls, value: str) -> str:
+        """Without surrounding whitespace or trailing ``/``.
+
+        Such a variant names no Drive folder, but it would slip past the
+        check that no statement source shares a folder with another source.
+        """
+        folder = value.strip().rstrip("/").strip()
+        if not folder:
+            msg = "folder_id is empty"
+            raise ValueError(msg)
+        return folder
 
 
 def _source_discriminator(v: Any) -> str:
@@ -282,6 +299,36 @@ class AppConfig(BaseModel):
     logging: LoggingConfig = LoggingConfig()
     ingest: IngestConfig = IngestConfig()
     annotations: AnnotationsConfig = AnnotationsConfig()
+
+    @model_validator(mode="after")
+    def _check_sources(self) -> AppConfig:
+        """Source names are unique, and a statement folder is no other's.
+
+        A source's name keys its sync state, its lock and its retries, so
+        two sources with one name would share them. A folder read as both
+        receipts and statements would send each file down both pipelines,
+        and two statement sources on one folder would read each file twice.
+        The folder ID is the only folder value refused: a folder reached by
+        another route (a shortcut, a parent folder) isn't seen.
+        """
+        seen: set[str] = set()
+        for source in self.sources:
+            if source.name in seen:
+                msg = f"two sources are named {source.name!r}"
+                raise ValueError(msg)
+            seen.add(source.name)
+        drive = [s for s in self.sources if isinstance(s, GdriveSourceConfig)]
+        for source in drive:
+            if source.documents != "statements":
+                continue
+            for other in drive:
+                if other is not source and other.folder_id == source.folder_id:
+                    msg = (
+                        f"statement source {source.name!r} reads the same Drive "
+                        f"folder as {other.documents[:-1]} source {other.name!r}"
+                    )
+                    raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _check_source_stale(self) -> AppConfig:

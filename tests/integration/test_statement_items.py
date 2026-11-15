@@ -259,6 +259,12 @@ class TestDone:
 
 
 class TestFeedLock:
+    # This relies on statement writes running at READ COMMITTED (Key
+    # Technical Decisions): each statement takes a new snapshot, so the copy
+    # check the item runs after the feed lock is granted sees the holder's
+    # committed statement. At REPEATABLE READ or SERIALIZABLE the snapshot
+    # would date from the transaction's first statement, before the lock, and
+    # the check would miss it.
     def test_an_item_waits_on_the_feed_lock_and_ends_as_a_copy(
         self,
         pg_conn: psycopg.Connection[dict[str, Any]],

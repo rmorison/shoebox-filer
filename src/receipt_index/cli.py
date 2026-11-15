@@ -24,7 +24,7 @@ from receipt_index.paging import page_envelope
 load_dotenv()
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from datetime import datetime
     from decimal import Decimal
 
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from receipt_index.duplicates import Actor, CandidateStatus
     from receipt_index.models import IngestLogEntry, Receipt, ReceiptEvent
     from receipt_index.requeue import OrphanReport, RequeueOutcome
+    from receipt_index.statements import StatementAgents
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def ingest(
     from receipt_index.adapters.imap import ImapAdapter
     from receipt_index.config import GdriveSourceConfig, ImapSourceConfig
     from receipt_index.db import INGEST_STATEMENT_TIMEOUT_SECONDS, get_connection
-    from receipt_index.fetching import SourcePool
+    from receipt_index.fetching import SourcePool, ingest_type
     from receipt_index.locks import SourceLock
     from receipt_index.pipeline import IngestResult, run_due_retries, run_ingest
     from receipt_index.repository import select_due
@@ -149,6 +150,8 @@ def ingest(
 
     agents = _extraction_agents(config, config.llm.model)
     email_agent, document_agent = agents["email"], agents["document"]
+    # Statement sources go to the statement pipeline, as in `serve`.
+    statement_agents = None if dry_run else _statement_agents(config, sources)
     policy = RetryPolicy.from_config(config.ingest)
     totals = IngestResult()
     source_results: list[tuple[str, IngestResult]] = []
@@ -195,12 +198,14 @@ def ingest(
                     store=store,
                     source_name=source_config.name,
                     source_type=source_config.type,
+                    item_type=ingest_type(source_config),
                     agent=agent,
                     llm_model=config.llm.model,
                     dry_run=dry_run,
                     limit=limit,
                     source_lock=source_lock,
                     policy=policy,
+                    statement_agents=statement_agents,
                 )
                 # Retries for the sources this run holds, after the read; not
                 # when the read itself stopped.
@@ -208,7 +213,7 @@ def ingest(
                     due = select_due(
                         conn,
                         source_name=source_config.name,
-                        source_type=source_config.type,
+                        source_type=ingest_type(source_config),
                         configured=[s.name for s in config.sources],
                         limit=limit,
                     )
@@ -232,6 +237,7 @@ def ingest(
                             llm_model=config.llm.model,
                             policy=policy,
                             own_source=source_config.name,
+                            statement_agents=statement_agents,
                         )
                         result.processed += retried.processed
                         result.skipped += retried.skipped
@@ -347,6 +353,9 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
         agents = _extraction_agents(config, config.llm.model)
         ingest_config = config.ingest
         health = ingest_config.health
+        # Only the sources this serve holds: their retry passes are the only
+        # ones that take statement items.
+        statement_agents = _statement_agents(config, held)
         service = Service(
             sources=held,
             all_sources=config.sources,
@@ -372,6 +381,7 @@ def serve(ctx: click.Context, source_names: tuple[str, ...]) -> None:
             ping_interval_seconds=health.ping_interval_seconds,
             ping_probe=_ping_probe(config),
             requested=[s.name for s in sources],
+            statement_agents=statement_agents,
         )
 
         def _on_signal(signum: int, _frame: object) -> None:
@@ -1610,6 +1620,28 @@ def _extraction_agents(config: AppConfig, model: str) -> dict[str, Any]:
     }
 
 
+def _statement_agents(
+    config: AppConfig, sources: Sequence[SourceConfig]
+) -> StatementAgents | None:
+    """The statement agents, when any of ``sources`` takes statements.
+
+    Built only through ``llm.anthropic_model``, whose client never traces,
+    and ``StatementAgents.create``, which refuses to build while tracing
+    instrumentation is loaded.
+    """
+    from receipt_index.fetching import STATEMENT_INGEST_TYPE, ingest_type
+
+    if not any(ingest_type(s) == STATEMENT_INGEST_TYPE for s in sources):
+        return None
+    from receipt_index.llm import anthropic_model
+    from receipt_index.statements import StatementAgents
+
+    model, settings = anthropic_model(
+        api_key=config.llm.api_key, model=config.llm.model
+    )
+    return StatementAgents.create(model, settings)
+
+
 def _cost(tokens: Decimal, price: Decimal | None) -> Decimal | None:
     from decimal import Decimal
 
@@ -1743,6 +1775,15 @@ def backfill(
         click.echo(
             f"Error: source {source_name!r} not found in config. "
             f"Available sources: {available}",
+            err=True,
+        )
+        sys.exit(1)
+    if getattr(source_config, "documents", None) == "statements":
+        # Backfill runs the receipt pipeline; a statement source's items
+        # never go there.
+        click.echo(
+            f"Error: source {source_name!r} takes statements; backfill reads "
+            "receipt sources only",
             err=True,
         )
         sys.exit(1)

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
 import psycopg
 import pytest
 
@@ -166,7 +169,10 @@ def test_no_masked_file_name_holds_eight_digits_in_a_row() -> None:
         )
         masked = masked_file_name(name)
         assert masked is None or not re.search(r"[0-9]{8}", masked), name
-        assert masked_file_name(masked) == masked, name  # idempotent
+        # These names settle within the passes, so masking again changes
+        # nothing (not promised for a name that hasn't settled by the last
+        # pass: see masked_file_name).
+        assert masked_file_name(masked) == masked, name
         # Nor eight digits, of any script, joined by anything but a word of
         # five or more letters.
         normalized = unicodedata.normalize("NFKC", masked or "")
@@ -220,6 +226,50 @@ def test_an_item_whose_source_is_gone_is_looked_for_in_sources_of_its_type() -> 
         assert pool.candidates("statements-drive", STATEMENT_INGEST_TYPE) == [
             "statements-drive"
         ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # 200k characters: digit groups joined by a four-letter word, one
+        # run of the whole name.
+        ("1234abcd" * 25_000)[:200_000],
+        ("9" * 50 + "abcd") * (200_000 // 54),
+        # 200k characters of an escape that decodes to another escape.
+        "%25" * 66_667,
+        "%25" * 66_660 + "4111",
+    ],
+    ids=["digits-and-a-short-word", "long-groups", "percent-25", "percent-25-digits"],
+)
+def test_a_very_long_name_is_masked_in_bounded_passes(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from receipt_index import statements
+
+    passes = {"cut": 0, "decode": 0}
+    cut, decode = statements._cut_name_runs, statements.urllib.parse.unquote
+
+    def counted_cut(value: str) -> str:
+        passes["cut"] += 1
+        return cut(value)
+
+    def counted_decode(value: str, *args: Any, **kwargs: Any) -> str:
+        passes["decode"] += 1
+        return decode(value, *args, **kwargs)
+
+    monkeypatch.setattr(statements, "_cut_name_runs", counted_cut)
+    monkeypatch.setattr(statements.urllib.parse, "unquote", counted_decode)
+    start = time.perf_counter()
+    masked = masked_file_name(name)
+    elapsed = time.perf_counter() - start
+    bound = statements._NAME_DECODE_PASSES
+    assert passes["cut"] <= bound
+    assert passes["decode"] <= bound * bound
+    # Linear passes over 200k characters: about a second here at most.
+    assert elapsed < 20, elapsed
+    assert masked is None or not re.search(r"[0-9]{8}", masked)
 
 
 def test_warm_mask_builds_the_patterns() -> None:

@@ -479,3 +479,76 @@ def test_startup_check_passes_read_role() -> None:
 def test_startup_check_refuses_in_process(role: str, match: str) -> None:
     with pytest.raises(RoleCheckError, match=match):
         startup_check(_dsn(role))
+
+
+@pytest.mark.usefixtures("roles")
+def test_an_original_no_statement_points_at_shows_in_no_tool(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    store: Path,
+    tmp_path: Path,
+) -> None:
+    """A statement item that failed after its original was put (plan U6).
+
+    The original is recorded when it is put, so it can stay with no
+    statement and no receipt pointing at it. No read tool lists it: the
+    tools reach a file only through a receipt.
+    """
+    import hashlib
+
+    from receipt_index.repository import record_original
+
+    data = b"%PDF-1.4 synthetic statement"
+    locator = "originals/2027/02/2027-02-03__statements-drive__abc/statement.pdf"
+    digest = hashlib.sha256(data).digest()
+    file_id = record_original(
+        pg_conn,
+        ref=f"local:{locator}",
+        sha256=digest,
+        byte_size=len(data),
+        media_type="application/pdf",
+    )
+    insert_ingest_log(
+        pg_conn,
+        source_id="drive-statement-1",
+        source_type="gdrive_statement",
+        source_name="statements-drive",
+        status="failed",
+        error_message="the gates refused the statement: GateInputError",
+        error_class="content",
+        counts_attempt=True,
+    )
+    pg_conn.commit()
+    log = tmp_path / "mcp-access.jsonl"
+
+    async def session() -> dict[str, CallToolResult]:
+        async with Client(_in_process(store, log)) as client:
+            # The file's own ID, where a receipt ID goes: a tool that read
+            # stored_files directly would answer with the file.
+            by_file_id = {"receipt_id": str(file_id)}
+            return {
+                "all": await client.call_tool("search_receipts", {}),
+                "failures": await client.call_tool("list_failures", {}),
+                "one": await client.call_tool("get_receipt", by_file_id),
+                "file": await client.call_tool("get_receipt_file", by_file_id),
+            }
+
+    r = anyio.run(session)
+    found = r["all"].structured_content
+    assert found is not None
+    assert found["total"] == 0
+    failures = r["failures"].structured_content
+    assert failures is not None
+    (failure,) = failures["failures"]
+    assert failure["source_id"] == "drive-statement-1"
+    assert not r["all"].is_error
+    assert not r["failures"].is_error
+    # Not found, as for any ID that names no receipt: the file isn't an error
+    # of its own, and no tool reaches it.
+    for name in ("one", "file"):
+        assert r[name].is_error
+        assert "not found" in json.dumps(r[name].model_dump(mode="json")).lower()
+    for result in r.values():
+        out = json.dumps(result.model_dump(mode="json"))
+        assert "statement.pdf" not in out
+        assert locator not in out
+        assert digest.hex() not in out
