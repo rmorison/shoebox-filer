@@ -705,3 +705,35 @@ def test_amounts_and_dates_beside_a_whole_run_or_alone_are_kept(text: str) -> No
 def test_a_card_written_only_in_amount_and_date_shapes_is_cut() -> None:
     # Four or more groups, 13 digits or more, every one set aside.
     assert mask_digits("Ref 41.11 11/11 11.11 12.34") == ("Ref 1234", 1)
+
+
+# The categories, the digit fold and the joiner set follow the running
+# Python's Unicode (14.0 on 3.11, 15.0 on 3.12, 15.1 on 3.13). The suite was
+# written against 14.0; counts tied to a version are checked there exactly,
+# and on later versions only as a floor (Unicode adds characters, it does
+# not remove them).
+_WRITTEN_AGAINST = "14.0.0"
+_LO_NUMERALS_UNDER_14 = 58
+
+
+def _version(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split("."))
+
+
+def _lo_numerals() -> int:
+    return sum(
+        1
+        for code in range(sys.maxunicode + 1)
+        if not 0xD800 <= code <= 0xDFFF
+        and unicodedata.category(chr(code)) == "Lo"
+        and unicodedata.numeric(chr(code), -1.0) in range(10)
+    )
+
+
+def test_the_lo_numeral_limit_counts_against_the_unicode_version() -> None:
+    count = _lo_numerals()
+    if unicodedata.unidata_version == _WRITTEN_AGAINST:
+        assert count == _LO_NUMERALS_UNDER_14
+    else:
+        assert _version(unicodedata.unidata_version) > _version(_WRITTEN_AGAINST)
+        assert count >= _LO_NUMERALS_UNDER_14

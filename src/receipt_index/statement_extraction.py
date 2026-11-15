@@ -727,6 +727,12 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     that looks like a mark (a click letter like a bar) ends one too, and so
     keeps a number in parts; an other letter with a numeral value is not folded,
     so a number written wholly in them passes.
+
+    The first call builds the mask's patterns, several seconds over every code
+    point, unless ``warm_mask`` ran first: ``serve`` warms it at start, and any
+    other caller pays it once inside its first call. The categories, the digit
+    fold and the joiner set follow the running Python's Unicode version; a code
+    point newer than it is unassigned, so it counts as invisible and joins.
     """
     if text is None:
         return None, 0
