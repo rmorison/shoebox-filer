@@ -51,7 +51,7 @@ from receipt_index.pdf_reader import normalise_statement_text, page_marked_text
 from receipt_index.pdf_validate import STATEMENT_BOUNDS
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from pydantic_ai.messages import ModelMessage
     from pydantic_ai.models import Model, ModelRequestParameters
@@ -418,8 +418,9 @@ def normalise_institution(name: str | None) -> str | None:
 _IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
 # Letters and symbols that render as blank space. The normaliser drops the
 # Hangul and halfwidth fillers and the blank Braille pattern; the mask joins
-# across them all anyway. Every other letter or symbol (Lo, Lm, So, Sk) is
-# visible, and breaks a run as a letter does: a decision.
+# across them all anyway. Every other letter or symbol is visible: a cased
+# or other letter (Lu, Ll, Lt, Lo) breaks a run, while a modifier letter
+# (Lm) or a symbol joins one, as punctuation does (see _is_joiner).
 _BLANK_GLYPHS: Final = frozenset(
     "\u115f\u1160\u2800\u303f\u3164\uffa0\U0001d159\U0001da7f\U0001da80"
     # Egyptian hieroglyph full and half blank: letters from Unicode 15.0
@@ -433,28 +434,98 @@ def _is_ignorable(ch: str) -> bool:
     return ch in _BLANK_GLYPHS or unicodedata.category(ch) in _IGNORABLE_CATEGORIES
 
 
-@functools.cache
-def _masked_run() -> re.Pattern[str]:
-    """Invisible characters inside a number, built once (about 850 ranges)."""
+# The letter forms of x, which read as "times" or as a grouping mark between
+# digit groups ("4111x2222"): Latin, Cyrillic ha and Greek chi, small and
+# capital. A letter built on one of them (an x with a dot above) joins too.
+_X_LETTERS: Final = "xX\u0445\u0425\u03c7\u03a7"
+# Categories that join as themselves: punctuation, symbols, modifier letters
+# and spacing marks. Digits outside ASCII join too, but never count.
+_JOINING_CATEGORIES: Final = frozenset(
+    {"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Lm", "Mc"}
+)
+_NUMBER_CATEGORIES: Final = frozenset({"Nd", "No", "Nl"})
+
+
+def _joins_as_itself(ch: str) -> bool:
+    if ch in _X_LETTERS:
+        return True
+    category = unicodedata.category(ch)
+    if category in _JOINING_CATEGORIES:
+        return True
+    return category in _NUMBER_CATEGORIES and not "0" <= ch <= "9"
+
+
+def _is_x_form(ch: str) -> bool:
+    """A letter whose NFKD form is an x letter with only marks after it."""
+    parts = unicodedata.normalize("NFKD", ch)
+    return (
+        len(parts) > 1
+        and parts[0] in _X_LETTERS
+        and all(unicodedata.category(c) in {"Mn", "Me"} for c in parts[1:])
+    )
+
+
+def _is_joiner(ch: str) -> bool:
+    """A character that joins two digit groups into one number.
+
+    Any punctuation or symbol (categories P* and S*), modifier letter (Lm),
+    spacing mark (Mc) or digit outside ASCII (Nd, No, Nl), and the x
+    letters (x, Cyrillic ha, Greek chi) and letters built on them; also a
+    character whose NFKC form is made only of those (a fullwidth ``#``, a
+    small colon, a mathematical x). NFKC only classifies: the text itself
+    is never changed by it, and only ASCII digits count toward a run.
+    """
+    if _joins_as_itself(ch) or _is_x_form(ch):
+        return True
+    folded = unicodedata.normalize("NFKC", ch)
+    return bool(folded) and all(_joins_as_itself(c) for c in folded)
+
+
+def _character_class(member: Callable[[str], bool]) -> str:
+    """Every code point ``member`` accepts, as ranges for a character class."""
     ranges: list[list[int]] = []
     for code in range(sys.maxunicode + 1):
-        # Lone surrogates (Cs) included: pydantic refuses them in model
-        # output, but a run never ends on one either way.
-        if _is_ignorable(chr(code)):
+        if member(chr(code)):
             if ranges and ranges[-1][1] == code - 1:
                 ranges[-1][1] = code
             else:
                 ranges.append([code, code])
-    ignorable = "".join(
+    return "".join(
         re.escape(chr(low))
         if low == high
         else f"{re.escape(chr(low))}-{re.escape(chr(high))}"
         for low, high in ranges
     )
-    # Invisible characters between two characters of a number: dropped, so
-    # none can split one.
-    context = r"[0-9 \-./,'\u2019\u00b7\u2044]"
+
+
+@functools.cache
+def _joiner_class() -> str:
+    """Every joiner, as a character class body, built once."""
+    # Lone surrogates aren't punctuation or symbols; skipping them keeps
+    # NFKC away from them.
+    return _character_class(
+        lambda ch: not "\ud800" <= ch <= "\udfff" and _is_joiner(ch)
+    )
+
+
+@functools.cache
+def _masked_run() -> re.Pattern[str]:
+    """Invisible characters inside a number, built once (about 850 ranges)."""
+    # Lone surrogates (Cs) included: pydantic refuses them in model output,
+    # but a run never ends on one either way.
+    ignorable = _character_class(_is_ignorable)
+    # Invisible characters between two characters a number can hold (a
+    # digit, a space or any joiner): dropped, so none can split one. Between
+    # two marks with no digit near, this can drop a combining accent from
+    # text outside a number: an accepted over-cut.
+    context = rf"[0-9 {_joiner_class()}]"
     return re.compile(rf"(?<={context})[{ignorable}]+(?={context})")
+
+
+@functools.cache
+def _span() -> re.Pattern[str]:
+    """Digit groups joined by any run of spaces and joiners, built once."""
+    return re.compile(rf"[0-9]+(?:[ {_joiner_class()}]+[0-9]+)*")
 
 
 def _is_dash(ch: str) -> bool:
@@ -475,8 +546,9 @@ def _dashes() -> re.Pattern[str]:
 
 
 def warm_mask() -> None:
-    """Build the mask's patterns now, once per process (about a second)."""
+    """Build the mask's patterns now, once per process (a few seconds)."""
     _masked_run()
+    _span()
     _dashes()
 
 
@@ -490,19 +562,32 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
 
     The text is normalised as the statement's was, separators are folded
     (whitespace to one space, Unicode dashes to ``-``), and invisible
-    characters inside a number are dropped. Then each span of digits joined
-    only by spaces and the marks institutions print inside a number
-    (``- . / , ' \u2019 \u00b7 \u2044``) is split at its spaces into tokens.
-    An amount with cents and a short date (``11/09``, ``11/09/2026``, or a
-    range of them) are set aside and break a run. So are a range of years
+    characters inside a number are dropped. Then each span of digit groups
+    joined by any run of spaces and joiners is read: a joiner is any
+    punctuation or symbol (``# : * | + $ %``, brackets, a bullet, a star, a
+    fullwidth form), modifier letter, spacing mark, digit outside ASCII
+    (never counted), or x letter (x, Cyrillic ha, Greek chi, and letters
+    built on them), classified after NFKC. The span is split into tokens
+    at its spaces and at every joiner except the marks that shape an
+    amount or a date
+    (``- . / , ' \u2019 \u00b7 \u2044``). An amount with cents and a short
+    date (``11/09``, ``11/09/2026``, or a range of them) are set aside and
+    break a run. So are a range of years
     (``2025-2026``) and a ZIP+4 (``94105-1234``), but only when, once
     amounts and dates are set aside, one is the only token with digits left
     in its span; beside any other digit group either is part of a number.
     Every run of the other tokens that totals eight digits or more is cut to
     its last four digits.
     A lone bare amount in thousands groups (nine digits or fewer,
-    ``123,456,789``) stays. Any other mark (``$ # % = @ +``, brackets) ends
-    a span, so an amount beside a store number or a date stays readable.
+    ``123,456,789``) stays. So an amount with cents or a date beside a store
+    number stays readable (``STORE #0412 $45.99``, ``0412*45.99``), while
+    groups split by any mark are cut together (``4111#2222#3333#4444``
+    becomes ``4444``). Where the two can't be told apart (``STORE 0412*4599``)
+    they are cut: a leaked number costs more than an over-cut description.
+    Only a letter (cased, or another letter such as a CJK ideograph) that
+    isn't an x form ends a span. Known limit: an other letter that looks
+    like a mark (a click letter like a bar) ends one too, and so keeps a
+    number in parts.
     """
     if text is None:
         return None, 0
@@ -515,13 +600,13 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         count += cuts
         return masked
 
-    return _SPAN.sub(cut_span, text), count
+    return _span().sub(cut_span, text), count
 
 
-# Marks an institution prints inside a number; any other ends one.
+# The joiners that shape an amount or a date, kept inside a token; every
+# other joiner splits tokens as a space does.
 _JOINERS = "-./,'\u2019\u00b7\u2044"
-_SPAN = re.compile(rf"[0-9]+(?:(?:(?: *[{_JOINERS}])+ *| +)[0-9]+)*")
-_TOKEN = re.compile(r"\S+")
+_TOKEN = re.compile(rf"[0-9{re.escape(_JOINERS)}]+")
 # An amount with cents: plain, at most seven whole digits ("1234567.89"),
 # or in thousands groups with the other separator for the point
 # ("1,234,567.89", "1.234.567,89"). A longer plain one ("123456789.12") is

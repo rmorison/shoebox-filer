@@ -222,7 +222,7 @@ def count_field(
     prepared = mask.prepare(text)
     field_cuts = 0
     field_asides: set[str] = set()
-    spans = list(se._SPAN.finditer(prepared))
+    spans = list(se._span().finditer(prepared))
     if spans:
         counts["fields.with_a_digit_span"] += 1
     for span_match in spans:

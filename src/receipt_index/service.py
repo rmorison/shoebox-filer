@@ -835,8 +835,8 @@ class Service:
             # Fail loud at start, not on the first statement, if tracing
             # instrumentation is loaded (it would export statement text).
             refuse_instrumentation()
-            # Build the mask's pattern now, not inside a statement's first
-            # watchdog step (about a second).
+            # Build the mask's patterns now, not inside a statement's first
+            # watchdog step (a few seconds).
             warm_mask()
         self.timings = timings
         self._watching = [s.name for s in sources]

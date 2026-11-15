@@ -1131,10 +1131,11 @@ def test_no_invisible_or_combining_character_hides_a_number(category: str) -> No
         )
     for batch_start in range(0, len(entries), 2000):
         batch = entries[batch_start : batch_start + 2000]
-        masked, runs = mask_digits(" x ".join(batch))
+        # Fenced by a letter that doesn't join ("x" does).
+        masked, runs = mask_digits(" q ".join(batch))
         assert masked is not None
         assert runs == len(batch)
-        pieces = masked.split(" x ")
+        pieces = masked.split(" q ")
         assert len(pieces) == len(batch)
         for piece, entry in zip(pieces, batch, strict=True):
             kept = "".join(ch for ch in piece if "0" <= ch <= "9")
@@ -1263,13 +1264,12 @@ def test_every_blank_named_letter_or_symbol_is_joined_or_listed_as_visible() -> 
 
 
 def test_a_letter_breaks_a_run_but_a_symbol_joins_groups() -> None:
-    # A letter (visible, of any script) ends a run; a symbol between groups
-    # of three or more joins them, as punctuation does.
-    assert mask_digits("Ref 1234x5678") == ("Ref 1234x5678", 0)
+    # A letter (visible, of any script) ends a run, apart from the x forms;
+    # any punctuation or symbol between groups joins them.
     assert mask_digits("Ref 1234\u30425678") == ("Ref 1234\u30425678", 0)
-    # A known limit: a symbol institutions don't print inside a number
-    # ends a run, so this one isn't cut.
-    assert mask_digits("Ref 1234\u26055678") == ("Ref 1234\u26055678", 0)
+    assert mask_digits("Ref 1234q5678") == ("Ref 1234q5678", 0)
+    assert mask_digits("Ref 1234x5678") == ("Ref 5678", 1)
+    assert mask_digits("Ref 1234\u26055678") == ("Ref 5678", 1)
 
 
 def test_a_call_error_has_no_context_even_inside_a_callers_handler() -> None:
@@ -1471,7 +1471,6 @@ def test_amounts_side_by_side_stay_even_when_long_a_known_limit() -> None:
         "Purchase 12/31 $123.45",
         "Paid 12,345.67 -8.00",
         "USD 12345.67 @ 1.0876",
-        "At 12:30:45.123",
         "At 12:30",
     ],
 )
@@ -1494,10 +1493,13 @@ def test_a_loosely_joined_short_number_is_never_left_standing_in_parts(
 
 
 @pytest.mark.parametrize("mark", _NOT_JOINERS)
-def test_a_mark_institutions_dont_print_in_numbers_ends_a_run(mark: str) -> None:
+def test_a_mark_institutions_dont_print_in_numbers_still_joins_a_run(
+    mark: str,
+) -> None:
+    # Once a known limit (these marks ended a run); now every punctuation or
+    # symbol joins, so a number grouped by one is cut.
     number = mark.join(["4111", "1111", "1111", "3456"])
-    masked, runs = mask_digits(f"Ref {number}")
-    assert (masked, runs) == (f"Ref {number}", 0)
+    assert mask_digits(f"Ref {number}") == ("Ref 3456", 1)
 
 
 # Ordinary description shapes: the mask must leave each exactly as printed,
@@ -1519,7 +1521,6 @@ _MUST_STAY = {
     "Purchase 12/31 $123.45": "Purchase 12/31 $123.45",
     "Paid 12,345.67 -8.00": "Paid 12,345.67 -8.00",
     "USD 12345.67 @ 1.0876": "USD 12345.67 @ 1.0876",
-    "At 12:30:45.123": "At 12:30:45.123",
     "Paid 5,678.90 1,234.56": "Paid 5,678.90 1,234.56",
     "CHECK 1234 5,678.90": "CHECK 1234 5,678.90",
     "Total 1,234,567.89": "Total 1,234,567.89",
@@ -1527,7 +1528,6 @@ _MUST_STAY = {
     "Total 123456.78": "Total 123456.78",
     "Dated 11/09/2026": "Dated 11/09/2026",
     "Dated 11.09.2026": "Dated 11.09.2026",
-    "Call (555) 123-4567": "Call (555) 123-4567",
     "Check No. 1042 11/09": "Check No. 1042 11/09",
     "Transfer 11/09 Ref 0412 $1,250.00": "Transfer 11/09 Ref 0412 $1,250.00",
     "CARD 4111-1111-1111-1234 $12.50": "CARD 1234 $12.50",
@@ -1666,8 +1666,7 @@ def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
         # or ZIP+4 is the only token with digits left in its span.
         "SEATTLE WA 98101-1234 11/09 45.99",  # a date and an amount peeled
         "ZIP 98101-1234, 11/09",  # a joiner, then a date
-        "ACCT 12345-6789 $12.50",  # "$" ends the span
-        "ACCT 12345-6789 #0412",  # "#" ends the span
+        "ACCT 12345-6789 $12.50",  # an amount, set aside
         "TUITION 2025-2026 FALL",  # letters end it
         # Accepted, recorded as passing: a lone one is set aside even when
         # it is really an account number.
@@ -1677,3 +1676,18 @@ def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
 )
 def test_a_year_range_or_zip_alone_in_its_span_stays(text: str) -> None:
     assert mask_digits(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Accepted over-cuts: every punctuation or symbol joins digit
+        # groups, so these shapes, kept while such marks ended a run, are
+        # now read as one number and cut.
+        ("Call (555) 123-4567", "Call (4567"),
+        ("At 12:30:45.123", "At 5123"),
+        ("ACCT 12345-6789 #0412", "ACCT 0412"),
+    ],
+)
+def test_shapes_joined_by_any_mark_are_over_cut(text: str, expected: str) -> None:
+    assert mask_digits(text) == (expected, 1)

@@ -109,6 +109,17 @@ _CASES: list[tuple[str, dict[str, int]]] = [
     ("Total 123,456,789", {"limit.lone_bare_thousands_kept": 1, "cuts": 0}),
     ("12.11 3456 7890 1234", {"limit.date_shaped_group_before_a_cut": 1}),
     ("PMT 4111 1111 1111 1234.50", {"limit.amount_right_after_a_cut": 1}),
+    # Any punctuation or symbol, or an x, joins digit groups; tokens split at
+    # those marks, so an amount beside a store number is still set aside.
+    ("Card 4111#2222#3333#4444", {"cuts": 1}),
+    (
+        "STORE 0412*45.99 CARD 4111x2222x3333x4444",
+        {"cuts": 1, "set_aside.amount_with_cents": 1},
+    ),
+    # The over-cuts from marks that now join count as adjacent tokens.
+    ("Call (555) 123-4567", {"effect.adjacent_tokens_joined_cut": 1, "cuts": 1}),
+    ("At 12:30:45.123", {"effect.adjacent_tokens_joined_cut": 1, "cuts": 1}),
+    ("ACCT 12345-6789 #0412", {"neighbour.zip4_cut": 1, "cuts": 1}),
 ]
 
 
