@@ -437,12 +437,13 @@ def _is_ignorable(ch: str) -> bool:
 
 
 # The letter forms of x, which read as "times" or as a grouping mark between
-# digit groups ("4111x2222"), small and capital: Latin x and chi, Cyrillic
+# digit groups ("4111x2222"), small and capital: Latin x and chi (with
+# their hook, ring, serif and long-leg variants), Cyrillic
 # ha (plain, with a descender, a hook or a stroke), Greek chi, Coptic khi,
 # and two other letters shaped like x (an Old Italic eks and a syllabics
 # letter). A letter built on one of them (an x with a dot above) joins too.
 _X_LETTERS: Final = (
-    "xX\ua7b3\uab53"
+    "xX\ua7b3\uab53\u1d8d\uab54\uab55\uab56\uab57\uab58\uab59"
     "\u0445\u0425\u04b2\u04b3\u04fc\u04fd\u04fe\u04ff"
     "\u03c7\u03a7\u2cac\u2cad"
     "\U00010317\u157d"

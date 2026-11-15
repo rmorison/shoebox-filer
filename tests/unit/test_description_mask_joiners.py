@@ -221,6 +221,7 @@ def _is_named_joiner(ch: str) -> bool:
     x_letters = (
         "xX\ua7b3\uab53\u0445\u0425\u04b2\u04b3\u04fc\u04fd\u04fe\u04ff"
         "\u03c7\u03a7\u2cac\u2cad\U00010317\u157d"
+        "\u1d8d\uab54\uab55\uab56\uab57\uab58\uab59"
     )
 
     def direct(c: str) -> bool:
@@ -372,7 +373,24 @@ _CASED_X_LOOKALIKES = [
     "\uab53",  # Latin small chi
     "\U00010317",  # an other letter shaped like x
     "\u157d",  # an other letter shaped like x
+    "\u1d8d",  # Latin small x with palatal hook
+    "\uab54",  # Latin small chi with low right ring
+    "\uab55",  # Latin small chi with low left serif
+    "\uab56",  # Latin small x with low right ring
+    "\uab57",  # Latin small x with long left leg
+    "\uab58",  # Latin small x with long left leg and low right ring
+    "\uab59",  # Latin small x with long left leg with serif
 ]
+
+
+# Other letters (Lo) shaped like x stay the signed-off Lo limit: pinned.
+_LO_X_SHAPES = ["\u16ea", "\U000102b4", "\U0001029c", "\U0001bc01"]
+
+
+@pytest.mark.parametrize("mark", _LO_X_SHAPES)
+def test_an_other_letter_shaped_like_x_is_a_known_limit(mark: str) -> None:
+    text = f"Card {_number(mark)}"
+    assert mask_digits(text) == (text, 0)
 
 
 @pytest.mark.parametrize("mark", _CASED_X_LOOKALIKES)
