@@ -415,7 +415,7 @@ def normalise_institution(name: str | None) -> str | None:
 # Normalisation drops many of those, but not all (an Arabic number sign, a
 # Mongolian selector, a combining accent), and none may hide a number. A digit
 # outside ASCII (fullwidth, circled, another script's, a number character
-# worth 0 to 9) counts once folded, by decision; a fraction and an other
+# worth a whole number) counts once folded, by decision; a fraction and an other
 # letter with a numeral value are not folded.
 _IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
 # Letters and symbols that render as blank space. The normaliser drops the
@@ -481,7 +481,7 @@ def _is_joiner(ch: str) -> bool:
 
     Any punctuation or symbol (categories P* and S*), modifier letter (Lm),
     spacing mark (Mc) or number character (Nd, No, Nl) the digit fold
-    leaves (a fraction, a Roman numeral above nine), and the x letters
+    leaves (one without a whole-number value), and the x letters
     (``_X_LETTERS``) and letters built on them; also a
     character whose NFKC form is made only of those (a fullwidth ``#``, a
     small colon, a mathematical x). NFKC only classifies: the text itself
@@ -595,8 +595,9 @@ def _digit_fold(ch: str) -> str | None:
     - a character with a digit value (``unicodedata.decimal``, then
       ``unicodedata.digit``): a digit of any script, a circled, double
       circled or superscript digit;
-    - a single number character (No, Nl) whose value is a whole number from
-      0 to 9, such as a Roman numeral one;
+    - a single number character (No, Nl) whose value is a whole number, to
+      that number's digits: a Roman numeral one to ``1``, a negative circled
+      eleven to ``11``;
     - a character whose NFKC form holds digits: a fullwidth or
       mathematical digit, or a symbol that expands to digits and a word,
       of which only the digits are kept. (NFKD finds no digit NFKC misses.)
@@ -616,7 +617,7 @@ def _digit_fold(ch: str) -> str | None:
         return str(value)
     if unicodedata.category(ch) in {"No", "Nl"}:
         number = unicodedata.numeric(ch, None)
-        if number is not None and number.is_integer() and 0 <= number <= 9:
+        if number is not None and number.is_integer() and number >= 0:
             return str(int(number))
     digits = [_digits_of(c) for c in nfkc]
     return "".join(str(d) for d in digits if d is not None) or None
@@ -659,7 +660,7 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     The text is normalised as the statement's was. Every character outside ASCII
     that stands for digits becomes the ASCII digits it stands for (see
     ``_digit_fold``: a digit of any script, a circled, superscript or fullwidth
-    digit, a number character worth 0 to 9, a symbol that expands to digits;
+    digit, a number character worth a whole number, a symbol that expands to digits;
     never a vulgar fraction or an other letter). Separators are folded
     (whitespace to one space, Unicode dashes to ``-``), and invisible characters
     inside a number are dropped. Those three, the normalisation and the cut are

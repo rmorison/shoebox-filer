@@ -248,14 +248,14 @@ def _is_named_joiner(ch: str) -> bool:
 
 def _stands_for_digits(ch: str) -> bool:
     # Folded to digits and counted, not a joiner: the digit tests cover it.
-    # A digit value, a lone number character worth 0 to 9, or digits in
+    # A digit value, a lone number character with a whole value, or digits in
     # its NFKC or NFKD form; never a vulgar fraction.
     nfkc = unicodedata.normalize("NFKC", ch)
     if "\u2044" in nfkc:
         return False
     if unicodedata.category(ch) in {"No", "Nl"}:
         value = unicodedata.numeric(ch, None)
-        if value is not None and value in range(10):
+        if value is not None and value.is_integer() and value >= 0:
             return True
     forms = ch + nfkc + unicodedata.normalize("NFKD", ch)
     return any(unicodedata.digit(c, None) is not None for c in forms)
@@ -582,3 +582,27 @@ def test_an_other_letter_numeral_is_a_known_limit(numeral: str) -> None:
     assert mask_digits(whole) == (whole, 0)
     split = f"Card {_number(numeral)}"
     assert mask_digits(split) == (split, 0)
+
+
+# Single characters worth a whole number of 10 or more: they fold to that
+# number's digits and count (negative circled 11 to 20, double circled
+# ten, dingbat circled tens, circled numbers on a black square).
+_TENS_AND_MORE = [
+    *[chr(code) for code in range(0x24EB, 0x24F5)],
+    "\u24fe",
+    "\u277f",
+    "\u2789",
+    "\u2793",
+    *[chr(code) for code in range(0x3248, 0x3250)],
+]
+
+
+@pytest.mark.parametrize("number", _TENS_AND_MORE)
+def test_a_character_worth_ten_or_more_counts(number: str) -> None:
+    value = str(int(unicodedata.numeric(number)))
+    digits = "41" + value * 3 + "11"
+    assert mask_digits(f"Acct 41{number * 3}11") == (f"Acct {digits[-4:]}", 1)
+
+
+def test_three_negative_circled_elevens_count() -> None:
+    assert mask_digits("Acct 41\u24eb\u24eb\u24eb11") == ("Acct 1111", 1)
