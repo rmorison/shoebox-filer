@@ -216,8 +216,8 @@ def test_three_decimal_figures_beside_a_store_number_are_cut() -> None:
 
 def _is_named_joiner(ch: str) -> bool:
     """The rule as stated: punctuation, symbol, modifier letter, spacing
-    mark, digit outside ASCII, or an x letter (or one built on it), after
-    NFKC."""
+    mark, number character outside ASCII, or an x letter (or one built on
+    it), after NFKC. Those the digit fold takes are left out below."""
     x_letters = (
         "xX\ua7b3\uab53\u0445\u0425\u04b2\u04b3\u04fc\u04fd\u04fe\u04ff"
         "\u03c7\u03a7\u2cac\u2cad\U00010317\u157d"
@@ -247,8 +247,17 @@ def _is_named_joiner(ch: str) -> bool:
 
 def _stands_for_digits(ch: str) -> bool:
     # Folded to digits and counted, not a joiner: the digit tests cover it.
-    folded = unicodedata.normalize("NFKC", ch)
-    return any(unicodedata.decimal(c, None) is not None for c in ch + folded)
+    # A digit value, a lone number character worth 0 to 9, or digits in
+    # its NFKC or NFKD form; never a vulgar fraction.
+    nfkc = unicodedata.normalize("NFKC", ch)
+    if "\u2044" in nfkc:
+        return False
+    if unicodedata.category(ch) in {"No", "Nl"}:
+        value = unicodedata.numeric(ch, None)
+        if value is not None and value in range(10):
+            return True
+    forms = ch + nfkc + unicodedata.normalize("NFKD", ch)
+    return any(unicodedata.digit(c, None) is not None for c in forms)
 
 
 def _joiners() -> list[str]:
@@ -348,7 +357,8 @@ def test_an_other_letter_lookalike_is_a_known_limit(mark: str) -> None:
     assert mask_digits(text) == (text, 0)
 
 
-# Cased letters that look like x or chi: x forms too.
+# Letters that look like x or chi, cased and other (the last two are
+# Lo): x forms too.
 _CASED_X_LOOKALIKES = [
     "\u2cac",  # khi, capital
     "\u2cad",  # khi, small
@@ -438,7 +448,7 @@ def test_a_number_written_wholly_in_other_digits_is_cut(
 
 
 def test_other_digits_print_as_ascii_and_amounts_and_dates_stay() -> None:
-    # The fold is the one change to the text beyond a cut.
+    # A digit fold changes the text beyond a cut: it prints in ASCII.
     text = "Paid \uff04" + _digits_in(0xFF10, "45.99 on 11/09")
     assert mask_digits(text) == ("Paid \uff0445.99 on 11/09", 0)
     assert mask_digits("Item \u2460 ok") == ("Item 1 ok", 0)
@@ -490,3 +500,67 @@ def test_a_separator_that_expands_under_nfkc_does_not_split_a_number(
     separator: str,
 ) -> None:
     assert mask_digits(f"Card {separator.join(_GROUPS)}") == ("Card 4444", 1)
+
+
+# Characters that stand for a digit without a decimal value: a digit value
+# only (unicodedata.digit), or a single number character (No, Nl) whose value
+# is a whole number from 0 to 9. Each is the digit one of its set.
+_OTHER_ONES = [
+    "\u1369",  # a digit-value-only one, block 1369-1371
+    "\u24f5",  # double circled one
+    "\u2776",  # dingbat negative circled one
+    "\u2780",  # dingbat circled sans-serif one
+    "\u278a",  # dingbat negative circled sans-serif one
+    "\U00010a40",  # a digit-value-only one, block 10A40-10A43
+    "\U00010e60",  # a digit-value-only one, block 10E60-10E68
+    "\u19da",  # a digit-value-only one
+    "\u3021",  # a number letter (Nl) worth one, block 3021-3029
+    "\u2160",  # Roman numeral one
+    "\u2170",  # small Roman numeral one
+    "\U0001d360",  # counting rod one
+]
+
+
+@pytest.mark.parametrize("one", _OTHER_ONES)
+def test_a_number_written_wholly_in_digit_value_characters_is_cut(one: str) -> None:
+    number = " ".join([one * 4] * 4)
+    assert mask_digits(f"Card {number}") == ("Card 1111", 1)
+
+
+@pytest.mark.parametrize("one", _OTHER_ONES)
+def test_a_digit_value_character_counts_toward_the_eight(one: str) -> None:
+    # Five ASCII digits and three that stand for one: eight digits, cut.
+    assert mask_digits(f"Ref 123{one * 3}45") == ("Ref 1145", 1)
+
+
+@pytest.mark.parametrize("zero", ["\u24ff", "\u3007"])
+def test_a_digit_value_zero_counts_toward_the_eight(zero: str) -> None:
+    assert mask_digits(f"Ref 123{zero * 3}45") == ("Ref 0045", 1)
+
+
+_FRACTIONS = ["\u00bd", "\u2153", "\u215f", "\u2189"]
+
+
+@pytest.mark.parametrize("fraction", _FRACTIONS)
+def test_a_fraction_is_not_folded(fraction: str) -> None:
+    text = f"Paid 1{fraction} lb"
+    assert mask_digits(text) == (text, 0)
+
+
+@pytest.mark.parametrize("fraction", _FRACTIONS)
+def test_a_fraction_between_groups_still_joins(fraction: str) -> None:
+    assert mask_digits(f"Card {_number(fraction)}") == ("Card 4444", 1)
+
+
+# Known limit, signed off: other letters (Lo) with a numeral value are not
+# folded, so a number written wholly in them passes unmasked, and one between
+# digit groups ends a run like any letter. A sample, pinned.
+_LO_NUMERALS = ["\u4e00", "\u4e8c", "\u4e09", "\u56db", "\u4e94", "\u4e5d"]
+
+
+@pytest.mark.parametrize("numeral", _LO_NUMERALS)
+def test_an_other_letter_numeral_is_a_known_limit(numeral: str) -> None:
+    whole = "Card " + " ".join([numeral * 4] * 4)
+    assert mask_digits(whole) == (whole, 0)
+    split = f"Card {_number(numeral)}"
+    assert mask_digits(split) == (split, 0)
