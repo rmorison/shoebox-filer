@@ -242,8 +242,12 @@ def _is_named_joiner(ch: str) -> bool:
         and all(unicodedata.category(c) in {"Mn", "Me"} for c in decomposed[1:])
     ):
         return True
+    if ch.isspace() or unicodedata.category(ch) in {"Mn", "Me", "Cf", "Co", "Cn"}:
+        return False
     folded = unicodedata.normalize("NFKC", ch)
-    return bool(folded) and all(direct(c) for c in folded)
+    # A space and marks only (a presentation form of a vowel mark) join too.
+    spacing = [c for c in folded if unicodedata.category(c) not in {"Mn", "Me"}]
+    return bool(spacing) and all(c == " " or direct(c) for c in spacing)
 
 
 def _stands_for_digits(ch: str) -> bool:
@@ -349,6 +353,7 @@ _LO_LOOKALIKES = [
     "\ua78f",  # looks like a middle dot
     "\u1427",  # looks like a middle dot
     "\u4e00",  # looks like a dash
+    "\ufe73",  # a tail fragment: its NFKC is itself, a letter
 ]
 
 
@@ -606,3 +611,26 @@ def test_a_character_worth_ten_or_more_counts(number: str) -> None:
 
 def test_three_negative_circled_elevens_count() -> None:
     assert mask_digits("Acct 41\u24eb\u24eb\u24eb11") == ("Acct 1111", 1)
+
+
+# Presentation forms (Lo) whose NFKC form is only a space, marks or
+# joiners: they render as a mark, so they join as one.
+_PRESENTATION_MARKS = [
+    *[
+        chr(code)
+        for code in range(0xFE70, 0xFE80)
+        if unicodedata.category(chr(code)) == "Lo" and code != 0xFE73
+    ],
+    *[chr(code) for code in range(0xFCF2, 0xFCF5)],
+    *[chr(code) for code in range(0xFC5E, 0xFC64)],
+]
+
+
+def test_the_presentation_marks_are_other_letters() -> None:
+    assert len(_PRESENTATION_MARKS) == 23
+    assert {unicodedata.category(ch) for ch in _PRESENTATION_MARKS} == {"Lo"}
+
+
+@pytest.mark.parametrize("mark", _PRESENTATION_MARKS)
+def test_a_presentation_form_of_a_mark_joins(mark: str) -> None:
+    assert mask_digits(f"Card {_number(mark)}") == ("Card 4444", 1)

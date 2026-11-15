@@ -482,16 +482,21 @@ def _is_joiner(ch: str) -> bool:
     Any punctuation or symbol (categories P* and S*), modifier letter (Lm),
     spacing mark (Mc) or number character (Nd, No, Nl) the digit fold
     leaves (one without a whole-number value), and the x letters
-    (``_X_LETTERS``) and letters built on them; also a
-    character whose NFKC form is made only of those (a fullwidth ``#``, a
-    small colon, a mathematical x). NFKC only classifies: the text itself
+    (``_X_LETTERS``) and letters built on them; also a character whose NFKC
+    form is made only of those, spaces and invisible characters (a
+    fullwidth ``#``, a small colon, a mathematical x, a presentation form
+    of a vowel mark). NFKC only classifies: the text itself
     is never changed by it. Digits outside ASCII are folded to ASCII
     before this is asked (``_fold_digits``), and then count.
     """
     if _joins_as_itself(ch) or _is_x_form(ch):
         return True
+    if _is_ignorable(ch) or ch.isspace():
+        return False
     folded = unicodedata.normalize("NFKC", ch)
-    return bool(folded) and all(_joins_as_itself(c) for c in folded)
+    return any(_joins_as_itself(c) or c == " " for c in folded) and all(
+        c == " " or _joins_as_itself(c) or _is_ignorable(c) for c in folded
+    )
 
 
 def _character_class(member: Callable[[str], bool]) -> str:
