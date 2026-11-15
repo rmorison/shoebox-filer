@@ -836,7 +836,7 @@ class Service:
             # instrumentation is loaded (it would export statement text).
             refuse_instrumentation()
             # Build the mask's patterns now, not inside a statement's first
-            # watchdog step (a few seconds).
+            # watchdog step (several seconds).
             warm_mask()
         self.timings = timings
         self._watching = [s.name for s in sources]

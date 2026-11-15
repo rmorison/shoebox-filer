@@ -166,9 +166,7 @@ class _Mask:
 
     def prepare(self, text: str) -> str:
         """The field as ``mask_digits`` sees it before reading spans."""
-        se = self.se
-        folded = se._fold_separators(se.normalise_statement_text(text))
-        prepared: str = se._masked_run().sub("", folded)
+        prepared: str = self.se._prepare(text)
         return prepared
 
     def digits(self, token: str) -> str:

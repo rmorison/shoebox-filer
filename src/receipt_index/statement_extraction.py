@@ -407,13 +407,14 @@ def normalise_institution(name: str | None) -> str | None:
     return text or None
 
 
-# The mask (contract, Masking): fold separators, then cut every run of eight
-# or more ASCII digits to its last four. Between two digits a run may hold
-# spaces, dashes, and any character that renders as nothing or as a mark on
-# its neighbour: format characters (Cf), combining marks (Mn, Me), private
-# use (Co) and unassigned code points (Cn). Normalisation drops many of
-# those, but not all (an Arabic number sign, a Mongolian selector, a
-# combining accent), and none may hide a number. ASCII digits only, by
+# The mask (contract, Masking): fold digits outside ASCII to ASCII and fold
+# separators, then cut every run of eight or more digits to its last four.
+# Between two digits a run may hold spaces, dashes, and any character that
+# renders as nothing or as a mark on its neighbour: format characters (Cf),
+# combining marks (Mn, Me), private use (Co) and unassigned code points (Cn).
+# Normalisation drops many of those, but not all (an Arabic number sign, a
+# Mongolian selector, a combining accent), and none may hide a number. A digit
+# outside ASCII (fullwidth, circled, another script's) counts once folded, by
 # decision.
 _IGNORABLE_CATEGORIES: Final = frozenset({"Cf", "Mn", "Me", "Co", "Cn", "Cs"})
 # Letters and symbols that render as blank space. The normaliser drops the
@@ -435,11 +436,19 @@ def _is_ignorable(ch: str) -> bool:
 
 
 # The letter forms of x, which read as "times" or as a grouping mark between
-# digit groups ("4111x2222"): Latin, Cyrillic ha and Greek chi, small and
-# capital. A letter built on one of them (an x with a dot above) joins too.
-_X_LETTERS: Final = "xX\u0445\u0425\u03c7\u03a7"
+# digit groups ("4111x2222"), small and capital: Latin x and chi, Cyrillic
+# ha (plain, with a descender, a hook or a stroke), Greek chi, Coptic khi,
+# and two other letters shaped like x (an Old Italic eks and a syllabics
+# letter). A letter built on one of them (an x with a dot above) joins too.
+_X_LETTERS: Final = (
+    "xX\ua7b3\uab53"
+    "\u0445\u0425\u04b2\u04b3\u04fc\u04fd\u04fe\u04ff"
+    "\u03c7\u03a7\u2cac\u2cad"
+    "\U00010317\u157d"
+)
 # Categories that join as themselves: punctuation, symbols, modifier letters
-# and spacing marks. Digits outside ASCII join too, but never count.
+# and spacing marks. A number character the digit fold leaves (a Roman
+# numeral) joins too, and never counts.
 _JOINING_CATEGORIES: Final = frozenset(
     {"Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So", "Lm", "Mc"}
 )
@@ -469,11 +478,13 @@ def _is_joiner(ch: str) -> bool:
     """A character that joins two digit groups into one number.
 
     Any punctuation or symbol (categories P* and S*), modifier letter (Lm),
-    spacing mark (Mc) or digit outside ASCII (Nd, No, Nl), and the x
-    letters (x, Cyrillic ha, Greek chi) and letters built on them; also a
+    spacing mark (Mc) or number character (Nd, No, Nl) the digit fold
+    leaves, and the x
+    letters (``_X_LETTERS``) and letters built on them; also a
     character whose NFKC form is made only of those (a fullwidth ``#``, a
     small colon, a mathematical x). NFKC only classifies: the text itself
-    is never changed by it, and only ASCII digits count toward a run.
+    is never changed by it. Digits outside ASCII are folded to ASCII
+    before this is asked (``_fold_digits``), and then count.
     """
     if _joins_as_itself(ch) or _is_x_form(ch):
         return True
@@ -509,17 +520,31 @@ def _joiner_class() -> str:
 
 
 @functools.cache
-def _masked_run() -> re.Pattern[str]:
-    """Invisible characters inside a number, built once (about 850 ranges)."""
+def _ignorable_class() -> str:
+    """Every invisible character, as a character class body (about 850 ranges)."""
     # Lone surrogates (Cs) included: pydantic refuses them in model output,
     # but a run never ends on one either way.
-    ignorable = _character_class(_is_ignorable)
-    # Invisible characters between two characters a number can hold (a
-    # digit, a space or any joiner): dropped, so none can split one. Between
-    # two marks with no digit near, this can drop a combining accent from
-    # text outside a number: an accepted over-cut.
-    context = rf"[0-9 {_joiner_class()}]"
-    return re.compile(rf"(?<={context})[{ignorable}]+(?={context})")
+    return _character_class(_is_ignorable)
+
+
+@functools.cache
+def _masked_run() -> re.Pattern[str]:
+    """A stretch from one ASCII digit to another through spaces, joiners and
+    invisible characters: the only place invisible characters are dropped,
+    so none can split a number and none is dropped from words."""
+    held = f" {_joiner_class()}{_ignorable_class()}"
+    return re.compile(rf"[0-9](?:[{held}]*[0-9])*")
+
+
+@functools.cache
+def _invisible() -> re.Pattern[str]:
+    return re.compile(f"[{_ignorable_class()}]+")
+
+
+def _drop_invisible_in_numbers(text: str) -> str:
+    """``text`` with every invisible character inside a number dropped."""
+    invisible = _invisible()
+    return _masked_run().sub(lambda run: invisible.sub("", run.group()), text)
 
 
 @functools.cache
@@ -546,10 +571,55 @@ def _dashes() -> re.Pattern[str]:
 
 
 def warm_mask() -> None:
-    """Build the mask's patterns now, once per process (a few seconds)."""
+    """Build the mask's patterns now, once per process (several seconds)."""
+    _digit_folds()
     _masked_run()
+    _invisible()
     _span()
     _dashes()
+
+
+def _digit_fold(ch: str) -> str | None:
+    """The ASCII digits a character outside ASCII stands for, or None.
+
+    A decimal digit (``unicodedata.decimal``), or a character whose NFKC
+    form holds decimal digits: a fullwidth, circled or superscript digit,
+    or a symbol that expands to digits and a word (only the digits kept).
+    """
+    if ch.isascii():
+        return None
+    value = unicodedata.decimal(ch, None)
+    if value is not None:
+        return str(value)
+    folded = unicodedata.normalize("NFKC", ch)
+    digits = [unicodedata.decimal(c, None) for c in folded]
+    return "".join(str(d) for d in digits if d is not None) or None
+
+
+@functools.cache
+def _digit_folds() -> dict[int, str]:
+    """Every character outside ASCII that stands for digits, built once."""
+    folds: dict[int, str] = {}
+    for code in range(sys.maxunicode + 1):
+        if 0xD800 <= code <= 0xDFFF:
+            continue
+        digits = _digit_fold(chr(code))
+        if digits is not None:
+            folds[code] = digits
+    return folds
+
+
+def _fold_digits(text: str) -> str:
+    """Every digit outside ASCII to the ASCII digits it stands for."""
+    return text.translate(_digit_folds())
+
+
+def _prepare(text: str) -> str:
+    """The field as the mask reads it: normalised, digits and separators
+    folded, invisible characters inside numbers dropped."""
+    return _drop_invisible_in_numbers(
+        _fold_separators(_fold_digits(normalise_statement_text(text)))
+    )
 
 
 def _fold_separators(text: str) -> str:
@@ -560,38 +630,38 @@ def _fold_separators(text: str) -> str:
 def mask_digits(text: str | None) -> tuple[str | None, int]:
     """``text`` with every account-like number cut to its last four, and the count.
 
-    The text is normalised as the statement's was, separators are folded
-    (whitespace to one space, Unicode dashes to ``-``), and invisible
-    characters inside a number are dropped. Then each span of digit groups
-    joined by any run of spaces and joiners is read: a joiner is any
-    punctuation or symbol (``# : * | + $ %``, brackets, a bullet, a star, a
-    fullwidth form), modifier letter, spacing mark, digit outside ASCII
-    (never counted), or x letter (x, Cyrillic ha, Greek chi, and letters
-    built on them), classified after NFKC. The span is split into tokens
-    at its spaces and at every joiner except the marks that shape an
-    amount or a date
-    (``- . / , ' \u2019 \u00b7 \u2044``). An amount with cents and a short
-    date (``11/09``, ``11/09/2026``, or a range of them) are set aside and
-    break a run. So are a range of years
-    (``2025-2026``) and a ZIP+4 (``94105-1234``), but only when, once
-    amounts and dates are set aside, one is the only token with digits left
-    in its span; beside any other digit group either is part of a number.
-    Every run of the other tokens that totals eight digits or more is cut to
-    its last four digits.
-    A lone bare amount in thousands groups (nine digits or fewer,
-    ``123,456,789``) stays. So an amount with cents or a date beside a store
-    number stays readable (``STORE #0412 $45.99``, ``0412*45.99``), while
-    groups split by any mark are cut together (``4111#2222#3333#4444``
-    becomes ``4444``). Where the two can't be told apart (``STORE 0412*4599``)
-    they are cut: a leaked number costs more than an over-cut description.
-    Only a letter (cased, or another letter such as a CJK ideograph) that
-    isn't an x form ends a span. Known limit: an other letter that looks
-    like a mark (a click letter like a bar) ends one too, and so keeps a
-    number in parts.
+    The text is normalised as the statement's was, every digit outside ASCII
+    (fullwidth, circled, superscript, another script's, or a symbol that
+    expands to digits) becomes the ASCII digits it stands for: the one
+    change to the text besides a cut. Separators are folded (whitespace to
+    one space, Unicode dashes to ``-``), and invisible characters inside a
+    number are dropped. Then each span of digit groups joined by any run of
+    spaces and joiners is read: a joiner is any punctuation or symbol (``# :
+    * | + $ %``, brackets, a bullet, a star, a fullwidth form), modifier
+    letter, spacing mark, number character left after the fold (never
+    counted), or x letter (x, chi, khi and Cyrillic ha forms, and letters
+    built on them), classified after NFKC. The span is split into tokens at
+    its spaces and at every joiner except the marks that shape an amount or
+    a date (``- . / , ' \u2019 \u00b7 \u2044``). An amount with cents and a
+    short date (``11/09``, ``11/09/2026``, or a range of them) are set aside
+    and break a run. So are a range of years (``2025-2026``) and a ZIP+4
+    (``94105-1234``), but only when, once amounts and dates are set aside,
+    one is the only token with digits left in its span; beside any other
+    digit group either is part of a number. Every run of the other tokens
+    that totals eight digits or more is cut to its last four digits. A lone
+    bare amount in thousands groups (nine digits or fewer, ``123,456,789``)
+    stays. So an amount with cents or a date beside a store number stays
+    readable (``STORE #0412 $45.99``, ``0412*45.99``), while groups split by
+    any mark are cut together (``4111#2222#3333#4444`` becomes ``4444``).
+    Where the two can't be told apart (``STORE 0412*4599``) they are cut: a
+    leaked number costs more than an over-cut description. Only a letter
+    (cased, or another letter such as a CJK ideograph) that isn't an x form
+    ends a span. Known limit: an other letter that looks like a mark (a
+    click letter like a bar) ends one too, and so keeps a number in parts.
     """
     if text is None:
         return None, 0
-    text = _masked_run().sub("", _fold_separators(normalise_statement_text(text)))
+    text = _prepare(text)
     count = 0
 
     def cut_span(span: re.Match[str]) -> str:

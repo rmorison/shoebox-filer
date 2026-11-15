@@ -402,11 +402,11 @@ def test_an_institution_keeps_its_case_and_loses_extra_space(
         # Groups of three or more joined by any other separator, eight
         # digits in all, are cut.
         ("Ref 1234.5678", "Ref 5678", 1),
-        # ASCII digits only, by decision.
+        # Digits outside ASCII fold to ASCII and count.
         (
             "Card \uff14\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11",
-            "Card \uff14\uff11\uff11\uff11\uff11\uff11\uff11\uff11\uff11",
-            0,
+            "Card 1111",
+            1,
         ),
         # Two runs in one text.
         ("From 4111111111111111 to 5500000000000004", "From 1111 to 0004", 2),
