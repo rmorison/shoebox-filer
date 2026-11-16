@@ -1334,6 +1334,11 @@ class TestWatchdog:
             configured=[_SOURCE],
         )
         config = SimpleNamespace(name=_SOURCE, type="gdrive", documents="statements")
+        # serve builds the mask's patterns at start, before its watchdog runs;
+        # cold, the first mask call alone takes longer than one step's budget.
+        from receipt_index.statement_extraction import warm_mask
+
+        warm_mask()
         health.start()
         started = time.monotonic()
         try:
