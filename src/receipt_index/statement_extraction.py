@@ -715,18 +715,19 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     more is cut to its last four digits. A span of 13 digits or more, the shortest
     card number, sets nothing aside and is cut whole when no run of its number
     tokens holds 13 digits, or when it has only amounts and dates in four groups or
-    more (see ``_cut_whole``); only an amount with cents a currency marks
-    (``$45.99``, ``45.99 USD``) stays, the rest cut as one. A lone bare amount in
-    thousands groups (nine digits or fewer, ``123,456,789``) stays. So an amount
-    with cents or a date beside a store number stays readable (``STORE #0412
-    $45.99``, ``0412*45.99``), while groups split by any mark are cut together
-    (``4111#2222#3333#4444`` becomes ``4444``). Where the two can't be told apart
-    (``STORE 0412*4599``) they are cut: a leaked number costs more than an over-cut
-    description. Only a letter (cased, or another letter such as a CJK ideograph)
-    that isn't an x form ends a span. Known limits: an other letter that looks like
-    a mark (a click letter like a bar) ends one too, and so keeps a number in parts;
-    an other letter with a numeral value is not folded, so a number written wholly
-    in them passes.
+    more (see ``_cut_whole``); only an amount with cents of six whole digits or
+    fewer that a currency marks (``$45.99``, ``45.99 USD``) stays, the rest cut as
+    one; a currency symbol between two digits doesn't mark (see
+    ``_currency_marked``). A lone bare amount in thousands groups (nine digits or
+    fewer, ``123,456,789``) stays. So an amount with cents or a date beside a store
+    number stays readable (``STORE #0412 $45.99``, ``0412*45.99``), while groups
+    split by any mark are cut together (``4111#2222#3333#4444`` becomes ``4444``).
+    Where the two can't be told apart (``STORE 0412*4599``) they are cut: a leaked
+    number costs more than an over-cut description. Only a letter (cased, or another
+    letter such as a CJK ideograph) that isn't an x form ends a span. Known limits:
+    an other letter that looks like a mark (a click letter like a bar) ends one too,
+    and so keeps a number in parts; an other letter with a numeral value is not
+    folded, so a number written wholly in them passes.
 
     The first call builds the mask's patterns, several seconds over every code
     point, unless ``warm_mask`` ran first: ``serve`` warms it at start, and any
@@ -789,6 +790,9 @@ YER ZAR ZMW ZWG
 _CURRENCY_CODES: Final = frozenset(_CURRENCY_CODE_LIST.split())
 _CODE_BEFORE = re.compile(r"(?<![A-Za-z])(?P<code>[A-Z]{3}) ?$")
 _CODE_AFTER = re.compile(r" ?(?P<code>[A-Z]{3})(?![A-Za-z])")
+# The most whole digits a currency-marked amount kept in a card-length
+# span may have: beside the last four, at most six more and the cents show.
+_MAX_KEPT_WHOLE_DIGITS: Final = 6
 # A short date, or a range of two: month and day (either order) with "/" or
 # ".", and an optional two- or four-digit year.
 _DATE = re.compile(
@@ -863,27 +867,55 @@ def _is_currency_mark(ch: str) -> bool:
 def _currency_marked(
     span: str, groups: list[re.Match[str]], before: str, after: str
 ) -> list[re.Match[str]]:
-    """The amounts with cents in ``span`` a currency marks: a currency symbol
-    (category Sc) or an ISO 4217 code touching the amount, or one space away,
-    on either side (``$45.99``, ``\u20ac 45,99``, ``45.99 USD``)."""
+    """The amounts with cents in ``span`` a currency marks, of six whole digits
+    or fewer (up to ``999,999.99``).
+
+    A mark is a currency symbol (category Sc) touching the amount or one space
+    away, with no digit on its far side (``$45.99``, ``\u20ac 45,99``); so a
+    symbol between two digit groups (``4111$1111``), or one that belongs to the
+    next number (``11.11 $5``), never counts. Or it is an ISO 4217 code: before
+    the amount, touching it or one space away (``USD 45.99``); after it, only
+    when the code ends the field or punctuation follows it (``45.99 USD``,
+    ``45.99 CAD.``), so a code that is a word in a sentence (``11.11 ALL
+    rest``) doesn't count."""
     marked = []
     for token in groups:
-        if not _is_cents_amount(token.group().strip(_JOINERS)):
+        core = token.group().strip(_JOINERS)
+        if not _is_cents_amount(core):
             continue
-        left = (before[-4:] + span[: token.start()])[-4:]
-        right = (span[token.end() :] + after[:4])[:4]
-        symbol_left = left.removesuffix(" ")[-1:]
-        symbol_right = right.removeprefix(" ")[:1]
+        if len(_NON_DIGIT.sub("", core)) - 2 > _MAX_KEPT_WHOLE_DIGITS:
+            continue
+        left = (before[-6:] + span[: token.start()])[-6:]
+        right = (span[token.end() :] + after[:6])[:6]
+        if _symbol_beside(left[::-1]) or _symbol_beside(right):
+            marked.append(token)
+            continue
         code_left = _CODE_BEFORE.search(left)
+        if code_left is not None and code_left["code"] in _CURRENCY_CODES:
+            marked.append(token)
+            continue
         code_right = _CODE_AFTER.match(right)
         if (
-            (symbol_left and _is_currency_mark(symbol_left))
-            or (symbol_right and _is_currency_mark(symbol_right))
-            or (code_left is not None and code_left["code"] in _CURRENCY_CODES)
-            or (code_right is not None and code_right["code"] in _CURRENCY_CODES)
+            code_right is not None
+            and code_right["code"] in _CURRENCY_CODES
+            and _ends_or_punctuation(right[code_right.end() :])
         ):
             marked.append(token)
     return marked
+
+
+def _symbol_beside(side: str) -> bool:
+    """Whether ``side``, read outward from an amount, starts with a currency
+    symbol (after at most one space) that has no digit beyond it."""
+    rest = side.removeprefix(" ")
+    if not rest or not _is_currency_mark(rest[0]):
+        return False
+    return not rest[1:2].isdigit()
+
+
+def _ends_or_punctuation(rest: str) -> bool:
+    """Whether the text after a code ends the field or is punctuation."""
+    return not rest or unicodedata.category(rest[0]).startswith("P")
 
 
 def _cut_all_but(

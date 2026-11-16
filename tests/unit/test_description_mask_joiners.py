@@ -787,3 +787,69 @@ def test_an_unmarked_amount_in_a_card_length_span_is_still_cut(text: str) -> Non
 
 def test_a_card_with_a_marked_group_shows_only_that_group_a_known_limit() -> None:
     assert mask_digits("Card 4111 1111 $11.11 1111") == ("Card 1111 $11.11", 1)
+
+
+def _shown_digits(text: str) -> int:
+    masked, runs = mask_digits(text)
+    assert runs == 1
+    assert masked is not None
+    return len([ch for ch in masked if ch.isdigit()])
+
+
+# A kept amount has at most six whole digits; a larger one is cut.
+def test_a_marked_amount_of_seven_whole_digits_or_more_is_cut() -> None:
+    assert mask_digits("1234 5678 $9012345.67") == ("4567", 1)
+
+
+def test_a_marked_amount_of_six_whole_digits_is_kept() -> None:
+    assert mask_digits("1234 5678 $901234.56") == ("5678 $901234.56", 1)
+
+
+# A mark counts only for the amount it is attached to: never with a digit on
+# its far side, so never as a separator between two digit groups.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "4111$1111$1111$11.11",
+        "4111\u20ac1111\u20ac1111\u20ac11.11",
+        "4111\u00a31111\u00a31111\u00a311.11",
+        "4111\u00a51111\u00a51111\u00a511.11",
+        "4111\uffe51111\uffe51111\uffe511.11",
+        "Card 4111 1111 3456 11.11 $5",
+        "Card 4111 1111 3456 11.11 \u20ac5",
+        "Card 4111 1111 3456 11,11\u00a35",
+    ],
+)
+def test_a_currency_mark_between_digits_spares_nothing(text: str) -> None:
+    assert _shown_digits(text) == 4
+
+
+# A code on the right counts only at the end of the field or before
+# punctuation.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1234 5678 9012 11.11 ALL rest",
+        "1234 5678 9012 11.11 USD FOR ITEMS",
+        "1234 5678 9012 11.11 CAD and more",
+    ],
+)
+def test_a_code_on_the_right_followed_by_more_words_spares_nothing(
+    text: str,
+) -> None:
+    assert _shown_digits(text) == 4
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("PAID 1234567890 11.11 CAD", "PAID 7890 11.11 CAD"),
+        ("PAID 1234567890 11.11 CAD.", "PAID 7890 11.11 CAD."),
+        ("PAID 1234567890 11.11 CAD; NEXT", "PAID 7890 11.11 CAD; NEXT"),
+        ("PAID 1234567890 11.11 USD)", "PAID 7890 11.11 USD)"),
+    ],
+)
+def test_a_code_on_the_right_at_the_end_or_before_punctuation_is_kept(
+    text: str, expected: str
+) -> None:
+    assert mask_digits(text) == (expected, 1)
