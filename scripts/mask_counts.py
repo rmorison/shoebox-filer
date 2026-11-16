@@ -116,6 +116,7 @@ LABELS: tuple[str, ...] = (
     # A span of 13 digits or more cut whole, its amounts and dates with it.
     "effect.card_length_span_cut",
     "effect.currency_marked_amount_kept",
+    "effect.backstop_span_cut",
     "overcut.two_years_side_by_side",
     "overcut.two_group_dash_number",
     "overcut.two_bare_thousands_side_by_side",
@@ -230,7 +231,15 @@ def count_field(
         counts["spans"] += 1
         span = span_match.group()
         around = (prepared[: span_match.start()], prepared[span_match.end() :])
-        field_cuts += _count_span(mask, span, counts, field_asides, kind, around)
+        cut = _count_span(mask, span, counts, field_asides, kind, around)
+        # The backstop after the rules: a span of 13 digits or more still
+        # showing more than 12 is cut whole, as one cut.
+        masked, rule_cuts = se._cut_tokens(span, *around)
+        if se._backstop(span, masked, rule_cuts) != (masked, rule_cuts):
+            counts["effect.backstop_span_cut"] += 1
+            counts["cuts"] += 1 - cut
+            cut = 1
+        field_cuts += cut
     if field_cuts:
         counts["fields.with_a_cut"] += 1
     for aside in field_asides:

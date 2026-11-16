@@ -714,20 +714,22 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
     is part of a number. Every run of the other tokens that totals eight digits or
     more is cut to its last four digits. A span of 13 digits or more, the shortest
     card number, sets nothing aside and is cut whole when no run of its number
-    tokens holds 13 digits, or when it has only amounts and dates in four groups or
-    more (see ``_cut_whole``); only an amount with cents of six whole digits or
-    fewer that a currency marks (``$45.99``, ``45.99 USD``) stays, the rest cut as
-    one; a currency symbol between two digits doesn't mark (see
-    ``_currency_marked``). A lone bare amount in thousands groups (nine digits or
-    fewer, ``123,456,789``) stays. So an amount with cents or a date beside a store
-    number stays readable (``STORE #0412 $45.99``, ``0412*45.99``), while groups
-    split by any mark are cut together (``4111#2222#3333#4444`` becomes ``4444``).
-    Where the two can't be told apart (``STORE 0412*4599``) they are cut: a leaked
-    number costs more than an over-cut description. Only a letter (cased, or another
-    letter such as a CJK ideograph) that isn't an x form ends a span. Known limits:
-    an other letter that looks like a mark (a click letter like a bar) ends one too,
-    and so keeps a number in parts; an other letter with a numeral value is not
-    folded, so a number written wholly in them passes.
+    tokens holds 13 digits, or when it has only amounts and dates (see
+    ``_cut_whole``); only the last amount with cents of six whole digits or fewer
+    that a currency marks (``$45.99``, ``45.99 USD``) stays, the rest cut as one; a
+    currency symbol with a digit beyond it doesn't mark (see ``_currency_marked``).
+    Then a backstop: a span of 13 digits or more that still shows more than 12 is
+    cut whole to its last four (see ``_backstop``). A lone bare amount in thousands
+    groups (nine digits or fewer, ``123,456,789``) stays. So an amount with cents or
+    a date beside a store number stays readable (``STORE #0412 $45.99``,
+    ``0412*45.99``), while groups split by any mark are cut together
+    (``4111#2222#3333#4444`` becomes ``4444``). Where the two can't be told apart
+    (``STORE 0412*4599``) they are cut: a leaked number costs more than an over-cut
+    description. Only a letter (cased, or another letter such as a CJK ideograph)
+    that isn't an x form ends a span. Known limits: an other letter that looks like
+    a mark (a click letter like a bar) ends one too, and so keeps a number in parts;
+    an other letter with a numeral value is not folded, so a number written wholly
+    in them passes.
 
     The first call builds the mask's patterns, several seconds over every code
     point, unless ``warm_mask`` ran first: ``serve`` warms it at start, and any
@@ -745,6 +747,7 @@ def mask_digits(text: str | None) -> tuple[str | None, int]:
         masked, cuts = _cut_tokens(
             span.group(), text[: span.start()], text[span.end() :]
         )
+        masked, cuts = _backstop(span.group(), masked, cuts)
         count += cuts
         return masked
 
@@ -768,12 +771,10 @@ _BARE_THOUSANDS = re.compile(r"[0-9]{1,3}([,.'\u2019])[0-9]{3}(?:\1[0-9]{3})*")
 _MAX_AMOUNT_DIGITS: Final = 12
 _MAX_BARE_AMOUNT_DIGITS: Final = 9
 _MIN_MASKED_DIGITS: Final = 8
-# The shortest card number, and the fewest groups a card number printed
-# only in amount- or date-shaped groups has. A span with that many digits,
-# an amount's or a date's own included, may set nothing aside: see
-# _cut_whole.
+# The shortest card number. A span with that many digits, an amount's or a
+# date's own included, may set nothing aside but one marked amount: see
+# _cut_whole and _backstop.
 _MIN_CARD_DIGITS: Final = 13
-_MIN_CARD_GROUPS: Final = 4
 # The ISO 4217 codes of the currencies in use. One touching an amount, or a
 # space away, marks it as money (see _currency_marked).
 _CURRENCY_CODE_LIST = """
@@ -860,6 +861,23 @@ def _cut_tokens(span: str, before: str = "", after: str = "") -> tuple[str, int]
     return _cut_runs(span, runs)
 
 
+# The most digits a span of 13 digits or more may show once masked: its last
+# four and one kept amount (six whole digits and cents).
+_MAX_SHOWN_DIGITS: Final = 4 + _MAX_KEPT_WHOLE_DIGITS + 2
+
+
+def _backstop(span: str, masked: str, cuts: int) -> tuple[str, int]:
+    """The guard after the rules: a span of 13 digits or more that still shows
+    more than 12 is cut whole to its last four, whatever the rules kept. So a
+    gap in any exemption becomes an over-cut, not a leak."""
+    digits = _NON_DIGIT.sub("", span)
+    if len(digits) < _MIN_CARD_DIGITS:
+        return masked, cuts
+    if len(_NON_DIGIT.sub("", masked)) <= _MAX_SHOWN_DIGITS:
+        return masked, cuts
+    return digits[-4:], 1
+
+
 def _is_currency_mark(ch: str) -> bool:
     return unicodedata.category(ch) == "Sc"
 
@@ -867,16 +885,20 @@ def _is_currency_mark(ch: str) -> bool:
 def _currency_marked(
     span: str, groups: list[re.Match[str]], before: str, after: str
 ) -> list[re.Match[str]]:
-    """The amounts with cents in ``span`` a currency marks, of six whole digits
-    or fewer (up to ``999,999.99``).
+    """The one amount kept in a span cut whole, if any: the last amount with
+    cents in ``span`` that a currency marks, of six whole digits or fewer (up
+    to ``999,999.99``). Any other marked amount is cut with the rest.
 
     A mark is a currency symbol (category Sc) touching the amount or one space
-    away, with no digit on its far side (``$45.99``, ``\u20ac 45,99``); so a
+    away, with no digit beyond it (``$45.99``, ``\u20ac 45,99``). Looking
+    beyond it skips invisible characters, and, for a symbol touching the
+    amount, the joiners after it; for a symbol a space away, spaces too. So a
     symbol between two digit groups (``4111$1111``), or one that belongs to the
-    next number (``11.11 $5``), never counts. Or it is an ISO 4217 code: before
-    the amount, touching it or one space away (``USD 45.99``); after it, only
-    when the code ends the field or punctuation follows it (``45.99 USD``,
-    ``45.99 CAD.``), so a code that is a word in a sentence (``11.11 ALL
+    next number (``11.11 $5``, ``11.11 $ 5``, ``11.11 $ x 5``), never counts.
+    Or it is an ISO 4217 code: before the amount, touching it or one space
+    away (``USD 45.99``); after it, only when the code ends the field or
+    punctuation follows it, past any spaces and invisible characters (``45.99
+    USD``, ``45.99 CAD.``), so a code that is a word in a sentence (``11.11 ALL
     rest``) doesn't count."""
     marked = []
     for token in groups:
@@ -885,8 +907,8 @@ def _currency_marked(
             continue
         if len(_NON_DIGIT.sub("", core)) - 2 > _MAX_KEPT_WHOLE_DIGITS:
             continue
-        left = (before[-6:] + span[: token.start()])[-6:]
-        right = (span[token.end() :] + after[:6])[:6]
+        left = (before[-_LOOK:] + span[: token.start()])[-_LOOK:]
+        right = (span[token.end() :] + after[:_LOOK])[:_LOOK]
         if _symbol_beside(left[::-1]) or _symbol_beside(right):
             marked.append(token)
             continue
@@ -901,21 +923,53 @@ def _currency_marked(
             and _ends_or_punctuation(right[code_right.end() :])
         ):
             marked.append(token)
-    return marked
+    return marked[-1:]
+
+
+# How far either side of an amount the mark checks read. Reading past a
+# window cut short counts as finding a digit, so a long run of marks or
+# invisible characters can only make an amount lose its mark.
+_LOOK: Final = 32
 
 
 def _symbol_beside(side: str) -> bool:
     """Whether ``side``, read outward from an amount, starts with a currency
-    symbol (after at most one space) that has no digit beyond it."""
-    rest = side.removeprefix(" ")
-    if not rest or not _is_currency_mark(rest[0]):
+    symbol (after any invisible characters and at most one space) that has no
+    digit beyond it."""
+    at = _skip(side, 0, spaces=False, joiners=False)
+    spaced = side[at : at + 1] == " "
+    if spaced:
+        at = _skip(side, at + 1, spaces=False, joiners=False)
+    if at >= len(side) or not _is_currency_mark(side[at]):
         return False
-    return not rest[1:2].isdigit()
+    beyond = _skip(side, at + 1, spaces=spaced, joiners=True)
+    if beyond >= len(side):
+        return len(side) < _LOOK
+    return not side[beyond].isdigit()
 
 
 def _ends_or_punctuation(rest: str) -> bool:
-    """Whether the text after a code ends the field or is punctuation."""
-    return not rest or unicodedata.category(rest[0]).startswith("P")
+    """Whether the text after a code, past any spaces and invisible
+    characters, ends the field or is punctuation."""
+    at = _skip(rest, 0, spaces=True, joiners=False)
+    if at >= len(rest):
+        return len(rest) < _LOOK
+    return unicodedata.category(rest[at]).startswith("P")
+
+
+def _skip(text: str, at: int, *, spaces: bool, joiners: bool) -> int:
+    """The first index from ``at`` that isn't an invisible character, nor a
+    space or a joiner when those are skipped too."""
+    while at < len(text):
+        ch = text[at]
+        if not (
+            _is_ignorable(ch)
+            or (spaces and ch == " ")
+            or (joiners and ch != " " and _is_joiner(ch))
+        ):
+            break
+        at += 1
+    return at
 
 
 def _cut_all_but(
@@ -986,17 +1040,17 @@ def _cut_whole(span: str, groups: list[re.Match[str]], runs: Runs) -> bool:
     left once amounts and dates are set aside and no run of them holds 13 digits
     or more: a card number split by amount- or date-shaped groups. A whole run
     of 13 or more is a card number already, cut on its own, so an amount beside
-    it stays. A span of amounts and dates alone is cut when it has four groups
-    or more (a card number in four groups shaped like amounts or dates); with
-    fewer it stays, like a rent line's dates and amount. Its currency-marked
-    amounts count toward the 13 but are kept (see ``_cut_all_but``).
+    it stays. A span of amounts and dates alone is cut whatever its number of
+    groups (a card number in groups shaped like amounts or dates). At most one
+    currency-marked amount counts toward the 13 but is kept (see
+    ``_currency_marked`` and ``_cut_all_but``).
     """
     if len(_NON_DIGIT.sub("", span)) < _MIN_CARD_DIGITS:
         return False
     lengths = [len(_NON_DIGIT.sub("", "".join(t.group() for t in run))) for run in runs]
     if any(lengths):
         return max(lengths) < _MIN_CARD_DIGITS
-    return len(groups) >= _MIN_CARD_GROUPS
+    return True
 
 
 def _cut_runs(span: str, runs: Runs) -> tuple[str, int]:

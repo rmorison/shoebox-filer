@@ -56,7 +56,7 @@ _CASES: list[tuple[str, dict[str, int]]] = [
     ("HOTEL 11/09-11/12", {"set_aside.short_date_range": 1, "cuts": 0}),
     ("TUITION 2025-2026", {"set_aside.year_range_alone": 1, "cuts": 0}),
     (
-        "SEATTLE WA 98101-1234 11/09 45.99",
+        "SEATTLE WA 98101-1234 1/9",
         {"set_aside.zip4_alone": 1, "set_aside.short_date": 1, "cuts": 0},
     ),
     ("ACCT 12345-6789 0123", {"neighbour.zip4_cut": 1, "cuts": 1}),
@@ -136,6 +136,8 @@ _CASES: list[tuple[str, dict[str, int]]] = [
         {"effect.card_length_span_cut": 1, "cuts": 1, "set_aside.amount_with_cents": 0},
     ),
     ("Ref 41.11 11/11 11.11 12.34", {"effect.card_length_span_cut": 1, "cuts": 1}),
+    # The backstop: no shape the rules leave too long is known, so none fires.
+    ("Card 4111 1111 1111 1234", {"effect.backstop_span_cut": 0, "cuts": 1}),
     # A currency-marked amount stays; the number beside it is cut.
     (
         "AMZN 1234567890 $45.99",
@@ -427,3 +429,15 @@ def test_usage_without_a_path() -> None:
     result = _run()
     assert result.returncode == 2
     assert result.stdout == ""
+
+
+def test_the_backstop_is_counted_when_it_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With the rules switched off, only the backstop cuts; the counts follow
+    # mask_digits, so the self-check stays at 0.
+    mask = mask_counts._Mask()
+    monkeypatch.setattr(mask.se, "_cut_tokens", lambda span, *_: (span, 0))
+    counts: Counter[str] = Counter()
+    mask_counts.count_field(mask, "Card 4111 1111 1111 1234", counts)
+    assert counts["effect.backstop_span_cut"] == 1
+    assert counts["cuts"] == 1
+    assert counts["check.cut_count_mismatch"] == 0

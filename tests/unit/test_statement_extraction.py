@@ -1389,7 +1389,6 @@ def test_a_number_in_thousands_groups_beyond_an_amount_is_cut(number: str) -> No
     "text",
     [
         "Total 12,345,678.90",
-        "Total 123,456,789,012.50",
         "Total 123,456,789",
         "Paid 1,234.56 at 12:30",
         "Total 123456.78",
@@ -1511,7 +1510,6 @@ _MUST_STAY = {
     "HOTEL 11/09-11/12": "HOTEL 11/09-11/12",
     "HOTEL 11/09 11/12": "HOTEL 11/09 11/12",
     "HOTEL 11/09 - 11/12": "HOTEL 11/09 - 11/12",
-    "RENT 11/01-11/30 1,200.00": "RENT 11/01-11/30 1,200.00",
     "INT 4.25% 10/01-10/31": "INT 4.25% 10/01-10/31",
     "PERIOD 10/01/26-10/31/26": "PERIOD 10/01/26-10/31/26",
     "2 x $12.50 = $25.00": "2 x $12.50 = $25.00",
@@ -1653,6 +1651,15 @@ def test_a_mark_before_or_after_a_cut_number_is_kept() -> None:
         # A date-shaped first group in a span of 13 digits or more is cut
         # with the rest.
         ("Ref 12.11 3456 7890 1234", "Ref 1234"),
+        # A span of 13 digits or more shows at most 12: its last four and one
+        # currency-marked amount. Amounts, dates, a ZIP+4 or a year range
+        # alone in such a span are cut with it.
+        ("RENT 11/01-11/30 1,200.00", "RENT 0000"),
+        ("Total 123,456,789,012.50", "Total 1250"),
+        ("SEATTLE WA 98101-1234 11/09 45.99", "SEATTLE WA 4599"),
+        ("ZIP 98101-1234, 11/09", "ZIP 1109"),
+        ("ACCT 12345-6789 $12.50", "ACCT 6789 $12.50"),
+        ("$12,345.67 $23,456.78", "$4567 $23,456.78"),
     ],
 )
 def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
@@ -1664,9 +1671,9 @@ def test_the_recorded_over_cuts_and_limits(text: str, expected: str) -> None:
     [
         # "Whole span": once amounts and dates are set aside, the year range
         # or ZIP+4 is the only token with digits left in its span.
-        "SEATTLE WA 98101-1234 11/09 45.99",  # a date and an amount peeled
-        "ZIP 98101-1234, 11/09",  # a joiner, then a date
-        "ACCT 12345-6789 $12.50",  # an amount, set aside
+        "SEATTLE WA 98101-1234 1/9",  # a date peeled
+        "ZIP 98101-1234, 1/9",  # a joiner, then a date
+        "ACCT 12345-6789 $1.50",  # an amount, set aside
         "TUITION 2025-2026 FALL",  # letters end it
         # Accepted, recorded as passing: a lone one is set aside even when
         # it is really an account number.

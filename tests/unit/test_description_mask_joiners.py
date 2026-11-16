@@ -689,8 +689,6 @@ def test_an_amount_beside_a_store_number_is_still_kept(text: str) -> None:
     "text",
     [
         "PAYMENT 4111 1111 1111 1234 12.50",  # a whole run of 13 or more
-        "RENT 11/01-11/30 1,200.00",
-        "$12,345.67 $23,456.78",
         "Fees 1.11 1/11 2.22 3.33",  # four groups, under 13 digits
     ],
 )
@@ -847,9 +845,46 @@ def test_a_code_on_the_right_followed_by_more_words_spares_nothing(
         ("PAID 1234567890 11.11 CAD.", "PAID 7890 11.11 CAD."),
         ("PAID 1234567890 11.11 CAD; NEXT", "PAID 7890 11.11 CAD; NEXT"),
         ("PAID 1234567890 11.11 USD)", "PAID 7890 11.11 USD)"),
+        ("PAID 1234567890 11.11 USD\u200b", "PAID 7890 11.11 USD"),
+        ("PAID 1234567890 11.11 USD\u200b.", "PAID 7890 11.11 USD."),
     ],
 )
 def test_a_code_on_the_right_at_the_end_or_before_punctuation_is_kept(
     text: str, expected: str
 ) -> None:
     assert mask_digits(text) == (expected, 1)
+
+
+# At most one marked amount is kept in a span of 13 digits or more, also
+# when the span holds only amounts.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("$123456.78 $123456.78", "$5678 $123456.78"),
+        ("$41.11 $11.11 $11.11 $11.11", "$1111 $11.11"),
+        ("12345678 $12.34 $56.78 $90.12", "5678 $90.12"),
+        ("$12,345.67 $23,456.78", "$4567 $23,456.78"),
+    ],
+)
+def test_a_card_length_span_keeps_at_most_one_marked_amount(
+    text: str, expected: str
+) -> None:
+    assert mask_digits(text) == (expected, 1)
+
+
+# Looking beyond a currency symbol skips invisible characters and spaces.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Card 4111 1111 3456 11.11 $\u200b5",
+        "Card 4111 1111 3456 11.11 $\u00ad5",
+        "Card 4111 1111 3456 11.11 $\u20605",
+        "Card 4111 1111 3456 11.11 $\u200d5",
+        "4111 1111 1111 $ 11.11 $ 5",
+        "Card 4111 1111 3456 11.11 $ x 5",
+    ],
+)
+def test_a_symbol_with_a_digit_beyond_invisibles_or_spaces_spares_nothing(
+    text: str,
+) -> None:
+    assert _shown_digits(text) == 4
