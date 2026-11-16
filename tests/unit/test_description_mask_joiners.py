@@ -737,3 +737,53 @@ def test_the_lo_numeral_limit_counts_against_the_unicode_version() -> None:
     else:
         assert _version(unicodedata.unidata_version) > _version(_WRITTEN_AGAINST)
         assert count >= _LO_NUMERALS_UNDER_14
+
+
+# A currency-marked amount (a currency symbol or code touching it, or one
+# space away) is exempt from the card-length cut: it stays as printed, and
+# the number beside it is cut to its last four.
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("AMZN 1234567890 $45.99", "AMZN 7890 $45.99"),
+        ("CALL 800-555-1234 $45.99", "CALL 1234 $45.99"),
+        ("INV 20261115 $1,250.00", "INV 1115 $1,250.00"),
+        ("INV 20261115 $1,250.00 NET30", "INV 1115 $1,250.00 NET30"),
+        ("POS 123456789012 $5.00", "POS 9012 $5.00"),
+        ("REF 1234567890 11/09 $12.50", "REF 1109 $12.50"),
+        ("PAID 1234567890 45.99 USD", "PAID 7890 45.99 USD"),
+        ("PAID 1234567890 45,99 EUR", "PAID 7890 45,99 EUR"),
+        ("PAID 1234567890 45,99 \u20ac", "PAID 7890 45,99 \u20ac"),
+        ("PAID 1234567890 \u20ac45,99", "PAID 7890 \u20ac45,99"),
+        ("PAID 1234567890 \uffe545.99", "PAID 7890 \uffe545.99"),
+    ],
+)
+def test_a_currency_marked_amount_beside_a_number_is_kept(
+    text: str, expected: str
+) -> None:
+    assert mask_digits(text) == (expected, 1)
+
+
+def test_a_code_marked_amount_alone_is_kept() -> None:
+    assert mask_digits("USD 45.99") == ("USD 45.99", 0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "4111 1111 11.11 1111",
+        "4111*1111*1111*11.11",
+        "4111 11/09 1111 1234",
+        "41.11 11/11 11.11 12.34",
+        "PAID 1234567890 45.99 REF",  # three letters, but not a currency
+    ],
+)
+def test_an_unmarked_amount_in_a_card_length_span_is_still_cut(text: str) -> None:
+    masked, runs = mask_digits(text)
+    assert runs == 1
+    assert masked is not None
+    assert len([ch for ch in masked if ch.isdigit()]) == 4
+
+
+def test_a_card_with_a_marked_group_shows_only_that_group_a_known_limit() -> None:
+    assert mask_digits("Card 4111 1111 $11.11 1111") == ("Card 1111 $11.11", 1)

@@ -136,6 +136,19 @@ _CASES: list[tuple[str, dict[str, int]]] = [
         {"effect.card_length_span_cut": 1, "cuts": 1, "set_aside.amount_with_cents": 0},
     ),
     ("Ref 41.11 11/11 11.11 12.34", {"effect.card_length_span_cut": 1, "cuts": 1}),
+    # A currency-marked amount stays; the number beside it is cut.
+    (
+        "AMZN 1234567890 $45.99",
+        {
+            "effect.card_length_span_cut": 1,
+            "effect.currency_marked_amount_kept": 1,
+            "cuts": 1,
+        },
+    ),
+    (
+        "PAID 1234567890 45.99 REF",
+        {"effect.card_length_span_cut": 1, "effect.currency_marked_amount_kept": 0},
+    ),
     # A whole run of 13 digits or more: the amount beside it is set aside.
     (
         "PAYMENT 4111 1111 1111 1234 12.50",
