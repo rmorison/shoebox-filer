@@ -423,7 +423,10 @@ def masked_file_name(name: str | None) -> str | None:
     ``-visa-``, or by a tatweel, is one run, and a run of eight digits or
     more becomes ``[number]``. A file name has no amounts to keep readable,
     so a long date run (``2027-01-31``), or digits either side of a short
-    word, is cut as well. The description mask then runs as a backstop.
+    word, is cut as well. The description mask then runs as a backstop. It
+    writes any digit outside ASCII still left (a digit of another script,
+    which NFKC keeps) and any vulgar fraction in ASCII, so a stored name can
+    differ from its decoded form in its digits.
 
     Known limits: groups split by a word of five or more letters stay
     apart; numerals spelled out, written as CJK numerals or as Roman

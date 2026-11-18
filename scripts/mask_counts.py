@@ -113,6 +113,10 @@ LABELS: tuple[str, ...] = (
     "effect.short_tokens_after_a_date_cut",
     "effect.adjacent_tokens_joined_cut",
     "effect.bare_thousands_over_nine_digits_cut",
+    # A span of 13 digits or more cut whole, its amounts and dates with it.
+    "effect.card_length_span_cut",
+    "effect.currency_marked_amount_kept",
+    "effect.backstop_span_cut",
     "overcut.two_years_side_by_side",
     "overcut.two_group_dash_number",
     "overcut.two_bare_thousands_side_by_side",
@@ -166,9 +170,7 @@ class _Mask:
 
     def prepare(self, text: str) -> str:
         """The field as ``mask_digits`` sees it before reading spans."""
-        se = self.se
-        folded = se._fold_separators(se.normalise_statement_text(text))
-        prepared: str = se._masked_run().sub("", folded)
+        prepared: str = self.se._prepare(text)
         return prepared
 
     def digits(self, token: str) -> str:
@@ -222,13 +224,22 @@ def count_field(
     prepared = mask.prepare(text)
     field_cuts = 0
     field_asides: set[str] = set()
-    spans = list(se._SPAN.finditer(prepared))
+    spans = list(se._span().finditer(prepared))
     if spans:
         counts["fields.with_a_digit_span"] += 1
     for span_match in spans:
         counts["spans"] += 1
         span = span_match.group()
-        field_cuts += _count_span(mask, span, counts, field_asides, kind)
+        around = (prepared[: span_match.start()], prepared[span_match.end() :])
+        cut = _count_span(mask, span, counts, field_asides, kind, around)
+        # The backstop after the rules: a span of 13 digits or more still
+        # showing more than 12 is cut whole, as one cut.
+        masked, rule_cuts = se._cut_tokens(span, *around)
+        if se._backstop(span, masked, rule_cuts) != (masked, rule_cuts):
+            counts["effect.backstop_span_cut"] += 1
+            counts["cuts"] += 1 - cut
+            cut = 1
+        field_cuts += cut
     if field_cuts:
         counts["fields.with_a_cut"] += 1
     for aside in field_asides:
@@ -244,8 +255,22 @@ def _count_span(
     counts: Counter[str],
     field_asides: set[str],
     source: str | None = None,
+    around: tuple[str, str] = ("", ""),
 ) -> int:
     se = mask.se
+    groups, runs = se._split_runs(span)
+    if se._cut_whole(span, groups, runs):
+        # Cut whole: only a currency-marked amount is kept; every other
+        # group is cut as one.
+        counts["effect.card_length_span_cut"] += 1
+        marked = se._currency_marked(span, groups, *around)
+        counts["effect.currency_marked_amount_kept"] += len(marked)
+        rest = [t for t in groups if t not in marked]
+        cut = bool(rest) and _count_run(
+            mask, span, rest, after_date=False, counts=counts
+        )
+        counts["cuts"] += int(cut)
+        return int(cut)
     tokens = list(se._TOKEN.finditer(span))
     left = [
         t
