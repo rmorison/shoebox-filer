@@ -29,7 +29,6 @@ import functools
 import json
 import logging
 import re
-import threading
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -48,8 +47,11 @@ from mcp_types import (
 )
 from pydantic import BaseModel, Field
 
+from receipt_index import access_log as _access_log
 from receipt_index import repository, statement_repository
-from receipt_index.access_log import WITHHELD
+from receipt_index.access_log import (
+    AccessLogError as AccessLogError,  # re-exported
+)
 from receipt_index.access_log import (
     default_access_log_path as default_access_log_path,  # re-exported
 )
@@ -59,7 +61,24 @@ from receipt_index.models import (  # noqa: TC001 (pydantic resolves them)
     ProvenanceSummary,
 )
 from receipt_index.paging import next_offset, page_envelope
-from receipt_index.statement_extraction import within_mask_bound
+from receipt_index.statement_contract import (
+    STATEMENT_CONTRACT_VERSION as STATEMENT_CONTRACT_VERSION,  # re-exported
+)
+from receipt_index.statement_contract import account_out as _account_out
+from receipt_index.statement_contract import change_out as _change_out
+from receipt_index.statement_contract import line_out as _line_out
+from receipt_index.statement_contract import (
+    lines_read_failures as _lines_read_failures,
+)
+from receipt_index.statement_contract import (  # noqa: F401 (tests import it here)
+    money as _money,
+)
+from receipt_index.statement_contract import (
+    statement_out as _statement_out,
+)
+from receipt_index.statement_contract import (
+    statement_read_failures as _statement_read_failures,
+)
 from receipt_index.store import InvalidRefError, LocalEvidenceStore, rendition_ref
 
 if TYPE_CHECKING:
@@ -78,8 +97,6 @@ DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 
-STATEMENT_CONTRACT_VERSION = 1
-"""The statement read contract's version, in every statement tool's response."""
 DEFAULT_CHANGE_PAGE_SIZE = 100
 DEFAULT_LINE_PAGE_SIZE = 500
 MAX_LINE_PAGE_SIZE = 1000
@@ -404,39 +421,11 @@ class FileResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AccessLogError(Exception):
-    """The access log can't be written."""
-
-
-class AccessLog:
-    """Append-only JSON-lines log of file fetches and withheld statement reads."""
+class AccessLog(_access_log.AccessLog):
+    """The access log, its entries echoed under this module's logger."""
 
     def __init__(self, path: Path) -> None:
-        self.path = path
-        self._lock = threading.Lock()
-
-    def check_writable(self) -> None:
-        """Create the log's directory and open it for append, or raise."""
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8"):
-                pass
-        except OSError as exc:
-            msg = f"access log {self.path} is not writable: {exc}"
-            raise AccessLogError(msg) from exc
-
-    def record(self, entry: dict[str, Any]) -> None:
-        """Append one entry and echo it to the application log."""
-        line = json.dumps(entry, sort_keys=True, default=str)
-        try:
-            with self._lock:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
-        except OSError as exc:
-            msg = f"access log {self.path} is not writable: {exc}"
-            raise AccessLogError(msg) from exc
-        logger.info("access: %s", line)
+        super().__init__(path, echo=logger)
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +613,6 @@ def _client_info(ctx: Context) -> dict[str, str | None]:
 
 _CURSOR = re.compile(r"s1:(0|[1-9][0-9]{0,18})")
 _MAX_CURSOR = 2**63 - 1
-_CENT = Decimal("0.01")
 
 
 class StatementToolError(Exception):
@@ -679,251 +667,6 @@ def _check_range(name: str, value: int, low: int, high: int | None) -> int:
         bound = f"from {low}" if high is None else f"from {low} to {high}"
         raise _statement_error("invalid_argument", f"{name} must be {bound}")
     return value
-
-
-class _Unreadable:
-    """A stored value the contract can't carry: its call is withheld."""
-
-    def __repr__(self) -> str:
-        return "<unreadable>"
-
-
-_UNREADABLE: Final = _Unreadable()
-# What the account's NUMERIC(14,2) money columns hold: a total in the JSONB
-# is held to the same shape. Its stored spelling must be ASCII digits, an
-# optional minus and at most two places, checked before Decimal reads it:
-# Decimal also takes exponents, underscores, whitespace, other scripts'
-# digits, NaN and infinity.
-_STORED_MONEY: Final = re.compile(r"-?[0-9]{1,12}(?:\.[0-9]{1,2})?")
-_MAX_STORED_MONEY: Final = Decimal(10) ** 12
-
-
-def _stored_money(value: object, *, nullable: bool = True) -> str | _Unreadable | None:
-    """A total from the JSONB as contract money, or ``_UNREADABLE``.
-
-    The pipeline stores each as a decimal string. Anything else (another
-    JSON type, a missing key, null where ``nullable`` is false, or text that
-    isn't a plain decimal of at most two places that a NUMERIC(14,2) holds)
-    can't be served as money."""
-    if value is None and nullable:
-        return None
-    if not isinstance(value, str) or _STORED_MONEY.fullmatch(value) is None:
-        return _UNREADABLE
-    try:
-        amount = Decimal(value)
-        # Both hold by the pattern; checked again so a change to it fails
-        # closed rather than raising past the withheld path.
-        if not amount.is_finite() or abs(amount) >= _MAX_STORED_MONEY:
-            return _UNREADABLE
-        return _money(amount)
-    except InvalidOperation:
-        return _UNREADABLE
-
-
-def _money(value: Decimal | None) -> str | None:
-    """A contract money string: two places, never ``-0.00``."""
-    if value is None:
-        return None
-    cents = value.quantize(_CENT)
-    if cents.is_zero():
-        return "0.00"
-    return f"{cents:f}"
-
-
-def _day(value: date | None) -> str | None:
-    return None if value is None else value.isoformat()
-
-
-def _timestamp(value: datetime) -> str:
-    """RFC 3339 in UTC, microseconds, with a ``Z``."""
-    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-_LOAN_FIGURES = (
-    "principal_before",
-    "principal_after",
-    "principal_paid",
-    "interest",
-    "escrow",
-    "fees",
-    "advances",
-)
-
-
-def _loan(row: dict[str, Any]) -> dict[str, str | None] | None:
-    """A loan account's figures, as the gates digested them.
-
-    The gates digest ``loan`` as null only for a loan account whose
-    extraction was capped (it read no figures), and as an object, its
-    figures null when not printed, for every other loan account. Any
-    other account type has no loan.
-    """
-    if row["account_type"] != "loan" or row["failure_class"] == "too_many_lines":
-        return None
-    return {name: _money(row[name]) for name in _LOAN_FIGURES}
-
-
-def _stored_field(total: dict[str, Any], key: str) -> object:
-    """A key of a stored total; a missing one is ``_UNREADABLE``, not null."""
-    return total.get(key, _UNREADABLE)
-
-
-def _stored_totals(
-    value: object, read: Callable[[dict[str, Any]], dict[str, Any]]
-) -> list[dict[str, Any] | _Unreadable] | _Unreadable:
-    """A JSONB totals list, each object read by ``read``.
-
-    The CHECK holds the column to an array, and the pipeline writes objects
-    into it. Anything else is ``_UNREADABLE``, at the level it went wrong."""
-    if not isinstance(value, list):
-        return _UNREADABLE
-    return [read(t) if isinstance(t, dict) else _UNREADABLE for t in value]
-
-
-def _totals(account: dict[str, Any], key: str) -> list[tuple[int, dict[str, Any]]]:
-    """An account's readable totals of one kind, with their indexes."""
-    totals = account[key]
-    if totals is _UNREADABLE:
-        return []
-    return [(i, t) for i, t in enumerate(totals) if t is not _UNREADABLE]
-
-
-def _account_out(row: dict[str, Any]) -> dict[str, Any]:
-    """One account in the contract's per-account shape."""
-    return {
-        "account_id": str(row["account_id"]),
-        "ordinal": row["ordinal"],
-        "match_key": {
-            "account_type": row["account_type"],
-            "last4": row["last4"],
-            "occurrence": row["occurrence"],
-        },
-        "institution": row["institution"],
-        "last4": row["last4"],
-        "account_type": row["account_type"],
-        "currency": row["currency"],
-        "period_start": _day(row["period_start"]),
-        "period_end": _day(row["period_end"]),
-        "status": row["status"],
-        "held_by_statement": row["held_by_statement"],
-        "beginning_balance": _money(row["beginning_balance"]),
-        "ending_balance": _money(row["ending_balance"]),
-        "section_totals": _stored_totals(
-            row["section_totals"],
-            lambda t: {
-                "section": _stored_field(t, "section"),
-                "amount": _stored_money(_stored_field(t, "amount"), nullable=False),
-            },
-        ),
-        "column_totals": _stored_totals(
-            row["column_totals"],
-            lambda t: {
-                "section": _stored_field(t, "section"),
-                "credits": _stored_money(_stored_field(t, "credits")),
-                "debits": _stored_money(_stored_field(t, "debits")),
-            },
-        ),
-        "line_order": row["line_order"],
-        "line_count": row["line_count"],
-        "date_grace_days": row["date_grace_days"],
-        "failure_class": row["failure_class"],
-        "difference": _money(row["difference"]),
-        "first_page": row["first_page"],
-        "last_page": row["last_page"],
-        "loan": _loan(row),
-        "content_digest": bytes(row["content_digest"]).hex(),
-    }
-
-
-def _account_text(account: dict[str, Any]) -> list[tuple[str, object]]:
-    """An account's free-text fields, each named for the log."""
-    where = f"accounts[{account['ordinal']}]"
-    fields: list[tuple[str, object]] = [
-        (f"{where}.institution", account["institution"])
-    ]
-    for i, total in _totals(account, "section_totals"):
-        # Never null in a section total (the contract): a null one is unread.
-        section = _UNREADABLE if total["section"] is None else total["section"]
-        fields.append((f"{where}.section_totals[{i}].section", section))
-    for i, total in _totals(account, "column_totals"):
-        fields.append((f"{where}.column_totals[{i}].section", total["section"]))
-    return fields
-
-
-def _servable(value: object) -> bool:
-    """Whether a stored text field can be served: null, or text in bound."""
-    if value is None:
-        return True
-    return isinstance(value, str) and within_mask_bound(value)
-
-
-def _account_unreadable(account: dict[str, Any]) -> list[str]:
-    """The names of an account's stored totals that can't be served: a
-    totals value that isn't a list, an element that isn't an object, or a
-    figure that isn't contract money."""
-    where = f"accounts[{account['ordinal']}]"
-    failed: list[str] = []
-    for key, sides in (
-        ("section_totals", ("amount",)),
-        ("column_totals", ("credits", "debits")),
-    ):
-        if account[key] is _UNREADABLE:
-            failed.append(f"{where}.{key}")
-            continue
-        for i, total in enumerate(account[key]):
-            if total is _UNREADABLE:
-                failed.append(f"{where}.{key}[{i}]")
-                continue
-            failed.extend(
-                f"{where}.{key}[{i}].{side}"
-                for side in sides
-                if total[side] is _UNREADABLE
-            )
-    return failed
-
-
-def _statement_out(
-    rev: dict[str, Any], accounts: list[dict[str, Any]]
-) -> dict[str, Any]:
-    """One revision in the contract's per-statement shape."""
-    return {
-        "contract_version": STATEMENT_CONTRACT_VERSION,
-        "statement_id": str(rev["statement_id"]),
-        "source_sha256": bytes(rev["source_sha256"]).hex(),
-        "revision": rev["revision"],
-        "extracted_at": _timestamp(rev["created_at"]),
-        "is_current": rev["is_current"],
-        "current_revision": rev["current_revision"],
-        "document_type": rev["document_type"],
-        "rejected_bound": rev["rejected_bound"],
-        "status": rev["status"],
-        "hold_reason": rev["hold_reason"],
-        "period_start": _day(rev["period_start"]),
-        "period_end": _day(rev["period_end"]),
-        "printed_account_count": rev["printed_account_count"],
-        "pages": rev["pages"],
-        "extractor": {
-            "model": rev["llm_model"],
-            "prompt_version": rev["prompt_version"],
-            "first_pass_version": rev["first_pass_version"],
-        },
-        "masked_runs": rev["masked_runs"],
-        "accounts": accounts,
-    }
-
-
-def _line_out(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "line_id": str(row["line_id"]),
-        "ordinal": row["ordinal"],
-        "posted_date": _day(row["posted_date"]),
-        "transaction_date": _day(row["transaction_date"]),
-        "description": row["description"],
-        "amount": _money(row["amount"]),
-        "running_balance": _money(row["running_balance"]),
-        "section": row["section"],
-        "page": row["page"],
-    }
 
 
 def _refuses(
@@ -1286,22 +1029,21 @@ def build_server(
     def withhold(
         tool: str,
         rev: dict[str, Any],
-        fields: list[tuple[str, object]],
+        failed: list[str],
         ctx: Context,
         account_ordinal: int | None = None,
-        unreadable: list[str] | None = None,
     ) -> None:
         """Refuse the call if any stored field can't be served as stored.
 
-        A free-text field fails when it isn't text (or null) or fails the
-        mask's bound; ``unreadable`` names stored totals that aren't
+        ``failed`` names the fields that failed the read check
+        (``statement_contract``): a free-text field that isn't text (or
+        null) or fails the mask's bound, or a stored total that isn't
         contract money. Nothing is re-masked or repaired: the digest covers
         the stored values. The refusal
         is logged and recorded in the access log by IDs and field names
         only, never the text, and stands even if the access log can't be
         written.
         """
-        failed = [*(unreadable or ()), *(n for n, v in fields if not _servable(v))]
         if not failed:
             return
         statement_id, revision = str(rev["statement_id"]), rev["revision"]
@@ -1312,16 +1054,14 @@ def build_server(
             revision,
             ", ".join(failed),
         )
-        entry: dict[str, Any] = {
-            "ts": datetime.now(UTC).isoformat(),
-            "tool": tool,
-            "statement_id": statement_id,
-            "revision": revision,
-            "account_ordinal": account_ordinal,
-            "fields": failed,
-            "outcome": WITHHELD,
-            "client": _client_info(ctx),
-        }
+        entry = _access_log.withheld_entry(
+            tool=tool,
+            statement_id=statement_id,
+            revision=revision,
+            account_ordinal=account_ordinal,
+            fields=failed,
+            client=_client_info(ctx),
+        )
         try:
             access_log.record(entry)
         except AccessLogError as exc:
@@ -1363,16 +1103,7 @@ def build_server(
         return _structured(
             {
                 "contract_version": STATEMENT_CONTRACT_VERSION,
-                "changes": [
-                    {
-                        "statement_id": str(c.statement_id),
-                        "revision": c.revision,
-                        "status": c.status,
-                        "document_type": c.document_type,
-                        "source_sha256": bytes(c.source_sha256).hex(),
-                    }
-                    for c in changes
-                ],
+                "changes": [_change_out(c) for c in changes],
                 "next_cursor": next_cursor,
             }
         )
@@ -1408,13 +1139,7 @@ def build_server(
             rev = revision_or_error(conn, uid, revision)
             rows = statement_repository.get_accounts(conn, rev["revision_id"])
         accounts = [_account_out(row) for row in rows]
-        withhold(
-            "get_statement",
-            rev,
-            [field for account in accounts for field in _account_text(account)],
-            ctx,
-            unreadable=[name for a in accounts for name in _account_unreadable(a)],
-        )
+        withhold("get_statement", rev, _statement_read_failures(accounts), ctx)
         return _structured(_statement_out(rev, accounts))
 
     @server.tool(annotations=_READ_ONLY_TOOL)
@@ -1466,11 +1191,7 @@ def build_server(
         withhold(
             "get_statement_lines",
             rev,
-            [
-                (f"lines[{line['ordinal']}].{name}", line[name])
-                for line in lines
-                for name in ("description", "section")
-            ],
+            _lines_read_failures(lines),
             ctx,
             account_ordinal=account_ordinal,
         )
