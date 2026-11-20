@@ -998,7 +998,7 @@ Extracts a statement again from its stored original and appends the result as a 
 - **Without `--yes`** it is a dry run: it shows the current revision's status, type, masked-digit count, last run's tokens and accounts, and says what a rerun would do. It makes no model call and changes nothing.
 - **With `--yes`** it checks the stored original's SHA-256 against the statement's, then runs the same steps as intake: the first pass and one model call per account (at most 8), the same mask and the same gates. The new revision is written with origin `rerun` and becomes current, and the statement appears once more in the change feed.
 - **The new revision becomes current whatever its result.** If it is held or rejected, it is still current. To change that, rerun again. Every earlier revision is kept unchanged and stays readable with `statements show STATEMENT_ID --revision N`.
-- It prints the old and new revision side by side: status, type, masked digit runs (and whether they changed), tokens, and each account's status and line count.
+- It prints the revision it replaced and the one it wrote, side by side, and says so if another write has since made a later revision current: status, type, masked digit runs (and whether they changed), tokens, and each account's status and line count.
 - If the original is missing, unreadable or its SHA-256 differs, or the model call fails, nothing is written and the command exits 1.
 
 The model is `llm.model` from the config, and the key is the configured Anthropic key. A rerun costs about what the statement cost at intake: the dry run shows the last run's tokens.
@@ -1012,7 +1012,7 @@ Its use is the last step of a restore (see [Server Deployment](server-deployment
 - Give statement IDs, or `--all`, not both.
 - Every ID is checked before anything is written; an unknown one stops the command with nothing republished.
 - **Without `--yes`** it lists the statements and their current feed positions, and writes nothing.
-- **With `--yes`** each statement is republished in its own short transaction, so `serve` isn't held up and a run cut short is safe to run again.
+- **With `--yes`** each statement is republished in its own short transaction, so `serve` isn't held up and a run cut short is safe to run again. If a statement disappears or the database refuses partway, the command exits 1; the statements before it stay republished, and running it again finishes the rest.
 
 JSON is `{dry_run, statements, total}`, each entry `{statement_id, revision, change_seq, new_change_seq}` (`new_change_seq` null in a dry run).
 
@@ -1082,7 +1082,7 @@ Every `get_receipt_file` call appends one JSON line to the access log, and the s
 
 A withheld statement read appends a line too, with `outcome` `withheld`, `ts`, `tool`, `client`, `statement_id`, `revision`, `account_ordinal` (null for `get_statement`) and `fields`, the names of the fields that failed (for example `accounts[1].institution` or `lines[12].description`), never their text. The refusal stands even if the line can't be written. [`status`](#status) counts these lines. Other statement reads aren't logged.
 
-The [`statements`](#statements) commands write to the same log (`RECEIPT_INDEX_MCP_ACCESS_LOG`, or the default path), and their lines aren't echoed to stderr:
+The [`statements`](#statements) commands write to the same log (`RECEIPT_INDEX_MCP_ACCESS_LOG`, or the default path). As with the server's, each line is also logged at INFO on stderr:
 
 - `statements show` appends a `withheld` line like the server's, with `tool` `cli statements show`, `account_ordinal` null, and `client` `{"name": "receipt-index", "user": <the account that ran it>}`. `status` counts it with the server's.
 - `statements file` appends one line per use: `ts`, `tool` `cli statements file`, `statement_id`, `source_sha256`, `outcome` `path` and `client`. The line is written before the path is printed; if it can't be written, no path is printed.

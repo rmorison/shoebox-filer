@@ -16,7 +16,11 @@ import pytest
 from click.testing import CliRunner
 
 from receipt_index.cli import cli
-from receipt_index.statement_repository import republish_each
+from receipt_index.statement_repository import (
+    RepublishStoppedError,
+    republish_each,
+)
+from receipt_index.statements import RerunOutcome
 from tests.unit.test_cli import _MINIMAL_CONFIG_YAML, _make_config
 
 if TYPE_CHECKING:
@@ -69,6 +73,8 @@ _REVISION: dict[str, Any] = {
     "revision_id": UUID(int=1),
     "statement_id": UUID(_ID),
     "revision": 3,
+    "is_current": True,
+    "current_revision": 3,
     "created_at": datetime(2026, 11, 1, 12, 0, tzinfo=UTC),
     "status": "held",
     "hold_reason": "account_held",
@@ -321,7 +327,221 @@ def test_republish_each_keeps_the_ones_before_a_failure() -> None:
             "receipt_index.statement_repository.republish",
             side_effect=[11, LookupError("no statement")],
         ),
-        pytest.raises(LookupError),
+        pytest.raises(RepublishStoppedError) as stopped,
     ):
         republish_each(conn, [UUID(int=1), UUID(int=2)])
     assert conn.commit.call_count == 2
+    conn.rollback.assert_called_once_with()
+    assert stopped.value.statement_id == UUID(int=2)
+    assert stopped.value.republished == [11]
+
+
+# ---------------------------------------------------------------------------
+# Review round 1
+# ---------------------------------------------------------------------------
+
+
+def test_file_logs_with_the_shared_entry_and_echoes_it_at_info(
+    config_file: Path,
+    snapshot: MagicMock,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    log = tmp_path / "logs" / "access.jsonl"
+    monkeypatch.setenv("RECEIPT_INDEX_MCP_ACCESS_LOG", str(log))
+    location = {"source_sha256": bytes(32), "ref": "originals/ab/cd.pdf"}
+    store = MagicMock()
+    path = tmp_path / "store" / "originals" / "ab" / "cd.pdf"
+    store.local_path.return_value = path
+    with (
+        patch(
+            "receipt_index.statement_repository.original_location",
+            return_value=location,
+        ),
+        patch("receipt_index.store.open_store", return_value=store),
+    ):
+        result = _invoke(config_file, "file", _ID)
+    assert result.exit_code == 0, result.output
+    assert result.stdout == f"{path}  (missing)\n"
+    (line,) = log.read_text().splitlines()
+    entry = json.loads(line)
+    assert set(entry) == {
+        "ts",
+        "tool",
+        "statement_id",
+        "source_sha256",
+        "outcome",
+        "client",
+    }
+    assert entry["tool"] == "cli statements file"
+    assert entry["outcome"] == "path"
+    assert entry["source_sha256"] == "00" * 32
+    # As documented: the line is also logged at INFO on stderr.
+    assert f"access: {line}" in result.stderr
+
+
+@contextmanager
+def _rerun_yes(
+    outcome: RerunOutcome | Exception, revisions: dict[int | None, dict[str, Any]]
+) -> Iterator[MagicMock]:
+    """Patch a --yes rerun: the run's result and the revisions read back."""
+
+    def get_revision(_conn: Any, _uid: UUID, revision: int | None = None) -> Any:
+        return revisions[revision]
+
+    rerun = MagicMock(name="rerun_statement")
+    if isinstance(outcome, Exception):
+        rerun.side_effect = outcome
+    else:
+        rerun.return_value = outcome
+    with (
+        patch(
+            "receipt_index.statement_repository.get_revision",
+            side_effect=get_revision,
+        ) as get,
+        patch(
+            "receipt_index.statement_repository.get_accounts",
+            return_value=[_ACCOUNT_ROW],
+        ),
+        patch("receipt_index.cli._rerun_agents"),
+        patch("receipt_index.store.open_store"),
+        patch("receipt_index.db.get_connection"),
+        patch("receipt_index.statements.rerun_statement", rerun),
+    ):
+        yield get
+
+
+def test_the_rerun_report_reads_the_revision_it_wrote(
+    config_file: Path, snapshot: MagicMock
+) -> None:
+    written = {**_REVISION, "revision": 4, "is_current": False, "current_revision": 5}
+    newer = {**_REVISION, "revision": 5, "status": "complete", "hold_reason": None}
+    revisions = {None: _REVISION, 3: _REVISION, 4: written, 5: newer}
+    with _rerun_yes(RerunOutcome(3, 4, 99), revisions) as get:
+        result = _invoke(config_file, "rerun", _ID, "--yes")
+    assert result.exit_code == 0, result.output
+    assert [c.args[2] for c in get.call_args_list] == [None, 4]
+    lines = result.stdout.splitlines()
+    assert lines[0] == f"Rerun of statement {_ID}: revision 3 -> 4, made current."
+    assert lines[1] == (
+        "Revision 4 is no longer current: revision 5 was written after it."
+    )
+
+
+def test_the_rerun_report_rereads_the_revision_it_replaced(
+    config_file: Path, snapshot: MagicMock
+) -> None:
+    replaced = {**_REVISION, "revision": 4, "masked_runs": 7}
+    written = {**_REVISION, "revision": 5, "masked_runs": 7}
+    revisions = {None: _REVISION, 4: replaced, 5: written}
+    with _rerun_yes(RerunOutcome(4, 5, 99), revisions) as get:
+        result = _invoke(config_file, "rerun", _ID, "--yes")
+    assert result.exit_code == 0, result.output
+    assert [c.args[2] for c in get.call_args_list] == [None, 5, 4]
+    assert "revision 4 -> 5, made current." in result.stdout
+    assert "Masked digit runs: 7 -> 7 (unchanged)" in result.stdout
+
+
+_PLANTED = "planted-statement-text"
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError(_PLANTED), OSError(5, _PLANTED), AssertionError(_PLANTED)]
+)
+def test_an_unexpected_rerun_error_is_named_by_class_only(
+    config_file: Path, snapshot: MagicMock, error: Exception
+) -> None:
+    with _rerun_yes(error, {None: _REVISION}):
+        result = _invoke(config_file, "rerun", _ID, "--yes")
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert (
+        f"Error: the rerun failed ({type(error).__name__}); nothing was written."
+        in result.stderr
+    )
+    assert _PLANTED not in result.output
+
+
+def test_a_failed_read_back_names_the_written_revision_by_class_only(
+    config_file: Path, snapshot: MagicMock
+) -> None:
+    import psycopg
+
+    calls = 0
+
+    def get_revision(_conn: Any, _uid: UUID, revision: int | None = None) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _REVISION
+        raise psycopg.OperationalError(_PLANTED)
+
+    with (
+        _rerun_yes(RerunOutcome(3, 4, 99), {None: _REVISION}),
+        patch(
+            "receipt_index.statement_repository.get_revision",
+            side_effect=get_revision,
+        ),
+    ):
+        result = _invoke(config_file, "rerun", _ID, "--yes")
+    assert result.exit_code == 1
+    assert (
+        "revision 4 was written and made current, but reading it back failed "
+        "(OperationalError)."
+    ) in result.stderr
+    assert _PLANTED not in result.output
+
+
+def test_republish_reports_how_many_were_done_when_one_disappears(
+    config_file: Path, snapshot: MagicMock
+) -> None:
+    other = UUID("0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c")
+    positions = [
+        {"statement_id": UUID(_ID), "revision": 1, "change_seq": 7},
+        {"statement_id": other, "revision": 2, "change_seq": 8},
+    ]
+    with (
+        patch(
+            "receipt_index.statement_repository.feed_positions",
+            return_value=positions,
+        ),
+        patch(
+            "receipt_index.statement_repository.republish_each",
+            side_effect=RepublishStoppedError(other, [21]),
+        ),
+        patch("receipt_index.db.get_connection"),
+    ):
+        result = _invoke(config_file, "republish", "--all", "--yes")
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert (
+        f"Error: statement {other} no longer exists; 1 of 2 statements were "
+        "republished before it, and stay republished. Run the command again "
+        "to finish."
+    ) in result.stderr
+    assert result.stdout == ""
+
+
+def test_republish_names_a_database_error_by_class_only(
+    config_file: Path, snapshot: MagicMock
+) -> None:
+    import psycopg
+
+    positions = [{"statement_id": UUID(_ID), "revision": 1, "change_seq": 7}]
+    with (
+        patch(
+            "receipt_index.statement_repository.feed_positions",
+            return_value=positions,
+        ),
+        patch(
+            "receipt_index.statement_repository.republish_each",
+            side_effect=psycopg.errors.CheckViolation(_PLANTED),
+        ),
+        patch("receipt_index.db.get_connection"),
+    ):
+        result = _invoke(config_file, "republish", _ID, "--yes")
+    assert result.exit_code == 1
+    assert "the database refused the republish (CheckViolation)" in result.stderr
+    assert _PLANTED not in result.output

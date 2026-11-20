@@ -1,7 +1,8 @@
 """The access log: where it lives, how it is written, what ``status`` reads.
 
 The MCP server (``mcp_server``) appends one JSON line per file fetch and per
-statement read it withholds. ``status`` counts the withheld ones, so the
+statement read it withholds; ``statements show`` and ``statements file``
+append theirs to the same log. ``status`` counts the withheld ones, so the
 operator sees them without reading the log. This module imports nothing
 from MCP, so ``status`` doesn't load the SDK.
 """
@@ -113,6 +114,24 @@ class AccessLog:
             msg = f"access log {self.path} is not writable: {exc}"
             raise AccessLogError(msg) from exc
         self._echo.info("access: %s", line)
+
+
+def file_entry(
+    *,
+    tool: str,
+    statement_id: str,
+    source_sha256: str,
+    client: dict[str, str | None],
+) -> dict[str, Any]:
+    """One use of a statement original's path: IDs and the hash, no content."""
+    return {
+        "ts": datetime.now(UTC).isoformat(),
+        "tool": tool,
+        "statement_id": statement_id,
+        "source_sha256": source_sha256,
+        "outcome": "path",
+        "client": client,
+    }
 
 
 def withheld_entry(

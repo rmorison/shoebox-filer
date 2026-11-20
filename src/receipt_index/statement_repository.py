@@ -372,6 +372,16 @@ def republish(conn: psycopg.Connection[dict[str, Any]], statement_id: UUID) -> i
     return change_seq
 
 
+class RepublishStoppedError(LookupError):
+    """A statement to republish no longer exists; the ones before it are done."""
+
+    def __init__(self, statement_id: UUID, republished: list[int]) -> None:
+        super().__init__(f"No statement {statement_id}")
+        self.statement_id = statement_id
+        # The new change_seq of each statement committed before it, in order.
+        self.republished = republished
+
+
 def republish_each(
     conn: psycopg.Connection[dict[str, Any]], statement_ids: Sequence[UUID]
 ) -> list[int]:
@@ -380,14 +390,20 @@ def republish_each(
     One transaction per statement holds the feed lock for one statement at
     a time, so the worker isn't blocked for the whole run, and an
     interrupted run is safe to repeat. Returns each one's new change_seq,
-    in order. A statement that doesn't exist raises ``LookupError``, after
-    the ones before it have been committed.
+    in order. A statement that doesn't exist rolls back its own transaction
+    and raises :class:`RepublishStoppedError`, which carries the ones
+    committed before it.
     """
     conn.commit()
     new_seqs: list[int] = []
     for statement_id in statement_ids:
-        new_seqs.append(republish(conn, statement_id))
+        try:
+            new_seq = republish(conn, statement_id)
+        except LookupError:
+            conn.rollback()
+            raise RepublishStoppedError(statement_id, new_seqs) from None
         conn.commit()
+        new_seqs.append(new_seq)
     return new_seqs
 
 

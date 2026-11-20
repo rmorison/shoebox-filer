@@ -3173,12 +3173,11 @@ def statements_file(ctx: click.Context, statement_id: str, output_format: str) -
     unmasked, so each use is recorded in the access log first; if the log
     can't be written, no path is printed and the command exits 1.
     """
-    from datetime import datetime as _datetime
-
     from receipt_index.access_log import (
         AccessLog,
         AccessLogError,
         configured_access_log_path,
+        file_entry,
     )
     from receipt_index.statement_repository import original_location
     from receipt_index.store import InvalidRefError, open_store
@@ -3198,14 +3197,12 @@ def statements_file(ctx: click.Context, statement_id: str, output_format: str) -
     except InvalidRefError:
         _fail(f"Error: the original of statement {uid} isn't in the local store.")
     sha = bytes(location["source_sha256"]).hex()
-    entry = {
-        "ts": _datetime.now(UTC).isoformat(),
-        "tool": "cli statements file",
-        "statement_id": str(uid),
-        "source_sha256": sha,
-        "outcome": "path",
-        "client": _cli_client(),
-    }
+    entry = file_entry(
+        tool="cli statements file",
+        statement_id=str(uid),
+        source_sha256=sha,
+        client=_cli_client(),
+    )
     try:
         AccessLog(configured_access_log_path()).record(entry)
     except AccessLogError as exc:
@@ -3234,6 +3231,8 @@ def _run_summary(rev: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, A
 
     return {
         "revision": rev["revision"],
+        "is_current": rev["is_current"],
+        "current_revision": rev["current_revision"],
         "extracted_at": timestamp(rev["created_at"]),
         "status": rev["status"],
         "hold_reason": rev["hold_reason"],
@@ -3257,12 +3256,15 @@ def _run_summary(rev: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, A
     }
 
 
-def _read_summary(config: AppConfig, uid: UUID) -> tuple[dict[str, Any], str]:
-    """The current revision's summary and the statement's hash, or exit 1."""
+def _read_summary(
+    config: AppConfig, uid: UUID, revision: int | None = None
+) -> tuple[dict[str, Any], str]:
+    """A revision's summary (the current one by default) and the statement's
+    hash, or exit 1."""
     from receipt_index.statement_repository import get_accounts
 
     with _statement_snapshot(config.database.url) as conn:
-        rev = _read_revision(conn, uid, None)
+        rev = _read_revision(conn, uid, revision)
         rows = get_accounts(conn, rev["revision_id"])
     return _run_summary(rev, rows), bytes(rev["source_sha256"]).hex()
 
@@ -3375,7 +3377,7 @@ def statements_rerun(
     try:
         agents = _rerun_agents(config)
         with get_connection(config.database.url) as conn:
-            rerun_statement(
+            outcome = rerun_statement(
                 conn,
                 open_store(config.store),
                 uid,
@@ -3393,7 +3395,21 @@ def statements_rerun(
             f"Error: the database refused the rerun ({type(exc).__name__}); "
             "nothing was written."
         )
-    current, _ = _read_summary(config, uid)
+    except Exception as exc:
+        # Anything else, by class only: its message could quote the input.
+        _fail(f"Error: the rerun failed ({type(exc).__name__}); nothing was written.")
+    # Report the revisions this run read and wrote, not whatever is current
+    # now: another write can land between the commit and these reads.
+    try:
+        current, _ = _read_summary(config, uid, outcome.revision)
+        if outcome.previous_revision != previous["revision"]:
+            previous, _ = _read_summary(config, uid, outcome.previous_revision)
+    except psycopg.Error as exc:
+        _fail(
+            f"Error: revision {outcome.revision} was written and made current, "
+            f"but reading it back failed ({type(exc).__name__}). Read it with "
+            f"`statements show {uid} --revision {outcome.revision}`."
+        )
     changed = current["masked_runs"] != previous["masked_runs"]
 
     if output_format == "json":
@@ -3412,8 +3428,13 @@ def statements_rerun(
         return
     click.echo(
         f"Rerun of statement {uid}: revision {previous['revision']} -> "
-        f"{current['revision']}, now current."
+        f"{current['revision']}, made current."
     )
+    if not current["is_current"]:
+        click.echo(
+            f"Revision {current['revision']} is no longer current: revision "
+            f"{current['current_revision']} was written after it."
+        )
     click.echo(
         _field(
             "Status",
@@ -3475,8 +3496,14 @@ def statements_republish(
     interrupted run is safe to repeat. Every ID is checked before anything
     is written.
     """
+    import psycopg
+
     from receipt_index.db import get_connection
-    from receipt_index.statement_repository import feed_positions, republish_each
+    from receipt_index.statement_repository import (
+        RepublishStoppedError,
+        feed_positions,
+        republish_each,
+    )
 
     if bool(statement_ids) == select_all:
         msg = "Give statement IDs or --all, not both."
@@ -3501,9 +3528,24 @@ def statements_republish(
 
     new_seqs: list[int | None] = [None] * len(positions)
     if yes:
-        with get_connection(config.database.url) as conn:
-            new_seqs = list(
-                republish_each(conn, [p["statement_id"] for p in positions])
+        try:
+            with get_connection(config.database.url) as conn:
+                new_seqs = list(
+                    republish_each(conn, [p["statement_id"] for p in positions])
+                )
+        except RepublishStoppedError as exc:
+            _fail(
+                f"Error: statement {exc.statement_id} no longer exists; "
+                f"{len(exc.republished)} of {len(positions)} statements were "
+                "republished before it, and stay republished. Run the command "
+                "again to finish."
+            )
+        except psycopg.Error as exc:
+            # By class only: a constraint's detail can quote a row's values.
+            _fail(
+                f"Error: the database refused the republish "
+                f"({type(exc).__name__}). Statements republished before it "
+                "stay republished; run the command again to finish."
             )
     entries = [
         {
