@@ -233,3 +233,35 @@ def _no_duplicates(
     monkeypatch.setattr(duplicates, "match_original", lambda *a, **k: None)
     monkeypatch.setattr(duplicates, "decide", lambda *a, **k: duplicates.Decision())
     monkeypatch.setattr(duplicates, "record_flags", lambda *a, **k: 0)
+
+
+@pytest.fixture
+def mask_output_in_bound(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[list[str]]:
+    """Check every ``mask_digits`` output a test makes against the read bound.
+
+    The MCP statement tools refuse a field that fails ``within_mask_bound``
+    (plan U7), so the bound must never refuse the mask's own output. A mask
+    test module opts in with ``pytestmark``; then each call its tests make,
+    by the module's own ``mask_digits`` or through ``statement_extraction``,
+    is checked, and the test fails on the first output past the bound.
+    Yields the outputs seen, so a module can assert it checked any.
+    """
+    from receipt_index import statement_extraction as se
+
+    real = se.mask_digits
+    seen: list[str] = []
+
+    def checked(text: str | None) -> tuple[str | None, int]:
+        masked, cuts = real(text)
+        if masked is not None:
+            seen.append(masked)
+            msg = f"the read bound refuses the mask's output {masked!a} of {text!a}"
+            assert se.within_mask_bound(masked), msg
+        return masked, cuts
+
+    monkeypatch.setattr(se, "mask_digits", checked)
+    if getattr(request.module, "mask_digits", None) is real:
+        monkeypatch.setattr(request.module, "mask_digits", checked)
+    yield seen

@@ -404,3 +404,106 @@ def changes_after(
         (after, limit),
     ).fetchall()
     return [StatementChange(**row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Reads for the MCP statement tools (plan U7)
+# ---------------------------------------------------------------------------
+
+
+def statement_exists(
+    conn: psycopg.Connection[dict[str, Any]], statement_id: UUID
+) -> bool:
+    """Whether a statement with this ID exists."""
+    row = conn.execute(
+        "SELECT 1 FROM receipt.statements WHERE id = %s", (statement_id,)
+    ).fetchone()
+    return row is not None
+
+
+def get_revision(
+    conn: psycopg.Connection[dict[str, Any]],
+    statement_id: UUID,
+    revision: int | None = None,
+) -> dict[str, Any] | None:
+    """One revision of a statement, or its current one when ``revision`` is None.
+
+    The row carries the revision's columns, its ``revision_id``, the
+    statement's ``source_sha256`` and ``current_revision``, and
+    ``is_current``. None when the statement or that revision doesn't exist.
+    """
+    match = "r.id = s.current_revision_id" if revision is None else "r.revision = %s"
+    params: tuple[Any, ...] = (
+        (statement_id,) if revision is None else (statement_id, revision)
+    )
+    return conn.execute(
+        f"""\
+        SELECT s.id AS statement_id, s.source_sha256,
+               cr.revision AS current_revision,
+               r.id = s.current_revision_id AS is_current,
+               r.id AS revision_id, r.revision, r.document_type, r.status,
+               r.hold_reason, r.rejected_bound, r.masked_runs, r.period_start,
+               r.period_end, r.printed_account_count, r.pages, r.llm_model,
+               r.prompt_version, r.first_pass_version, r.created_at
+        FROM receipt.statements s
+        JOIN receipt.statement_revisions cr ON cr.id = s.current_revision_id
+        JOIN receipt.statement_revisions r ON r.statement_id = s.id
+        WHERE s.id = %s AND {match}
+        """,
+        params,
+    ).fetchone()
+
+
+_ACCOUNT_COLUMNS = """\
+a.id AS account_id, a.ordinal, a.occurrence, a.institution, a.last4,
+a.account_type, a.currency, a.period_start, a.period_end, a.status,
+a.held_by_statement, a.failure_class, a.difference, a.first_page,
+a.last_page, a.line_order, a.date_grace_days, a.beginning_balance,
+a.ending_balance, a.section_totals, a.column_totals, a.principal_before,
+a.principal_after, a.principal_paid, a.interest, a.escrow, a.fees,
+a.advances, a.content_digest,
+(SELECT count(*) FROM receipt.statement_lines l WHERE l.account_id = a.id)
+    AS line_count"""
+
+
+def get_accounts(
+    conn: psycopg.Connection[dict[str, Any]], revision_id: UUID
+) -> list[dict[str, Any]]:
+    """A revision's accounts in document order, each with its ``line_count``."""
+    return conn.execute(
+        f"SELECT {_ACCOUNT_COLUMNS} FROM receipt.statement_accounts a"
+        " WHERE a.revision_id = %s ORDER BY a.ordinal",
+        (revision_id,),
+    ).fetchall()
+
+
+def get_account(
+    conn: psycopg.Connection[dict[str, Any]], revision_id: UUID, ordinal: int
+) -> dict[str, Any] | None:
+    """One account of a revision by its ordinal, or None."""
+    return conn.execute(
+        f"SELECT {_ACCOUNT_COLUMNS} FROM receipt.statement_accounts a"
+        " WHERE a.revision_id = %s AND a.ordinal = %s",
+        (revision_id, ordinal),
+    ).fetchone()
+
+
+def get_lines(
+    conn: psycopg.Connection[dict[str, Any]],
+    account_id: UUID,
+    *,
+    limit: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    """One page of an account's lines, in ``ordinal`` order."""
+    return conn.execute(
+        """\
+        SELECT id AS line_id, ordinal, posted_date, transaction_date,
+               description, amount, running_balance, section, page
+        FROM receipt.statement_lines
+        WHERE account_id = %s
+        ORDER BY ordinal
+        LIMIT %s OFFSET %s
+        """,
+        (account_id, limit, offset),
+    ).fetchall()

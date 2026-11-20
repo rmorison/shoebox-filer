@@ -67,6 +67,13 @@ _HISTORY_WRITER = "receipt_index_mcp_test_history_writer"
 _CURSOR_WRITER = "receipt_index_mcp_test_cursor_writer"
 
 _CLI = str(Path(sys.executable).parent / "receipt-index")
+# What migrations 000002 and 000024 let the read role SELECT: the tables the
+# startup check requires.
+_READ_TABLES = (
+    "receipt.receipts, receipt.ingest_log, receipt.statements, "
+    "receipt.statement_revisions, receipt.statement_accounts, "
+    "receipt.statement_lines"
+)
 
 
 def _ensure_login_role(conn: psycopg.Connection[dict[str, Any]], role: str) -> None:
@@ -90,8 +97,8 @@ def _ensure_login_role(conn: psycopg.Connection[dict[str, Any]], role: str) -> N
 
 @pytest.fixture()
 def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
-    """Login roles with the grants migrations 000002/000004 give, plus one
-    that holds only a column-level INSERT."""
+    """Login roles with the grants migrations 000002/000004/000024 give,
+    plus one that holds only a column-level INSERT."""
     for role in (
         _READ_ROLE,
         _WRITE_ROLE,
@@ -105,9 +112,7 @@ def roles(pg_conn: psycopg.Connection[dict[str, Any]]) -> None:
         f"GRANT USAGE ON SCHEMA receipt TO {_READ_ROLE}, {_WRITE_ROLE}, "
         f"{_COLUMN_WRITER}"
     )
-    pg_conn.execute(
-        f"GRANT SELECT ON receipt.receipts, receipt.ingest_log TO {_READ_ROLE}"
-    )
+    pg_conn.execute(f"GRANT SELECT ON {_READ_TABLES} TO {_READ_ROLE}")
     pg_conn.execute(
         f"GRANT SELECT, DELETE ON receipt.receipts TO {_WRITE_ROLE}; "
         f"GRANT SELECT ON receipt.ingest_log TO {_WRITE_ROLE}; "
@@ -260,6 +265,9 @@ def test_lists_tools_and_searches_over_stdio(
         "get_receipt",
         "get_receipt_file",
         "list_failures",
+        "list_statement_changes",
+        "get_statement",
+        "get_statement_lines",
     }
     first = page1.structured_content
     second = page2.structured_content

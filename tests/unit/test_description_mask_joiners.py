@@ -17,6 +17,10 @@ import pytest
 
 from receipt_index.statement_extraction import mask_digits
 
+# Every mask output these tests make must pass the MCP tools' read bound
+# (plan U7): the bound must never refuse the mask's own output.
+pytestmark = pytest.mark.usefixtures("mask_output_in_bound")
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

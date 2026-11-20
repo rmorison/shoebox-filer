@@ -1550,7 +1550,7 @@ The server refuses to start unless its database role is read-only. It logs in as
 
 ### 10.1 One-time setup
 
-**1. Create the access-log directory.** Fetches are logged to `data/mcp-logs`, a separate bind mount. It is deliberately outside `data/receipts` and `data/backups`, because the crontab copies both of those to Dropbox and a fetch log has no business leaving the host. Skip this if you provisioned with the current [3.4](#34-create-the-bind-mount-directories-before-the-first-up--d).
+**1. Create the access-log directory.** File fetches and withheld statement reads are logged to `data/mcp-logs`, a separate bind mount. It is deliberately outside `data/receipts` and `data/backups`, because the crontab copies both of those to Dropbox and a fetch log has no business leaving the host. Skip this if you provisioned with the current [3.4](#34-create-the-bind-mount-directories-before-the-first-up--d).
 
 ```bash
 cd ~/receipt-index
@@ -1603,7 +1603,11 @@ docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index mcp 
 
 ### 10.2 The access log
 
-One JSON line per `get_receipt_file` call: timestamp, receipt ID, stored path, size, whether content was returned, the outcome, and the client's name and version. If the log can't be written, the server withholds the file. The log is small and isn't rotated. Read it with:
+One JSON line per `get_receipt_file` call: timestamp, receipt ID, stored path, size, whether content was returned, the outcome, and the client's name and version. If the log can't be written, the server withholds the file.
+
+A statement read the server refuses with `withheld` adds a line too, with outcome `withheld`: the statement ID, revision, account and the names of the fields that failed the read check, never their values. `receipt-index status` counts these under MCP, so you see them without reading the log; see [CLI Reference: Statement tools](cli-reference.md#statement-tools). A withheld revision is a stored-data problem: re-extract the statement, or correct the stored rows.
+
+The log is small and isn't rotated. Read it with:
 
 ```bash
 tail -n 20 data/mcp-logs/mcp-access.jsonl

@@ -452,13 +452,15 @@ def _ping_probe(config: AppConfig) -> Callable[[], list[str]]:
 )
 @click.pass_context
 def status(ctx: click.Context, output_format: str, check: bool) -> None:
-    """Show each source's sync state, serve's heartbeat and the retry counts.
+    """Show each source's sync state, serve's heartbeat, the retry counts, and
+    the statement reads the MCP server withheld.
 
     Works with or without `serve` running: it reads the database, and the
     heartbeat file if there is one. With --check it prints only the problem
     lines (or "ok") and exits 1 if there is any; it is serve's container
     healthcheck. Terminal failures never fail the check.
     """
+    from receipt_index.access_log import configured_access_log_path
     from receipt_index.health import HEARTBEAT_PATH, collect, report_json, report_text
 
     config = _load_config_or_exit(ctx)
@@ -470,6 +472,9 @@ def status(ctx: click.Context, output_format: str, check: bool) -> None:
         # The healthcheck needs no retry counts: fewer queries under its
         # timeout.
         retries=not (check and output_format == "text"),
+        # Statement reads the MCP server withheld (its access log), so the
+        # operator sees them without reading the log.
+        access_log_path=configured_access_log_path(),
     )
 
     if output_format == "json":
@@ -2630,7 +2635,7 @@ def duplicates_scan(ctx: click.Context, dry_run: bool, window_days: int) -> None
     default=None,
     envvar="RECEIPT_INDEX_MCP_ACCESS_LOG",
     help=(
-        "JSON-lines file recording every file fetch "
+        "JSON-lines file recording every file fetch and withheld statement read "
         "[default: $XDG_STATE_HOME/receipt-index/mcp-access.jsonl]."
     ),
 )
