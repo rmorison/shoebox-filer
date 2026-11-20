@@ -19,6 +19,7 @@ import pytest
 from mcp import Client
 
 from receipt_index import mcp_server
+from receipt_index.access_log import count_withheld
 from receipt_index.mcp_server import (
     _INSTRUCTIONS,
     MAX_LINE_PAGE_SIZE,
@@ -428,6 +429,17 @@ def _withheld_entries(log_path: Path) -> list[dict[str, Any]]:
     return [e for e in entries if e["outcome"] == "withheld"]
 
 
+def _assert_withheld(result: CallToolResult, log_path: Path, field: str) -> None:
+    """Refused with ``withheld``, logged by field name only, counted by
+    ``status`` (which reads the log through ``count_withheld``)."""
+    assert _error(result).startswith("withheld: ")
+    (entry,) = _withheld_entries(log_path)
+    assert entry["fields"] == [field]
+    withheld = count_withheld(log_path)
+    assert withheld is not None
+    assert withheld.count == 1
+
+
 def _assert_no_text(result: CallToolResult, text: str) -> None:
     out = json.dumps(result.model_dump(mode="json"))
     digits = re.sub(
@@ -556,16 +568,27 @@ def test_stored_totals_come_back_as_contract_money(
 ) -> None:
     repo.get_accounts.return_value = [
         _account(
-            section_totals=[{"section": "fees", "amount": "15.5"}],
-            column_totals=[{"section": None, "credits": "-0.00", "debits": "7"}],
+            section_totals=[
+                {"section": "fees", "amount": "15.5"},
+                {"section": "credits", "amount": "-0"},
+            ],
+            column_totals=[
+                {"section": None, "credits": "-0.00", "debits": "7"},
+                {"section": "fees", "credits": None, "debits": "999999999999.99"},
+            ],
         )
     ]
     data = _ok(_call(log_path, "get_statement", {"statement_id": str(_STATEMENT)}))
     (account,) = data["accounts"]
-    assert account["section_totals"] == [{"section": "fees", "amount": "15.50"}]
-    assert account["column_totals"] == [
-        {"section": None, "credits": "0.00", "debits": "7.00"}
+    assert account["section_totals"] == [
+        {"section": "fees", "amount": "15.50"},
+        {"section": "credits", "amount": "0.00"},
     ]
+    assert account["column_totals"] == [
+        {"section": None, "credits": "0.00", "debits": "7.00"},
+        {"section": "fees", "credits": None, "debits": "999999999999.99"},
+    ]
+    assert not log_path.exists() or not _withheld_entries(log_path)
 
 
 @pytest.mark.parametrize(
@@ -579,6 +602,17 @@ def test_stored_totals_come_back_as_contract_money(
         "1.234",
         "1234567890123.00",
         "4929381766207319",
+        # Past the default context's 28 digits: quantize would raise.
+        "1" * 30,
+        "1E+30",
+        # Spellings Decimal reads but the pipeline never stores.
+        "1e2",
+        "1_0.00",
+        " 1.00",
+        "1.00\n",
+        "+1.00",
+        ".50",
+        "\u0663.\u0660\u0660",
         12,
         1.5,
         True,
@@ -603,9 +637,7 @@ def test_a_stored_total_that_is_not_contract_money_is_withheld(
     )
     repo.get_accounts.return_value = [_account(**{where: [total | {field: value}]})]
     result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
-    assert _error(result).startswith("withheld: ")
-    (entry,) = _withheld_entries(log_path)
-    assert entry["fields"] == [f"accounts[1].{where}[0].{field}"]
+    _assert_withheld(result, log_path, f"accounts[1].{where}[0].{field}")
     assert "4929" not in json.dumps(result.model_dump(mode="json"))
     assert "4929" not in log_path.read_text()
 
@@ -625,6 +657,56 @@ def test_a_stored_section_that_is_not_text_is_withheld(
     assert _error(result).startswith("withheld: ")
     (entry,) = _withheld_entries(log_path)
     assert entry["fields"] == [f"accounts[1].{where}[0].section"]
+
+
+@pytest.mark.parametrize("element", ["fees", 12, None, True, ["fees", "1.00"]])
+@pytest.mark.parametrize("where", ["section_totals", "column_totals"])
+def test_a_stored_total_that_is_not_an_object_is_withheld(
+    repo: MagicMock, log_path: Path, element: object, where: str
+) -> None:
+    repo.get_accounts.return_value = [_account(**{where: [element]})]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    _assert_withheld(result, log_path, f"accounts[1].{where}[0]")
+
+
+@pytest.mark.parametrize("totals", ["fees", {"section": "fees"}, None, 12])
+@pytest.mark.parametrize("where", ["section_totals", "column_totals"])
+def test_stored_totals_that_are_not_a_list_are_withheld(
+    repo: MagicMock, log_path: Path, totals: object, where: str
+) -> None:
+    repo.get_accounts.return_value = [_account(**{where: totals})]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    _assert_withheld(result, log_path, f"accounts[1].{where}")
+
+
+@pytest.mark.parametrize(
+    ("where", "total", "field"),
+    [
+        ("section_totals", {"section": "fees"}, "amount"),
+        ("section_totals", {"amount": "1.00"}, "section"),
+        ("column_totals", {"section": "fees", "debits": "1.00"}, "credits"),
+        ("column_totals", {"section": "fees", "credits": "1.00"}, "debits"),
+        ("column_totals", {"credits": "1.00", "debits": None}, "section"),
+    ],
+)
+def test_a_stored_total_missing_a_key_is_withheld(
+    repo: MagicMock, log_path: Path, where: str, total: dict[str, Any], field: str
+) -> None:
+    # A missing key isn't null: the digest covers the stored object.
+    repo.get_accounts.return_value = [_account(**{where: [total]})]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    _assert_withheld(result, log_path, f"accounts[1].{where}[0].{field}")
+
+
+def test_a_section_total_amount_of_null_is_withheld(
+    repo: MagicMock, log_path: Path
+) -> None:
+    # The contract: a section total is a printed magnitude, never null.
+    repo.get_accounts.return_value = [
+        _account(section_totals=[{"section": "fees", "amount": None}])
+    ]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    _assert_withheld(result, log_path, "accounts[1].section_totals[0].amount")
 
 
 def test_a_section_totals_section_of_null_is_withheld(

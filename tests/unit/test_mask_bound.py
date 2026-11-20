@@ -70,6 +70,14 @@ def test_text_within_the_bound_passes(text: str | None) -> None:
             "groups of four on both sides of a letter",
             "Synthetic 1234 5678 9012 Q 3456",
         ),
+        # A run split by a mark that isn't a letter: the mask reads it as
+        # one run, so the guard must too.
+        ("three groups of four, by middle dots (U+00B7)", "1234\u00b75678\u00b79012"),
+        ("three groups of four, by bullets (U+2022)", "1234\u20225678\u20229012"),
+        (
+            "three groups of four, by zero-width spaces (U+200B)",
+            "1234\u200b5678\u200b9012",
+        ),
         (
             "a run between short words",
             "Chapter 12 then 4111 1111 then 1234 5678 9012",

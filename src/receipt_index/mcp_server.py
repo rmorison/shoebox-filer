@@ -690,31 +690,34 @@ class _Unreadable:
 
 _UNREADABLE: Final = _Unreadable()
 # What the account's NUMERIC(14,2) money columns hold: a total in the JSONB
-# is held to the same shape.
+# is held to the same shape. Its stored spelling must be ASCII digits, an
+# optional minus and at most two places, checked before Decimal reads it:
+# Decimal also takes exponents, underscores, whitespace, other scripts'
+# digits, NaN and infinity.
+_STORED_MONEY: Final = re.compile(r"-?[0-9]{1,12}(?:\.[0-9]{1,2})?")
 _MAX_STORED_MONEY: Final = Decimal(10) ** 12
 
 
-def _stored_money(value: object) -> str | _Unreadable | None:
+def _stored_money(value: object, *, nullable: bool = True) -> str | _Unreadable | None:
     """A total from the JSONB as contract money, or ``_UNREADABLE``.
 
     The pipeline stores each as a decimal string. Anything else (another
-    JSON type, text that isn't a finite number, more than two places, or
-    past what a NUMERIC(14,2) holds) can't be served as money."""
-    if value is None:
+    JSON type, a missing key, null where ``nullable`` is false, or text that
+    isn't a plain decimal of at most two places that a NUMERIC(14,2) holds)
+    can't be served as money."""
+    if value is None and nullable:
         return None
-    if not isinstance(value, str):
+    if not isinstance(value, str) or _STORED_MONEY.fullmatch(value) is None:
         return _UNREADABLE
     try:
         amount = Decimal(value)
+        # Both hold by the pattern; checked again so a change to it fails
+        # closed rather than raising past the withheld path.
+        if not amount.is_finite() or abs(amount) >= _MAX_STORED_MONEY:
+            return _UNREADABLE
+        return _money(amount)
     except InvalidOperation:
         return _UNREADABLE
-    if (
-        not amount.is_finite()
-        or amount != amount.quantize(_CENT)
-        or abs(amount) >= _MAX_STORED_MONEY
-    ):
-        return _UNREADABLE
-    return _money(amount)
 
 
 def _money(value: Decimal | None) -> str | None:
@@ -760,6 +763,31 @@ def _loan(row: dict[str, Any]) -> dict[str, str | None] | None:
     return {name: _money(row[name]) for name in _LOAN_FIGURES}
 
 
+def _stored_field(total: dict[str, Any], key: str) -> object:
+    """A key of a stored total; a missing one is ``_UNREADABLE``, not null."""
+    return total.get(key, _UNREADABLE)
+
+
+def _stored_totals(
+    value: object, read: Callable[[dict[str, Any]], dict[str, Any]]
+) -> list[dict[str, Any] | _Unreadable] | _Unreadable:
+    """A JSONB totals list, each object read by ``read``.
+
+    The CHECK holds the column to an array, and the pipeline writes objects
+    into it. Anything else is ``_UNREADABLE``, at the level it went wrong."""
+    if not isinstance(value, list):
+        return _UNREADABLE
+    return [read(t) if isinstance(t, dict) else _UNREADABLE for t in value]
+
+
+def _totals(account: dict[str, Any], key: str) -> list[tuple[int, dict[str, Any]]]:
+    """An account's readable totals of one kind, with their indexes."""
+    totals = account[key]
+    if totals is _UNREADABLE:
+        return []
+    return [(i, t) for i, t in enumerate(totals) if t is not _UNREADABLE]
+
+
 def _account_out(row: dict[str, Any]) -> dict[str, Any]:
     """One account in the contract's per-account shape."""
     return {
@@ -780,18 +808,21 @@ def _account_out(row: dict[str, Any]) -> dict[str, Any]:
         "held_by_statement": row["held_by_statement"],
         "beginning_balance": _money(row["beginning_balance"]),
         "ending_balance": _money(row["ending_balance"]),
-        "section_totals": [
-            {"section": t.get("section"), "amount": _stored_money(t.get("amount"))}
-            for t in row["section_totals"]
-        ],
-        "column_totals": [
-            {
-                "section": t.get("section"),
-                "credits": _stored_money(t.get("credits")),
-                "debits": _stored_money(t.get("debits")),
-            }
-            for t in row["column_totals"]
-        ],
+        "section_totals": _stored_totals(
+            row["section_totals"],
+            lambda t: {
+                "section": _stored_field(t, "section"),
+                "amount": _stored_money(_stored_field(t, "amount"), nullable=False),
+            },
+        ),
+        "column_totals": _stored_totals(
+            row["column_totals"],
+            lambda t: {
+                "section": _stored_field(t, "section"),
+                "credits": _stored_money(_stored_field(t, "credits")),
+                "debits": _stored_money(_stored_field(t, "debits")),
+            },
+        ),
         "line_order": row["line_order"],
         "line_count": row["line_count"],
         "date_grace_days": row["date_grace_days"],
@@ -810,11 +841,11 @@ def _account_text(account: dict[str, Any]) -> list[tuple[str, object]]:
     fields: list[tuple[str, object]] = [
         (f"{where}.institution", account["institution"])
     ]
-    for i, total in enumerate(account["section_totals"]):
+    for i, total in _totals(account, "section_totals"):
         # Never null in a section total (the contract): a null one is unread.
         section = _UNREADABLE if total["section"] is None else total["section"]
         fields.append((f"{where}.section_totals[{i}].section", section))
-    for i, total in enumerate(account["column_totals"]):
+    for i, total in _totals(account, "column_totals"):
         fields.append((f"{where}.column_totals[{i}].section", total["section"]))
     return fields
 
@@ -826,20 +857,28 @@ def _servable(value: object) -> bool:
     return isinstance(value, str) and within_mask_bound(value)
 
 
-def _account_money(account: dict[str, Any]) -> list[str]:
-    """The names of an account's stored totals that aren't contract money."""
+def _account_unreadable(account: dict[str, Any]) -> list[str]:
+    """The names of an account's stored totals that can't be served: a
+    totals value that isn't a list, an element that isn't an object, or a
+    figure that isn't contract money."""
     where = f"accounts[{account['ordinal']}]"
-    failed = [
-        f"{where}.section_totals[{i}].amount"
-        for i, total in enumerate(account["section_totals"])
-        if total["amount"] is _UNREADABLE
-    ]
-    for i, total in enumerate(account["column_totals"]):
-        failed.extend(
-            f"{where}.column_totals[{i}].{side}"
-            for side in ("credits", "debits")
-            if total[side] is _UNREADABLE
-        )
+    failed: list[str] = []
+    for key, sides in (
+        ("section_totals", ("amount",)),
+        ("column_totals", ("credits", "debits")),
+    ):
+        if account[key] is _UNREADABLE:
+            failed.append(f"{where}.{key}")
+            continue
+        for i, total in enumerate(account[key]):
+            if total is _UNREADABLE:
+                failed.append(f"{where}.{key}[{i}]")
+                continue
+            failed.extend(
+                f"{where}.{key}[{i}].{side}"
+                for side in sides
+                if total[side] is _UNREADABLE
+            )
     return failed
 
 
@@ -1374,7 +1413,7 @@ def build_server(
             rev,
             [field for account in accounts for field in _account_text(account)],
             ctx,
-            unreadable=[name for a in accounts for name in _account_money(a)],
+            unreadable=[name for a in accounts for name in _account_unreadable(a)],
         )
         return _structured(_statement_out(rev, accounts))
 

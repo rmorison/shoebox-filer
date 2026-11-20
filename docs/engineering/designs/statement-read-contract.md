@@ -63,7 +63,7 @@ A well-formed cursor ahead of everything the server has issued (possible after a
 
 ### Withheld
 
-Text is masked before it is stored. Before a tool returns a revision's data, it checks what it is about to return once more. `get_statement` checks each account's `institution`, every totals `section` (text; never null in a section total) and every totals amount, credits and debits (a decimal string that fits the contract's money: finite, at most two places, under 10^12). `get_statement_lines` checks the page's `description` and `section` values. Each text field is held to the mask's own rule (see [the read check](#masking)). If any field fails, the call is refused with `withheld`, and nothing of that revision is returned by that call. Nothing is re-masked or repaired at read, since the digest covers the stored values.
+Text is masked before it is stored. Before a tool returns a revision's data, it checks what it is about to return once more. `get_statement` checks each account's `institution`, every totals `section` (text; never null in a section total) and every totals amount, credits and debits (a plain decimal string, an optional minus and ASCII digits with at most two places, under 10^12; never null in a section total). Each total must be an object holding all its keys, in a list. `get_statement_lines` checks the page's `description` and `section` values. Each text field is held to the mask's own rule (see [the read check](#masking)). If any field fails, the call is refused with `withheld`, and nothing of that revision is returned by that call. Nothing is re-masked or repaired at read, since the digest covers the stored values.
 
 - **The client's safe default:** treat the whole revision as held for review. A refusal on any page of `get_statement_lines` holds the revision, so discard the pages already read from it. Never read the refusal as an empty statement or account, and never as a fault to retry in a tight loop.
 - A refusal is recorded in the server's access log by statement ID, revision, account ordinal and field name, never the text. `receipt-index status` shows how many reads were withheld and when the latest was.
@@ -129,7 +129,7 @@ Text is masked before it is stored. Before a tool returns a revision's data, it 
 | `status` | `clean`, `held`, or `figures_only` (loans) |
 | `held_by_statement` | True when the statement's hold reason holds this account; then `status` is `held` even if its own gates passed |
 | `beginning_balance`, `ending_balance` | As printed, on the statement-balance basis; null when not printed |
-| `section_totals` | `[{section, amount}]`: each printed section total as an unsigned magnitude, in printed order; `section` is never null here |
+| `section_totals` | `[{section, amount}]`: each printed section total as an unsigned magnitude, in printed order; neither `section` nor `amount` is ever null here |
 | `column_totals` | `[{section, credits, debits}]`: a table's printed column totals as unsigned magnitudes; `section` null for a table covering the whole account. Credits are the lines that raise a deposit balance or lower a card or loan balance |
 | `line_order` | `oldest_first` or `newest_first`, as printed |
 | `line_count` | Lines this account carries (0 for held and loan accounts) |

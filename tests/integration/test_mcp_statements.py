@@ -413,27 +413,37 @@ def test_a_row_the_mask_would_cut_is_withheld(
     assert entry["fields"] == ["lines[2].description"]
 
 
+@pytest.mark.parametrize(
+    ("amount", "label"),
+    [
+        ("4929381766207319", "a card-length digit string"),
+        ("1" * 30, "past Decimal's default precision"),
+        ("1E+30", "an exponent form"),
+    ],
+)
 def test_a_stored_total_that_is_not_money_is_withheld(
     pg_conn: psycopg.Connection[dict[str, Any]],
     evidence: LocalEvidenceStore,
     log: Path,
+    amount: str,
+    label: str,
 ) -> None:
     statement_id = _ingest(pg_conn, evidence, Replies(), page="Synthetic totals page")
-    # A digit string in a total's amount: no CHECK reads the totals' amounts.
+    # No CHECK reads the totals' amounts.
     pg_conn.execute("SET LOCAL session_replication_role = replica")
     pg_conn.execute(
         "UPDATE receipt.statement_accounts SET section_totals = %s::jsonb",
-        (json.dumps([{"section": "fees", "amount": "4929381766207319"}]),),
+        (json.dumps([{"section": "fees", "amount": amount}]),),
     )
     pg_conn.commit()
     server = _server(evidence, log)
 
     result = _call(server, "get_statement", {"statement_id": statement_id})
 
-    assert _refusal(result).startswith("withheld: ")
-    assert "4929381766207319" not in _dump(result)
+    assert _refusal(result).startswith("withheld: "), label
+    assert amount not in _dump(result), label
     (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
-    assert entry["fields"] == ["accounts[1].section_totals[0].amount"]
+    assert entry["fields"] == ["accounts[1].section_totals[0].amount"], label
 
 
 def test_an_offset_past_64_bits_is_refused_before_postgres(
