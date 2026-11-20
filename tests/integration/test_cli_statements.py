@@ -603,6 +603,52 @@ def test_a_held_rerun_still_becomes_current(
     assert "held or rejected, it is still current" in said
 
 
+def test_the_rerun_report_names_its_own_revision_after_a_later_rerun(
+    pg_conn: Conn,
+    evidence: LocalEvidenceStore,
+    run: Run,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from receipt_index import statements as statements_module
+
+    statement_id = _plain(pg_conn, evidence, "Synthetic raced rerun page")
+    old = _statement(pg_conn, statement_id)["revision"]
+    real = statements_module.rerun_statement
+
+    def rerun_then_another(*args: Any, **kwargs: Any) -> Any:
+        # The CLI's run commits, then a second rerun lands before the CLI
+        # reads anything back for its report.
+        first = real(*args, **kwargs)
+        real(*args, **kwargs)
+        return first
+
+    monkeypatch.setattr("receipt_index.statements.rerun_statement", rerun_then_another)
+
+    result = run("statements", "rerun", statement_id, "--yes")
+
+    assert result.exit_code == 0, result.output
+    rows = pg_conn.execute(
+        "SELECT revision FROM receipt.statement_revisions"
+        " WHERE statement_id = %s ORDER BY revision",
+        (statement_id,),
+    ).fetchall()
+    pg_conn.commit()
+    revisions = [r["revision"] for r in rows]
+    assert len(revisions) == 3
+    assert revisions[0] == old
+    first, second = revisions[1:]
+    assert _statement(pg_conn, statement_id)["revision"] == second
+    lines = result.stdout.splitlines()
+    assert lines[0] == (
+        f"Rerun of statement {statement_id}: revision {old} -> {first}, made current."
+    )
+    assert lines[1] == (
+        f"Revision {first} is no longer current: revision {second} was "
+        "written after it."
+    )
+    assert f"Accounts in revision {first}:" in lines
+
+
 def test_the_write_login_cannot_use_replica_mode() -> None:
     with (
         psycopg.connect(_login_dsn(_WRITE_LOGIN)) as conn,

@@ -444,7 +444,9 @@ def test_the_rerun_report_rereads_the_revision_it_replaced(
     assert "Masked digit runs: 7 -> 7 (unchanged)" in result.stdout
 
 
-_PLANTED = "planted-statement-text"
+# A card-length number, built here so no such literal sits in the source.
+_NUMBER = "".join(str((7 * i + 3) % 10) for i in range(16))
+_PLANTED = f"planted statement text {_NUMBER}"
 
 
 @pytest.mark.parametrize(
@@ -462,6 +464,7 @@ def test_an_unexpected_rerun_error_is_named_by_class_only(
         in result.stderr
     )
     assert _PLANTED not in result.output
+    assert _NUMBER not in result.output
 
 
 def test_a_failed_read_back_names_the_written_revision_by_class_only(
@@ -545,3 +548,36 @@ def test_republish_names_a_database_error_by_class_only(
     assert result.exit_code == 1
     assert "the database refused the republish (CheckViolation)" in result.stderr
     assert _PLANTED not in result.output
+
+
+def test_a_rerun_refuses_a_locator_outside_the_store_without_a_traceback(
+    config_file: Path, snapshot: MagicMock, tmp_path: Path
+) -> None:
+    from receipt_index.store import LocalEvidenceStore
+
+    root = tmp_path / "store"
+    root.mkdir()
+    location = {"source_sha256": bytes(32), "ref": "../../etc/passwd"}
+    agents = MagicMock(name="agents")
+    with (
+        patch(
+            "receipt_index.statement_repository.get_revision", return_value=_REVISION
+        ),
+        patch(
+            "receipt_index.statement_repository.get_accounts",
+            return_value=[_ACCOUNT_ROW],
+        ),
+        patch("receipt_index.statements.get_revision", return_value=_REVISION),
+        patch("receipt_index.statements.original_location", return_value=location),
+        patch("receipt_index.statements.extract_statement") as extract,
+        patch("receipt_index.cli._rerun_agents", return_value=agents),
+        patch("receipt_index.store.open_store", return_value=LocalEvidenceStore(root)),
+        patch("receipt_index.db.get_connection"),
+    ):
+        result = _invoke(config_file, "rerun", _ID, "--yes")
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert "Error: the stored original can't be read: InvalidRefError" in result.stderr
+    assert "passwd" not in result.output
+    extract.assert_not_called()

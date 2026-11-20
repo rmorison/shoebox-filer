@@ -89,7 +89,7 @@ from receipt_index.statement_repository import (
     set_current_revision,
     statement_for_sha256,
 )
-from receipt_index.store import StoreFolder
+from receipt_index.store import StoreError, StoreFolder
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -1085,7 +1085,8 @@ def rerun_statement(
     The new revision is current whatever its status.
 
     Raises :class:`StatementRerunError` (no statement, no stored original,
-    or stored bytes that don't match the statement's hash),
+    an original the store can't open or read, or stored bytes that don't
+    match the statement's hash),
     :class:`StatementItemError` (a read or the gates failed) or
     :class:`~receipt_index.statement_extraction.StatementCallError` (a model
     call failed). Any of them writes nothing.
@@ -1102,7 +1103,9 @@ def rerun_statement(
     try:
         with store.open(location["ref"]) as fh:
             data = fh.read()
-    except OSError as exc:
+    except (OSError, StoreError) as exc:
+        # A locator the store refuses (InvalidRefError) is a StoreError.
+        # By class only: either message can quote the locator or a path.
         msg = f"the stored original can't be read: {type(exc).__name__}"
         raise StatementRerunError(msg) from None
     if hashlib.sha256(data).digest() != bytes(location["source_sha256"]):
@@ -1126,6 +1129,9 @@ def rerun_statement(
     )
 
     try:
+        # As intake does. The revision trigger would take the counter's row
+        # lock first anyway; taking it here keeps the order explicit, the
+        # feed lock before any statement row, if the trigger changes.
         lock_feed(conn)
         revision_id = _write_run(conn, statement_id, extracted)
         change_seq = set_current_revision(
