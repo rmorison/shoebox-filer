@@ -34,6 +34,7 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import TYPE_CHECKING, Any
 
+from receipt_index.access_log import Withheld, count_withheld
 from receipt_index.config import ImapSourceConfig
 
 if TYPE_CHECKING:
@@ -281,6 +282,9 @@ class Report:
     retries: dict[str, int] | None = None
     terminal_recent: int = 0
     problems: list[Problem] = field(default_factory=list)
+    # Statement reads the MCP server withheld, from its access log; None
+    # when there is no log to read here, or it wasn't asked for.
+    withheld: Withheld | None = None
 
 
 def _secs(seconds: float) -> str:
@@ -390,12 +394,15 @@ def collect(
     heartbeat_path: Path = HEARTBEAT_PATH,
     now: datetime | None = None,
     retries: bool = True,
+    access_log_path: Path | None = None,
 ) -> Report:
     """Read the heartbeat file and the database, and run the checks.
 
     ``retries`` adds the retry counts ``status`` shows; the ping needs only
     the count of items turned terminal within ``terminal_alert_seconds``.
-    A database that can't be reached is a problem, not an exception.
+    With ``retries``, ``access_log_path`` adds the count of statement reads
+    the MCP server withheld. A database that can't be reached is a
+    problem, not an exception.
     """
     from receipt_index.repository import (
         count_due_retries,
@@ -418,6 +425,8 @@ def collect(
         for s in config.sources
     ]
     report = Report(now=now, sources=statuses, heartbeat=heartbeat, database_ok=True)
+    if retries and access_log_path is not None:
+        report.withheld = count_withheld(access_log_path)
 
     window = ingest.health.terminal_alert_seconds
     try:
@@ -587,6 +596,14 @@ def report_json(report: Report) -> dict[str, Any]:
         "sources": sources,
         "worker": worker,
         "retries": report.retries,
+        "mcp_withheld": (
+            None
+            if report.withheld is None
+            else {
+                "count": report.withheld.count,
+                "latest_at": report.withheld.latest_at,
+            }
+        ),
         "orphans": [
             {
                 "source_name": r.source_name,
@@ -672,6 +689,17 @@ def report_text(report: Report) -> list[str]:
             f"  pending {retries['pending']}, retrying {retries['retrying']}, "
             f"queued {retries['queued']}, terminal {retries['terminal']}, "
             f"skipped in the last 7 days {retries['skipped_7d']}"
+        )
+    out.append("MCP")
+    withheld = data["mcp_withheld"]
+    if withheld is None:
+        out.append("  withheld statement reads: unknown (no access log here)")
+    elif withheld["count"] == 0:
+        out.append("  withheld statement reads: 0")
+    else:
+        out.append(
+            f"  withheld statement reads: {withheld['count']} "
+            f"(latest {withheld['latest_at']})"
         )
     out.append("Problems")
     out.extend(f"  {line}" for line in data["problems"] or ["none"])

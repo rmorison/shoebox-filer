@@ -566,6 +566,7 @@ uv run receipt-index status [--check] [--output text|json]
 - **Orphaned sync state**: rows for a source name or folder no longer in the config, for example after a rename.
 - **Worker**: the heartbeat's age, `serve`'s process ID, the sources it watches, how long it has been on its current step, the sources paused after errors (for how long, and why) and the sources it stopped watching after losing their lock.
 - **Retries**: pending (failed, due now), retrying (failed, due later), queued, terminal, and skipped in the last 7 days. `failures --status retrying` lists pending and retrying together.
+- **MCP**: how many statement reads the [MCP server](#mcp) withheld, and when the latest was, from its [access log](#access-log) (the log `mcp` writes without `--access-log`). `unknown` when there's no log on this host. A withheld read is a stored-data problem to look into, not a `--check` problem.
 - **Problems**: the `--check` lines.
 
 ### The checks
@@ -947,7 +948,7 @@ It prints how many renditions it recorded, and how many share bytes with another
 
 ## mcp
 
-Run a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so that agents can search receipts and fetch their PDFs. It uses the same search and repository code as the commands above. It never changes the database or the file store.
+Run a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so that agents can search receipts and fetch their PDFs, and a client such as a ledger can read extracted statements. It uses the same search and repository code as the commands above. It never changes the database or the file store.
 
 ```bash
 uv run receipt-index mcp [OPTIONS]
@@ -959,18 +960,18 @@ An MCP client normally starts this command itself (see [MCP client setup](#mcp-c
 
 | Option | Description |
 |---|---|
-| `--access-log PATH` | JSON-lines file that records every file fetch. Env: `RECEIPT_INDEX_MCP_ACCESS_LOG`. Default: `$XDG_STATE_HOME/receipt-index/mcp-access.jsonl` (`~/.local/state/...`) |
+| `--access-log PATH` | JSON-lines file that records every file fetch and every withheld statement read. Env: `RECEIPT_INDEX_MCP_ACCESS_LOG`. Default: `$XDG_STATE_HOME/receipt-index/mcp-access.jsonl` (`~/.local/state/...`) |
 | `--max-content-bytes N` | Largest PDF returned as content (default: 10 MiB, 10485760 bytes) |
 
 ### Database role
 
-The server connects with `RECEIPT_INDEX_MCP_DATABASE_URL`, or with `database.url` from the config when that is unset. **It refuses to start unless the role is read-only:** the role must hold `SELECT` on `receipt.receipts` and `receipt.ingest_log`, and no `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on either (column-level grants count), nor `CREATE` on schema `receipt`. That includes privileges of any role it is a member of, even one whose privileges it doesn't inherit, since it could `SET ROLE` to that role. In devtest, use `receipt_index_dev_read`. For production, see [Server Deployment: Read-only MCP server](server-deployment.md#10-read-only-mcp-server).
+The server connects with `RECEIPT_INDEX_MCP_DATABASE_URL`, or with `database.url` from the config when that is unset. **It refuses to start unless the role is read-only:** the role must hold `SELECT` on `receipt.receipts`, `receipt.ingest_log`, `receipt.statements`, `receipt.statement_revisions`, `receipt.statement_accounts` and `receipt.statement_lines`, and no `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on any of them (column-level grants count), nor `CREATE` on schema `receipt`. That includes privileges of any role it is a member of, even one whose privileges it doesn't inherit, since it could `SET ROLE` to that role. In devtest, use `receipt_index_dev_read`. For production, see [Server Deployment: Read-only MCP server](server-deployment.md#10-read-only-mcp-server).
 
 Every connection is also opened read-only (`default_transaction_read_only`), and each tool call runs in one `REPEATABLE READ, READ ONLY` transaction, so a page and its `total` come from the same snapshot.
 
 ### Tools
 
-All four tools are read-only. Amounts are decimal strings (`"42.99"`) in both directions, so an amount never passes through a float. Dates are `YYYY-MM-DD`. Each receipt carries `amount` (the total), `paid_amount` and `effective_amount`, with the meanings in [Amounts](#amounts), and the `amount` filters match the effective amount.
+All seven tools are read-only. The four receipt tools are below; the three statement tools follow in [Statement tools](#statement-tools). Amounts are decimal strings (`"42.99"`) in both directions, so an amount never passes through a float. Dates are `YYYY-MM-DD`. Each receipt carries `amount` (the total), `paid_amount` and `effective_amount`, with the meanings in [Amounts](#amounts), and the `amount` filters match the effective amount.
 
 | Tool | Inputs | Returns |
 |---|---|---|
@@ -985,6 +986,18 @@ Each receipt is the `show --output json` record plus `file: {path, exists}`. `pa
 
 **File content.** `content_omitted_reason` is `null` when the content is included, `"not_requested"` when `include_content` is false, and `"too_large"` when the PDF is over `--max-content-bytes`; the path is returned either way. A receipt whose PDF is missing from the store, or whose stored path points outside it, is a tool error.
 
+### Statement tools
+
+Three tools read extracted statements. Their shapes, formats, error codes and digest are set by the [statement read contract](../engineering/designs/statement-read-contract.md), version 1; every response carries `contract_version`.
+
+| Tool | Inputs | Returns |
+|---|---|---|
+| `list_statement_changes` | `cursor` (optional), `limit` (1-200, default 100) | `{contract_version, changes, next_cursor}`: statements created or changed after the cursor, oldest change first. Keep calling with `next_cursor` |
+| `get_statement` | `statement_id`, `revision` (optional; default the current one) | One revision with its accounts, balances, totals and digests, but not their lines |
+| `get_statement_lines` | `statement_id`, `revision`, `account_ordinal`, `limit` (1-1000, default 500), `offset` (default 0) | `{contract_version, lines, total, limit, offset, next_offset}`: one account's lines. A held or loan account has none |
+
+A refused call is an error whose message starts with a code: `invalid_cursor`, `invalid_id`, `not_found`, `invalid_argument` or `withheld`. Free text (institution, section names, line descriptions) is stored masked: at most the last four digits of a card or account number are shown. Before returning a revision's text, the server checks it against the mask once more; if a field fails, the call is refused with `withheld` and recorded in the access log. Treat a withheld revision as held for review. No tool returns a statement's original PDF.
+
 ### Access log
 
 Every `get_receipt_file` call appends one JSON line to the access log, and the same line is logged at INFO on stderr:
@@ -994,6 +1007,8 @@ Every `get_receipt_file` call appends one JSON line to the access log, and the s
 ```
 
 `outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged. A `receipt_id` that isn't a UUID is cut to its first 64 characters in the log line and the error. One kind of call writes no line: one the SDK rejects before the tool runs, because an argument is missing or has the wrong type. It gets a protocol error and no file.
+
+A withheld statement read appends a line too, with `outcome` `withheld`, `ts`, `tool`, `client`, `statement_id`, `revision`, `account_ordinal` (null for `get_statement`) and `fields`, the names of the fields that failed (for example `accounts[1].institution` or `lines[12].description`), never their text. The refusal stands even if the line can't be written. [`status`](#status) counts these lines. Other statement reads aren't logged.
 
 ### MCP client setup
 

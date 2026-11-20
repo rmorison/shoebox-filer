@@ -67,9 +67,13 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     config.write_text(_CONFIG)
     hb = tmp_path / "hb"
     monkeypatch.setattr(health, "HEARTBEAT_PATH", hb)
+    # Never the real log under the home directory.
+    access_log = tmp_path / "mcp-logs" / "mcp-access.jsonl"
+    monkeypatch.setenv("RECEIPT_INDEX_MCP_ACCESS_LOG", str(access_log))
     state: dict[str, Any] = {
         "config": config,
         "hb": hb,
+        "access_log": access_log,
         "rows": [_row("mail", "INBOX", 30, error="read failed: timeout")],
         "db_ok": True,
     }
@@ -186,6 +190,7 @@ class TestReport:
             "sources",
             "worker",
             "retries",
+            "mcp_withheld",
             "orphans",
             "problems",
         }
@@ -203,6 +208,58 @@ class TestReport:
         result = _run(env)
         assert result.exit_code == 1
         assert "unknown (database unreachable)" in result.output
+
+
+def _log(path: Path, *entries: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(e) for e in entries] + ["not json", "[1]"]
+    path.write_text("\n".join(lines) + "\n")
+
+
+class TestWithheld:
+    """Statement reads the MCP server withheld, counted from its access log."""
+
+    _ENTRIES = (
+        {"ts": "2027-02-03T10:00:00+00:00", "outcome": "withheld"},
+        {"ts": "2027-02-01T10:00:00+00:00", "outcome": "ok"},
+        {"ts": "2027-02-04T09:00:00+00:00", "outcome": "withheld"},
+    )
+
+    def test_text_shows_the_count_and_the_latest(self, env: dict[str, Any]) -> None:
+        _log(env["access_log"], *self._ENTRIES)
+        out = _run(env).output
+        assert (
+            "MCP\n  withheld statement reads: 2 (latest 2027-02-04T09:00:00+00:00)"
+            in out
+        )
+        assert out.rstrip().endswith("heartbeat missing")
+
+    def test_none_withheld(self, env: dict[str, Any]) -> None:
+        _log(env["access_log"], {"ts": "2027-02-01T10:00:00+00:00", "outcome": "ok"})
+        assert "withheld statement reads: 0\n" in _run(env).output
+
+    def test_no_access_log_here(self, env: dict[str, Any]) -> None:
+        out = _run(env).output
+        assert "withheld statement reads: unknown (no access log here)" in out
+
+    def test_json(self, env: dict[str, Any]) -> None:
+        _log(env["access_log"], *self._ENTRIES)
+        data = json.loads(_run(env, "--output", "json").stdout)
+        assert data["mcp_withheld"] == {
+            "count": 2,
+            "latest_at": "2027-02-04T09:00:00+00:00",
+        }
+
+    def test_json_without_a_log(self, env: dict[str, Any]) -> None:
+        data = json.loads(_run(env, "--output", "json").stdout)
+        assert data["mcp_withheld"] is None
+
+    def test_the_check_never_reads_it(self, env: dict[str, Any]) -> None:
+        # A withheld read is the operator's to look at, not a health failure.
+        _log(env["access_log"], *self._ENTRIES)
+        _beat(env["hb"])
+        result = _run(env, "--check")
+        assert (result.exit_code, result.output) == (0, "ok\n")
 
 
 class TestServeWiring:

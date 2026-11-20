@@ -6,23 +6,26 @@ cents). A seeded stdlib fuzz checks that bound on spans built from digit
 groups, amounts, currency symbols and codes, invisible characters, spaces
 and joiners. Raise ``MASK_FUZZ_ITERATIONS`` (and change ``MASK_FUZZ_SEED``)
 for a longer run.
+
+The bound is ``within_mask_bound``, the one the MCP statement tools check at
+read (plan U7). Every mask output here goes through it twice: in each test,
+and through the ``mask_output_in_bound`` fixture.
 """
 
 from __future__ import annotations
 
 import os
 import random
-from typing import TYPE_CHECKING
+
+import pytest
 
 from receipt_index import statement_extraction as se
-from receipt_index.statement_extraction import mask_digits
+from receipt_index.statement_extraction import mask_digits, within_mask_bound
 
-if TYPE_CHECKING:
-    import pytest
+pytestmark = pytest.mark.usefixtures("mask_output_in_bound")
 
 _ITERATIONS = int(os.environ.get("MASK_FUZZ_ITERATIONS", "3000"))
 _SEED = int(os.environ.get("MASK_FUZZ_SEED", "20261115"))
-_MAX_SHOWN = 4 + 8
 
 # Currency symbols (Sc), with fullwidth and small forms.
 _SYMBOLS = ["$", "\u20ac", "\u00a3", "\u00a5", "\uff04", "\ufe69", "\uffe5", "\u20b9"]
@@ -83,8 +86,36 @@ def test_a_card_length_span_never_shows_more_than_twelve_digits() -> None:
             continue
         masked, _ = mask_digits(text)
         assert masked is not None
-        shown = sum(ch.isdigit() for ch in masked)
-        assert shown <= _MAX_SHOWN, ascii(text)
+        assert within_mask_bound(masked), ascii(text)
+
+
+def _kept_shape(rng: random.Random) -> str:
+    """An amount a currency marks, or a short date: shapes the mask keeps."""
+    if rng.random() < 0.5:
+        whole = str(rng.randint(1, 999_999))
+        amount = f"{whole}.{rng.randint(0, 99):02d}"
+        symbol = rng.choice(_SYMBOLS)
+        return rng.choice([symbol + amount, symbol + " " + amount, amount + symbol])
+    month, day = rng.randint(1, 12), rng.randint(1, 28)
+    year = rng.choice(["", f"/{rng.randint(0, 99):02d}", f"/{rng.randint(1900, 2099)}"])
+    return f"{month:02d}/{day:02d}{year}"
+
+
+def test_a_kept_shape_beside_card_length_text_stays_in_bound() -> None:
+    # A currency-marked amount or a kept date in the same span as a
+    # card-length number: the mask may keep the one shape, never more than
+    # the bound, and the read bound never refuses what it gives.
+    rng = random.Random(_SEED + 1)
+    checked = 0
+    for _ in range(_ITERATIONS):
+        card = _card_length_text(rng)
+        kept = _kept_shape(rng)
+        text = rng.choice([f"{card} {kept}", f"{kept} {card}"])
+        masked, _ = mask_digits(text)
+        assert masked is not None
+        assert within_mask_bound(masked), ascii(text)
+        checked += 1
+    assert checked == _ITERATIONS
 
 
 def test_the_backstop_cuts_a_span_the_rules_left_too_long(

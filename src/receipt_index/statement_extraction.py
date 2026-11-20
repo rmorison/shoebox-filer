@@ -866,6 +866,11 @@ def _cut_tokens(span: str, before: str = "", after: str = "") -> tuple[str, int]
 _MAX_SHOWN_DIGITS: Final = 4 + _MAX_KEPT_WHOLE_DIGITS + 2
 
 
+def _shown_digits(text: str) -> int:
+    """How many ASCII digits ``text`` shows (the mask has folded the rest)."""
+    return len(_NON_DIGIT.sub("", text))
+
+
 def _backstop(span: str, masked: str, cuts: int) -> tuple[str, int]:
     """The guard after the rules: a span of 13 digits or more that still shows
     more than 12 is cut whole to its last four, whatever the rules kept. So a
@@ -873,9 +878,44 @@ def _backstop(span: str, masked: str, cuts: int) -> tuple[str, int]:
     digits = _NON_DIGIT.sub("", span)
     if len(digits) < _MIN_CARD_DIGITS:
         return masked, cuts
-    if len(_NON_DIGIT.sub("", masked)) <= _MAX_SHOWN_DIGITS:
+    if _shown_digits(masked) <= _MAX_SHOWN_DIGITS:
         return masked, cuts
     return digits[-4:], 1
+
+
+# Eight digits in a row: what migration 000023's CHECKs refuse, read here
+# after the mask's own folding, so digits of any script count too.
+_EIGHT_IN_A_ROW = re.compile(r"[0-9]{8}")
+
+
+def within_mask_bound(text: str | None) -> bool:
+    """Whether ``text`` keeps the mask's bound, read as the mask reads it.
+
+    The text is prepared as ``mask_digits`` prepares it (normalised, digits
+    of any script folded to ASCII, separators folded, invisible characters
+    inside numbers dropped), then two things are checked: no span of digit
+    groups (``_span``, the mask's own reading) shows more than 12 digits,
+    the backstop's limit; and no eight digits stand in a row. The second
+    is the CHECK of migration 000023, but stricter by design: the CHECK
+    reads ASCII digits only, while this reads every digit the mask folds,
+    and sees through an invisible character inside a run.
+
+    Every output of ``mask_digits`` passes (the mask tests assert it). The
+    MCP statement tools run it on every free-text field they return, and
+    refuse a field that fails it (``withheld``), so a row that never went
+    through the mask (a restore from an older build, a hand insert) can't
+    leave the server. Known limit, accepted: a kept amount of eight or more
+    digits in a row would fail it, and be withheld.
+    """
+    if text is None:
+        return True
+    prepared = _prepare(text)
+    if _EIGHT_IN_A_ROW.search(prepared):
+        return False
+    return all(
+        _shown_digits(span.group()) <= _MAX_SHOWN_DIGITS
+        for span in _span().finditer(prepared)
+    )
 
 
 def _is_currency_mark(ch: str) -> bool:

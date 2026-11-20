@@ -153,7 +153,9 @@ def _log_lines(log_path: Path) -> list[dict[str, Any]]:
 
 
 class TestListTools:
-    def test_lists_four_read_only_tools(self, store_root: Path, log_path: Path) -> None:
+    def test_lists_seven_read_only_tools(
+        self, store_root: Path, log_path: Path
+    ) -> None:
         async def go() -> Any:
             async with Client(_server(store_root, log_path)) as client:
                 return await client.list_tools()
@@ -164,6 +166,9 @@ class TestListTools:
             "get_receipt",
             "get_receipt_file",
             "list_failures",
+            "list_statement_changes",
+            "get_statement",
+            "get_statement_lines",
         }
         for tool in tools.values():
             assert tool.annotations is not None
@@ -697,6 +702,20 @@ class TestCheckReadOnlyRole:
     def test_role_without_select_is_refused(self) -> None:
         with pytest.raises(RoleCheckError, match="SELECT"):
             check_read_only_role(self._conn([], can_read=False))
+
+    def test_the_select_check_covers_the_statement_tables(self) -> None:
+        conn = self._conn([])
+        check_read_only_role(conn)
+        sql = conn.execute.call_args_list[2].args[0]
+        for table in (
+            "receipt.receipts",
+            "receipt.ingest_log",
+            "receipt.statements",
+            "receipt.statement_revisions",
+            "receipt.statement_accounts",
+            "receipt.statement_lines",
+        ):
+            assert f"has_table_privilege('{table}', 'SELECT')" in sql
 
 
 class TestAccessLog:
