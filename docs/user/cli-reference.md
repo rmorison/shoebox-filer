@@ -16,6 +16,7 @@
 - [`uv run receipt-index refund`](#refund) — Link refunds to their purchases, unlink them, and list them
 - [`uv run receipt-index duplicates`](#duplicates) — Review suspected duplicates, scan existing receipts; `link` and `unlink` move a source item between receipts
 - [`uv run receipt-index store`](#store) — Record the hash and location of each stored rendition
+- [`uv run receipt-index statements`](#statements) — List, show, rerun and republish extracted bank, card and loan statements
 - [`uv run receipt-index mcp`](#mcp) — Serve the index read-only to MCP clients (agents)
 
 All commands require a configured `.env` file (see [Getting Started](getting-started.md)).
@@ -566,7 +567,7 @@ uv run receipt-index status [--check] [--output text|json]
 - **Orphaned sync state**: rows for a source name or folder no longer in the config, for example after a rename.
 - **Worker**: the heartbeat's age, `serve`'s process ID, the sources it watches, how long it has been on its current step, the sources paused after errors (for how long, and why) and the sources it stopped watching after losing their lock.
 - **Retries**: pending (failed, due now), retrying (failed, due later), queued, terminal, and skipped in the last 7 days. `failures --status retrying` lists pending and retrying together.
-- **MCP**: how many statement reads the [MCP server](#mcp) withheld, and when the latest was, from its [access log](#access-log) (the log `mcp` writes without `--access-log`). `unknown` when there's no log on this host. A withheld read is a stored-data problem to look into, not a `--check` problem.
+- **MCP**: how many statement reads the [MCP server](#mcp) withheld, and when the latest was, from its [access log](#access-log) (the log `mcp` writes without `--access-log`). The count includes the revisions [`statements show`](#statements) withheld, which it records in the same log. `unknown` when there's no log on this host. A withheld read is a stored-data problem to look into, not a `--check` problem.
 - **Problems**: the `--check` lines.
 
 ### The checks
@@ -946,6 +947,77 @@ It prints how many renditions it recorded, and how many share bytes with another
 
 ---
 
+## statements
+
+Read and maintain the extracted bank, card and loan statements: the same data the [MCP statement tools](#statement-tools) serve, from the command line.
+
+```bash
+uv run receipt-index statements list [--status STATUS]... [--since YYYY-MM-DD] [--output text|json]
+uv run receipt-index statements show STATEMENT_ID [--revision N] [--output text|json]
+uv run receipt-index statements file STATEMENT_ID [--output text|json]
+uv run receipt-index statements rerun STATEMENT_ID [--yes] [--output text|json]
+uv run receipt-index statements republish (STATEMENT_ID... | --all) [--yes] [--output text|json]
+```
+
+`list`, `show` and `file` only read: each runs in one read-only transaction, so it sees one consistent state and can't write. `rerun` and `republish` change the database only with `--yes`; without it they print what they would do and change nothing.
+
+Statement text is stored masked: at most the last four digits of a card or account number. What each command prints:
+
+| Command | Prints |
+|---------|--------|
+| `list` | IDs, revisions, dates, statuses, document types and hold reasons. No free text |
+| `show` | One revision as stored, masked, after the same check the MCP tools make. Institution, section names and totals; no lines |
+| `file` | The path to the stored original PDF. Never its content: the command doesn't open the file. The original isn't masked, so each use is logged |
+| `rerun` | IDs, statuses, document types, last fours, counts and tokens. No free text: use `show` for the new revision's text |
+| `republish` | IDs, revisions and places in the change feed |
+
+### list
+
+Lists each statement at its current revision, in change-feed order (oldest change first). `--status` (`complete`, `incomplete`, `held` or `rejected`, repeatable) keeps statements with that status; `--since` keeps those whose current revision was extracted on or after that day (UTC). JSON is `{contract_version, statements, total, limit, offset, next_offset}`, each entry the read contract's change-feed entry.
+
+### show
+
+Shows one revision of a statement, with its accounts' balances, totals and digests, but not their lines. `--revision N` picks an earlier revision; the default is the current one. JSON is the read contract's per-statement shape, the same as the MCP tool `get_statement`.
+
+Before printing, `show` checks the stored text against the mask's rule and the stored totals against the contract's money format, as the MCP tools do. If a field fails, it prints nothing of the revision, writes the field names (never their text) to stderr and the [access log](#access-log), and exits 1:
+
+```
+withheld: statement <id> revision 3: a stored field failed the read check (accounts[1].institution). ...
+```
+
+Treat that revision as held for review. `statements rerun` extracts it again. The refusal stands even if the access log can't be written; a warning says so.
+
+### file
+
+Prints the path of the statement's stored original, and `(missing)` after it when the file isn't there. JSON is `{statement_id, source_sha256, ref, path, exists}`. Each use writes a line to the [access log](#access-log) first; if the line can't be written, the command prints no path and exits 1.
+
+### rerun
+
+Extracts a statement again from its stored original and appends the result as a new revision.
+
+- **Without `--yes`** it is a dry run: it shows the current revision's status, type, masked-digit count, last run's tokens and accounts, and says what a rerun would do. It makes no model call and changes nothing.
+- **With `--yes`** it checks the stored original's SHA-256 against the statement's, then runs the same steps as intake: the first pass and one model call per account (at most 8), the same mask and the same gates. The new revision is written with origin `rerun` and becomes current, and the statement appears once more in the change feed.
+- **The new revision becomes current whatever its result.** If it is held or rejected, it is still current. To change that, rerun again. Every earlier revision is kept unchanged and stays readable with `statements show STATEMENT_ID --revision N`.
+- It prints the old and new revision side by side: status, type, masked digit runs (and whether they changed), tokens, and each account's status and line count.
+- If the original is missing, unreadable or its SHA-256 differs, or the model call fails, nothing is written and the command exits 1.
+
+The model is `llm.model` from the config, and the key is the configured Anthropic key. A rerun costs about what the statement cost at intake: the dry run shows the last run's tokens.
+
+### republish
+
+Gives statements a fresh place in the change feed without writing a revision: each statement's revision and content stay as they are, and only its change-feed position (`change_seq`) and publish count move. A client that reads the feed sees each one again, once.
+
+Its use is the last step of a restore (see [Server Deployment](server-deployment.md)): restored statements can sit below a cursor a client already holds, and `republish --all --yes` moves every one past it.
+
+- Give statement IDs, or `--all`, not both.
+- Every ID is checked before anything is written; an unknown one stops the command with nothing republished.
+- **Without `--yes`** it lists the statements and their current feed positions, and writes nothing.
+- **With `--yes`** each statement is republished in its own short transaction, so `serve` isn't held up and a run cut short is safe to run again.
+
+JSON is `{dry_run, statements, total}`, each entry `{statement_id, revision, change_seq, new_change_seq}` (`new_change_seq` null in a dry run).
+
+---
+
 ## mcp
 
 Run a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so that agents can search receipts and fetch their PDFs, and a client such as a ledger can read extracted statements. It uses the same search and repository code as the commands above. It never changes the database or the file store.
@@ -1009,6 +1081,11 @@ Every `get_receipt_file` call appends one JSON line to the access log, and the s
 `outcome` is one of `ok`, `too_large`, `not_found`, `file_missing`, `path_outside_store`, `invalid_id` or `error` (a database or file-system failure; nothing is returned). The `client` name and version are whatever the MCP client sent when it connected, or `null`. The server checks the log is writable at startup, and if a write fails later, it withholds the file rather than return it unlogged. A `receipt_id` that isn't a UUID is cut to its first 64 characters in the log line and the error. One kind of call writes no line: one the SDK rejects before the tool runs, because an argument is missing or has the wrong type. It gets a protocol error and no file.
 
 A withheld statement read appends a line too, with `outcome` `withheld`, `ts`, `tool`, `client`, `statement_id`, `revision`, `account_ordinal` (null for `get_statement`) and `fields`, the names of the fields that failed (for example `accounts[1].institution` or `lines[12].description`), never their text. The refusal stands even if the line can't be written. [`status`](#status) counts these lines. Other statement reads aren't logged.
+
+The [`statements`](#statements) commands write to the same log (`RECEIPT_INDEX_MCP_ACCESS_LOG`, or the default path), and their lines aren't echoed to stderr:
+
+- `statements show` appends a `withheld` line like the server's, with `tool` `cli statements show`, `account_ordinal` null, and `client` `{"name": "receipt-index", "user": <the account that ran it>}`. `status` counts it with the server's.
+- `statements file` appends one line per use: `ts`, `tool` `cli statements file`, `statement_id`, `source_sha256`, `outcome` `path` and `client`. The line is written before the path is printed; if it can't be written, no path is printed.
 
 ### MCP client setup
 

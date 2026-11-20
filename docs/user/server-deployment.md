@@ -615,6 +615,15 @@ make migrate-up
 
 Re-run the Gate C queries: same expected versions, `dirty = f`.
 
+Last, give every restored statement a fresh place in the statement change feed:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm --entrypoint receipt-index scheduler \
+    statements republish --all --yes
+```
+
+A client that reads the statement change feed, such as a ledger, keeps a cursor: the last place in the feed it has read. A restored statement's place can sit below that cursor, so the client would never see it again. Republishing gives each statement a fresh place past every cursor, with its revision and content unchanged; the client sees each one once more. It writes no revision. With `serve` running or not: each statement holds the feed's lock only for its own short transaction. It is safe to run again, so a run cut short is simply repeated. See [`statements republish`](cli-reference.md#republish). A database with no statements prints `Republished 0 statements.`
+
 ### 6.5 Files
 
 ```bash
@@ -1001,6 +1010,15 @@ The full-loss story: the server is gone and Dropbox holds everything — the nig
 5. Run the checks in [8.4](#84-separate-database-logins) step 7 and Gate B step 5: each URL connects as its login, the scheduler holds no owner credential, a backup runs as the read login, and the MCP check passes if the MCP server is set up.
 
 6. Re-run Gates A–D and the verification queries in [6.6](#66-verification-queries), then Gate G. After a nightly restore, expect to lose at most one day of ingest (the window between the last nightly dump and the loss); those messages are still in the mailbox and will be re-ingested on the next cycles, since their `source_id`s went down with the database.
+
+7. Last, give every restored statement a fresh place in the statement change feed:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml run --rm --entrypoint receipt-index scheduler \
+       statements republish --all --yes
+   ```
+
+   A client that reads the statement change feed, such as a ledger, keeps a cursor: the last place in the feed it has read. A restored statement's place can sit below that cursor, so the client would never see it again. Republishing gives each statement a fresh place past every cursor, with its revision and content unchanged; the client sees each one once more. It writes no revision. With `serve` running or not: each statement holds the feed's lock only for its own short transaction. It is safe to run again, so a run cut short is simply repeated. See [`statements republish`](cli-reference.md#republish).
 
 ### 8.4 Separate database logins
 

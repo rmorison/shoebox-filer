@@ -25,9 +25,9 @@ from receipt_index.mcp_server import (
     MAX_LINE_PAGE_SIZE,
     STATEMENT_CONTRACT_VERSION,
     AccessLog,
-    _money,
     build_server,
 )
+from receipt_index.statement_contract import money as _money
 from receipt_index.statement_repository import StatementChange
 
 if TYPE_CHECKING:

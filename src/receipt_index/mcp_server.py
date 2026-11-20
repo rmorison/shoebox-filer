@@ -70,9 +70,6 @@ from receipt_index.statement_contract import line_out as _line_out
 from receipt_index.statement_contract import (
     lines_read_failures as _lines_read_failures,
 )
-from receipt_index.statement_contract import (  # noqa: F401 (tests import it here)
-    money as _money,
-)
 from receipt_index.statement_contract import (
     statement_out as _statement_out,
 )

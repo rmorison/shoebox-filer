@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import sys
+from contextlib import contextmanager
 from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
@@ -24,7 +25,7 @@ from receipt_index.paging import page_envelope
 load_dotenv()
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
     from datetime import datetime
     from decimal import Decimal
 
@@ -2789,3 +2790,752 @@ def gdrive(client_credentials: str) -> None:
         "\n"
         f"\n  GDRIVE_TOKEN_JSON='{token_json}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# statements (plan U8)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _statement_snapshot(database_url: str) -> Iterator[Any]:
+    """One read-only, repeatable-read transaction for a statement read.
+
+    READ ONLY is set on the transaction itself, not only as the session's
+    default, so no write can run inside it.
+    """
+    import psycopg
+
+    from receipt_index import db
+
+    with db.get_connection(database_url, read_only=True) as conn:
+        conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+        conn.read_only = True
+        yield conn
+
+
+def _rerun_agents(config: AppConfig) -> StatementAgents:
+    """The statement agents, built as ``serve`` builds them.
+
+    Only through ``llm.anthropic_model``, whose client never traces, and
+    ``StatementAgents.create``, which refuses to build while tracing
+    instrumentation is loaded.
+    """
+    from receipt_index.llm import anthropic_model
+    from receipt_index.statements import StatementAgents
+
+    model, settings = anthropic_model(
+        api_key=config.llm.api_key, model=config.llm.model
+    )
+    return StatementAgents.create(model, settings)
+
+
+@cli.group()
+def statements() -> None:
+    """Bank, card and loan statements: list, show, rerun and republish.
+
+    Text is shown as stored: masked, so at most the last four digits of a
+    card or account number. `show` checks it once more before printing, as
+    the MCP tools do, and refuses (withheld) a revision with a field past
+    the mask's bound.
+    """
+
+
+_DASH = "\u2014"
+_STATEMENT_STATUSES = ("complete", "incomplete", "held", "rejected")
+_OUTPUT_OPTION = click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+# The database's bigint: a revision past it never reaches a query.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _fail(message: str) -> NoReturn:
+    click.echo(message, err=True)
+    sys.exit(1)
+
+
+def _statement_uuid(value: str) -> UUID:
+    """A statement ID argument; the input is never echoed back."""
+    try:
+        return UUID(value)
+    except ValueError:
+        _fail("Error: the statement ID is not a UUID.")
+
+
+def _cli_client() -> dict[str, str | None]:
+    """Who ran the command, for the access log."""
+    import getpass
+
+    try:
+        user: str | None = getpass.getuser()
+    except (KeyError, OSError):
+        user = None
+    return {"name": "receipt-index", "user": user}
+
+
+def _field(label: str, value: object) -> str:
+    """A labelled line, values aligned in one column."""
+    return f"{label + ':':<19}{value}"
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+@statements.command("list")
+@click.option(
+    "--status",
+    "statuses",
+    multiple=True,
+    type=click.Choice(_STATEMENT_STATUSES),
+    help="Only statements with this status (repeatable).",
+)
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Only statements whose current revision was extracted on or after "
+    "this day (YYYY-MM-DD, UTC).",
+)
+@_OUTPUT_OPTION
+@click.pass_context
+def statements_list(
+    ctx: click.Context,
+    statuses: tuple[str, ...],
+    since: datetime | None,
+    output_format: str,
+) -> None:
+    """List statements at their current revision, in feed order.
+
+    Read-only. Prints no free text: IDs, revisions, dates, statuses and
+    types only. JSON entries are the read contract's change-feed entries.
+    """
+    from receipt_index.statement_contract import (
+        STATEMENT_CONTRACT_VERSION,
+        change_out,
+    )
+    from receipt_index.statement_repository import list_statements
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    with _statement_snapshot(config.database.url) as conn:
+        listed = list_statements(
+            conn,
+            statuses=statuses,
+            since=None if since is None else since.replace(tzinfo=UTC),
+        )
+
+    if output_format == "json":
+        items = [change_out(s.change) for s in listed]
+        envelope = page_envelope(
+            "statements", items, total=len(items), limit=None, offset=0
+        )
+        click.echo(
+            json.dumps(
+                {"contract_version": STATEMENT_CONTRACT_VERSION, **envelope}, indent=2
+            )
+        )
+        return
+    if not listed:
+        click.echo("No statements.")
+        return
+    click.echo(
+        f"{'ID':<36}  {'REVISION':>16}  {'EXTRACTED':<10}  {'STATUS':<10}  "
+        f"{'TYPE':<20}  HOLD"
+    )
+    for s in listed:
+        click.echo(
+            f"{s.change.statement_id!s:<36}  {s.change.revision:>16}  "
+            f"{s.extracted_at.astimezone(UTC).date().isoformat():<10}  "
+            f"{s.change.status:<10}  {s.change.document_type:<20}  "
+            f"{s.hold_reason or ''}".rstrip()
+        )
+    click.echo(_plural(len(listed), "statement"))
+
+
+def _withhold(statement_id: str, revision: int, failed: list[str]) -> NoReturn:
+    """Refuse `statements show`: log it, record it in the access log, exit 1.
+
+    Field names only, never the text. The refusal stands even if the access
+    log can't be written.
+    """
+    from receipt_index.access_log import (
+        AccessLog,
+        AccessLogError,
+        configured_access_log_path,
+        withheld_entry,
+    )
+
+    names = ", ".join(failed)
+    logger.warning(
+        "statements show withheld statement %s revision %s: %s failed the read check",
+        statement_id,
+        revision,
+        names,
+    )
+    click.echo(
+        f"withheld: statement {statement_id} revision {revision}: a stored "
+        f"field failed the read check ({names}). Treat this revision as held "
+        "for review; `statements rerun` re-extracts it.",
+        err=True,
+    )
+    entry = withheld_entry(
+        tool="cli statements show",
+        statement_id=statement_id,
+        revision=revision,
+        account_ordinal=None,
+        fields=failed,
+        client=_cli_client(),
+    )
+    try:
+        AccessLog(configured_access_log_path()).record(entry)
+    except AccessLogError as exc:
+        logger.error("%s", exc)
+        click.echo(f"Warning: {exc}", err=True)
+    sys.exit(1)
+
+
+def _read_revision(conn: Any, uid: UUID, revision: int | None) -> dict[str, Any]:
+    """A revision of a statement, or exit 1 naming what doesn't exist."""
+    from receipt_index.statement_repository import get_revision, statement_exists
+
+    rev = get_revision(conn, uid, revision)
+    if rev is not None:
+        return rev
+    if revision is None or not statement_exists(conn, uid):
+        _fail(f"Error: no statement {uid}")
+    _fail(f"Error: no revision {revision} of statement {uid}")
+
+
+def _money_or_dash(value: str | None) -> str:
+    return _DASH if value is None else value
+
+
+def _print_account(account: dict[str, Any]) -> None:
+    last4 = account["last4"] or _DASH
+    held = ", held by the statement" if account["held_by_statement"] else ""
+    click.echo(
+        f"  [{account['ordinal']}] {account['account_type']} {last4} "
+        f"{account['currency'] or _DASH}: {account['status']}{held}"
+    )
+    click.echo(f"      Institution: {account['institution'] or _DASH}")
+    period = (
+        f"{account['period_start']} to {account['period_end']}"
+        if account["period_start"] or account["period_end"]
+        else _DASH
+    )
+    click.echo(f"      Period: {period}")
+    click.echo(
+        f"      Balances: beginning {_money_or_dash(account['beginning_balance'])}, "
+        f"ending {_money_or_dash(account['ending_balance'])}"
+    )
+    click.echo(
+        f"      Lines: {account['line_count']} ({account['line_order'] or 'no order'})"
+    )
+    if account["failure_class"] is not None:
+        pages = (
+            f", pages {account['first_page']}-{account['last_page']}"
+            if account["first_page"] is not None
+            else ""
+        )
+        difference = (
+            f", difference {account['difference']}"
+            if account["difference"] is not None
+            else ""
+        )
+        click.echo(f"      Failure: {account['failure_class']}{difference}{pages}")
+    if account["section_totals"]:
+        totals = "; ".join(
+            f"{t['section']} {t['amount']}" for t in account["section_totals"]
+        )
+        click.echo(f"      Section totals: {totals}")
+    if account["column_totals"]:
+        columns = "; ".join(
+            f"{t['section'] or 'whole account'} credits "
+            f"{_money_or_dash(t['credits'])}, debits {_money_or_dash(t['debits'])}"
+            for t in account["column_totals"]
+        )
+        click.echo(f"      Column totals: {columns}")
+    if account["loan"] is not None:
+        figures = ", ".join(
+            f"{name.replace('_', ' ')} {_money_or_dash(value)}"
+            for name, value in account["loan"].items()
+        )
+        click.echo(f"      Loan: {figures}")
+    click.echo(f"      Digest: {account['content_digest']}")
+
+
+def _print_statement(data: dict[str, Any]) -> None:
+    """A revision in text, from its contract shape (already checked)."""
+    current = (
+        "current" if data["is_current"] else f"current is {data['current_revision']}"
+    )
+    status = data["status"]
+    if data["hold_reason"]:
+        status += f" ({data['hold_reason']})"
+    doc_type = data["document_type"]
+    if data["rejected_bound"]:
+        doc_type += f" ({data['rejected_bound']})"
+    period = (
+        f"{data['period_start']} to {data['period_end']}"
+        if data["period_start"] or data["period_end"]
+        else _DASH
+    )
+    extractor = data["extractor"]
+    click.echo(_field("Statement", f"{data['statement_id']}"))
+    click.echo(_field("SHA-256", f"{data['source_sha256']}"))
+    click.echo(_field("Revision", f"{data['revision']} ({current})"))
+    click.echo(_field("Extracted", f"{data['extracted_at']}"))
+    click.echo(_field("Type", f"{doc_type}"))
+    click.echo(_field("Status", f"{status}"))
+    click.echo(_field("Period", f"{period}"))
+    click.echo(_field("Pages", f"{_shown(data['pages'])}"))
+    click.echo(_field("Printed accounts", f"{_shown(data['printed_account_count'])}"))
+    click.echo(
+        _field(
+            "Extractor",
+            f"{_shown(extractor['model'])}, prompt "
+            f"{_shown(extractor['prompt_version'])}, first pass "
+            f"{_shown(extractor['first_pass_version'])}",
+        )
+    )
+    click.echo(_field("Masked digit runs", f"{data['masked_runs']}"))
+    click.echo(_field("Accounts", f"{len(data['accounts'])}"))
+    for account in data["accounts"]:
+        _print_account(account)
+
+
+@statements.command("show")
+@click.argument("statement_id")
+@click.option(
+    "--revision",
+    type=int,
+    default=None,
+    help="Revision number; the current revision when left out.",
+)
+@_OUTPUT_OPTION
+@click.pass_context
+def statements_show(
+    ctx: click.Context,
+    statement_id: str,
+    revision: int | None,
+    output_format: str,
+) -> None:
+    """Show one revision of a statement and its accounts (not their lines).
+
+    Read-only. JSON is the read contract's per-statement shape, the same as
+    the MCP tool get_statement. Before printing, the stored text is checked
+    against the mask's bound and the stored totals against the money
+    format, as the MCP tools check them: if a field fails, nothing of the
+    revision is printed, the field names go to stderr and the access log,
+    and the command exits 1 (withheld).
+    """
+    from receipt_index.statement_contract import (
+        account_out,
+        statement_out,
+        statement_read_failures,
+    )
+    from receipt_index.statement_repository import get_accounts
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _statement_uuid(statement_id)
+    if revision is not None and not _INT64_MIN <= revision <= _INT64_MAX:
+        _fail("Error: --revision is out of range.")
+    with _statement_snapshot(config.database.url) as conn:
+        rev = _read_revision(conn, uid, revision)
+        accounts = [account_out(row) for row in get_accounts(conn, rev["revision_id"])]
+
+    failed = statement_read_failures(accounts)
+    if failed:
+        _withhold(str(uid), rev["revision"], failed)
+    data = statement_out(rev, accounts)
+    if output_format == "json":
+        click.echo(json.dumps(data, indent=2))
+    else:
+        _print_statement(data)
+
+
+@statements.command("file")
+@click.argument("statement_id")
+@_OUTPUT_OPTION
+@click.pass_context
+def statements_file(ctx: click.Context, statement_id: str, output_format: str) -> None:
+    """Print where a statement's original PDF is stored: its path only.
+
+    Never the file's content: the command doesn't open it. The original is
+    unmasked, so each use is recorded in the access log first; if the log
+    can't be written, no path is printed and the command exits 1.
+    """
+    from datetime import datetime as _datetime
+
+    from receipt_index.access_log import (
+        AccessLog,
+        AccessLogError,
+        configured_access_log_path,
+    )
+    from receipt_index.statement_repository import original_location
+    from receipt_index.store import InvalidRefError, open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _statement_uuid(statement_id)
+    with _statement_snapshot(config.database.url) as conn:
+        location = original_location(conn, uid)
+    if location is None:
+        _fail(f"Error: no statement {uid}")
+    ref: str | None = location["ref"]
+    if ref is None:
+        _fail(f"Error: statement {uid} has no stored original.")
+    try:
+        path = open_store(config.store).local_path(ref)
+    except InvalidRefError:
+        _fail(f"Error: the original of statement {uid} isn't in the local store.")
+    sha = bytes(location["source_sha256"]).hex()
+    entry = {
+        "ts": _datetime.now(UTC).isoformat(),
+        "tool": "cli statements file",
+        "statement_id": str(uid),
+        "source_sha256": sha,
+        "outcome": "path",
+        "client": _cli_client(),
+    }
+    try:
+        AccessLog(configured_access_log_path()).record(entry)
+    except AccessLogError as exc:
+        _fail(f"Error: {exc}; no path printed.")
+    exists = path.exists()
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "statement_id": str(uid),
+                    "source_sha256": sha,
+                    "ref": ref,
+                    "path": str(path),
+                    "exists": exists,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"{path}" + ("" if exists else "  (missing)"))
+
+
+def _run_summary(rev: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """A revision with no free text: IDs, enums, counts and dates only."""
+    from receipt_index.statement_contract import timestamp
+
+    return {
+        "revision": rev["revision"],
+        "extracted_at": timestamp(rev["created_at"]),
+        "status": rev["status"],
+        "hold_reason": rev["hold_reason"],
+        "document_type": rev["document_type"],
+        "rejected_bound": rev["rejected_bound"],
+        "masked_runs": rev["masked_runs"],
+        "input_tokens": rev["input_tokens"],
+        "output_tokens": rev["output_tokens"],
+        "accounts": [
+            {
+                "ordinal": a["ordinal"],
+                "account_type": a["account_type"],
+                "last4": a["last4"],
+                "status": a["status"],
+                "failure_class": a["failure_class"],
+                "held_by_statement": a["held_by_statement"],
+                "line_count": a["line_count"],
+            }
+            for a in rows
+        ],
+    }
+
+
+def _read_summary(config: AppConfig, uid: UUID) -> tuple[dict[str, Any], str]:
+    """The current revision's summary and the statement's hash, or exit 1."""
+    from receipt_index.statement_repository import get_accounts
+
+    with _statement_snapshot(config.database.url) as conn:
+        rev = _read_revision(conn, uid, None)
+        rows = get_accounts(conn, rev["revision_id"])
+    return _run_summary(rev, rows), bytes(rev["source_sha256"]).hex()
+
+
+def _with_reason(value: str, reason: str | None) -> str:
+    return value if reason is None else f"{value} ({reason})"
+
+
+def _print_run_accounts(summary: dict[str, Any]) -> None:
+    for a in summary["accounts"]:
+        status = _with_reason(a["status"], a["failure_class"])
+        if a["held_by_statement"]:
+            status += ", held by the statement"
+        click.echo(
+            f"  [{a['ordinal']}] {a['account_type']} {a['last4'] or _DASH}: "
+            f"{status}, {_plural(a['line_count'], 'line')}"
+        )
+
+
+def _becomes_current(uid: UUID, revision: int) -> str:
+    return (
+        "The new revision becomes current whatever its result: if it is held "
+        "or rejected, it is still current. To change that, rerun again; "
+        f"revision {revision} stays readable with "
+        f"`statements show {uid} --revision {revision}`."
+    )
+
+
+@statements.command("rerun")
+@click.argument("statement_id")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Run it. Without it, only show the current revision and what a "
+    "rerun would do.",
+)
+@_OUTPUT_OPTION
+@click.pass_context
+def statements_rerun(
+    ctx: click.Context, statement_id: str, yes: bool, output_format: str
+) -> None:
+    """Extract a statement again from its stored original, as a new revision.
+
+    Without --yes this is a dry run: it shows the current revision's
+    figures and makes no model call. With --yes it reads the stored
+    original, runs the first pass and one call per account with the
+    configured model, the same mask and gates as intake, and appends a new
+    revision, which becomes current whatever its result. Every earlier
+    revision is kept unchanged.
+
+    Prints no free text: run `statements show` for the new revision's text.
+    """
+    from receipt_index.statement_extraction import StatementCallError
+    from receipt_index.statements import (
+        StatementItemError,
+        StatementRerunError,
+        rerun_statement,
+    )
+    from receipt_index.store import open_store
+
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    uid = _statement_uuid(statement_id)
+    previous, sha = _read_summary(config, uid)
+
+    if not yes:
+        if output_format == "json":
+            click.echo(
+                json.dumps(
+                    {"statement_id": str(uid), "dry_run": True, "current": previous},
+                    indent=2,
+                )
+            )
+            return
+        click.echo(_field("Statement", f"{uid}"))
+        click.echo(_field("SHA-256", f"{sha}"))
+        click.echo(
+            _field(
+                "Current revision",
+                f"{previous['revision']} (extracted {previous['extracted_at']})",
+            )
+        )
+        status = _with_reason(previous["status"], previous["hold_reason"])
+        click.echo(_field("Status", f"{status}"))
+        doc_type = _with_reason(previous["document_type"], previous["rejected_bound"])
+        click.echo(_field("Type", doc_type))
+        click.echo(_field("Masked digit runs", f"{previous['masked_runs']}"))
+        click.echo(
+            _field(
+                "Last run's tokens",
+                f"{previous['input_tokens']:,} input, "
+                f"{previous['output_tokens']:,} output",
+            )
+        )
+        click.echo(_field("Accounts", f"{len(previous['accounts'])}"))
+        _print_run_accounts(previous)
+        click.echo("")
+        click.echo(
+            "Dry run: nothing was changed. With --yes, the rerun reads the "
+            "stored original, calls the model (a first pass, then one call per "
+            "account, at most 8) and appends a new revision."
+        )
+        click.echo(_becomes_current(uid, previous["revision"]))
+        return
+
+    import psycopg
+
+    from receipt_index.db import get_connection
+
+    try:
+        agents = _rerun_agents(config)
+        with get_connection(config.database.url) as conn:
+            rerun_statement(
+                conn,
+                open_store(config.store),
+                uid,
+                agents=agents,
+                llm_model=config.llm.model,
+            )
+    except StatementRerunError as exc:
+        _fail(f"Error: {exc}")
+    except (StatementItemError, StatementCallError) as exc:
+        # Both carry no statement text: a fixed message, or a kind and class.
+        _fail(f"Error: the rerun failed: {exc}; nothing was written.")
+    except psycopg.Error as exc:
+        # By class only: a constraint's detail can quote a row's values.
+        _fail(
+            f"Error: the database refused the rerun ({type(exc).__name__}); "
+            "nothing was written."
+        )
+    current, _ = _read_summary(config, uid)
+    changed = current["masked_runs"] != previous["masked_runs"]
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {
+                    "statement_id": str(uid),
+                    "dry_run": False,
+                    "previous": previous,
+                    "current": current,
+                    "masked_runs_changed": changed,
+                },
+                indent=2,
+            )
+        )
+        return
+    click.echo(
+        f"Rerun of statement {uid}: revision {previous['revision']} -> "
+        f"{current['revision']}, now current."
+    )
+    click.echo(
+        _field(
+            "Status",
+            f"{_with_reason(previous['status'], previous['hold_reason'])} -> "
+            f"{_with_reason(current['status'], current['hold_reason'])}",
+        )
+    )
+    click.echo(
+        _field("Type", f"{previous['document_type']} -> {current['document_type']}")
+    )
+    click.echo(
+        _field(
+            "Masked digit runs",
+            f"{previous['masked_runs']} -> {current['masked_runs']} "
+            f"({'changed' if changed else 'unchanged'})",
+        )
+    )
+    click.echo(
+        _field(
+            "Tokens",
+            f"{current['input_tokens']:,} input, {current['output_tokens']:,} output",
+        )
+    )
+    click.echo(f"Accounts in revision {current['revision']}:")
+    _print_run_accounts(current)
+    if current["status"] in ("held", "rejected"):
+        click.echo(
+            f"This run is {current['status']}, and it is current all the same: "
+            "held or rejected, it is still current. Rerun again, or read the "
+            f"earlier revision with `statements show {uid} --revision "
+            f"{previous['revision']}`."
+        )
+
+
+@statements.command("republish")
+@click.argument("statement_ids", nargs=-1)
+@click.option("--all", "select_all", is_flag=True, help="Every statement.")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Republish them. Without it, only list what would be republished.",
+)
+@_OUTPUT_OPTION
+@click.pass_context
+def statements_republish(
+    ctx: click.Context,
+    statement_ids: tuple[str, ...],
+    select_all: bool,
+    yes: bool,
+    output_format: str,
+) -> None:
+    """Give statements a fresh place in the change feed, with no new revision.
+
+    The restore runbook's last step: after a restore, a statement's place in
+    the feed can sit below a cursor a client already holds, and this moves
+    it past every cursor. Each statement's revision and content stay as
+    they are. Without --yes this is a dry run and writes nothing. With
+    --yes each statement is republished in its own short transaction, so an
+    interrupted run is safe to repeat. Every ID is checked before anything
+    is written.
+    """
+    from receipt_index.db import get_connection
+    from receipt_index.statement_repository import feed_positions, republish_each
+
+    if bool(statement_ids) == select_all:
+        msg = "Give statement IDs or --all, not both."
+        raise click.UsageError(msg)
+    config = _load_config_or_exit(ctx)
+    _configure_logging(config)
+    ids: list[UUID] = []
+    for n, value in enumerate(statement_ids, start=1):
+        try:
+            ids.append(UUID(value))
+        except ValueError:
+            _fail(f"Error: statement ID {n} is not a UUID; nothing was republished.")
+    with _statement_snapshot(config.database.url) as conn:
+        positions = feed_positions(conn, None if select_all else ids)
+    missing = sorted({*ids} - {p["statement_id"] for p in positions}, key=str)
+    if missing:
+        _fail(
+            "Error: no statement "
+            + ", ".join(str(m) for m in missing)
+            + "; nothing was republished."
+        )
+
+    new_seqs: list[int | None] = [None] * len(positions)
+    if yes:
+        with get_connection(config.database.url) as conn:
+            new_seqs = list(
+                republish_each(conn, [p["statement_id"] for p in positions])
+            )
+    entries = [
+        {
+            "statement_id": str(p["statement_id"]),
+            "revision": p["revision"],
+            "change_seq": p["change_seq"],
+            "new_change_seq": seq,
+        }
+        for p, seq in zip(positions, new_seqs, strict=True)
+    ]
+
+    if output_format == "json":
+        click.echo(
+            json.dumps(
+                {"dry_run": not yes, "statements": entries, "total": len(entries)},
+                indent=2,
+            )
+        )
+        return
+    for e in entries:
+        moved = (
+            f"{e['change_seq']}"
+            if e["new_change_seq"] is None
+            else f"{e['change_seq']} -> {e['new_change_seq']}"
+        )
+        click.echo(
+            f"  {e['statement_id']}  revision {e['revision']}  feed position {moved}"
+        )
+    if yes:
+        click.echo(f"Republished {_plural(len(entries), 'statement')}.")
+    else:
+        click.echo(
+            f"Dry run: nothing was changed. {_plural(len(entries), 'statement')} "
+            "would be republished; pass --yes to republish them."
+        )
