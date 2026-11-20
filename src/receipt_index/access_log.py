@@ -1,7 +1,8 @@
-"""Where the MCP server's access log lives, and what ``status`` reads from it.
+"""The access log: where it lives, how it is written, what ``status`` reads.
 
-The server (``mcp_server``) appends one JSON line per file fetch and per
-statement read it withholds. ``status`` counts the withheld ones, so the
+The MCP server (``mcp_server``) appends one JSON line per file fetch and per
+statement read it withholds; ``statements show`` and ``statements file``
+append theirs to the same log. ``status`` counts the withheld ones, so the
 operator sees them without reading the log. This module imports nothing
 from MCP, so ``status`` doesn't load the SDK.
 """
@@ -9,9 +10,15 @@ from MCP, so ``status`` doesn't load the SDK.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 ACCESS_LOG_ENV = "RECEIPT_INDEX_MCP_ACCESS_LOG"
 WITHHELD = "withheld"
@@ -64,3 +71,86 @@ def count_withheld(path: Path) -> Withheld | None:
     except OSError:
         return None
     return Withheld(count=count, latest_at=latest)
+
+
+# ---------------------------------------------------------------------------
+# Writing the log
+# ---------------------------------------------------------------------------
+
+
+class AccessLogError(Exception):
+    """The access log can't be written."""
+
+
+class AccessLog:
+    """Append-only JSON-lines log of file fetches and withheld statement reads."""
+
+    def __init__(self, path: Path, *, echo: logging.Logger | None = None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        # The logger each entry is echoed to at INFO; the MCP server passes
+        # its own, so its stderr shows the line under its name.
+        self._echo = echo or logger
+
+    def check_writable(self) -> None:
+        """Create the log's directory and open it for append, or raise."""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            msg = f"access log {self.path} is not writable: {exc}"
+            raise AccessLogError(msg) from exc
+
+    def record(self, entry: dict[str, Any]) -> None:
+        """Append one entry and echo it to the application log."""
+        line = json.dumps(entry, sort_keys=True, default=str)
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except OSError as exc:
+            msg = f"access log {self.path} is not writable: {exc}"
+            raise AccessLogError(msg) from exc
+        self._echo.info("access: %s", line)
+
+
+def file_entry(
+    *,
+    tool: str,
+    statement_id: str,
+    source_sha256: str,
+    client: dict[str, str | None],
+) -> dict[str, Any]:
+    """One use of a statement original's path: IDs and the hash, no content."""
+    return {
+        "ts": datetime.now(UTC).isoformat(),
+        "tool": tool,
+        "statement_id": statement_id,
+        "source_sha256": source_sha256,
+        "outcome": "path",
+        "client": client,
+    }
+
+
+def withheld_entry(
+    *,
+    tool: str,
+    statement_id: str,
+    revision: int,
+    account_ordinal: int | None,
+    fields: list[str],
+    client: dict[str, str | None],
+) -> dict[str, Any]:
+    """One withheld read's log line: IDs and field names, never the text."""
+    return {
+        "ts": datetime.now(UTC).isoformat(),
+        "tool": tool,
+        "statement_id": statement_id,
+        "revision": revision,
+        "account_ordinal": account_ordinal,
+        "fields": fields,
+        "outcome": WITHHELD,
+        "client": client,
+    }

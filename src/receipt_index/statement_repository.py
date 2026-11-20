@@ -372,19 +372,53 @@ def republish(conn: psycopg.Connection[dict[str, Any]], statement_id: UUID) -> i
     return change_seq
 
 
-def republish_all(conn: psycopg.Connection[dict[str, Any]]) -> int:
-    """Republish every statement, committing after each one.
+class RepublishStoppedError(LookupError):
+    """A statement to republish no longer exists; the ones before it are done."""
+
+    def __init__(self, statement_id: UUID, republished: list[int]) -> None:
+        super().__init__(f"No statement {statement_id}")
+        self.statement_id = statement_id
+        # The new change_seq of each statement committed before it, in order.
+        self.republished = republished
+
+
+def republish_each(
+    conn: psycopg.Connection[dict[str, Any]], statement_ids: Sequence[UUID]
+) -> list[int]:
+    """Republish each statement, committing after each one.
 
     One transaction per statement holds the feed lock for one statement at
     a time, so the worker isn't blocked for the whole run, and an
-    interrupted run is safe to repeat. Returns how many were republished.
+    interrupted run is safe to repeat. Returns each one's new change_seq,
+    in order. A statement that doesn't exist rolls back its own transaction
+    and raises :class:`RepublishStoppedError`, which carries the ones
+    committed before it.
     """
-    rows = conn.execute("SELECT id FROM receipt.statements ORDER BY id").fetchall()
     conn.commit()
-    for row in rows:
-        republish(conn, row["id"])
+    new_seqs: list[int] = []
+    for statement_id in statement_ids:
+        try:
+            new_seq = republish(conn, statement_id)
+        except LookupError:
+            conn.rollback()
+            raise RepublishStoppedError(statement_id, new_seqs) from None
         conn.commit()
-    return len(rows)
+        new_seqs.append(new_seq)
+    return new_seqs
+
+
+def all_statement_ids(conn: psycopg.Connection[dict[str, Any]]) -> list[UUID]:
+    """Every statement's ID, in ID order."""
+    rows = conn.execute("SELECT id FROM receipt.statements ORDER BY id").fetchall()
+    return [row["id"] for row in rows]
+
+
+def republish_all(conn: psycopg.Connection[dict[str, Any]]) -> int:
+    """Republish every statement, committing after each one.
+
+    See :func:`republish_each`. Returns how many were republished.
+    """
+    return len(republish_each(conn, all_statement_ids(conn)))
 
 
 def changes_after(
@@ -444,7 +478,8 @@ def get_revision(
                r.id AS revision_id, r.revision, r.document_type, r.status,
                r.hold_reason, r.rejected_bound, r.masked_runs, r.period_start,
                r.period_end, r.printed_account_count, r.pages, r.llm_model,
-               r.prompt_version, r.first_pass_version, r.created_at
+               r.prompt_version, r.first_pass_version, r.created_at, r.origin,
+               r.input_tokens, r.output_tokens
         FROM receipt.statements s
         JOIN receipt.statement_revisions cr ON cr.id = s.current_revision_id
         JOIN receipt.statement_revisions r ON r.statement_id = s.id
@@ -506,4 +541,102 @@ def get_lines(
         LIMIT %s OFFSET %s
         """,
         (account_id, limit, offset),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Reads for the statements CLI (plan U8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StatementListing:
+    """One statement at its current revision, for ``statements list``."""
+
+    change: StatementChange
+    extracted_at: datetime
+    hold_reason: str | None
+
+
+def list_statements(
+    conn: psycopg.Connection[dict[str, Any]],
+    *,
+    statuses: Sequence[str] = (),
+    since: datetime | None = None,
+) -> list[StatementListing]:
+    """Statements at their current revision, in feed order.
+
+    ``statuses`` keeps only those statuses (none: all); ``since`` keeps
+    current revisions extracted at or after it.
+    """
+    rows = conn.execute(
+        """        SELECT s.id AS statement_id, r.revision, s.status, s.document_type,
+               s.source_sha256, s.change_seq, r.created_at AS extracted_at,
+               r.hold_reason
+        FROM receipt.statements s
+        JOIN receipt.statement_revisions r ON r.id = s.current_revision_id
+        WHERE (cardinality(%(statuses)s::text[]) = 0
+               OR s.status = ANY(%(statuses)s::text[]))
+          AND (%(since)s::timestamptz IS NULL OR r.created_at >= %(since)s)
+        ORDER BY s.change_seq
+        """,
+        {"statuses": list(statuses), "since": since},
+    ).fetchall()
+    return [
+        StatementListing(
+            change=StatementChange(
+                statement_id=row["statement_id"],
+                revision=row["revision"],
+                status=row["status"],
+                document_type=row["document_type"],
+                source_sha256=row["source_sha256"],
+                change_seq=row["change_seq"],
+            ),
+            extracted_at=row["extracted_at"],
+            hold_reason=row["hold_reason"],
+        )
+        for row in rows
+    ]
+
+
+def original_location(
+    conn: psycopg.Connection[dict[str, Any]], statement_id: UUID
+) -> dict[str, Any] | None:
+    """Where a statement's original is stored, or None for no statement.
+
+    The row has the statement's ``source_sha256`` and the store's ``ref``
+    (``backend:locator``) of its original, or a null ``ref`` when the store
+    holds no copy of it.
+    """
+    row = conn.execute(
+        """        SELECT s.source_sha256,
+               (SELECT l.backend || ':' || l.locator
+                  FROM receipt.file_locations l
+                 WHERE l.file_id = s.original_file_id
+                   AND l.purpose = 'original' AND l.owner = 'store'
+                 ORDER BY l.created_at, l.id
+                 LIMIT 1) AS ref
+        FROM receipt.statements s
+        WHERE s.id = %s
+        """,
+        (statement_id,),
+    ).fetchone()
+    return row
+
+
+def feed_positions(
+    conn: psycopg.Connection[dict[str, Any]], statement_ids: Sequence[UUID] | None
+) -> list[dict[str, Any]]:
+    """Each statement's current revision and place in the feed, in ID order.
+
+    ``None`` selects every statement; IDs that don't exist are left out.
+    """
+    return conn.execute(
+        """        SELECT s.id AS statement_id, r.revision, s.change_seq
+        FROM receipt.statements s
+        JOIN receipt.statement_revisions r ON r.id = s.current_revision_id
+        WHERE %(all)s OR s.id = ANY(%(ids)s)
+        ORDER BY s.id
+        """,
+        {"all": statement_ids is None, "ids": list(statement_ids or [])},
     ).fetchall()

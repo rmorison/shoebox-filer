@@ -33,7 +33,7 @@ import logging
 import sys
 import unicodedata
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import BuiltinMethodType
@@ -79,14 +79,17 @@ from receipt_index.statement_repository import (
     RevisionRow,
     add_source,
     create_statement,
+    get_revision,
     insert_account,
     insert_lines,
     insert_revision,
     lock_feed,
     new_statement_id,
+    original_location,
+    set_current_revision,
     statement_for_sha256,
 )
-from receipt_index.store import StoreFolder
+from receipt_index.store import StoreError, StoreFolder
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -98,6 +101,7 @@ if TYPE_CHECKING:
 
     from receipt_index.errors import ErrorClass
     from receipt_index.models import RawReceipt
+    from receipt_index.statement_repository import Origin
     from receipt_index.store import EvidenceStore
 
 logger = logging.getLogger(__name__)
@@ -530,12 +534,37 @@ def extract_statement(
     source_id: str,
     control: RunControl | None,
     usage: _Usage,
+    origin: Origin = "ingest",
 ) -> _Extracted:
     """Read and extract one statement: steps 3 to 5. No database access.
+
+    ``origin`` is recorded on the revision: ``ingest`` for intake,
+    ``rerun`` for ``statements rerun``. Both runs take the same steps, so
+    the same read bounds, prompts, mask and gates.
 
     Raises :class:`StatementItemError` for a read that should be retried,
     and lets a :class:`StatementCallError` through.
     """
+    extracted = _extract_statement(
+        data,
+        agents=agents,
+        llm_model=llm_model,
+        source_id=source_id,
+        control=control,
+        usage=usage,
+    )
+    return replace(extracted, revision=replace(extracted.revision, origin=origin))
+
+
+def _extract_statement(
+    data: bytes,
+    *,
+    agents: StatementAgents,
+    llm_model: str,
+    source_id: str,
+    control: RunControl | None,
+    usage: _Usage,
+) -> _Extracted:
     _step(control, source_id)
     start_failure: str | None = None
     try:
@@ -712,6 +741,23 @@ def _write_accounts(
         account_id = insert_account(conn, revision_id, _account_row(account))
         if account.lines:
             insert_lines(conn, account_id, _line_rows(account))
+
+
+def _write_run(
+    conn: psycopg.Connection[dict[str, Any]],
+    statement_id: UUID,
+    extracted: _Extracted,
+) -> UUID:
+    """Append one run: its revision, its accounts and their lines.
+
+    The caller holds the feed lock, then points the statement at the
+    revision (a new statement, or a rerun's ``set_current_revision``) in
+    the same transaction.
+    """
+    revision_id, _ = insert_revision(conn, statement_id, extracted.revision)
+    if extracted.gated is not None:
+        _write_accounts(conn, revision_id, extracted.gated.accounts)
+    return revision_id
 
 
 def _success_row(
@@ -942,9 +988,7 @@ def process_statement(
                 state=state,
             )
         statement_id = new_statement_id(conn)
-        revision_id, _ = insert_revision(conn, statement_id, extracted.revision)
-        if extracted.gated is not None:
-            _write_accounts(conn, revision_id, extracted.gated.accounts)
+        revision_id = _write_run(conn, statement_id, extracted)
         create_statement(
             conn,
             statement_id=statement_id,
@@ -1000,3 +1044,121 @@ def process_statement(
         extracted.revision.document_type,
     )
     return ItemOutcome("success")
+
+
+# ---------------------------------------------------------------------------
+# statements rerun (plan U8)
+# ---------------------------------------------------------------------------
+
+
+class StatementRerunError(Exception):
+    """A rerun refused before any model call: nothing was written."""
+
+
+@dataclass(frozen=True)
+class RerunOutcome:
+    """A rerun's new revision, as written."""
+
+    previous_revision: int
+    revision: int
+    change_seq: int
+
+
+def rerun_statement(
+    conn: psycopg.Connection[dict[str, Any]],
+    store: EvidenceStore,
+    statement_id: UUID,
+    *,
+    agents: StatementAgents,
+    llm_model: str,
+) -> RerunOutcome:
+    """Run a statement again from its stored original, as a new revision.
+
+    The same steps as intake (U5 steps 3 to 5, :func:`extract_statement`),
+    so the same read bounds, prompts, mask and gates, with
+    ``origin = 'rerun'``. The read and the model calls run with no
+    transaction open. Then one short transaction, under the feed lock,
+    appends the revision, its accounts and lines, and makes it current
+    (:func:`~receipt_index.statement_repository.set_current_revision`, which
+    draws the statement's new place in the feed): every earlier revision is
+    kept as it is, and the append-only triggers refuse any change to one.
+    The new revision is current whatever its status.
+
+    Raises :class:`StatementRerunError` (no statement, no stored original,
+    an original the store can't open or read, or stored bytes that don't
+    match the statement's hash),
+    :class:`StatementItemError` (a read or the gates failed) or
+    :class:`~receipt_index.statement_extraction.StatementCallError` (a model
+    call failed). Any of them writes nothing.
+    """
+    current = get_revision(conn, statement_id)
+    location = original_location(conn, statement_id)
+    conn.commit()
+    if current is None or location is None:
+        msg = f"no statement {statement_id}"
+        raise StatementRerunError(msg)
+    if location["ref"] is None:
+        msg = f"statement {statement_id} has no stored original"
+        raise StatementRerunError(msg)
+    try:
+        with store.open(location["ref"]) as fh:
+            data = fh.read()
+    except (OSError, StoreError) as exc:
+        # A locator the store refuses (InvalidRefError) is a StoreError.
+        # By class only: either message can quote the locator or a path.
+        msg = f"the stored original can't be read: {type(exc).__name__}"
+        raise StatementRerunError(msg) from None
+    if hashlib.sha256(data).digest() != bytes(location["source_sha256"]):
+        msg = (
+            f"the stored original of statement {statement_id} doesn't match its "
+            "SHA-256; nothing was run"
+        )
+        raise StatementRerunError(msg)
+
+    # As at the start of every intake run.
+    refuse_instrumentation()
+    quiet_payload_loggers()
+    extracted = extract_statement(
+        data,
+        agents=agents,
+        llm_model=llm_model,
+        source_id=f"rerun of {statement_id}",
+        control=None,
+        usage=_Usage(),
+        origin="rerun",
+    )
+
+    try:
+        # As intake does. The revision trigger would take the counter's row
+        # lock first anyway; taking it here keeps the order explicit, the
+        # feed lock before any statement row, if the trigger changes.
+        lock_feed(conn)
+        revision_id = _write_run(conn, statement_id, extracted)
+        change_seq = set_current_revision(
+            conn,
+            statement_id=statement_id,
+            revision_id=revision_id,
+            status=extracted.revision.status,
+            document_type=extracted.revision.document_type,
+        )
+        row = conn.execute(
+            "SELECT revision FROM receipt.statement_revisions WHERE id = %s",
+            (revision_id,),
+        ).fetchone()
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    assert row is not None
+    logger.info(
+        "Statement %s rerun: revision %s, %s, %s",
+        statement_id,
+        row["revision"],
+        extracted.revision.status,
+        extracted.revision.document_type,
+    )
+    return RerunOutcome(
+        previous_revision=current["revision"],
+        revision=row["revision"],
+        change_seq=change_seq,
+    )
