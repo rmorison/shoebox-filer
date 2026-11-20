@@ -347,7 +347,8 @@ class TestGetStatement:
         repo.get_revision.return_value = None
         args = {"statement_id": str(_STATEMENT), "revision": 3}
         text = _error(_call(log_path, "get_statement", args))
-        assert text == f"not_found: no revision 3 of {_STATEMENT}"
+        assert text == f"not_found: no such revision of {_STATEMENT}"
+        assert "3" not in text.removesuffix(str(_STATEMENT))
 
 
 # ---------------------------------------------------------------------------
@@ -409,12 +410,12 @@ class TestGetStatementLines:
     def test_an_unknown_account(self, repo: MagicMock, log_path: Path) -> None:
         repo.get_account.return_value = None
         text = _error(_call(log_path, "get_statement_lines", _LINES))
-        assert text == f"not_found: no account 1 in revision 5 of {_STATEMENT}"
+        assert text == f"not_found: no such account in that revision of {_STATEMENT}"
 
     def test_an_unknown_revision(self, repo: MagicMock, log_path: Path) -> None:
         repo.get_revision.return_value = None
         text = _error(_call(log_path, "get_statement_lines", _LINES))
-        assert text == f"not_found: no revision 5 of {_STATEMENT}"
+        assert text == f"not_found: no such revision of {_STATEMENT}"
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +544,187 @@ def test_every_statement_tool_is_read_only(log_path: Path) -> None:
         assert annotations is not None
         assert annotations.read_only_hint is True
         assert annotations.destructive_hint is False
+
+
+# ---------------------------------------------------------------------------
+# Stored totals: money through the contract's format, or withheld
+# ---------------------------------------------------------------------------
+
+
+def test_stored_totals_come_back_as_contract_money(
+    repo: MagicMock, log_path: Path
+) -> None:
+    repo.get_accounts.return_value = [
+        _account(
+            section_totals=[{"section": "fees", "amount": "15.5"}],
+            column_totals=[{"section": None, "credits": "-0.00", "debits": "7"}],
+        )
+    ]
+    data = _ok(_call(log_path, "get_statement", {"statement_id": str(_STATEMENT)}))
+    (account,) = data["accounts"]
+    assert account["section_totals"] == [{"section": "fees", "amount": "15.50"}]
+    assert account["column_totals"] == [
+        {"section": None, "credits": "0.00", "debits": "7.00"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "not a number",
+        "",
+        "1.234",
+        "1234567890123.00",
+        "4929381766207319",
+        12,
+        1.5,
+        True,
+        {"amount": "1.00"},
+    ],
+)
+@pytest.mark.parametrize(
+    ("where", "field"),
+    [
+        ("section_totals", "amount"),
+        ("column_totals", "credits"),
+        ("column_totals", "debits"),
+    ],
+)
+def test_a_stored_total_that_is_not_contract_money_is_withheld(
+    repo: MagicMock, log_path: Path, value: object, where: str, field: str
+) -> None:
+    total: dict[str, Any] = (
+        {"section": "fees", "amount": "1.00"}
+        if where == "section_totals"
+        else {"section": "fees", "credits": "1.00", "debits": "1.00"}
+    )
+    repo.get_accounts.return_value = [_account(**{where: [total | {field: value}]})]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    assert _error(result).startswith("withheld: ")
+    (entry,) = _withheld_entries(log_path)
+    assert entry["fields"] == [f"accounts[1].{where}[0].{field}"]
+    assert "4929" not in json.dumps(result.model_dump(mode="json"))
+    assert "4929" not in log_path.read_text()
+
+
+@pytest.mark.parametrize("section", [12, 1.5, True, {"a": "b"}, ["fees"]])
+@pytest.mark.parametrize("where", ["section_totals", "column_totals"])
+def test_a_stored_section_that_is_not_text_is_withheld(
+    repo: MagicMock, log_path: Path, section: object, where: str
+) -> None:
+    total: dict[str, Any] = (
+        {"section": section, "amount": "1.00"}
+        if where == "section_totals"
+        else {"section": section, "credits": "1.00", "debits": None}
+    )
+    repo.get_accounts.return_value = [_account(**{where: [total]})]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    assert _error(result).startswith("withheld: ")
+    (entry,) = _withheld_entries(log_path)
+    assert entry["fields"] == [f"accounts[1].{where}[0].section"]
+
+
+def test_a_section_totals_section_of_null_is_withheld(
+    repo: MagicMock, log_path: Path
+) -> None:
+    # The contract: a section total's section is never null.
+    repo.get_accounts.return_value = [
+        _account(section_totals=[{"section": None, "amount": "1.00"}])
+    ]
+    result = _call(log_path, "get_statement", {"statement_id": str(_STATEMENT)})
+    assert _error(result).startswith("withheld: ")
+    (entry,) = _withheld_entries(log_path)
+    assert entry["fields"] == ["accounts[1].section_totals[0].section"]
+
+
+# ---------------------------------------------------------------------------
+# Integers past the database's range, and integers that aren't
+# ---------------------------------------------------------------------------
+
+_INT64_MAX = 2**63 - 1
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "name"),
+    [
+        ("get_statement_lines", _LINES | {"offset": _INT64_MAX + 1}, "offset"),
+        ("get_statement_lines", _LINES | {"revision": _INT64_MAX + 1}, "revision"),
+        ("get_statement_lines", _LINES | {"revision": -(2**63) - 1}, "revision"),
+        (
+            "get_statement_lines",
+            _LINES | {"account_ordinal": _INT64_MAX + 1},
+            "account_ordinal",
+        ),
+        (
+            "get_statement_lines",
+            _LINES | {"account_ordinal": -(2**63) - 1},
+            "account_ordinal",
+        ),
+        (
+            "get_statement",
+            {"statement_id": str(_STATEMENT), "revision": _INT64_MAX + 1},
+            "revision",
+        ),
+    ],
+)
+def test_an_integer_past_64_bits_is_refused_before_the_database(
+    repo: MagicMock, log_path: Path, tool: str, args: dict[str, Any], name: str
+) -> None:
+    text = _error(_call(log_path, tool, args))
+    assert text.startswith(f"invalid_argument: {name} must be from ")
+    repo.get_revision.assert_not_called()
+    repo.get_lines.assert_not_called()
+
+
+def test_the_largest_64_bit_values_reach_the_database(
+    repo: MagicMock, log_path: Path
+) -> None:
+    repo.get_lines.return_value = []
+    args = _LINES | {"offset": _INT64_MAX, "revision": _INT64_MAX}
+    _ok(_call(log_path, "get_statement_lines", args))
+    assert repo.get_lines.call_args.kwargs["offset"] == _INT64_MAX
+
+
+@pytest.mark.parametrize("value", [True, "5", 2.0])
+@pytest.mark.parametrize(
+    ("tool", "base", "name"),
+    [
+        ("list_statement_changes", {}, "limit"),
+        ("get_statement", {"statement_id": str(_STATEMENT)}, "revision"),
+        ("get_statement_lines", _LINES, "revision"),
+        ("get_statement_lines", _LINES, "account_ordinal"),
+        ("get_statement_lines", _LINES, "limit"),
+        ("get_statement_lines", _LINES, "offset"),
+    ],
+)
+def test_an_integer_argument_must_be_an_integer(
+    repo: MagicMock,
+    log_path: Path,
+    tool: str,
+    base: dict[str, Any],
+    name: str,
+    value: object,
+) -> None:
+    result = _call(log_path, tool, base | {name: value})
+    assert result.is_error
+    repo.changes_after.assert_not_called()
+    repo.get_revision.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The access log's own log line
+# ---------------------------------------------------------------------------
+
+
+def test_a_withheld_entry_is_not_logged_as_a_file_fetch(
+    repo: MagicMock, log_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo.get_lines.return_value = [_line(1, description=f"PAY {_GROUPED}")]
+    with caplog.at_level("INFO", logger="receipt_index.mcp_server"):
+        _error(_call(log_path, "get_statement_lines", _LINES))
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("file fetch" in m for m in messages)
+    assert any(m.startswith("access: ") and '"withheld"' in m for m in messages)

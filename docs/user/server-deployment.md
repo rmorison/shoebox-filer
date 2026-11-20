@@ -1605,7 +1605,7 @@ docker compose -f deploy/docker-compose.yml exec -T scheduler receipt-index mcp 
 
 One JSON line per `get_receipt_file` call: timestamp, receipt ID, stored path, size, whether content was returned, the outcome, and the client's name and version. If the log can't be written, the server withholds the file.
 
-A statement read the server refuses with `withheld` adds a line too, with outcome `withheld`: the statement ID, revision, account and the names of the fields that failed the mask check, never their text. `receipt-index status` counts these under MCP, so you see them without reading the log; see [CLI Reference: Statement tools](cli-reference.md#statement-tools). A withheld revision is a stored-data problem: re-extract the statement, or correct the stored rows.
+A statement read the server refuses with `withheld` adds a line too, with outcome `withheld`: the statement ID, revision, account and the names of the fields that failed the read check, never their values. `receipt-index status` counts these under MCP, so you see them without reading the log; see [CLI Reference: Statement tools](cli-reference.md#statement-tools). A withheld revision is a stored-data problem: re-extract the statement, or correct the stored rows.
 
 The log is small and isn't rotated. Read it with:
 

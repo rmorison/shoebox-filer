@@ -2635,7 +2635,7 @@ def duplicates_scan(ctx: click.Context, dry_run: bool, window_days: int) -> None
     default=None,
     envvar="RECEIPT_INDEX_MCP_ACCESS_LOG",
     help=(
-        "JSON-lines file recording every file fetch "
+        "JSON-lines file recording every file fetch and withheld statement read "
         "[default: $XDG_STATE_HOME/receipt-index/mcp-access.jsonl]."
     ),
 )

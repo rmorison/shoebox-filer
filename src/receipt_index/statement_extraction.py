@@ -893,29 +893,40 @@ def within_mask_bound(text: str | None) -> bool:
 
     The text is prepared as ``mask_digits`` prepares it (normalised, digits
     of any script folded to ASCII, separators folded, invisible characters
-    inside numbers dropped), then two things are checked: no span of digit
-    groups (``_span``, the mask's own reading) shows more than 12 digits,
-    the backstop's limit; and no eight digits stand in a row. The second
-    is the CHECK of migration 000023, but stricter by design: the CHECK
-    reads ASCII digits only, while this reads every digit the mask folds,
-    and sees through an invisible character inside a run.
+    inside numbers dropped), then each span of digit groups (``_span``, the
+    mask's own reading) is split into runs as the mask splits it
+    (``_split_runs``: amounts with cents and short dates set aside), and
+    three things are checked: no run is one the mask cuts (``_cuts_run``:
+    eight digits or more across its tokens, however they are grouped); no
+    span shows more than 12 digits, the backstop's limit; and no eight
+    digits stand in a row. The last is the CHECK of migration 000023, but
+    stricter by design: the CHECK reads ASCII digits only, while this reads
+    every digit the mask folds, and sees through an invisible character
+    inside a run.
 
-    Every output of ``mask_digits`` passes (the mask tests assert it). The
-    MCP statement tools run it on every free-text field they return, and
-    refuse a field that fails it (``withheld``), so a row that never went
-    through the mask (a restore from an older build, a hand insert) can't
-    leave the server. Known limit, accepted: a kept amount of eight or more
-    digits in a row would fail it, and be withheld.
+    So the guard refuses what the mask's run rule would cut, and every
+    output of ``mask_digits`` passes (the mask tests assert both). The MCP
+    statement tools run it on every free-text field they return and refuse
+    a field that fails it (``withheld``). A row that never went through the
+    mask (a restore from an older build, a hand insert) is held to the
+    mask's own run rule, not a looser one. It doesn't redo the mask's
+    whole-span cut of a card number written in amount- and date-shaped
+    groups; the 12-digit limit stands in for it. Known limit, accepted: a
+    kept amount of eight or more digits in a row would fail it, and be
+    withheld.
     """
     if text is None:
         return True
     prepared = _prepare(text)
     if _EIGHT_IN_A_ROW.search(prepared):
         return False
-    return all(
-        _shown_digits(span.group()) <= _MAX_SHOWN_DIGITS
-        for span in _span().finditer(prepared)
-    )
+    for span in _span().finditer(prepared):
+        if _shown_digits(span.group()) > _MAX_SHOWN_DIGITS:
+            return False
+        _, runs = _split_runs(span.group())
+        if any(_cuts_run(run) for run in runs if run):
+            return False
+    return True
 
 
 def _is_currency_mark(ch: str) -> bool:
@@ -1093,22 +1104,32 @@ def _cut_whole(span: str, groups: list[re.Match[str]], runs: Runs) -> bool:
     return True
 
 
+def _run_digits(run: list[re.Match[str]]) -> str:
+    return "".join(_NON_DIGIT.sub("", t.group()) for t in run)
+
+
+def _cuts_run(run: list[re.Match[str]]) -> bool:
+    """Whether the mask cuts this run of number tokens: eight digits or
+    more, unless it is one bare amount in thousands groups of nine digits
+    or fewer. ``_cut_runs`` and ``within_mask_bound`` both ask this."""
+    digits = _run_digits(run)
+    lone_amount = (
+        len(run) == 1
+        and _BARE_THOUSANDS.fullmatch(run[0].group().strip(_JOINERS)) is not None
+        and len(digits) <= _MAX_BARE_AMOUNT_DIGITS
+    )
+    return len(digits) >= _MIN_MASKED_DIGITS and not lone_amount
+
+
 def _cut_runs(span: str, runs: Runs) -> tuple[str, int]:
     """``span`` with each run of eight digits or more cut to its last four."""
     pieces: list[str] = []
     position = 0
     cuts = 0
     for run in runs:
-        if not run:
+        if not run or not _cuts_run(run):
             continue
-        digits = "".join(_NON_DIGIT.sub("", t.group()) for t in run)
-        lone_amount = (
-            len(run) == 1
-            and _BARE_THOUSANDS.fullmatch(run[0].group().strip(_JOINERS))
-            and len(digits) <= _MAX_BARE_AMOUNT_DIGITS
-        )
-        if len(digits) < _MIN_MASKED_DIGITS or lone_amount:
-            continue
+        digits = _run_digits(run)
         start, end = run[0].start(), run[-1].end()
         # Keep a mark the run's first token starts with ("-4111 ..."); a
         # span always ends on a digit, so its last token never ends on one.

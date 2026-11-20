@@ -376,6 +376,86 @@ def test_rows_the_check_passes_but_the_guard_does_not_are_withheld(
     assert withheld.count == 2
 
 
+# Rows written past the mask in shapes the database CHECK passes: each holds
+# a run the mask would cut, so the guard refuses it (review round 1).
+_Q_PROBE = "Synthetic 4929 3817 6620 Q 7319"
+_THREE_GROUPS = "Synthetic 4929-3817-6620"
+
+
+@pytest.mark.parametrize("text", [_Q_PROBE, _THREE_GROUPS])
+def test_a_row_the_mask_would_cut_is_withheld(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    evidence: LocalEvidenceStore,
+    log: Path,
+    text: str,
+) -> None:
+    statement_id = _ingest(pg_conn, evidence, Replies(), page="Synthetic run page")
+    pg_conn.execute("SET LOCAL session_replication_role = replica")
+    pg_conn.execute(
+        "UPDATE receipt.statement_lines SET description = %s WHERE ordinal = 2",
+        (text,),
+    )
+    pg_conn.commit()
+    server = _server(evidence, log)
+    revision = _feed(server, None)["changes"][0]["revision"]
+
+    result = _call(
+        server,
+        "get_statement_lines",
+        {"statement_id": statement_id, "revision": revision, "account_ordinal": 1},
+    )
+
+    assert _refusal(result).startswith("withheld: ")
+    out = _dump(result)
+    assert "3817" not in out
+    assert "6620" not in out
+    (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["fields"] == ["lines[2].description"]
+
+
+def test_a_stored_total_that_is_not_money_is_withheld(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    evidence: LocalEvidenceStore,
+    log: Path,
+) -> None:
+    statement_id = _ingest(pg_conn, evidence, Replies(), page="Synthetic totals page")
+    # A digit string in a total's amount: no CHECK reads the totals' amounts.
+    pg_conn.execute("SET LOCAL session_replication_role = replica")
+    pg_conn.execute(
+        "UPDATE receipt.statement_accounts SET section_totals = %s::jsonb",
+        (json.dumps([{"section": "fees", "amount": "4929381766207319"}]),),
+    )
+    pg_conn.commit()
+    server = _server(evidence, log)
+
+    result = _call(server, "get_statement", {"statement_id": statement_id})
+
+    assert _refusal(result).startswith("withheld: ")
+    assert "4929381766207319" not in _dump(result)
+    (entry,) = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["fields"] == ["accounts[1].section_totals[0].amount"]
+
+
+def test_an_offset_past_64_bits_is_refused_before_postgres(
+    pg_conn: psycopg.Connection[dict[str, Any]],
+    evidence: LocalEvidenceStore,
+    log: Path,
+) -> None:
+    statement_id = _ingest(pg_conn, evidence, Replies(), page="Synthetic offset page")
+    server = _server(evidence, log)
+    revision = _feed(server, None)["changes"][0]["revision"]
+    args = {"statement_id": statement_id, "revision": revision, "account_ordinal": 1}
+
+    past, last = _calls(
+        server,
+        ("get_statement_lines", {**args, "offset": 2**63}),
+        ("get_statement_lines", {**args, "offset": 2**63 - 1}),
+    )
+
+    assert _refusal(past).startswith("invalid_argument: offset must be from ")
+    assert _ok(last)["lines"] == []
+
+
 # ---------------------------------------------------------------------------
 # The change feed
 # ---------------------------------------------------------------------------

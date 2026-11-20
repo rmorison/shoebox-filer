@@ -124,7 +124,11 @@ def test_the_backstop_cuts_a_span_the_rules_left_too_long(
     # With the rules switched off, the backstop alone still cuts.
     monkeypatch.setattr(se, "_cut_tokens", lambda span, *_: (span, 0))
     assert mask_digits("Card 4111 1111 1111 1234") == ("Card 1234", 1)
-    assert mask_digits("Card 4111 1111 1234") == ("Card 4111 1111 1234", 0)
+    # Twelve digits are within the backstop's bound, so it alone leaves them;
+    # the run rule cuts them, and so the read guard refuses them.
+    span = "4111 1111 1234"
+    assert se._backstop(span, span, 0) == (span, 0)
+    assert not se.within_mask_bound(f"Card {span}")
 
 
 def test_the_backstop_leaves_a_span_within_the_bound() -> None:

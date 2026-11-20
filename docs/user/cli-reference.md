@@ -996,7 +996,7 @@ Three tools read extracted statements. Their shapes, formats, error codes and di
 | `get_statement` | `statement_id`, `revision` (optional; default the current one) | One revision with its accounts, balances, totals and digests, but not their lines |
 | `get_statement_lines` | `statement_id`, `revision`, `account_ordinal`, `limit` (1-1000, default 500), `offset` (default 0) | `{contract_version, lines, total, limit, offset, next_offset}`: one account's lines. A held or loan account has none |
 
-A refused call is an error whose message starts with a code: `invalid_cursor`, `invalid_id`, `not_found`, `invalid_argument` or `withheld`. Free text (institution, section names, line descriptions) is stored masked: at most the last four digits of a card or account number are shown. Before returning a revision's text, the server checks it against the mask once more; if a field fails, the call is refused with `withheld` and recorded in the access log. Treat a withheld revision as held for review. No tool returns a statement's original PDF.
+A refused call is an error whose message starts with a code: `invalid_cursor`, `invalid_id`, `not_found`, `invalid_argument` or `withheld`. Free text (institution, section names, line descriptions) is stored masked: at most the last four digits of a card or account number are shown. Before returning a revision's data, the server checks its text against the mask's rule once more, and its stored totals against the contract's money format; if a field fails, the call is refused with `withheld` and recorded in the access log. Treat a withheld revision as held for review, and discard any pages of it already read. No tool returns a statement's original PDF.
 
 ### Access log
 

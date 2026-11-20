@@ -57,15 +57,15 @@ A refused call is an error result whose message starts with a stable code, then 
 | `invalid_id` | A `statement_id` that isn't a UUID. The message never repeats it. |
 | `not_found` | No such statement, no such revision of it, or no such account ordinal in that revision. |
 | `invalid_argument` | `limit` or `offset` out of range. |
-| `withheld` | A stored text field of the revision failed the mask's bound at read (see [Withheld](#withheld)). |
+| `withheld` | A stored field of the revision failed the read check (see [Withheld](#withheld)). |
 
 A well-formed cursor ahead of everything the server has issued (possible after a restore) isn't an error: it returns no changes, and `next_cursor` is the request's cursor.
 
 ### Withheld
 
-Text is masked before it is stored. Before any tool returns a revision's text, each free-text field (`institution`, every totals `section`, each line's `description` and `section`) is checked against the mask's bound once more. If one fails, the call is refused with `withheld`, and nothing of that revision is returned by that call. The stored text is never re-masked at read, since the digest covers it.
+Text is masked before it is stored. Before a tool returns a revision's data, it checks what it is about to return once more. `get_statement` checks each account's `institution`, every totals `section` (text; never null in a section total) and every totals amount, credits and debits (a decimal string that fits the contract's money: finite, at most two places, under 10^12). `get_statement_lines` checks the page's `description` and `section` values. Each text field is held to the mask's own rule (see [the read check](#masking)). If any field fails, the call is refused with `withheld`, and nothing of that revision is returned by that call. Nothing is re-masked or repaired at read, since the digest covers the stored values.
 
-- **The client's safe default:** treat the revision as held for review. Never read the refusal as an empty statement or account, and never as a fault to retry in a tight loop.
+- **The client's safe default:** treat the whole revision as held for review. A refusal on any page of `get_statement_lines` holds the revision, so discard the pages already read from it. Never read the refusal as an empty statement or account, and never as a fault to retry in a tight loop.
 - A refusal is recorded in the server's access log by statement ID, revision, account ordinal and field name, never the text. `receipt-index status` shows how many reads were withheld and when the latest was.
 - A withheld row is a stored-data problem, for the operator to fix (re-extract the statement, or correct the stored rows): a fix makes a new revision, or a republish, which appears in the feed.
 
@@ -274,6 +274,6 @@ One deterministic function masks `description`, `section` and `institution` afte
 
 The mask is a pattern guard for the ways institutions print account and card numbers, not a proof that no number can pass. It also cuts some numbers that aren't account numbers: a reference number of 8 or more digits, a phone number or an undelimited date keeps only its last four. The plan lists every known limit and side effect. A client should expect at most the last four digits of a card or account number in any text field.
 
-**The read check.** The server checks every free-text field again at read, by the same bound: no span shows more than 12 digits, and no eight digits stand in a row. Digits of any script count, so the check is stricter than the database's own check, which reads ASCII digits only. A field that fails is [withheld](#withheld). Known limit, accepted: a kept amount of eight or more digits in a row, or one of eight digits written in another script, would be withheld too. This fails closed: an over-cautious refusal, never a leak.
+**The read check.** The server checks every free-text field again at read, by the mask's own run rule: no run of digit groups that the mask would cut (eight digits or more, however the groups are split by spaces, dashes or other joiners, once amounts with cents and short dates are set aside), no span showing more than 12 digits, and no eight digits in a row. Digits of any script count, so the check is stricter than the database's own check, which reads ASCII digits only and only eight in a row. A field that fails is [withheld](#withheld). Text the mask wrote always passes. Known limit, accepted: a kept amount of eight or more digits in a row, or one of eight digits written in another script, would be withheld too. This fails closed: an over-cautious refusal, never a leak.
 
 `masked_runs` counts the cuts. The masked text is never logged.
